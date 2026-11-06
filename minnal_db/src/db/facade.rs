@@ -21,8 +21,8 @@ use crate::db::toml_config::MinnalTomlConfig;
 use crate::db::ttl_worker::{TtlTarget, TtlWorker};
 use crate::db::wal_worker::WalGcWorker;
 use crate::field_index::IndexValueType;
-use crate::store::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
-use crate::store::lsm_worker::{LsmCompactionTarget, LsmCompactionWorker};
+use crate::storage::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
+use crate::storage::lsm_worker::{LsmCompactionTarget, LsmCompactionWorker};
 
 // ── rkyv trait alias ───────────────────────────────────────────────────
 //
@@ -426,7 +426,7 @@ impl Db {
     }
 
     /// Snapshot of engine-wide operational metrics (runtime counters).
-    pub fn ops_metrics(&self) -> crate::db::metrics::MetricsSnapshot {
+    pub fn ops_metrics(&self) -> crate::support::metrics::MetricsSnapshot {
         self.inner.metrics_snapshot()
     }
 
@@ -437,12 +437,12 @@ impl Db {
     }
 
     /// Operational metrics for a single namespace, by name.
-    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
+    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::support::metrics::MetricsSnapshot> {
         self.inner.metrics_snapshot_for(namespace)
     }
 
     /// Per-namespace operational metrics for every live namespace, keyed by name.
-    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::db::metrics::MetricsSnapshot)> {
+    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::support::metrics::MetricsSnapshot)> {
         self.inner.metrics_snapshot_by_namespace()
     }
 
@@ -464,27 +464,27 @@ impl Db {
     }
 
     /// Returns a live LSM manifest snapshot for every active namespace.
-    pub fn lsm_manifests(&self) -> Vec<(String, crate::store::lsm::lsm_manifest::LsmManifest)> {
+    pub fn lsm_manifests(&self) -> Vec<(String, crate::storage::lsm::manifest::LsmManifest)> {
         self.inner.lsm_manifests()
     }
 
     /// Returns the in-memory (non-SSTable) LSM stats for every active namespace.
-    pub fn lsm_runtime_stats(&self) -> Vec<(String, crate::store::lsm::lsm_tree::LSMStats)> {
+    pub fn lsm_runtime_stats(&self) -> Vec<(String, crate::storage::lsm::tree::LSMStats)> {
         self.inner.lsm_runtime_stats()
     }
 
     /// Returns per-bucket value-log metadata for every active namespace.
-    pub fn value_log_shard_stats(&self) -> Vec<(String, Vec<(u32, crate::store::value_log::ValueLogMetadata)>)> {
+    pub fn value_log_shard_stats(&self) -> Vec<(String, Vec<(u32, crate::storage::value_log::ValueLogMetadata)>)> {
         self.inner.value_log_shard_stats()
     }
 
     /// Physical (on-disk) vs logical value-log footprint per shard, per namespace.
-    pub fn value_log_physical_stats(&self) -> Vec<(String, Vec<crate::store::value_log::sharded::ShardPhysicalStats>)> {
+    pub fn value_log_physical_stats(&self) -> Vec<(String, Vec<crate::storage::value_log::sharded::ShardPhysicalStats>)> {
         self.inner.value_log_physical_stats()
     }
 
     /// Per-page value-log garbage breakdown for one namespace (by name).
-    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::SegmentStats>)>> {
+    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::storage::value_log::SegmentStats>)>> {
         self.inner.value_log_segment_stats(namespace)
     }
 
@@ -1701,7 +1701,7 @@ impl AsyncDb {
     }
 
     /// Snapshot of engine-wide operational metrics (runtime counters).
-    pub fn ops_metrics(&self) -> crate::db::metrics::MetricsSnapshot {
+    pub fn ops_metrics(&self) -> crate::support::metrics::MetricsSnapshot {
         self.inner.ops_metrics()
     }
 
@@ -1712,12 +1712,12 @@ impl AsyncDb {
     }
 
     /// Operational metrics for a single namespace, by name.
-    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
+    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::support::metrics::MetricsSnapshot> {
         self.inner.ops_metrics_for(namespace)
     }
 
     /// Per-namespace operational metrics for every live namespace, keyed by name.
-    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::db::metrics::MetricsSnapshot)> {
+    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::support::metrics::MetricsSnapshot)> {
         self.inner.ops_metrics_by_namespace()
     }
 
@@ -1739,27 +1739,27 @@ impl AsyncDb {
     }
 
     /// Returns a live LSM manifest snapshot for every active namespace.
-    pub fn lsm_manifests(&self) -> Vec<(String, crate::store::lsm::lsm_manifest::LsmManifest)> {
+    pub fn lsm_manifests(&self) -> Vec<(String, crate::storage::lsm::manifest::LsmManifest)> {
         self.inner.lsm_manifests()
     }
 
     /// Returns the in-memory (non-SSTable) LSM stats for every active namespace.
-    pub fn lsm_runtime_stats(&self) -> Vec<(String, crate::store::lsm::lsm_tree::LSMStats)> {
+    pub fn lsm_runtime_stats(&self) -> Vec<(String, crate::storage::lsm::tree::LSMStats)> {
         self.inner.lsm_runtime_stats()
     }
 
     /// Returns per-bucket value-log metadata for every active namespace.
-    pub fn value_log_shard_stats(&self) -> Vec<(String, Vec<(u32, crate::store::value_log::ValueLogMetadata)>)> {
+    pub fn value_log_shard_stats(&self) -> Vec<(String, Vec<(u32, crate::storage::value_log::ValueLogMetadata)>)> {
         self.inner.value_log_shard_stats()
     }
 
     /// Physical (on-disk) vs logical value-log footprint per shard, per namespace.
-    pub fn value_log_physical_stats(&self) -> Vec<(String, Vec<crate::store::value_log::sharded::ShardPhysicalStats>)> {
+    pub fn value_log_physical_stats(&self) -> Vec<(String, Vec<crate::storage::value_log::sharded::ShardPhysicalStats>)> {
         self.inner.value_log_physical_stats()
     }
 
     /// Per-page value-log garbage breakdown for one namespace (by name).
-    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::SegmentStats>)>> {
+    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::storage::value_log::SegmentStats>)>> {
         self.inner.value_log_segment_stats(namespace)
     }
 

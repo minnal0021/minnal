@@ -10,7 +10,6 @@ pub mod index_manager;
 pub(crate) mod key_locks;
 pub mod kv_store;
 pub(crate) mod layout;
-pub mod metrics;
 pub mod namespace;
 pub mod namespace_index;
 pub(crate) mod query;

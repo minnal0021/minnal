@@ -354,7 +354,7 @@ minnal/
 │   ├── QUICKSTART.md       ← embedded quickstart + feature selection
 │   ├── README.md           ← detailed KV engine documentation
 │   └── src/
-│       ├── db/ store/      ← LSM + value-log KV engine
+│       ├── db/ storage/    ← LSM + value-log KV engine
 │       ├── field_index/    ← RoaringBitmap field indexing (part of kv-store)
 │       ├── semantic_search/← IVF clustering, RaBitQ quantisation, vector↔KV bridge (semantic-search)
 │       └── doc_store/      ← JSON document store (doc-store)

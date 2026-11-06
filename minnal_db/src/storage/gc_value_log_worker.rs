@@ -131,7 +131,7 @@ mod tests {
     use super::*;
     use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
     use crate::db::facade::Db;
-    use crate::store::lsm::lsm_tree::LSMConfig;
+    use crate::storage::lsm::tree::LSMConfig;
     use std::time::Duration;
     use tempfile::TempDir;
 

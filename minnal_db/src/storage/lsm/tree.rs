@@ -11,7 +11,7 @@
 //! - Compaction: Background thread merges read-only records into SSTable files
 
 use super::bloom::BloomFilter;
-use super::lsm_manifest::{LsmManifest, ManifestBucket, ManifestFile, ManifestLevel};
+use super::manifest::{LsmManifest, ManifestBucket, ManifestFile, ManifestLevel};
 use super::skip_list::skip_list::{KeyValueRecord, SkipList};
 use super::sparse_index::SparseIndex;
 use crate::support::{get_bucket_for_key, key_prefix_of};
@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use thiserror::Error;
 
-use crate::db::metrics::Metrics;
+use crate::support::metrics::Metrics;
 
 /// An L0 file written and fsynced by a flush, not yet registered.
 struct WrittenLevel0File {

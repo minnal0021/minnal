@@ -346,8 +346,8 @@ impl Database {
         };
         self.flush_wal_metadata_internal()?;
 
-        crate::db::metrics::Metrics::bump(&self.metrics.wal_gc_runs);
-        crate::db::metrics::Metrics::add(&self.metrics.wal_segments_deleted, segments_deleted);
+        crate::support::metrics::Metrics::bump(&self.metrics.wal_gc_runs);
+        crate::support::metrics::Metrics::add(&self.metrics.wal_segments_deleted, segments_deleted);
 
         // Liveness: the pin can only drain when a checkpoint advances the
         // fields' recorded offsets, so ask for one now and let the next GC tick

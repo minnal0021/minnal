@@ -8,10 +8,10 @@
 use crate::db::error::{KVError, Result};
 use crate::db::index_checkpoint_worker::IndexCheckpointTrigger;
 use crate::db::stats::{GCStats, Stats};
-use crate::store::lsm::lsm_tree::{LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
-use crate::store::lsm_worker::LsmCompactionCommand;
-use crate::store::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
-use crate::store::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
+use crate::storage::lsm::tree::{LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
+use crate::storage::lsm_worker::LsmCompactionCommand;
+use crate::storage::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
+use crate::storage::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
 
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::db::metrics::Metrics;
+use crate::support::metrics::Metrics;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::config::SyncConfig;
@@ -208,7 +208,7 @@ pub struct KVStore {
 
     /// Engine-wide operational counters, shared from `Database` via
     /// [`set_metrics`](Self::set_metrics). `None` for a standalone store (tests).
-    pub(crate) metrics: OnceLock<Arc<crate::db::metrics::Metrics>>,
+    pub(crate) metrics: OnceLock<Arc<crate::support::metrics::Metrics>>,
 
     /// Test-only crash point: when set, a GC pass returns the moment its segments are
     /// unlinked, skipping everything after. It exists to prove the *ordering* of
@@ -238,7 +238,7 @@ impl KVStore {
     /// Whether the namespace whose data directory is `base_path` holds any L1
     /// data, without opening it (see `LSMTree::has_level1_data`).
     pub(crate) fn has_level1_data(base_path: &Path) -> std::io::Result<bool> {
-        crate::store::lsm::lsm_tree::LSMTree::has_level1_data(&base_path.join("lsm"))
+        crate::storage::lsm::tree::LSMTree::has_level1_data(&base_path.join("lsm"))
     }
 
     /// Enable or disable re-verifying each value's CRC32 on read (default off).
@@ -366,14 +366,14 @@ impl KVStore {
 
     /// Attach the engine-wide operational counters, propagating them to the LSM
     /// tree as well (called once by `Database` after open).
-    pub(crate) fn set_metrics(&self, metrics: Arc<crate::db::metrics::Metrics>) {
+    pub(crate) fn set_metrics(&self, metrics: Arc<crate::support::metrics::Metrics>) {
         self.lsm.set_metrics(metrics.clone());
         let _ = self.metrics.set(metrics);
     }
 
     /// The operational counters, if attached. `None` for a standalone store.
     #[inline]
-    pub(crate) fn metrics(&self) -> Option<&crate::db::metrics::Metrics> {
+    pub(crate) fn metrics(&self) -> Option<&crate::support::metrics::Metrics> {
         self.metrics.get().map(|m| m.as_ref())
     }
 
@@ -402,7 +402,7 @@ impl KVStore {
     /// Must not be narrowed: the LSM compares a fresh write's sequence against
     /// entries that can be arbitrarily old (an L1 entry keeps its sequence for
     /// the lifetime of the database), so the width has to span the whole
-    /// sequence space, not just a recent window. See [`crate::store::lsm::lsm_tree`]'s
+    /// sequence space, not just a recent window. See [`crate::storage::lsm::tree`]'s
     /// `seq_newer`.
     pub(crate) fn alloc_seq(&self) -> u64 {
         self.seq_counter.read().fetch_add(1, Ordering::Relaxed)
@@ -1965,7 +1965,7 @@ impl KVStore {
 /// again later.
 struct SyncValueLogBeforePersist {
     inner: Arc<dyn LsmFlushObserver>,
-    logs: Vec<Arc<crate::store::value_log::ValueLog>>,
+    logs: Vec<Arc<crate::storage::value_log::ValueLog>>,
 }
 
 impl LsmFlushObserver for SyncValueLogBeforePersist {
@@ -2025,7 +2025,7 @@ impl Drop for KVStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
+    use crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
     use tempfile::TempDir;
 
     fn default_lsm_config() -> LSMConfig {
@@ -2073,7 +2073,7 @@ mod tests {
             1024 * 1024, // small segments so they seal and become GC candidates
         )
         .unwrap();
-        store.set_metrics(Arc::new(crate::db::metrics::Metrics::default()));
+        store.set_metrics(Arc::new(crate::support::metrics::Metrics::default()));
 
         // Four L0 files, each round overwriting the previous round's keys, so
         // the log fills with garbage exactly like an enqueue/delete queue.
@@ -2250,8 +2250,8 @@ mod tests {
 
         assert_eq!(store.get(b"k").unwrap(), Some(winner.clone()), "highest-seq write must win the read");
 
-        let winner_len = crate::store::value_log::ValueRecordHeader::record_len(b"k".len(), winner.len());
-        let loser_len = crate::store::value_log::ValueRecordHeader::record_len(b"k".len(), loser.len());
+        let winner_len = crate::storage::value_log::ValueRecordHeader::record_len(b"k".len(), winner.len());
+        let loser_len = crate::storage::value_log::ValueRecordHeader::record_len(b"k".len(), loser.len());
         let (mut live, mut garbage) = (0u64, 0u64);
         for (_bucket, segs) in store.value_log.all_segment_stats() {
             for s in segs {
@@ -2300,7 +2300,7 @@ mod tests {
             .join("value_logs")
             .join(format!("value_log_{}.seg{:06}", ptr.bucket, ptr.location.segment_id));
         let mut bytes = std::fs::read(&seg_path).unwrap();
-        bytes[ptr.location.rec_offset as usize + crate::store::value_log::ValueRecordHeader::SIZE] ^= 0xFF;
+        bytes[ptr.location.rec_offset as usize + crate::storage::value_log::ValueRecordHeader::SIZE] ^= 0xFF;
         std::fs::write(&seg_path, &bytes).unwrap();
 
         // With checksum verification on, the flipped payload is detected.

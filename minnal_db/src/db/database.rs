@@ -18,10 +18,10 @@ use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
 use crate::db::wal::{Wal, WalEntry, WalError, WalMetadata, WalOperationType};
 use crate::db::wal_worker::{WalGcTarget, WalGcWorker};
 use crate::field_index::{DynFieldIndex, IndexValueType};
-use crate::store::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
-use crate::store::lsm::lsm_tree::LsmFlushObserver;
-use crate::store::lsm_worker::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
-use crate::store::value_log::ValueLogMetadata;
+use crate::storage::gc_value_log_worker::{GCWorker, ValueLogGcTarget};
+use crate::storage::lsm::tree::LsmFlushObserver;
+use crate::storage::lsm_worker::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
+use crate::storage::value_log::ValueLogMetadata;
 
 use log::{debug, error, info, warn};
 use parking_lot::{Mutex, RwLock};
@@ -908,7 +908,7 @@ pub struct Database {
     // WAL-GC counters plus a fold of every dropped namespace's final totals.
     // Per-namespace counters live on each KVStore's own Metrics instance; the
     // engine-wide view (`metrics_snapshot`) sums those with this global one.
-    pub(crate) metrics: Arc<crate::db::metrics::Metrics>,
+    pub(crate) metrics: Arc<crate::support::metrics::Metrics>,
 }
 
 impl Database {
@@ -991,7 +991,7 @@ impl Database {
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
         // The engine-wide counters, shared with the vector index WAL.
-        let metrics = Arc::new(crate::db::metrics::Metrics::default());
+        let metrics = Arc::new(crate::support::metrics::Metrics::default());
         let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
 
         // One write-buffer budget for every field index of this database.
@@ -1039,7 +1039,7 @@ impl Database {
             let stores = db.stores.read();
             for kv_store in stores.values() {
                 kv_store.set_seq_counter(db.next_seq.clone());
-                kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+                kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
                 kv_store.set_index_gap_sink(Some(
                     Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
                 ));
@@ -1066,7 +1066,11 @@ impl Database {
     /// Open the vector index WAL in its directory, sharing the engine-wide
     /// counters. Records of namespaces no longer in the registry are released
     /// at once: replay skips them, so they must not hold the retired cut.
-    fn open_vector_index_wal(db_path: &Path, registry: &NamespaceRegistry, metrics: &Arc<crate::db::metrics::Metrics>) -> Result<VectorIndexWal> {
+    fn open_vector_index_wal(
+        db_path: &Path,
+        registry: &NamespaceRegistry,
+        metrics: &Arc<crate::support::metrics::Metrics>,
+    ) -> Result<VectorIndexWal> {
         let (wal, report) = VectorIndexWal::open(
             &crate::db::layout::vector_index_wal_dir(db_path),
             crate::db::vector_index_wal::DEFAULT_SEGMENT_SIZE,
@@ -1310,9 +1314,9 @@ impl Database {
         // Record write counters against this namespace's metrics (the store is
         // already in hand, so this is no extra lookup).
         if let Some(m) = kv_store.metrics() {
-            crate::db::metrics::Metrics::bump(&m.puts);
-            crate::db::metrics::Metrics::bump(&m.wal_writes);
-            crate::db::metrics::Metrics::add(
+            crate::support::metrics::Metrics::bump(&m.puts);
+            crate::support::metrics::Metrics::bump(&m.wal_writes);
+            crate::support::metrics::Metrics::add(
                 &m.wal_bytes_appended,
                 wal_pointer.size as u64 + u64::from(crate::db::segmented_log::FRAME_HEADER_LEN),
             );
@@ -1320,7 +1324,7 @@ impl Database {
 
         let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.put_to_storage_seq(key, value, seq));
         if !applied && let Some(m) = kv_store.metrics() {
-            crate::db::metrics::Metrics::bump(&m.apply_failures);
+            crate::support::metrics::Metrics::bump(&m.apply_failures);
         }
 
         // Step 3: Maybe sync the value log.
@@ -1346,9 +1350,9 @@ impl Database {
     fn commit_wal(&self, end: u64) -> Result<()> {
         let delay = Duration::from_micros(self.config.sync_config.commit_delay_us);
         let led = self.wal.commit(end, delay).map_err(wal_write_error)?;
-        crate::db::metrics::Metrics::bump(&self.metrics.wal_commit_writes);
+        crate::support::metrics::Metrics::bump(&self.metrics.wal_commit_writes);
         if led {
-            crate::db::metrics::Metrics::bump(&self.metrics.wal_commit_rounds);
+            crate::support::metrics::Metrics::bump(&self.metrics.wal_commit_rounds);
         }
         Ok(())
     }
@@ -1374,7 +1378,7 @@ impl Database {
         self.check_write_size(key, value)?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
-            crate::db::metrics::Metrics::bump(&m.no_wal_puts);
+            crate::support::metrics::Metrics::bump(&m.no_wal_puts);
         }
         // No WAL entry exists for this write, so until the memtable is flushed
         // it lives only in memory — the background flusher uses this to bound
@@ -1466,7 +1470,7 @@ impl Database {
         self.check_write_size(key, &[])?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
-            crate::db::metrics::Metrics::bump(&m.no_wal_deletes);
+            crate::support::metrics::Metrics::bump(&m.no_wal_deletes);
         }
         kv_store.note_no_wal_write();
         self.note_no_wal_index_exposure(namespace_id);
@@ -1524,7 +1528,7 @@ impl Database {
 
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
-            crate::db::metrics::Metrics::bump(&m.merges);
+            crate::support::metrics::Metrics::bump(&m.merges);
         }
 
         let existing = kv_store.get(key)?;
@@ -1576,7 +1580,7 @@ impl Database {
 
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
-            crate::db::metrics::Metrics::bump(&m.merges);
+            crate::support::metrics::Metrics::bump(&m.merges);
         }
 
         let existing = kv_store.get(key)?;
@@ -1658,9 +1662,9 @@ impl Database {
         let kv_store = self.get_store(namespace_id)?;
 
         if let Some(m) = kv_store.metrics() {
-            crate::db::metrics::Metrics::bump(&m.deletes);
-            crate::db::metrics::Metrics::bump(&m.wal_writes);
-            crate::db::metrics::Metrics::add(
+            crate::support::metrics::Metrics::bump(&m.deletes);
+            crate::support::metrics::Metrics::bump(&m.wal_writes);
+            crate::support::metrics::Metrics::add(
                 &m.wal_bytes_appended,
                 wal_pointer.size as u64 + u64::from(crate::db::segmented_log::FRAME_HEADER_LEN),
             );
@@ -1668,7 +1672,7 @@ impl Database {
 
         let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.delete_from_storage_seq(key, seq));
         if !applied && let Some(m) = kv_store.metrics() {
-            crate::db::metrics::Metrics::bump(&m.apply_failures);
+            crate::support::metrics::Metrics::bump(&m.apply_failures);
         }
 
         // Step 3: Maybe sync the value log. As in `put_ns`, syncing the value
@@ -1714,7 +1718,7 @@ impl Database {
         kv_store.set_seq_counter(self.next_seq.clone());
         // Per-namespace metrics: each store owns its own counters; the engine-wide
         // view is the sum of all stores' snapshots plus the global instance.
-        kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+        kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
         kv_store.set_index_gap_sink(Some(
             Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
         ));
@@ -1769,7 +1773,7 @@ impl Database {
         kv_store.set_seq_counter(self.next_seq.clone());
         // Per-namespace metrics: each store owns its own counters; the engine-wide
         // view is the sum of all stores' snapshots plus the global instance.
-        kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+        kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
         kv_store.set_index_gap_sink(Some(
             Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
         ));
@@ -2560,7 +2564,7 @@ impl Database {
         Self::check_total_len(
             key.len(),
             value.len(),
-            crate::store::value_log::max_record_payload(segment_size),
+            crate::storage::value_log::max_record_payload(segment_size),
             &format!("a record must fit one value-log segment; value_log.segment_size_bytes = {segment_size}"),
         )
     }
@@ -2690,7 +2694,7 @@ impl Database {
             match kv_store.seal_and_flush_to_level0() {
                 Ok(()) => {
                     flushed += 1;
-                    crate::db::metrics::Metrics::bump(&self.metrics.vector_wal_pin_flushes);
+                    crate::support::metrics::Metrics::bump(&self.metrics.vector_wal_pin_flushes);
                 }
                 Err(e) => warn!("[vector index WAL] failed to flush ns={ns_id} holding the retired cut: {e:?}"),
             }
@@ -2781,8 +2785,8 @@ impl Database {
             Ok(())
         })?;
 
-        crate::db::metrics::Metrics::add(&self.metrics.vector_wal_records_replayed, replayed);
-        crate::db::metrics::Metrics::add(&self.metrics.vector_wal_records_skipped, skipped);
+        crate::support::metrics::Metrics::add(&self.metrics.vector_wal_records_replayed, replayed);
+        crate::support::metrics::Metrics::add(&self.metrics.vector_wal_records_skipped, skipped);
         if replayed + skipped > 0 || !failed.is_empty() {
             info!(
                 "[RECOVERY] vector index WAL: replayed {replayed} record(s), skipped {skipped} of dropped namespaces, {} failed",
@@ -3061,7 +3065,7 @@ impl Database {
 
     /// Physical (on-disk `st_blocks`) vs logical (file length) value-log
     /// footprint per shard for every namespace. Cheap: one `stat` per shard.
-    pub fn value_log_physical_stats(&self) -> Vec<(String, Vec<crate::store::value_log::sharded::ShardPhysicalStats>)> {
+    pub fn value_log_physical_stats(&self) -> Vec<(String, Vec<crate::storage::value_log::sharded::ShardPhysicalStats>)> {
         let namespaces = self.list_namespaces();
         let stores = self.stores.read();
         namespaces
@@ -3074,7 +3078,7 @@ impl Database {
     ///
     /// Cheap: the counters are maintained in memory by writers, so this reads no
     /// segment data at all (the old per-page version had to scan every record).
-    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::store::value_log::SegmentStats>)>> {
+    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::storage::value_log::SegmentStats>)>> {
         let store = self.get_store_by_name(namespace)?;
         Ok(store.value_log.all_segment_stats())
     }
@@ -3098,7 +3102,7 @@ impl Database {
     /// of every live namespace's snapshot plus the global instance — which holds
     /// the WAL-GC counters (not attributable to one namespace) and the folded
     /// totals of every dropped namespace (so the aggregate stays monotonic).
-    pub fn metrics_snapshot(&self) -> crate::db::metrics::MetricsSnapshot {
+    pub fn metrics_snapshot(&self) -> crate::support::metrics::MetricsSnapshot {
         let mut agg = self.metrics.snapshot();
         for store in self.stores.read().values() {
             if let Some(m) = store.metrics() {
@@ -3114,7 +3118,7 @@ impl Database {
     /// the `vector_wal_*` counters belong to the two shared logs and are not
     /// attributed to any namespace — they are always `0` here and only
     /// populated in [`Self::metrics_snapshot`].
-    pub fn metrics_snapshot_for(&self, name: &str) -> Result<crate::db::metrics::MetricsSnapshot> {
+    pub fn metrics_snapshot_for(&self, name: &str) -> Result<crate::support::metrics::MetricsSnapshot> {
         let ns_id = self
             .registry
             .read()
@@ -3129,9 +3133,9 @@ impl Database {
 
     /// Per-namespace operational counters for every live namespace, keyed by
     /// namespace name. Excludes the global WAL-GC/retired accumulator.
-    pub fn metrics_snapshot_by_namespace(&self) -> Vec<(String, crate::db::metrics::MetricsSnapshot)> {
+    pub fn metrics_snapshot_by_namespace(&self) -> Vec<(String, crate::support::metrics::MetricsSnapshot)> {
         let registry = self.registry.read();
-        let mut out: Vec<(String, crate::db::metrics::MetricsSnapshot)> = self
+        let mut out: Vec<(String, crate::support::metrics::MetricsSnapshot)> = self
             .stores
             .read()
             .iter()
@@ -3148,7 +3152,7 @@ impl Database {
     ///
     /// Each entry is `(namespace_name, manifest)`.  The manifest is built
     /// from the in-memory LSM state so it does not touch disk.
-    pub fn lsm_manifests(&self) -> Vec<(String, crate::store::lsm::lsm_manifest::LsmManifest)> {
+    pub fn lsm_manifests(&self) -> Vec<(String, crate::storage::lsm::manifest::LsmManifest)> {
         let namespaces = self.list_namespaces();
         let stores = self.stores.read();
         namespaces
@@ -3160,7 +3164,7 @@ impl Database {
     /// Returns the in-memory (non-SSTable) LSM stats for every active namespace,
     /// as `(namespace_name, stats)`. Complements [`lsm_manifests`](Self::lsm_manifests),
     /// which only reflects on-disk SSTables.
-    pub fn lsm_runtime_stats(&self) -> Vec<(String, crate::store::lsm::lsm_tree::LSMStats)> {
+    pub fn lsm_runtime_stats(&self) -> Vec<(String, crate::storage::lsm::tree::LSMStats)> {
         let namespaces = self.list_namespaces();
         let stores = self.stores.read();
         namespaces
@@ -3324,7 +3328,7 @@ impl Database {
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
         // The engine-wide counters, shared with the vector index WAL.
-        let metrics = Arc::new(crate::db::metrics::Metrics::default());
+        let metrics = Arc::new(crate::support::metrics::Metrics::default());
         let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
 
         // One write-buffer budget for every field index of this database.
@@ -3370,7 +3374,7 @@ impl Database {
             let stores = db.stores.read();
             for kv_store in stores.values() {
                 kv_store.set_seq_counter(db.next_seq.clone());
-                kv_store.set_metrics(std::sync::Arc::new(crate::db::metrics::Metrics::default()));
+                kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
                 kv_store.set_index_gap_sink(Some(
                     Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
                 ));

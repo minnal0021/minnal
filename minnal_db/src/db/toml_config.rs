@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
 use crate::db::error::{KVError, Result};
-use crate::store::lsm::lsm_tree::LSMConfig;
+use crate::storage::lsm::tree::LSMConfig;
 use crate::support::DEFAULT_NUM_BUCKETS;
 
 /// Root structure mirroring `minnal.toml`.
@@ -263,7 +263,7 @@ impl Default for ValueLogSection {
 }
 
 fn default_segment_size_bytes() -> u64 {
-    crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES
+    crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES
 }
 
 /// `[recovery]` — WAL recovery settings.

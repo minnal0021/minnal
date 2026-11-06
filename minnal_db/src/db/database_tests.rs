@@ -1566,7 +1566,7 @@ fn concurrent_same_key_puts_keep_value_log_accounting_exact() {
         .iter()
         .map(|k| {
             let v = db.get(k).unwrap().expect("key present after the race");
-            crate::store::value_log::ValueRecordHeader::record_len(k.len(), v.len())
+            crate::storage::value_log::ValueRecordHeader::record_len(k.len(), v.len())
         })
         .sum();
 
@@ -1635,7 +1635,7 @@ fn existing_bucket_count_is_detected_from_segmented_value_logs() {
 
 #[test]
 fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
-    use crate::store::gc_value_log_worker::ValueLogGcTarget;
+    use crate::storage::gc_value_log_worker::ValueLogGcTarget;
     // The GC trigger is per-bucket, not just the namespace average: a bucket over the
     // trigger must be collected even when near-empty buckets drag the average below it.
     let dir = TempDir::new().unwrap();

@@ -8,7 +8,7 @@ use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConf
 #[cfg(test)]
 use crate::db::error::{KVError, Result};
 #[cfg(test)]
-use crate::store::lsm::lsm_tree::LSMConfig;
+use crate::storage::lsm::tree::LSMConfig;
 #[cfg(test)]
 use std::time::Duration;
 

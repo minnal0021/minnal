@@ -84,7 +84,7 @@
 compile_error!("minnal_db supports only Linux and macOS (its storage engine uses Unix pread/pwrite)");
 
 pub mod db;
-mod store;
+mod storage;
 mod support;
 
 // ── Folded layers ─────────────────────────────────────────────────────────────
@@ -135,7 +135,7 @@ pub use db::config::{
     DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
 };
 
-pub use store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
+pub use storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
 
 /// Default index checkpoint interval in milliseconds (the crash-replay window).
 pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS: u64 = db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL.as_millis() as u64;
@@ -165,17 +165,17 @@ pub use db::error::KVError;
 /// The subsystem errors carried by [`KVError`]'s variants.
 ///
 /// These are re-exported so those variants are actually usable: `LSMError`,
-/// `ValueLogError` and `ShardedValueLogError` live inside the private `store`
+/// `ValueLogError` and `ShardedValueLogError` live inside the private `storage`
 /// module, so without this a caller could match on `KVError::LsmError(_)` but
 /// never name or inspect the value inside it. `WalError` is reachable via
 /// `minnal_db::db::wal`, and is lifted here too so all four payloads are
 /// namable from one place.
 ///
-/// Re-exporting the types does not open the `store` module itself.
+/// Re-exporting the types does not open the `storage` module itself.
 pub use db::wal::WalError;
-pub use store::lsm::lsm_tree::LSMError;
-pub use store::value_log::ValueLogError;
-pub use store::value_log::sharded::ShardedValueLogError;
+pub use storage::lsm::tree::LSMError;
+pub use storage::value_log::ValueLogError;
+pub use storage::value_log::sharded::ShardedValueLogError;
 
 // ── Index types ───────────────────────────────────────────────────────────────
 
@@ -238,7 +238,7 @@ pub use db::stats::GCStats;
 
 /// Engine-wide operational metrics (runtime counters) and their serializable
 /// snapshot, returned by [`Db::ops_metrics`].
-pub use db::metrics::{Metrics, MetricsSnapshot};
+pub use support::metrics::{Metrics, MetricsSnapshot};
 
 pub use db::segmented_log::LogPosition;
 /// Snapshot of WAL state returned by [`Db::wal_metadata`].
@@ -246,26 +246,26 @@ pub use db::vector_index_wal::{VectorIndexWalHolder, VectorIndexWalPosition, Vec
 pub use db::wal::{WalMetadata, WalNamespaceProgress, WalSegmentState, WalStats};
 
 /// Live LSM manifest snapshot returned by [`Db::lsm_manifests`].
-pub use store::lsm::lsm_manifest::LsmManifest;
+pub use storage::lsm::manifest::LsmManifest;
 
 /// Per-bucket entry inside a [`ManifestLevel`].
-pub use store::lsm::lsm_manifest::ManifestBucket;
+pub use storage::lsm::manifest::ManifestBucket;
 /// Per-file entry inside a [`ManifestBucket`].
-pub use store::lsm::lsm_manifest::ManifestFile;
+pub use storage::lsm::manifest::ManifestFile;
 /// Per-level entry in an [`LsmManifest`].
-pub use store::lsm::lsm_manifest::ManifestLevel;
+pub use storage::lsm::manifest::ManifestLevel;
 /// In-memory (non-SSTable) LSM statistics, returned by [`Db::lsm_runtime_stats`].
-pub use store::lsm::lsm_tree::LSMStats;
+pub use storage::lsm::tree::LSMStats;
 
 /// Per-bucket value-log metadata returned by [`Db::value_log_shard_stats`].
-pub use store::value_log::ValueLogMetadata;
+pub use storage::value_log::ValueLogMetadata;
 
 /// Physical (on-disk) value-log shard footprint, returned by
 /// [`Db::value_log_physical_stats`].
-pub use store::value_log::sharded::ShardPhysicalStats;
+pub use storage::value_log::sharded::ShardPhysicalStats;
 
 /// Per-page value-log garbage breakdown, returned by [`Db::value_log_segment_stats`].
-pub use store::value_log::SegmentStats;
+pub use storage::value_log::SegmentStats;
 
 // ── Document store (folded layer) ─────────────────────────────────────────────
 //
@@ -315,5 +315,5 @@ pub use rkyv::Archived;
 
 /// LSM-tree configuration (compaction threshold, thread count, data dir).
 pub mod lsm {
-    pub use crate::store::lsm::lsm_tree::LSMConfig;
+    pub use crate::storage::lsm::tree::LSMConfig;
 }

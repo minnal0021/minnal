@@ -19,7 +19,7 @@ re-check them before starting work.
 | [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | ✅ **Done — 2026-10-09** |
 | [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
 | [FR-008](#fr-008--collect-unused-ivf-centres) | Collect unused IVF centres | `minnal_db` (`ivf_split`, `semantic_search`) | Low | Proposed |
-| [FR-009](#fr-009--a-blocked-simd-bloom-filter-for-l1-lookups) | A blocked SIMD Bloom filter for L1 lookups | `minnal_db` (`store/lsm`) | Low | Proposed |
+| [FR-009](#fr-009--a-blocked-simd-bloom-filter-for-l1-lookups) | A blocked SIMD Bloom filter for L1 lookups | `minnal_db` (`storage/lsm`) | Low | Proposed |
 | [FR-010](#fr-010--refuse-an-enable-for-as-long-as-a-vector-index-drop-is-pending) | Refuse an enable for as long as a vector-index drop is pending | `minnal_db` (`doc_store`), `minnal_db_api` | Low | Proposed |
 | [FR-011](#fr-011--a-test-harness-for-api-routes) | A test harness for API routes | `minnal_db_api` | Low | Proposed |
 | [FR-012](#fr-012--make-a-skipped-upsert_vectors-visible-to-its-caller) | Make a skipped `upsert_vectors` visible to its caller | `minnal_db` (`vector_kv`) | Low | Proposed |
@@ -1236,7 +1236,7 @@ The design and its risk table are in
 ## FR-009 — A blocked SIMD Bloom filter for L1 lookups
 
 **Filed:** 2026-11-04
-**Area:** `minnal_db` (`src/store/lsm/bloom.rs`)
+**Area:** `minnal_db` (`src/storage/lsm/bloom.rs`)
 **Severity:** Low — read latency on misses; no effect on results
 **Source:** SIMD survey, 2026-11-04. Needs a bare-metal measurement before any
 decision.

@@ -1,4 +1,4 @@
-use crate::store::lsm::lsm_tree::LSMConfig;
+use crate::storage::lsm::tree::LSMConfig;
 use crate::support::DEFAULT_NUM_BUCKETS;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -392,7 +392,7 @@ impl Default for DbConfig {
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
             wal_segment_size: crate::db::wal::DEFAULT_SEGMENT_SIZE as u64,
-            segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
+            segment_size_bytes: crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,
         }
@@ -414,7 +414,7 @@ impl DbConfig {
             num_buckets: DEFAULT_NUM_BUCKETS,
             skip_list_capacity: 100_000,
             wal_segment_size: crate::db::wal::DEFAULT_SEGMENT_SIZE as u64,
-            segment_size_bytes: crate::store::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
+            segment_size_bytes: crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
             fail_log_dir: None,
             verify_checksums_on_read: false,
         }

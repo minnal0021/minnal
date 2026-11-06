@@ -189,7 +189,7 @@ mod tests {
     use super::*;
     use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
     use crate::db::database::Database;
-    use crate::store::lsm::lsm_tree::LSMConfig;
+    use crate::storage::lsm::tree::LSMConfig;
     use tempfile::TempDir;
 
     struct SlowTarget(Arc<crate::support::runtime_probe::Busy>);

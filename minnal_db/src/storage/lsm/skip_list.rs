@@ -148,7 +148,7 @@ pub mod skip_list {
         /// hold: an L1 entry keeps its original sequence for the lifetime of the
         /// database, so the gap to a later write of the same key is unbounded.
         /// **Do not narrow the sequence again** — see
-        /// `lsm_tree::test_write_after_huge_seq_gap_beats_cold_l1_entry`.
+        /// `tree::test_write_after_huge_seq_gap_beats_cold_l1_entry`.
         #[inline]
         fn seq_is_newer_or_equal(new: u64, existing: u64) -> bool {
             new >= existing
@@ -770,7 +770,7 @@ pub mod skip_list {
 
     #[cfg(test)]
     mod tests {
-        use crate::store::lsm::skip_list::skip_list::DEFAULT_MAX_CAPACITY;
+        use crate::storage::lsm::skip_list::skip_list::DEFAULT_MAX_CAPACITY;
 
         use super::{KeyValueRecord, SkipList};
         use std::collections::BTreeMap;

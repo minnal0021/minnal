@@ -403,7 +403,7 @@ fsync per memtable flush of a vector namespace (flushes are seconds to minutes
 apart), on the log's own lock, not the main WAL's.
 
 **Where it hooks in.** Before Part 2 a flush reported three events to its
-`LsmFlushObserver` (`store/lsm/lsm_tree.rs`): the memtable is sealed (under the
+`LsmFlushObserver` (`storage/lsm/tree.rs`): the memtable is sealed (under the
 active memtable's write lock), its L0 files are written and fsynced but not yet
 registered, and they are registered. Neither of the first two can host the sync:
 

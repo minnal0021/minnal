@@ -1,8 +1,8 @@
 use crate::db::vector_index_wal::VectorIndexWalError;
 use crate::db::wal::WalError;
-use crate::store::lsm::lsm_tree::LSMError;
-use crate::store::value_log::ValueLogError;
-use crate::store::value_log::sharded::ShardedValueLogError;
+use crate::storage::lsm::tree::LSMError;
+use crate::storage::value_log::ValueLogError;
+use crate::storage::value_log::sharded::ShardedValueLogError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

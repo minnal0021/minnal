@@ -15,7 +15,7 @@ use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
 use crate::db::namespace::FieldId;
 use crate::db::namespace_index::ExtractorFn;
 use crate::field_index::{IndexValue, IndexValueType};
-use crate::store::lsm::lsm_tree::LSMConfig;
+use crate::storage::lsm::tree::LSMConfig;
 
 pub(crate) fn create_db_config() -> DbConfig {
     let gc_interval = Duration::from_secs(5);

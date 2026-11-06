@@ -12,7 +12,7 @@
 // addressed: `lookup_level1` now fast-rejects via the L1 min/max key range,
 // then a bloom filter (exact negative), then a sparse-index binary search
 // that bounds the residual linear scan to ~SAMPLE_INTERVAL entries instead
-// of the whole file — see its doc comment in `lsm_tree.rs`. This benchmark
+// of the whole file — see its doc comment in `lsm/tree.rs`. This benchmark
 // is no longer measuring a naive O(N) scan; it's the regression baseline
 // for the accelerated path.
 //

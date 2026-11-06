@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "doc-store")]
 pub(crate) mod file_lock;
 pub mod hex;
+pub mod metrics;
 #[cfg(test)]
 pub(crate) mod runtime_probe;
 pub(crate) mod simd_support;

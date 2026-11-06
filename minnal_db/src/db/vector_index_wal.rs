@@ -124,8 +124,8 @@
 //! passes its CRC but does not decode is corruption: the CRC says these are
 //! the bytes written.
 
-use crate::db::metrics::Metrics;
 use crate::db::segmented_log::{self, LogError, LogFormat, Progress, ProgressFile, SegmentedLog, segment_of};
+use crate::support::metrics::Metrics;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
