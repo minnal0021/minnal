@@ -72,7 +72,7 @@ checkpointing, and recovery that keep it all durable.
 
 ## 1. Defining a field
 
-An index begins with a field definition (`minnal_db/src/db/namespace.rs`):
+An index begins with a field definition (`minnal_db/src/db/namespace/registry.rs`):
 
 ```rust
 pub struct FieldDef {

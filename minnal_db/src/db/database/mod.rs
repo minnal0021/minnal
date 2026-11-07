@@ -5,7 +5,6 @@
 
 mod flush_observers;
 pub(crate) mod key_locks;
-mod namespaces;
 mod open;
 mod shutdown;
 mod stats;
@@ -124,7 +123,7 @@ pub struct Database {
     /// obvious way instead — holding `stores.write()` across the registry publish
     /// — would deadlock against `metrics_snapshot_by_namespace`, which holds
     /// `registry.read()` while taking `stores.read()`.
-    namespace_create_lock: Mutex<()>,
+    pub(in crate::db) namespace_create_lock: Mutex<()>,
 
     /// Serialises field-index activation.
     ///

@@ -1474,7 +1474,7 @@ at `warn`, but a drop racing the worker would then warn in normal operation.
 ## FR-013 — Namespace identity without a central registry file
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/db/namespace.rs`, `database/`, `wal/main_wal.rs`,
+**Area:** `minnal_db` (`src/db/namespace/`, `database/`, `wal/main_wal.rs`,
 `wal/vector_index_wal/mod.rs`, `layout.rs`, `indexing/manager.rs`), `minnal_db_api` (README)
 **Severity:** Medium — a damaged registry stops the whole database opening; no data
 is at risk from the design as it stands
@@ -1497,7 +1497,7 @@ Goals:
 ### What the registry does today
 
 `{db_path}/namespace_registry` is a binary file: a header with a CRC checksum, then an
-rkyv payload (`RegistryData`, `namespace.rs:347`). Every change rewrites it through
+rkyv payload (`RegistryData`, `namespace/registry.rs:347`). Every change rewrites it through
 `write_atomic_durable`. It has four jobs:
 
 | Job | Where it goes |
@@ -1518,7 +1518,7 @@ next namespace to take it.
 ### Proposed direction
 
 **Layout.** Add `id` and `ttl` to `NamespaceConfig`, the existing per-namespace
-`config.json` (`namespace.rs:54`). Opening a database scans for `ns_*` directories and
+`config.json` (`namespace/registry.rs:54`). Opening a database scans for `ns_*` directories and
 reads each one's config, which it already does once per namespace (`load_config`). The
 registry stays as an in-memory map, built by that scan.
 

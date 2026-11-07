@@ -565,7 +565,7 @@ pub(super) fn wal_write_error(e: WalError) -> KVError {
 /// [`WalPersistObserver`] and [`VectorIndexWal`] need: the LSM itself only knows
 /// memtable versions, and those are allocated per store. Every namespace's hub
 /// reports to the vector index WAL; it ignores namespaces that never appended.
-pub(super) struct LsmFlushObserverHub {
+pub(in crate::db) struct LsmFlushObserverHub {
     namespace_id: u32,
     wal_observer: Arc<WalPersistObserver>,
     vector_index_wal: Arc<VectorIndexWal>,
@@ -573,7 +573,7 @@ pub(super) struct LsmFlushObserverHub {
 }
 
 impl LsmFlushObserverHub {
-    pub(super) fn new(
+    pub(in crate::db) fn new(
         namespace_id: u32,
         wal_observer: Arc<WalPersistObserver>,
         vector_index_wal: Arc<VectorIndexWal>,

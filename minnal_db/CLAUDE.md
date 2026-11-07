@@ -10,7 +10,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 |---|---|
 | `src/lib.rs` | Public re-exports only — all types surfaced here |
 | `src/db/facade/` | `Db`, `AsyncDb` and their `Namespace` handles, one file each — the only entry points callers use |
-| `src/db/database/` | Internal coordinator: owns all subsystems, routes ops. `open`, `writes`, `namespaces`, `wal_ops`, `workers`, `stats`, `shutdown`, `flush_observers` |
+| `src/db/database/` | Internal coordinator: owns all subsystems, routes ops. `open`, `writes`, `wal_ops`, `workers`, `stats`, `shutdown`, `flush_observers` |
 | `src/db/layout.rs` | **The one place that knows the on-disk directory layout.** Nothing above it should `join("field-index")` or `format!("ns_{}", ..)` |
 | `src/db/indexing/index_fields.rs` | Registering, activating, dropping and measuring field indexes (`Database` methods) |
 | `src/db/wal/recovery.rs` | Replaying both logs at open (`Database` methods) |
@@ -23,7 +23,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 **The index checkpoint interval is the crash-replay window.** `scheduled_tasks.index_checkpoint_interval_ms` (default **1750 ms**) sets how often every field index is made durable, and after a crash each field replays the WAL from its last checkpoint. It was hardcoded at 15 minutes, which meant a crash could face fifteen minutes of writes to replay — measured at 7–27 minutes to restart a 16k-document store. It also caps WAL retention, since the index-replay watermark holds segments until a checkpoint advances. The per-tick cost is a flush per field index plus one marker write (tmp + rename + two fsyncs) per field.
 
 **WAL replay batches by value — keep it.** `activate_field_index` resolves every affected key first, groups the rows by extracted value, clears them all with `remove_all_for_rows` (one membership probe per bucket for the whole set), then changes each value's bitmap once with `insert_many`. It was introduced when every index write appended a whole bitmap, so the per-key form left one dead copy *per key* (a 6,000-key replay went 626 ms → 104 ms). Field-index writes now go to an in-memory overlay and are written once per spill, so the overlay would coalesce a per-key loop anyway; the grouping still saves a slot lookup and a bucket probe per key. Replay is bounded by the database's shared overlay budget (set on the field before replay; the hard limit spills mid-replay) and compacts inline on the `index_blob_backpressure_bytes` cap — the default cap when that is 0 — because the checkpoint worker is not running yet. See `src/field_index/CLAUDE.md` → *Writes are buffered in an overlay*.
-| `src/db/namespace.rs` | Namespace metadata, `FieldMeta`, `FieldId` |
+| `src/db/namespace/` | `registry` (the saved list of namespaces, schemas, `FieldMeta`, `FieldId`) and `ops` (the `Database` methods that create, look up and remove a namespace) |
 | `src/db/kv_store/` | `KVStore`: one namespace's LSM tree, value log and live field indexes. `writes`, `reads`, `row_ids`, `gc` (value-log GC), `maintenance` (flush, compaction, TTL, replay, stats) |
 | `src/db/kv_store/index_set.rs` | Per-namespace index registry, `ExtractorFn`, `RowIdFn`, `RowToKeyFn` |
 | `src/db/config/mod.rs` | `DbConfig`, `SyncConfig`, `ThresholdConfig`, `ScheduledTaskConfig` |

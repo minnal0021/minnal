@@ -1,6 +1,13 @@
 //! Creating, listing and removing namespaces.
 
-use super::*;
+use crate::db::database::{Database, LsmFlushObserverHub, OpenStoreLookup};
+use crate::db::error::Result;
+use crate::db::kv_store::KVStore;
+use crate::storage::lsm::tree::LsmFlushObserver;
+
+use log::warn;
+use std::sync::Arc;
+use std::time::Duration;
 
 impl Database {
     /// Create a new namespace. Returns the namespace ID.

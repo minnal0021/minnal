@@ -3,7 +3,7 @@
 use super::*;
 
 impl Database {
-    pub(super) fn check_closed(&self) -> Result<()> {
+    pub(in crate::db) fn check_closed(&self) -> Result<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(KVError::DatabaseClosed);
         }
