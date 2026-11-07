@@ -3245,13 +3245,27 @@ mod tests {
         // can observe a wrong/missing value is this race.
         //
         // Nothing compacts here, on purpose: each GC pass adds level-0 files, reads
-        // slow down, and the race window widens. It takes tens of passes to open (with
-        // a compaction in the GC loop, 6,000 passes never hit it), and a pass gets
-        // slower all the way, so the pass count below is what sets this test's length.
-        // Measured with the re-resolve removed: 61 of 62 runs failed by pass 116, the
-        // other at pass 210. 400 passes take about 65 s, 200 about 15 s.
+        // slow down, and the race window widens (with a compaction in the GC loop,
+        // 6,000 passes never hit it).
+        //
+        // A round is counted in GC passes that reclaimed something, since most passes
+        // find nothing to do. Three short rounds rather than one long one: catches level
+        // off by about 400 reclaiming passes, and passes slow down as level-0 files pile
+        // up. On tmpfs with the re-resolve removed, the first round caught it in 57 of 60
+        // runs and three rounds in 60 of 60; running one round on to 2,000 passes added
+        // a single catch in 60.
+        //
+        // This test only catches the bug on tmpfs, the default on Linux
+        // (`.cargo/test-runner.sh`). On a real disk (`TMPDIR=/var/tmp`, macOS) it missed
+        // the bug in all 37 runs, so a pass there means little.
+        for _ in 0..3 {
+            scan_during_gc_round();
+        }
+    }
+
+    fn scan_during_gc_round() {
         use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         let dir = TempDir::new().unwrap();
         let mut cfg = default_lsm_config();
@@ -3259,6 +3273,7 @@ mod tests {
         let store = KVStore::open(0, "default", dir.path(), cfg, SyncConfig::default(), DEFAULT_SEGMENT_SIZE_BYTES).unwrap();
 
         const N: u32 = 200;
+        const RECLAIMING_GC_PASSES: u64 = 400;
         let live_key = |i: u32| format!("live:{i:06}").into_bytes();
         let expected = |i: u32| {
             // Distinct prefix per key (catches cross-key misreads), padded so
@@ -3280,6 +3295,7 @@ mod tests {
 
         let all_live: Vec<Vec<u8>> = (0..N).map(live_key).collect();
         let stop = AtomicBool::new(false);
+        let reclaiming_passes = AtomicU64::new(0);
         let failure: Mutex<Option<String>> = Mutex::new(None);
 
         std::thread::scope(|s| {
@@ -3295,7 +3311,9 @@ mod tests {
             // GC: hammer compaction on the single bucket.
             s.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
-                    let _ = store.garbage_collect_with_threshold(0.0);
+                    if store.garbage_collect_with_threshold(0.0).is_ok_and(|gc| gc.bytes_reclaimed > 0) {
+                        reclaiming_passes.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             });
             // Scanner. The value-log invariant under test: a committed value is
@@ -3317,7 +3335,15 @@ mod tests {
                     *failure.lock().unwrap() = Some(msg);
                     stop.store(true, Ordering::Relaxed);
                 };
-                for _ in 0..400 {
+                let started = std::time::Instant::now();
+                while reclaiming_passes.load(Ordering::Relaxed) < RECLAIMING_GC_PASSES {
+                    if started.elapsed() > std::time::Duration::from_secs(600) {
+                        record(format!(
+                            "only {} GC passes reclaimed anything in 10 minutes",
+                            reclaiming_passes.load(Ordering::Relaxed)
+                        ));
+                        return;
+                    }
                     // scan_prefix_batch → resolve_entries_from_pointers + batch_read_from_entries
                     for (k, v) in store.scan_prefix_batch(b"live:").unwrap() {
                         let i: u32 = std::str::from_utf8(&k[5..]).unwrap().parse().unwrap();
