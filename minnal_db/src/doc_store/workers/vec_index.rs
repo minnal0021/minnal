@@ -397,7 +397,12 @@ impl VecIndexWorker {
             let mut dropping: Vec<String> = Vec::new();
             for ns in by_namespace.keys() {
                 let resolved = match self.schemas.vector_settings(ns) {
-                    Ok((settings, ns_id)) => self.ctx.for_namespace(&self.db, ns, ns_id, &settings).await.map(Arc::new),
+                    Ok((settings, ns_id)) => self
+                        .ctx
+                        .for_namespace(&self.db, ns, ns_id, &settings)
+                        .await
+                        .map(Arc::new)
+                        .map_err(DocStoreError::from),
                     Err(e) => Err(e),
                 }
                 .map_err(|e| e.to_string());

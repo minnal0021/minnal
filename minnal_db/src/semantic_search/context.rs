@@ -4,10 +4,44 @@
 
 use std::sync::Arc;
 
-use crate::doc_store::schema::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings};
-use crate::doc_store::*;
 use crate::semantic_search::PartitionHandle;
 use crate::semantic_search::service::SemanticSearchConfig;
+use crate::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings, VectorSettingsError};
+
+/// Why the [`SemanticSearchContext`] refused or could not serve a namespace. The
+/// document store reports each one as its matching `DocStoreError`.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextError {
+    /// A namespace names an embedding model this server's `supported_models`
+    /// does not list.
+    #[error("embedding model '{model}' is not supported by this server (supported: {supported})")]
+    UnsupportedEmbeddingModel { model: String, supported: String },
+
+    /// A namespace's embedding dimension is not the one the server lists for
+    /// its model (`supported_models`).
+    #[error("embedding_dim {dim} does not match model '{model}', which this server runs at {expected} dimensions")]
+    EmbeddingDimMismatch { model: String, dim: u32, expected: usize },
+
+    /// A semantic namespace has no centres and postings to search or index with.
+    #[error("namespace '{namespace}' has no seeded centres; restart to seed them, or drop its vector index and enable it again")]
+    VectorIndexNotSeeded { namespace: String },
+
+    /// Semantic search is not enabled for the namespace, or it is being dropped.
+    #[error("semantic search is not enabled for namespace '{namespace}'")]
+    SemanticSearchNotEnabled { namespace: String },
+
+    /// A partition rebuild of the namespace is already running.
+    #[error("a partition rebuild for namespace '{namespace}' is already running")]
+    VecRebuildInProgress { namespace: String },
+
+    /// A vector-index setting was rejected.
+    #[error(transparent)]
+    Settings(#[from] VectorSettingsError),
+
+    /// The underlying database returned an error.
+    #[error(transparent)]
+    Db(#[from] crate::KVError),
+}
 
 /// Semantic-search configuration attached to a [`DocStore`](crate::doc_store::DocStore).
 ///
@@ -43,7 +77,7 @@ pub struct SemanticSearchContext {
     pub supported_models: std::collections::BTreeMap<String, u32>,
     /// What a namespace's vector-index settings are filled with when it first
     /// enables semantic search (the server's TOML defaults, or built-in).
-    pub index_defaults: crate::doc_store::schema::vector_settings::IndexDefaults,
+    pub index_defaults: crate::vector_settings::IndexDefaults,
     /// Namespaces maintained at once by the partition maintenance task.
     pub maintenance_threads: usize,
     /// Threads a partition rebuild's k-means uses (at most
@@ -80,7 +114,7 @@ pub struct NamespaceSemantics {
     /// (kept so a request's overrides apply to them, not to the computed budget).
     pub search: SearchSettings,
     /// The namespace's partition maintenance settings.
-    pub maintenance: crate::doc_store::schema::vector_settings::MaintenanceSettings,
+    pub maintenance: crate::vector_settings::MaintenanceSettings,
 }
 
 impl SemanticSearchContext {
@@ -89,7 +123,7 @@ impl SemanticSearchContext {
         Self {
             config,
             supported_models: std::collections::BTreeMap::new(),
-            index_defaults: crate::doc_store::schema::vector_settings::IndexDefaults::default(),
+            index_defaults: crate::vector_settings::IndexDefaults::default(),
             maintenance_threads: crate::doc_store::workers::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
             rebuild_threads: crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS,
             rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -120,11 +154,11 @@ impl SemanticSearchContext {
     }
 
     /// Mark a rebuild of `namespace` as running, unless one already is.
-    pub(crate) fn claim_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<(), DocStoreError> {
+    pub(crate) fn claim_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<(), ContextError> {
         use crate::semantic_search::ivf_split::rebuild::{RebuildState, RebuildStatus};
         let mut rebuilds = self.rebuilds.lock();
         if rebuilds.get(namespace).is_some_and(|s| s.state == RebuildState::Running) {
-            return Err(DocStoreError::VecRebuildInProgress {
+            return Err(ContextError::VecRebuildInProgress {
                 namespace: namespace.to_owned(),
             });
         }
@@ -181,7 +215,7 @@ impl SemanticSearchContext {
     }
 
     /// Use `defaults` for namespaces that enable semantic search from now on.
-    pub fn with_index_defaults(mut self, defaults: crate::doc_store::schema::vector_settings::IndexDefaults) -> Self {
+    pub fn with_index_defaults(mut self, defaults: crate::vector_settings::IndexDefaults) -> Self {
         self.index_defaults = defaults;
         self
     }
@@ -190,7 +224,7 @@ impl SemanticSearchContext {
     /// centre, unless it already holds one (a re-enable, or a namespace seeded
     /// from a centroid file before M3). Checks the model first. Durable on
     /// return.
-    pub async fn init_namespace(&self, db: &crate::AsyncDb, namespace: &str, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
+    pub async fn init_namespace(&self, db: &crate::AsyncDb, namespace: &str, settings: &VectorIndexSettings) -> Result<(), ContextError> {
         self.check_model(settings)?;
         crate::semantic_search::vector_kv::create_vector_namespaces(db, namespace).await?;
         if !crate::semantic_search::vector_kv::ivf_exists(db, namespace).await? {
@@ -276,19 +310,19 @@ impl SemanticSearchContext {
 
     /// Check that `settings` can run here: when the server lists its models,
     /// the namespace's is one of them, at the listed dimension.
-    pub fn check_model(&self, settings: &VectorIndexSettings) -> Result<(), DocStoreError> {
+    pub fn check_model(&self, settings: &VectorIndexSettings) -> Result<(), ContextError> {
         if self.supported_models.is_empty() {
             return Ok(());
         }
         let dim = *self
             .supported_models
             .get(&settings.embedding_model)
-            .ok_or_else(|| DocStoreError::UnsupportedEmbeddingModel {
+            .ok_or_else(|| ContextError::UnsupportedEmbeddingModel {
                 model: settings.embedding_model.clone(),
                 supported: self.supported_models.keys().map(String::as_str).collect::<Vec<_>>().join(", "),
             })?;
         if dim != settings.embedding_dim {
-            return Err(DocStoreError::EmbeddingDimMismatch {
+            return Err(ContextError::EmbeddingDimMismatch {
                 model: settings.embedding_model.clone(),
                 dim: settings.embedding_dim,
                 expected: dim as usize,
@@ -305,11 +339,11 @@ impl SemanticSearchContext {
         namespace: &str,
         ns_id: u32,
         settings: &VectorIndexSettings,
-    ) -> Result<NamespaceSemantics, DocStoreError> {
+    ) -> Result<NamespaceSemantics, ContextError> {
         let key = (namespace.to_owned(), ns_id);
         let partition = loop {
             if self.is_dropping(namespace) {
-                return Err(DocStoreError::SemanticSearchNotEnabled {
+                return Err(ContextError::SemanticSearchNotEnabled {
                     namespace: namespace.to_owned(),
                 });
             }
@@ -319,7 +353,7 @@ impl SemanticSearchContext {
             let drops_begun = self.drops_begun.load(std::sync::atomic::Ordering::SeqCst);
             let ivf = crate::semantic_search::vector_kv::load_ivf(db, namespace, settings.rotation_seed)
                 .await?
-                .ok_or_else(|| DocStoreError::VectorIndexNotSeeded {
+                .ok_or_else(|| ContextError::VectorIndexNotSeeded {
                     namespace: namespace.to_owned(),
                 })?;
             #[cfg(test)]
@@ -379,7 +413,7 @@ impl SemanticSearchContext {
 impl NamespaceSemantics {
     /// This namespace's config with one request's search overrides applied
     /// (validated against the same ranges as the schema).
-    pub fn with_overrides(mut self, overrides: &SearchSpec) -> Result<Self, DocStoreError> {
+    pub fn with_overrides(mut self, overrides: &SearchSpec) -> Result<Self, ContextError> {
         let s = overrides.apply(self.search)?;
         self.config.probe = probe_settings(&s);
         self.search = s;

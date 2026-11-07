@@ -1379,7 +1379,7 @@ mod with_service {
         let store = std::sync::Arc::new(store);
         store.semantic_ctx.as_ref().unwrap().evict("pause_vector_drop"); // the next use loads
 
-        let (reached, release) = crate::doc_store::vector::context::load_pause::arm("pause_vector_drop");
+        let (reached, release) = crate::semantic_search::context::load_pause::arm("pause_vector_drop");
         let (settings, ns_id) = store.schemas.vector_settings("pause_vector_drop").unwrap();
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
@@ -1396,7 +1396,7 @@ mod with_service {
         release.notify_one();
         let loaded = loading.await.unwrap();
         assert!(
-            matches!(loaded, Err(DocStoreError::VectorIndexNotSeeded { .. })),
+            matches!(loaded, Err(crate::semantic_search::context::ContextError::VectorIndexNotSeeded { .. })),
             "the load read a partition the drop removed: is_dropped={:?}",
             loaded.as_ref().map(|p| p.is_dropped()).ok()
         );
@@ -1423,7 +1423,7 @@ mod with_service {
         let store = std::sync::Arc::new(store);
         store.semantic_ctx.as_ref().unwrap().evict("pause_store_drop");
 
-        let (reached, release) = crate::doc_store::vector::context::load_pause::arm("pause_store_drop");
+        let (reached, release) = crate::semantic_search::context::load_pause::arm("pause_store_drop");
         let (settings, ns_id) = store.schemas.vector_settings("pause_store_drop").unwrap();
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
@@ -1784,7 +1784,7 @@ mod with_service {
         let store = std::sync::Arc::new(store);
         store.semantic_ctx.as_ref().unwrap().evict("pause_delete"); // the next use loads and counts
 
-        let (reached, release) = crate::doc_store::vector::context::load_pause::arm("pause_delete");
+        let (reached, release) = crate::semantic_search::context::load_pause::arm("pause_delete");
         let loading = tokio::spawn({
             let store = std::sync::Arc::clone(&store);
             async move { partition(&store, "pause_delete").await }

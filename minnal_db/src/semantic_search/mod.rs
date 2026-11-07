@@ -1,5 +1,7 @@
 pub mod chunking;
 pub mod cluster;
+#[cfg(feature = "doc-store")]
+pub mod context;
 #[cfg(test)]
 mod eval;
 pub mod index;

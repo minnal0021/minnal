@@ -2,9 +2,6 @@
 
 use crate::doc_store::*;
 
-#[cfg(feature = "semantic-search")]
-pub(crate) mod context;
-
 impl DocStore {
     /// The health of `namespace`'s partition (document or KV store): every
     /// posting's size, state and lineage from memory, and with `codes` also the

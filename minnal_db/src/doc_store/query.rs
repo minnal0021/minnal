@@ -56,7 +56,7 @@ impl DocStore {
         let ns_id = ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
-        ctx.for_namespace(&self.db, namespace, ns_id, settings).await?.with_overrides(overrides)
+        Ok(ctx.for_namespace(&self.db, namespace, ns_id, settings).await?.with_overrides(overrides)?)
     }
 
     /// Clear the system-wide query-embedding cache, returning the number of

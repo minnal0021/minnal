@@ -64,13 +64,13 @@ pub(crate) use self::indexing::progress::{build_progress_path, read_disk_progres
 #[cfg(feature = "semantic-search")]
 pub use self::vector::VectorReindexOutcome;
 #[cfg(feature = "semantic-search")]
-pub use self::vector::context::{NamespaceSemantics, SemanticSearchContext};
-#[cfg(feature = "semantic-search")]
 pub(crate) use self::vector::vec_reindex_path;
 pub use self::vector::{ReindexStats, VecReindexProgress};
 #[cfg(feature = "semantic-search")]
 pub(crate) use self::write_gate::{InFlightWrite, InFlightWrites};
 pub(crate) use self::write_gate::{LifecycleLocks, WriteGate, WriteGuard};
+#[cfg(feature = "semantic-search")]
+pub use crate::semantic_search::context::{NamespaceSemantics, SemanticSearchContext};
 
 #[allow(unused_imports)]
 use helpers::*;

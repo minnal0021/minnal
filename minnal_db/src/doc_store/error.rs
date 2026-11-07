@@ -135,6 +135,22 @@ impl From<crate::vector_settings::VectorSettingsError> for SchemaError {
     }
 }
 
+#[cfg(feature = "semantic-search")]
+impl From<crate::semantic_search::context::ContextError> for DocStoreError {
+    fn from(e: crate::semantic_search::context::ContextError) -> Self {
+        use crate::semantic_search::context::ContextError as E;
+        match e {
+            E::UnsupportedEmbeddingModel { model, supported } => Self::UnsupportedEmbeddingModel { model, supported },
+            E::EmbeddingDimMismatch { model, dim, expected } => Self::EmbeddingDimMismatch { model, dim, expected },
+            E::VectorIndexNotSeeded { namespace } => Self::VectorIndexNotSeeded { namespace },
+            E::SemanticSearchNotEnabled { namespace } => Self::SemanticSearchNotEnabled { namespace },
+            E::VecRebuildInProgress { namespace } => Self::VecRebuildInProgress { namespace },
+            E::Settings(e) => e.into(),
+            E::Db(e) => Self::Db(e),
+        }
+    }
+}
+
 impl From<crate::vector_settings::VectorSettingsError> for DocStoreError {
     fn from(e: crate::vector_settings::VectorSettingsError) -> Self {
         Self::Schema(e.into())
