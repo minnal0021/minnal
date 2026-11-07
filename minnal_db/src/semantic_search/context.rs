@@ -167,7 +167,7 @@ impl SemanticSearchContext {
             RebuildStatus {
                 state: RebuildState::Running,
                 postings_requested: postings,
-                started_at_ms: unix_ms(),
+                started_at_ms: crate::support::now_ms(),
                 finished_at_ms: None,
                 report: None,
                 error: None,
@@ -180,7 +180,7 @@ impl SemanticSearchContext {
     pub(crate) fn finish_rebuild(&self, namespace: &str, result: Result<crate::semantic_search::ivf_split::rebuild::RebuildReport, String>) {
         use crate::semantic_search::ivf_split::rebuild::RebuildState;
         if let Some(status) = self.rebuilds.lock().get_mut(namespace) {
-            status.finished_at_ms = Some(unix_ms());
+            status.finished_at_ms = Some(crate::support::now_ms());
             match result {
                 Ok(report) => {
                     status.state = RebuildState::Done;
@@ -429,12 +429,6 @@ fn probe_settings(s: &SearchSettings) -> crate::semantic_search::ProbeSettings {
         min_probes: s.min_probes as usize,
         max_probes: s.max_probes as usize,
     }
-}
-
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Test-only: stop one partition load of a namespace after it has counted the

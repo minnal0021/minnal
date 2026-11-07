@@ -16,7 +16,9 @@
 //! to expire; a namespace re-created under the same name shows them until then,
 //! each stamped with when it was taken.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::support::now_ms;
 
 use serde::{Deserialize, Serialize};
 
@@ -72,10 +74,6 @@ fn prefix(namespace: &str) -> Vec<u8> {
     k.extend_from_slice(namespace.as_bytes());
     k.push(0);
     k
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Record `data` for `namespace`, to expire after `ttl`. Callers treat a failure

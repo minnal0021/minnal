@@ -735,7 +735,7 @@ mod tests {
         // large enough to fill several, so the documents' segments are
         // reclaimable.
         let config = || {
-            let mut c = crate::doc_store::test_db_config();
+            let mut c = crate::support::test_db_config();
             c.wal_segment_size = crate::db::wal::MIN_CONFIGURED_SEGMENT_SIZE;
             c
         };

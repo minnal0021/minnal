@@ -14,7 +14,7 @@ use super::bloom::BloomFilter;
 use super::manifest::{LsmManifest, ManifestBucket, ManifestFile, ManifestLevel};
 use super::skip_list::skip_list::{KeyValueRecord, SkipList};
 use super::sparse_index::SparseIndex;
-use crate::support::{get_bucket_for_key, key_prefix_of};
+use crate::support::{get_bucket_for_key, key_prefix_of, prefix_upper_bound};
 use log::{info, warn};
 use parking_lot::RwLock;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -1004,24 +1004,6 @@ impl Drop for L0ReadGuard {
     fn drop(&mut self) {
         self.entry.decrement_readers();
     }
-}
-
-/// The smallest key strictly greater than every key that has `prefix` as a
-/// prefix, so a prefix scan over `P` equals a range scan over `[P, upper)`.
-///
-/// Increments the last byte that is not `0xFF` and drops the all-`0xFF` tail.
-/// Returns `None` when `prefix` is empty or all `0xFF` — there is no finite upper
-/// bound, so the caller scans to the end of the keyspace.
-fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut upper = prefix.to_vec();
-    while let Some(last) = upper.last_mut() {
-        if *last != 0xFF {
-            *last += 1;
-            return Some(upper);
-        }
-        upper.pop();
-    }
-    None
 }
 
 /// Whether `a` is a strictly-newer write sequence than `b`, matching the

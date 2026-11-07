@@ -1,15 +1,14 @@
 //! Progress observer trait for index build operations.
 //!
-//! Both the field-index builder (`rebuild_index_for_namespace`) and the
-//! vector-index reindex path (`index_all`) implement build work in terms of
-//! this trait so that persistence, metrics, and in-memory state tracking are
-//! composable rather than baked into the build loop.
+//! The field-index builder (`rebuild_index_for_namespace`) reports through this
+//! trait so that persistence and in-memory state tracking are composable rather
+//! than baked into the build loop.
 //!
 //! # Built-in implementations
 //!
 //! - [`InMemoryProgress`] — atomics-backed snapshot for live API queries.
 //! - [`DiskProgress`] — throttled atomic-JSON tmp-then-rename for crash
-//!   recovery (replaces the ad-hoc `write_disk_progress` calls).
+//!   recovery.
 //! - [`ChainedObserver`] — fan-out to multiple observers.
 
 use std::path::{Path, PathBuf};

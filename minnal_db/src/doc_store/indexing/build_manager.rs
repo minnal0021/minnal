@@ -1,8 +1,6 @@
 //! Unified build-handle registry for both field-index and vector-index builds.
 //!
-//! [`IndexBuildManager`] replaces the ad-hoc
-//! `Arc<Mutex<HashMap<(String, String), IndexBuildHandle>>>` in `AppState`,
-//! providing a uniform surface for:
+//! [`IndexBuildManager`] provides a uniform surface for:
 //! - Tracking live builds by [`IndexId`]
 //! - Polling progress via [`IndexBuildSnapshot`]
 //! - Awaiting completion on graceful shutdown

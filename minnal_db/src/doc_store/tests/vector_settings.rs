@@ -1478,7 +1478,7 @@ mod with_service {
         store.shutdown().await.unwrap();
         drop(store);
 
-        let store = DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config())
+        let store = DocStore::open_with_config(db_dir.path(), crate::support::test_db_config())
             .await
             .unwrap()
             .with_semantic_search(context(&url));
@@ -1608,7 +1608,7 @@ mod with_service {
         store.shutdown().await.unwrap();
         drop(store);
 
-        let store = DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config())
+        let store = DocStore::open_with_config(db_dir.path(), crate::support::test_db_config())
             .await
             .unwrap()
             .with_semantic_search(context(&url));

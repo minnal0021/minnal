@@ -13,9 +13,9 @@
 //! | `vec_index` | Embeds documents from the vector-index queue | `semantic_search::workers` |
 //! | `ivf_maintenance` | Splits, merges and reassigns a namespace's postings | `semantic_search::workers` |
 //!
-//! The last two stay in `doc_store`: they need its schemas and in-flight write
-//! tracking, are feature-gated, and are started by `DocStore`. `db` must not
-//! import `doc_store`.
+//! The last two are feature-gated and started by `DocStore`, and reach its schemas
+//! and in-flight write tracking through `semantic_search::workers::WorkerHost`. `db`
+//! must not import `doc_store` or `semantic_search`.
 
 pub(crate) mod index_checkpoint;
 pub(crate) mod lsm_compaction;

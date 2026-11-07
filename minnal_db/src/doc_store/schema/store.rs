@@ -338,7 +338,7 @@ mod tests {
     }
 
     async fn open_db(dir: &std::path::Path) -> AsyncDb {
-        AsyncDb::open_with_config(dir.to_path_buf(), crate::doc_store::test_db_config())
+        AsyncDb::open_with_config(dir.to_path_buf(), crate::support::test_db_config())
             .await
             .unwrap()
     }

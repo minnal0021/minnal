@@ -23,7 +23,7 @@ pub(crate) fn make_schema(namespace: &str, indices: Vec<IndexSpec>) -> DocStoreS
 }
 
 pub(crate) async fn open_fresh(db_dir: &Path) -> DocStore {
-    DocStore::open_with_config(db_dir, crate::doc_store::test_db_config()).await.unwrap()
+    DocStore::open_with_config(db_dir, crate::support::test_db_config()).await.unwrap()
 }
 
 pub(crate) fn make_kv_schema(namespace: &str, key_type: KvKeyType, value_type: KvValueType) -> KvStoreSchema {

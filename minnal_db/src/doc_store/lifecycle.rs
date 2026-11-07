@@ -806,9 +806,7 @@ mod tests {
         store.shutdown().await.unwrap();
         drop(store);
 
-        let store = DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config())
-            .await
-            .unwrap();
+        let store = DocStore::open_with_config(db_dir.path(), crate::support::test_db_config()).await.unwrap();
         assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by the restart");
         store.remove("foo").await.unwrap();
         assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by dropping foo");

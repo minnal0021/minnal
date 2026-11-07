@@ -21,7 +21,7 @@ async fn the_lock_is_held_while_anything_still_holds_the_database() {
     let store = open_fresh(db_dir.path()).await;
     let pass = Arc::clone(&store.db); // what a worker's running pass holds
     drop(store);
-    match DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config()).await {
+    match DocStore::open_with_config(db_dir.path(), crate::support::test_db_config()).await {
         Err(DocStoreError::StoreLocked { .. }) => {}
         Err(e) => panic!("expected StoreLocked, got {e:?}"),
         Ok(_) => panic!("a second instance opened the files while the first was still alive"),
@@ -51,7 +51,7 @@ async fn test_second_open_of_the_same_directory_is_refused() {
 
     let _held = open_fresh(db_dir.path()).await;
 
-    match DocStore::open_with_config(db_dir.path(), crate::doc_store::test_db_config()).await {
+    match DocStore::open_with_config(db_dir.path(), crate::support::test_db_config()).await {
         Err(DocStoreError::StoreLocked { owner_pid, .. }) => {
             assert_eq!(owner_pid, Some(std::process::id()));
         }

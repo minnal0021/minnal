@@ -1,12 +1,5 @@
-//! Uniform progress and status types shared by both the field-index (RoaringBitmap)
-//! and the vector-index (IVF + RaBitQ) subsystems.
-//!
-//! Previously each subsystem had its own ad-hoc progress representation:
-//! - Field index: `DiskBuildProgress` with string statuses + `IndexBuildProgress`
-//! - Vector index: derived live from queue depth + `{ns}_sparse_vector_meta` count
-//!
-//! This module provides a single set of types that both systems populate so the
-//! REST API can return a consistent shape regardless of index kind.
+//! Progress and status types for field-index builds and vector-index reindexes, so
+//! the REST API can return one shape whichever kind of index it reports.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -125,13 +118,7 @@ impl IndexBuildSnapshot {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Current wall-clock time as milliseconds since the Unix epoch.
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+pub use crate::support::now_ms;
 
 /// Persistent state for a background index build, written to
 /// `{db_path}/field-index/{ns_id}/{field_id}/build_progress.json`.

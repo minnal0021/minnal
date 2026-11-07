@@ -88,7 +88,8 @@ pub use self::schema::{
 };
 
 // ── Pagination types ───────────────────────────────────────────────────────
-pub use self::pagination::{CursorPage, Page, Pagination, prefix_upper_bound};
+pub use self::pagination::{CursorPage, Page, Pagination};
+pub use crate::support::prefix_upper_bound;
 
 // ── Stored schemas ─────────────────────────────────────────────────────────
 pub use self::schema::store::{SCHEMA_NAMESPACE, StoredSchema};
@@ -413,20 +414,3 @@ impl DocStore {
 // leave that process locking an orphaned inode while a third process creates
 // and locks a fresh file at the same path — two owners at once. See
 // `support::file_lock`.
-
-// ── Tests ──────────────────────────────────────────────────────────────────────
-/// Test-only `DbConfig` with a deliberately small bucket count.
-///
-/// Every namespace eagerly opens `2 × num_buckets` file descriptors (one LSM L1
-/// file plus one value-log file per bucket), held for its lifetime. With the
-/// production default of 16 buckets a namespace-heavy test suite run at high
-/// `cargo test` parallelism (one test per core) exhausts the typical 1024 fd
-/// soft limit on many-core machines ("Too many open files"). Two buckets cuts
-/// the per-namespace fd cost ~8× while still exercising multi-bucket routing.
-#[cfg(test)]
-pub(crate) fn test_db_config() -> crate::DbConfig {
-    crate::DbConfig {
-        num_buckets: 2,
-        ..Default::default()
-    }
-}
