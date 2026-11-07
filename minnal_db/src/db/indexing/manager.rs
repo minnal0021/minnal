@@ -418,29 +418,44 @@ impl IndexManager {
     ///
     /// The list of fields to checkpoint is supplied by the caller (typically
     /// obtained from `NamespaceRegistry::all_indexed_fields`).
-    pub fn checkpoint_fields(&self, wal_tail: u64, fields: &[(u32, FieldId)]) -> Result<()> {
-        use std::io::Write;
+    ///
+    /// Returns the fields whose marker it wrote. A field dropped while the
+    /// checkpoint ran has no directory any more and is left out: the checkpoint
+    /// gathers its fields first and writes their markers after, so a drop can
+    /// land in between, and it used to fail the whole checkpoint with NotFound.
+    pub fn checkpoint_fields(&self, wal_tail: u64, fields: &[(u32, FieldId)]) -> Result<Vec<(u32, FieldId)>> {
+        let mut written = Vec::with_capacity(fields.len());
         for &(namespace_id, field_id) in fields {
             let field_path = self.field_path(namespace_id, field_id);
-            let checkpoint_file = field_path.join("checkpoint");
-            let tmp = checkpoint_file.with_extension("tmp");
-
-            // Write + fsync the tmp file so its bytes are durable before the rename.
-            {
-                let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(&wal_tail.to_le_bytes())?;
-                f.sync_all()?;
+            match Self::write_checkpoint_marker(&field_path, wal_tail) {
+                Ok(()) => written.push((namespace_id, field_id)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !field_path.exists() => {
+                    log::debug!("[IndexManager] ns={namespace_id} field={field_id} dropped during a checkpoint; no marker written");
+                }
+                Err(e) => {
+                    return Err(KVError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to write checkpoint for ns={namespace_id} field={field_id}: {e}"),
+                    )));
+                }
             }
-            std::fs::rename(&tmp, &checkpoint_file).map_err(|e| {
-                KVError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to write checkpoint for ns={} field={}: {}", namespace_id, field_id, e),
-                ))
-            })?;
-            // fsync the field directory so the rename survives a crash.
-            std::fs::File::open(&field_path)?.sync_all()?;
         }
-        Ok(())
+        Ok(written)
+    }
+
+    /// Write `wal_tail` to `{field_path}/checkpoint` durably: fsync the tmp file
+    /// before the rename, and the directory after it.
+    fn write_checkpoint_marker(field_path: &Path, wal_tail: u64) -> std::io::Result<()> {
+        use std::io::Write;
+        let checkpoint_file = field_path.join("checkpoint");
+        let tmp = checkpoint_file.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&wal_tail.to_le_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &checkpoint_file)?;
+        std::fs::File::open(field_path)?.sync_all()
     }
 
     /// Path of a field's durable gap record.
@@ -741,6 +756,19 @@ mod tests {
 
         mgr.checkpoint_fields(99999, &[(0, 0)]).unwrap();
         assert_eq!(mgr.read_checkpoint(0, 0, u64::MAX), 99999);
+    }
+
+    #[test]
+    fn a_field_dropped_during_a_checkpoint_is_left_out_of_it() {
+        let dir = TempDir::new().unwrap();
+        let mgr = IndexManager::open(dir.path()).unwrap();
+        for field in 0..3 {
+            std::fs::create_dir_all(mgr.field_path(1, field)).unwrap();
+        }
+        mgr.remove_field_path(1, 1).unwrap();
+        let written = mgr.checkpoint_fields(42, &[(1, 0), (1, 1), (1, 2)]).unwrap();
+        assert_eq!(written, vec![(1, 0), (1, 2)]);
+        assert!(!mgr.field_path(1, 1).exists(), "no directory recreated for the dropped field");
     }
 
     #[test]

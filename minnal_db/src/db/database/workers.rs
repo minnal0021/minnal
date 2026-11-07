@@ -167,7 +167,7 @@ impl IndexCheckpointTarget for Database {
             }
         }
 
-        self.index_manager.checkpoint_fields(wal_tail, &active_fields)?;
+        let active_fields = self.index_manager.checkpoint_fields(wal_tail, &active_fields)?;
         drop(stores);
         // Their markers are durable: the *checkpointed* event.
         self.wal_flush_observer.fields_checkpointed(&active_fields, wal_tail);
