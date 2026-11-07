@@ -188,6 +188,10 @@ pub struct Database {
     // Background index checkpoint worker
     pub(crate) index_checkpoint_worker: Arc<tokio::sync::RwLock<Option<Arc<IndexCheckpointWorker>>>>,
 
+    /// How many index checkpoints have started, and the highest-numbered one
+    /// that finished; see [`Database::index_checkpoint_covers`].
+    pub(crate) index_checkpoints: crate::db::indexing::manager::CheckpointCounter,
+
     // Global monotonic sequence counter. Seeded from the WAL on open.
     pub(crate) next_seq: Arc<AtomicU64>,
 

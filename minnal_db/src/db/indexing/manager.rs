@@ -607,6 +607,49 @@ impl IndexManager {
 
 // ── tests ──────────────────────────────────────────────────────────────────
 
+/// Numbers the index checkpoints, so a caller can tell when in-memory index
+/// changes it made have been written out: a field build's changes are not in the
+/// WAL, so only a checkpoint makes them durable.
+///
+/// Also runs the checkpoints one at a time. Two at once stage the same field's
+/// write buffer together, and a field allows one stage at a time: the
+/// background worker and an on-demand checkpoint (the admin route, or a build
+/// finishing) could overlap.
+#[derive(Default)]
+pub(crate) struct CheckpointCounter {
+    started: std::sync::atomic::AtomicU64,
+    finished: std::sync::atomic::AtomicU64,
+    one_at_a_time: parking_lot::Mutex<()>,
+}
+
+impl CheckpointCounter {
+    /// Held for a whole checkpoint.
+    pub(crate) fn exclusive(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.one_at_a_time.lock()
+    }
+
+    /// Number a checkpoint as it starts.
+    pub(crate) fn begin(&self) -> u64 {
+        self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// Record checkpoint `id` as written out.
+    pub(crate) fn finish(&self, id: u64) {
+        self.finished.fetch_max(id, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many checkpoints have started so far.
+    pub(crate) fn started(&self) -> u64 {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a checkpoint that started after `started` checkpoints had has
+    /// finished: one that staged everything changed before `started` was read.
+    pub(crate) fn covers(&self, started: u64) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst) > started
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +799,22 @@ mod tests {
 
         mgr.checkpoint_fields(99999, &[(0, 0)]).unwrap();
         assert_eq!(mgr.read_checkpoint(0, 0, u64::MAX), 99999);
+    }
+
+    /// Only a checkpoint that started after the counter was read covers the
+    /// changes made before it; one already running when they were made does not.
+    #[test]
+    fn a_checkpoint_covers_only_changes_made_before_it_started() {
+        let counter = CheckpointCounter::default();
+        let running = counter.begin();
+        let read = counter.started();
+        assert!(!counter.covers(read));
+        counter.finish(running);
+        assert!(!counter.covers(read), "it was running already when the change was made");
+        let next = counter.begin();
+        assert!(!counter.covers(read));
+        counter.finish(next);
+        assert!(counter.covers(read));
     }
 
     #[test]

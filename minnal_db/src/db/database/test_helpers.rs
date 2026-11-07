@@ -114,6 +114,7 @@ impl Database {
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
+            index_checkpoints: Default::default(),
             next_seq,
             key_locks: KeyLocks::new(),
             fail_log_dir,

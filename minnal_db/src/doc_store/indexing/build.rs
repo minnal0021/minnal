@@ -440,6 +440,12 @@ async fn rebuild_index_for_namespace(
     observer.on_status(BuildStatus::Running, None);
 
     let mut indexed: u64 = already_done;
+    // The rows this build sets live in memory until an index checkpoint writes
+    // them out; they are not in the WAL, so a crash before then loses them. The
+    // saved resume point therefore names a key only once a checkpoint that
+    // started after the key was indexed has finished. Naming it sooner skipped,
+    // on resume, every key a crash had taken back out of the index.
+    let mut unsaved: std::collections::VecDeque<(u64, Vec<u8>)> = std::collections::VecDeque::new();
 
     // ── Pass 2: rebuild, one cursor page at a time. On a resumed build the
     // cursor seeks strictly past the last processed key (the scan cursor is
@@ -470,8 +476,15 @@ async fn rebuild_index_for_namespace(
                 .into());
             }
             indexed += 1;
+            if indexed.is_multiple_of(1_000) {
+                unsaved.push_back((db.index_checkpoints_started(), key.clone()));
+            }
+            let mut resume_point = None;
+            while unsaved.front().is_some_and(|(started, _)| db.index_checkpoint_covers(*started)) {
+                resume_point = unsaved.pop_front().map(|(_, key)| key);
+            }
             // The observer persists to disk on its own cadence (every `every_n`).
-            observer.on_progress(indexed, total, false, Some(&key));
+            observer.on_progress(indexed, total, false, resume_point.as_deref());
 
             // Log progress and yield every 1 000 documents.
             if indexed.is_multiple_of(1_000) {
@@ -492,6 +505,9 @@ async fn rebuild_index_for_namespace(
         }
     }
 
+    // Write the built rows out before the record says complete: a complete
+    // build is never resumed, so rows a crash took back would stay missing.
+    db.checkpoint_index().await?;
     // Mark build complete.  The observer persists the terminal record from the
     // latest snapshot it has been fed via `on_progress`.
     observer.on_status(BuildStatus::Complete, None);

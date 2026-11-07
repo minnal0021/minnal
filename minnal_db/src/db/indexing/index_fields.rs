@@ -122,6 +122,21 @@ impl Database {
         store.reindex_field(field_id, key)
     }
 
+    /// How many index checkpoints have started so far. Read it after changing
+    /// an index outside the write path (a build); once
+    /// [`index_checkpoint_covers`](Self::index_checkpoint_covers) is true for the
+    /// value read, the change is on disk.
+    pub fn index_checkpoints_started(&self) -> u64 {
+        self.index_checkpoints.started()
+    }
+
+    /// Whether an index checkpoint that started after `started` checkpoints had
+    /// (a value of [`index_checkpoints_started`](Self::index_checkpoints_started))
+    /// has finished.
+    pub fn index_checkpoint_covers(&self, started: u64) -> bool {
+        self.index_checkpoints.covers(started)
+    }
+
     /// The configured field-index compaction threshold as a fraction
     /// (`0.0..1.0`) — a store is compacted at the next checkpoint once its waste
     /// ratio reaches this. Mirrors the clamp applied in `run_index_checkpoint`.

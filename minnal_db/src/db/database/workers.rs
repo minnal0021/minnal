@@ -70,6 +70,10 @@ impl IndexCheckpointTarget for Database {
     }
 
     fn run_index_checkpoint(&self) -> Result<usize> {
+        // Numbered before anything is staged: a change made before this point is
+        // in what it writes out (see `index_checkpoint_covers`).
+        let _one_at_a_time = self.index_checkpoints.exclusive();
+        let checkpoint_id = self.index_checkpoints.begin();
         // The offset this checkpoint claims the indices reflect. NOT the raw tail:
         // a write registers as in flight when it appends to the WAL and stays so
         // until its store apply *and index update* are done, so the tail can hold
@@ -181,6 +185,7 @@ impl IndexCheckpointTarget for Database {
         }
 
         self.persist_rejected_update_gaps();
+        self.index_checkpoints.finish(checkpoint_id);
         Ok(active_fields.len())
     }
 }

@@ -515,6 +515,19 @@ impl AsyncDb {
     /// one performed on clean shutdown; exposed for callers that want to force a
     /// flush + compaction on demand. Runs the blocking checkpoint on the
     /// blocking thread pool.
+    /// How many index checkpoints have started so far; see
+    /// [`index_checkpoint_covers`](Self::index_checkpoint_covers).
+    pub fn index_checkpoints_started(&self) -> u64 {
+        self.inner.inner.index_checkpoints_started()
+    }
+
+    /// Whether an index checkpoint that started after `started` checkpoints had
+    /// has finished, so index changes made before `started` was read are on disk.
+    /// A field build's changes are not in the WAL: only this makes them durable.
+    pub fn index_checkpoint_covers(&self, started: u64) -> bool {
+        self.inner.inner.index_checkpoint_covers(started)
+    }
+
     pub async fn checkpoint_index(&self) -> Result<usize> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.checkpoint_index())
