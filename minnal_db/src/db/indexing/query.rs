@@ -1,6 +1,6 @@
 //! Predicate query execution against the field indices.
 //!
-//! Split out of `database.rs`, which had accumulated fourteen unrelated
+//! Split out of `database/mod.rs`, which had accumulated fourteen unrelated
 //! responsibilities in one file. This one needs only the namespace registry and
 //! the per-namespace store, so it lifts out cleanly.
 //!

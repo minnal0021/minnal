@@ -76,7 +76,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
                                       ▼
                       ┌──────────────────────────────┐
                       │ Database coordinator         │
-                      │ (db/database.rs)             │
+                      │ (db/database/mod.rs)             │
                       │                              │
                       │ • namespace registry         │
                       │ • the shared WAL             │
@@ -409,7 +409,7 @@ The design and its measurements are in `src/semantic_search/doc/Vector-Index-WAL
 - **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
 - **Commit round** — one fsync and the callers it releases, in either log (`db/wal/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
 - **Sequence (seq)** — the global write counter (`next_seq`) every write draws from, whichever log it uses. The highest seq for a key wins everywhere: memtable, L0, L1, and replay of either log.
-- **Key stripe lock** (`db/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
+- **Key stripe lock** (`db/database/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
 - **Memtable** — a namespace's in-memory sorted buffer of recent writes (a skip list). **Seal:** turning a full one read-only so it can be flushed. **Flush:** writing a sealed memtable to L0 files and fsyncing them.
 - **L0 / L1** — the LSM tree's on-disk levels: L0 holds one file per flush per bucket, L1 one merged file per bucket. **Compaction** merges L0 into L1 and may drop tombstones there.
 - **Tombstone** — the record a delete leaves, so the key reads as absent until compaction removes both.

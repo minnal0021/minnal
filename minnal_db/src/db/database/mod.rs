@@ -3,10 +3,12 @@
 //! Manages a shared WAL, namespace registry, and multiple KVStore instances.
 //! Each namespace has independent LSM + value log storage.
 
+pub(crate) mod key_locks;
+
 use crate::db::config::DbConfig;
+use crate::db::database::key_locks::KeyLocks;
 use crate::db::error::{KVError, Result};
 use crate::db::indexing::manager::IndexManager;
-use crate::db::key_locks::KeyLocks;
 use crate::db::namespace::index_set::{ExtractorFn, IndexEntry};
 use crate::db::namespace::kv_store::KVStore;
 use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
@@ -3785,9 +3787,5 @@ impl TtlTarget for Database {
 
 /// Unit tests for the coordinator.
 ///
-/// Declared here with `#[path]` rather than as a sibling module so `use super::*`
-/// still resolves to this file's scope — the tests were written against it, and
-/// re-deriving 40 imports to move them would have been change for its own sake.
 #[cfg(test)]
-#[path = "database_tests.rs"]
 mod tests;

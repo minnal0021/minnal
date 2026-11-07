@@ -56,7 +56,7 @@ INGEST (synchronous, on the write path)                    [minnal_doc_store →
           after a crash the overlay is rebuilt by WAL replay from the checkpoint offset)
 
 CHECKPOINT (background, every 1.75 s by default / soft limit / backpressure / shutdown / Db::checkpoint_index)
-  IndexCheckpointWorker → Database::run_index_checkpoint   (database.rs)
+  IndexCheckpointWorker → Database::run_index_checkpoint   (database/mod.rs)
     wal_tail = wal_cut_ceiling()           (below any in-flight write)
     flush every row map first (its marker before any field's)
     per active field — spill, crash-ordered, no fsync under the write lock:
@@ -156,7 +156,7 @@ Further invariants:
 - **The two stores are reconciled at open, not kept atomic.** There is no marker across the bitmap and keymap stores. `DynFieldIndex::open` → `reconcile_at_open` drops values whose bitmap is missing, removes bitmaps no value maps to, and raises `next_slot` above every id either store holds. Content lost this way (and anything after the last checkpoint) comes back from **WAL replay**; a non-zero `damaged_at_open` makes `activate_field_index` record a `GapCause::DamagedIndexFile` full-rebuild gap, since dropped slots lost rows that replay from the checkpoint offset may not cover.
 - **Rehash never rewrites the live key table in place** (persistent stores): sync values, build the doubled table, write `blobs.keys.rehash`, rename over `blobs.keys`, fsync the dir, remap.
 
-Regression tests live beside the code in `blob_store.rs`, `dyn_index.rs` (`open_removes_an_orphan_bitmap_and_never_reuses_its_slot`, …) and `db/database_tests.rs` (damaged file → gap).
+Regression tests live beside the code in `blob_store.rs`, `dyn_index.rs` (`open_removes_an_orphan_bitmap_and_never_reuses_its_slot`, …) and `db/database/tests.rs` (damaged file → gap).
 
 #### Compaction is crash-safe via a staged file swap — do NOT rewrite in place
 

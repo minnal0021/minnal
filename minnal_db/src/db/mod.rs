@@ -3,7 +3,6 @@ pub mod database;
 pub mod error;
 pub mod facade;
 pub mod indexing;
-pub(crate) mod key_locks;
 pub(crate) mod layout;
 pub mod namespace;
 pub mod stats;

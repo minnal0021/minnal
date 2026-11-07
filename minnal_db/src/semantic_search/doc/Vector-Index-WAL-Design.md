@@ -30,7 +30,7 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
 - **Sequence (seq)** — the global write counter every write draws from,
   whichever log it uses; the highest seq for a key wins everywhere (memtable,
   L0, L1, replay).
-- **Key stripe lock** (`db/key_locks.rs`) — 1,024 locks, each key hashed to one
+- **Key stripe lock** (`db/database/key_locks.rs`) — 1,024 locks, each key hashed to one
   (its *stripe*). Every write takes its key's stripe before anything else and
   holds it until the write is applied, so one key's writes apply in seq order
   whichever log they use.
@@ -634,7 +634,7 @@ above, so the full M5 run checks both.
 1. **Code location:** `db/wal/vector_index_wal.rs` holds the log (record body,
    observer, retirement, replay) on the segmented log shared with the main WAL
    (`db/wal/segmented_log.rs`: segments, frames, append, sync, open, GC);
-   `database.rs` calls it at open and from the GC tick.
+   `database/mod.rs` calls it at open and from the GC tick.
    `minnal_db/CLAUDE.md`'s WAL-ownership rule names both files.
 2. **Fsync policy:** one `sync` per completion batch; no time bound.
 3. **Segment size:** 64 MiB, as the main WAL.

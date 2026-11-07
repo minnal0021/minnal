@@ -51,7 +51,7 @@ The ones this note leans on most:
   whichever log it uses. The highest seq for a key wins everywhere: memtable,
   L0, L1, and replay of either log, which re-applies each record with its
   original seq.
-- **Key stripe lock** (`db/key_locks.rs`) — 1,024 locks, each key hashed to one
+- **Key stripe lock** (`db/database/key_locks.rs`) — 1,024 locks, each key hashed to one
   (its *stripe*). Every write takes its key's stripe first. `merge` holds it
   across its read, its closure and its write, which is what makes a conditional
   update atomic.

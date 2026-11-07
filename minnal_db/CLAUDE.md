@@ -10,10 +10,10 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 |---|---|
 | `src/lib.rs` | Public re-exports only — all types surfaced here |
 | `src/db/facade.rs` | `Db` and `AsyncDb` — the only entry points callers use |
-| `src/db/database.rs` | Internal coordinator: owns all subsystems, routes ops |
+| `src/db/database/mod.rs` | Internal coordinator: owns all subsystems, routes ops |
 | `src/db/layout.rs` | **The one place that knows the on-disk directory layout.** Nothing above it should `join("field-index")` or `format!("ns_{}", ..)` |
 | `src/db/indexing/query.rs` | Predicate evaluation against the field indices (`Database` methods) |
-| `src/db/key_locks.rs` | Striped per-key write locks — the outermost lock on every write path |
+| `src/db/database/key_locks.rs` | Striped per-key write locks — the outermost lock on every write path |
 | `src/db/wal/gc.rs` | WAL GC + the index-replay watermark + the backstop key harvest |
 | `src/db/indexing/health.rs` | Gap records, index health, repair, no-WAL tracking (FR-001 remediation) |
 | `src/db/test_support.rs` | `#[cfg(test)]` fixtures shared by every test module in `db/` |
@@ -271,7 +271,7 @@ Each worker is a **single global task** that fans out over namespaces — there 
 - **The power-loss model records real fsync coverage** (test-only `written` / `synced` per segment, `first_open_segment`): `lose_unsynced` and `power_loss_extents` cut each segment to what an fsync covered, and `commit` asserts `covered(end)` — every earlier segment through its marker, `end`'s segment to `end`. A stress that snapshots "synced" records must take the list *at* the power loss: writers frozen inside a commit finish after the image.
 - **`commit` / `sync` run as commit rounds** (`CommitRounds`, design note §16): the fsync runs outside the append lock, concurrent callers share one fsync, and a call returns early when nothing was appended since the last fsync. `append(body_parts, under_lock)` takes the body as slices (one copy into the frame) and runs `under_lock(start, end)` before publishing the tail, which is where a log registers a record as not yet applied.
 
-All main-WAL logic (append, GC, recovery, sequence tracking) lives exclusively in `database.rs` (`Database`, the internal coordinator) on top of `Wal`. The one other log, the **vector index WAL** (the vector worker's no-WAL payloads, made durable by one fsync per batch instead of a memtable flush), lives in `db/wal/vector_index_wal.rs`, and `database.rs` only calls it at open and from the GC tick (design: `src/semantic_search/doc/Vector-Index-WAL-Design.md`). Do not add WAL code anywhere else.
+All main-WAL logic (append, GC, recovery, sequence tracking) lives exclusively in `database/mod.rs` (`Database`, the internal coordinator) on top of `Wal`. The one other log, the **vector index WAL** (the vector worker's no-WAL payloads, made durable by one fsync per batch instead of a memtable flush), lives in `db/wal/vector_index_wal.rs`, and `database/mod.rs` only calls it at open and from the GC tick (design: `src/semantic_search/doc/Vector-Index-WAL-Design.md`). Do not add WAL code anywhere else.
 
 **Vector index WAL specifics.** Segments `vector_index_wal/{id:010}.log` (magic `MVIW`), body `[ns_id|seq|key|value]` (a delete: `value_len = u32::MAX`, no value). `sync` makes every append that *returned before the call* durable (`syncs_waiting_together_share_one_fsync`). `unretired_bytes` counts record bytes from the retired cut (headers and end markers excluded). Its counters (`vector_wal_appends`, `_bytes_appended`, `_fsyncs`, `_gc_runs`, `_segments_deleted`, `_pin_flushes`, `_records_replayed`, `_records_skipped`) are bumped only on the database's global `Metrics`. Guard for reading from the cut: `open_does_not_read_segments_below_the_cut`.
 

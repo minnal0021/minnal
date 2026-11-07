@@ -368,7 +368,7 @@ makes it fail.
 After a crash, each field index replays the WAL written since its last
 checkpoint. It scans that stretch of the WAL, reads the current value of every
 key it touched, and updates the bitmaps. Measured with the ignored tests
-`replay_cost_vs_window` and `replay_cost_vs_total` in `db/database_tests.rs`:
+`replay_cost_vs_window` and `replay_cost_vs_total` in `db/database/tests.rs`:
 one string field with two values, 6,000 documents, baseline and new binaries
 alternated over two rounds:
 

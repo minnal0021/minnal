@@ -277,7 +277,7 @@ fn bench_closure(c: &mut Criterion) {
 // ── Group 3: what the key stripe added to the existing write path ──────
 //
 // `merge` is made atomic by a striped per-key lock that `put` and `delete` now
-// take as well. `db::key_locks::KeyLocks` is crate-private, so a bench (a
+// take as well. `db::database::key_locks::KeyLocks` is crate-private, so a bench (a
 // separate compilation unit) cannot call it — this **reproduces** its body
 // against the same primitives to size the cost. Treat it as a proxy for
 // `KeyLocks::guard`, not a measurement of it.

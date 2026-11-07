@@ -1,6 +1,6 @@
 //! WAL garbage collection, gated on the index-replay watermark.
 //!
-//! Split out of `database.rs`. WAL GC must not reclaim a segment an active field
+//! Split out of `database/mod.rs`. WAL GC must not reclaim a segment an active field
 //! index still needs to replay after a crash -- without that gate the index
 //! silently loses those documents for the life of the database (FR-001).
 //!

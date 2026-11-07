@@ -123,7 +123,7 @@ with the drive about 92% busy (`Fewer-WAL-Fsyncs-Design.md`, §14).
 An entry can leave the log once its write is in an L0 file. The WAL works that
 out in two stages: it keeps a **cut** (every entry below it is in an SSTable)
 and records it; WAL GC later deletes segments wholly below it.
-`WalPersistObserver` in `db/database.rs` does the first stage, driven by the
+`WalPersistObserver` in `db/database/mod.rs` does the first stage, driven by the
 flush events.
 
 **While writes come in.** Each write is appended to the WAL, then applied to
@@ -800,7 +800,7 @@ What does not change:
 
 ## 9. Tests
 
-**Change A** (`db/database_tests.rs`, `db/wal/gc.rs`):
+**Change A** (`db/database/tests.rs`, `db/wal/gc.rs`):
 
 - After a flush the saved cut equals the observer's cut, and a crash then
   replays nothing below it.
@@ -821,7 +821,7 @@ What does not change:
   every segment's bytes before and after a flush and a GC pass and checks the
   frames are unchanged.
 
-**A2** (`db/wal/gc.rs`, `db/database_tests.rs`):
+**A2** (`db/wal/gc.rs`, `db/database/tests.rs`):
 
 - A field whose checkpoint is behind a segment holds it; after its
   *checkpointed* event moves past, GC deletes it.
@@ -843,7 +843,7 @@ What does not change:
 - Open truncates a torn tail: after a torn record and a shorter new record, a
   second open replays only the new one.
 
-**Change C** (`db/wal/main_wal.rs`, `db/database_tests.rs`):
+**Change C** (`db/wal/main_wal.rs`, `db/database/tests.rs`):
 
 - Sixteen threads writing concurrently: every write is readable and replays
   after a crash, and `wal_commit_rounds` < writes.

@@ -200,7 +200,7 @@ root cause is that dropping an index leaves everything behind:
 an index leaves its files behind") is true of the engine but not of the whole
 system, and the real defect is sharper than a disk leak:
 
-- `Database::deactivate_field_index` (`database.rs`) is a two-line in-memory
+- `Database::deactivate_field_index` (`database/mod.rs`) is a two-line in-memory
   deregister that never touches disk, and `IndexManager` has
   `remove_namespace_path` (whole namespace) but **no per-field removal**. So an
   embedder driving the engine directly does leak the whole
@@ -517,7 +517,7 @@ the row map*.
 ### Acceptance criteria
 
 All met as of 2026-08-01. The test pinning each one is named beside it; all live
-in `minnal_db/src/db/database.rs` unless stated.
+in `minnal_db/src/db/database/mod.rs` unless stated.
 
 - [x] WAL GC does not reclaim a segment that any active field index still needs
   for replay, proven by the inverse of
@@ -714,10 +714,10 @@ are the engine's call.
 `put` can return `Ok(())` for a write that a subsequent `get` reports as absent.
 
 The write path is: WAL append + fsync (durability barrier), then a best-effort
-in-memory apply with bounded retry. `apply_with_retry` (`database.rs:688`) tries
+in-memory apply with bounded retry. `apply_with_retry` (`database/mod.rs:688`) tries
 `APPLY_RETRY_ATTEMPTS` (3) times, logs an `error!` on final failure, and returns
 `bool`. `put_ns` bumps the `apply_failures` metric on that `false` and then
-returns `Ok(())` regardless (`database.rs:760-773`); `delete_ns` mirrors it at
+returns `Ok(())` regardless (`database/mod.rs:760-773`); `delete_ns` mirrors it at
 `:846`.
 
 **The data is not lost** — it is durable in the WAL and replayed on the next
@@ -1474,7 +1474,7 @@ at `warn`, but a drop racing the worker would then warn in normal operation.
 ## FR-013 — Namespace identity without a central registry file
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/db/namespace/mod.rs`, `database.rs`, `wal/main_wal.rs`,
+**Area:** `minnal_db` (`src/db/namespace/mod.rs`, `database/mod.rs`, `wal/main_wal.rs`,
 `vector_index_wal.rs`, `layout.rs`, `indexing/manager.rs`), `minnal_db_api` (README)
 **Severity:** Medium — a damaged registry stops the whole database opening; no data
 is at risk from the design as it stands
@@ -1509,7 +1509,7 @@ rkyv payload (`RegistryData`, `namespace/mod.rs:347`). Every change rewrites it 
 
 The last job is the hard one. Saving the registry is the moment a drop becomes
 permanent (step 1 of `remove_namespace`), and recovery skips WAL entries whose
-namespace it does not list (`database.rs:2869`).
+namespace it does not list (`database/mod.rs:2869`).
 
 `next_id` cannot be replaced by the highest id plus one. Dropping the newest namespace
 would free its id, and the WAL would replay the dropped namespace's records into the

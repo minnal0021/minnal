@@ -14,7 +14,7 @@
 //! - the scans recovery, field-index replay and the backstop harvest use.
 //!
 //! What is retired, and when, is decided by `WalPersistObserver` in
-//! `database.rs`.
+//! `database/mod.rs`.
 
 use crate::db::wal::segmented_log::{self, LogError, LogFormat, LogPosition, OpenFrom, SegmentedLog};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
@@ -242,7 +242,7 @@ impl WalPointer {
 /// at or above its namespace's [`replay_from`](Self::replay_from), and WAL GC
 /// deletes segments wholly below [`cut`](Self::cut). It is saved by the flush
 /// that moves it, before that flush's L0 files are registered (see
-/// `WalPersistObserver::prepare_written` in `database.rs`).
+/// `WalPersistObserver::prepare_written` in `database/mod.rs`).
 ///
 /// `head` and `tail` are not saved: open derives them from the log (the oldest
 /// segment on disk, and the end of its valid frames).
