@@ -1474,7 +1474,7 @@ at `warn`, but a drop racing the worker would then warn in normal operation.
 ## FR-013 — Namespace identity without a central registry file
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/db/namespace/`, `database/`, `wal/main_wal.rs`,
+**Area:** `minnal_db` (`src/namespace/`, `src/db/namespace/namespace_ops.rs`, `database/`, `wal/main_wal.rs`,
 `wal/vector_index_wal/mod.rs`, `layout.rs`, `indexing/manager.rs`), `minnal_db_api` (README)
 **Severity:** Medium — a damaged registry stops the whole database opening; no data
 is at risk from the design as it stands

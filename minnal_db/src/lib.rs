@@ -95,6 +95,7 @@ mod support;
 pub mod doc_store;
 pub mod field_index;
 pub mod kv_store;
+pub mod namespace;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;
 // Sits outside both optional layers: a store's schema carries these settings
@@ -239,10 +240,10 @@ pub use kv_store::index_set::RowIdFn;
 pub use kv_store::index_set::RowToKeyFn;
 
 /// Namespace ID for the implicit default namespace.
-pub use db::namespace::DEFAULT_NAMESPACE_ID;
+pub use namespace::DEFAULT_NAMESPACE_ID;
 
 /// Name and ID for the system-wide namespace (always present, never removable).
-pub use db::namespace::{SYSTEM_NAMESPACE, SYSTEM_NAMESPACE_ID};
+pub use namespace::{SYSTEM_NAMESPACE, SYSTEM_NAMESPACE_ID};
 
 /// Snapshot statistics returned by [`Db::stats`].
 pub use db::stats::Stats;

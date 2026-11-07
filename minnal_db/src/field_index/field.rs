@@ -23,7 +23,7 @@ pub struct FieldMeta {
     ///
     /// A dropped field keeps its entry so a later re-add reuses the same
     /// [`FieldId`], but it is excluded from
-    /// [`NamespaceRegistry::all_indexed_fields`](crate::db::namespace::NamespaceRegistry::all_indexed_fields) and cannot be activated until
+    /// [`NamespaceRegistry::all_indexed_fields`](crate::namespace::NamespaceRegistry::all_indexed_fields) and cannot be activated until
     /// it is re-registered. See `FEATURE-REQUEST.md` (FR-001) —
     /// *Dropped-index cleanup*.
     pub dropped: bool,

@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::db::error::{KVError, Result};
+use crate::error::{KVError, Result};
 use crate::field_index::{FieldId, FieldMeta, IndexValueType};
 
 // ── Namespace config (persisted per namespace directory) ───────────────────

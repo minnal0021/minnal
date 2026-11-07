@@ -217,8 +217,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::namespace::DEFAULT_NAMESPACE_ID;
     use crate::db::test_support::*;
+    use crate::namespace::DEFAULT_NAMESPACE_ID;
     use tempfile::TempDir;
 
     /// Every L0 flush marks WAL entries persisted, after which recovery skips them
@@ -418,10 +418,10 @@ mod tests {
 #[cfg(test)]
 mod differential_tests {
     use crate::db::database::Database;
-    use crate::db::namespace::DEFAULT_NAMESPACE_ID;
     use crate::db::test_support::create_db_config;
     use crate::field_index::{IndexValue, IndexValueType};
     use crate::kv_store::index_set::ExtractorFn;
+    use crate::namespace::DEFAULT_NAMESPACE_ID;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use tempfile::TempDir;

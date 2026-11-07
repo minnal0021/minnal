@@ -2512,7 +2512,7 @@ fn unreadable_wal_metadata_without_l1_data_replays_the_log() {
     {
         let db = Database::open(dir.path(), create_db_config()).unwrap();
         db.put(b"flushed", b"v").unwrap();
-        db.get_store(crate::db::namespace::DEFAULT_NAMESPACE_ID)
+        db.get_store(crate::namespace::DEFAULT_NAMESPACE_ID)
             .unwrap()
             .flush_memtable_to_level0()
             .unwrap();
@@ -3136,7 +3136,7 @@ fn index_checkpoint_stops_below_an_in_flight_write() {
     use crate::db::workers::index_checkpoint::IndexCheckpointTarget;
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
-    let ns = crate::db::namespace::DEFAULT_NAMESPACE_ID;
+    let ns = crate::namespace::DEFAULT_NAMESPACE_ID;
     let field_id = activate_status_index(&db, ns);
     db.put(b"doc:1", br#"{"status":"active"}"#).unwrap();
 

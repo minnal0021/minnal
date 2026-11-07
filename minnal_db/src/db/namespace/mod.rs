@@ -1,8 +1,5 @@
-//! Namespaces: what exists and how it is created and removed. `registry` is the
-//! saved list of namespaces with their schemas and field types, and `ops` holds
-//! the `Database` methods that create, look up and remove a namespace.
+//! The `Database` methods that create, look up and remove a namespace. They need
+//! the database's internal fields, so they sit here rather than with the registry
+//! in `crate::namespace`.
 
-mod ops;
-mod registry;
-
-pub use registry::*;
+mod namespace_ops;

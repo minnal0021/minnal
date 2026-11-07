@@ -61,11 +61,12 @@ When touching feature-gated code, verify each combo compiles: default / `--featu
 
 ```
 src/lib.rs             — public API surface (re-exports; feature-gated)
-src/db/                — layout; namespace/ (registry, schema, create and remove), facade/, config/, database/ (the coordinator), wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
+src/db/                — layout; namespace/ (`namespace_ops`: create, look up and remove a namespace), facade/, config/, database/ (the coordinator), wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
 src/error.rs           — `KVError`, the engine's error type
 src/storage/           — LSM tree, value log
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
 src/kv_store/          — one namespace's LSM tree, value log and live field indexes; sits below db and does not import it
+src/namespace/         — the saved list of namespaces with their schemas and field types (`registry`)
 src/field_index/       — folded field-indexing module (always compiled)
 src/vector_index/      — each store's vector-index settings (`vector_settings`), in its schema with or without semantic search   #[cfg(doc-store)]
 src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge), context.rs and workers/ (with doc-store; they reach the stores above through `WorkerHost`)   #[cfg(semantic-search)]

@@ -4,7 +4,7 @@ pub use crate::error;
 pub mod facade;
 pub mod indexing;
 pub(crate) mod layout;
-pub mod namespace;
+mod namespace;
 pub use crate::kv_store::stats;
 pub mod wal;
 pub(crate) mod workers;

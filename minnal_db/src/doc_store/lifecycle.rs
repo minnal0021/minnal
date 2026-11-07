@@ -70,7 +70,7 @@ impl DocStore {
     /// delete or adopt. The caller holds the lifecycle lock and has seen no schema
     /// under this name. The default namespace always exists, so it is left alone.
     async fn clear_orphaned_namespace(&self, name: &str) -> Result<(), DocStoreError> {
-        if name == crate::db::namespace::DEFAULT_NAMESPACE {
+        if name == crate::namespace::DEFAULT_NAMESPACE {
             return Ok(());
         }
         let Some(orphan) = self.db.existing_namespace(name.to_owned()).await? else {
@@ -770,7 +770,7 @@ mod tests {
     async fn a_store_name_cannot_end_like_a_vector_companion() {
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await;
-        for suffix in crate::db::namespace::VECTOR_COMPANION_SUFFIXES {
+        for suffix in crate::namespace::VECTOR_COMPANION_SUFFIXES {
             let name = format!("foo{suffix}");
             let err = store.create(make_schema(&name, vec![])).await.unwrap_err();
             assert!(

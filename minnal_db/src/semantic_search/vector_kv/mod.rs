@@ -122,8 +122,8 @@ pub fn ivf_journal_ns(namespace: &str) -> String {
 }
 
 /// The suffixes that mark a namespace as a companion of another
-/// ([`VECTOR_COMPANION_SUFFIXES`](crate::db::namespace::VECTOR_COMPANION_SUFFIXES)).
-pub const COMPANION_SUFFIXES: [&str; 6] = crate::db::namespace::VECTOR_COMPANION_SUFFIXES;
+/// ([`VECTOR_COMPANION_SUFFIXES`](crate::namespace::VECTOR_COMPANION_SUFFIXES)).
+pub const COMPANION_SUFFIXES: [&str; 6] = crate::namespace::VECTOR_COMPANION_SUFFIXES;
 
 /// The companions removed when the vector index is dropped: all of them. The
 /// partition is derived from the data since M3 (a namespace grows it by

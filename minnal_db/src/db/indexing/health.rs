@@ -325,8 +325,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::namespace::DEFAULT_NAMESPACE_ID;
     use crate::db::test_support::*;
+    use crate::namespace::DEFAULT_NAMESPACE_ID;
     use std::sync::Arc;
     use tempfile::TempDir;
 

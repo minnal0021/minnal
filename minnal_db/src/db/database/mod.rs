@@ -20,7 +20,6 @@ use crate::db::config::DbConfig;
 use crate::db::database::key_locks::KeyLocks;
 use crate::db::error::{KVError, Result};
 use crate::db::indexing::manager::IndexManager;
-use crate::db::namespace::{DEFAULT_NAMESPACE_ID, NamespaceRegistry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::wal::segmented_log::LogError;
 use crate::db::wal::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
@@ -32,6 +31,7 @@ use crate::db::workers::value_log_gc::{GCWorker, ValueLogGcTarget};
 use crate::db::workers::wal_gc::{WalGcTarget, WalGcWorker};
 use crate::field_index::FieldId;
 use crate::kv_store::KVStore;
+use crate::namespace::{DEFAULT_NAMESPACE_ID, NamespaceRegistry};
 use crate::storage::lsm::tree::LsmFlushObserver;
 use crate::storage::value_log::ValueLogMetadata;
 
