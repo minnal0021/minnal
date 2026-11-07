@@ -73,7 +73,7 @@
 //!    (`prepare`). An operation started on top of an unfinished one would
 //!    take ids the unfinished one already used.
 //! 7. **A dropped namespace is never written.** Maintenance never creates a
-//!    namespace ([`companion`]), so an operation that outlives a drop fails rather
+//!    namespace (`companion`), so an operation that outlives a drop fails rather
 //!    than bring one back; the drop also stops maintenance and waits for the
 //!    operation in progress ([`PartitionHandle::mark_dropped`]).
 //!

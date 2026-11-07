@@ -61,19 +61,42 @@ When touching feature-gated code, verify each combo compiles: default / `--featu
 
 ```
 src/lib.rs             — public API surface (re-exports; feature-gated)
-src/db/                — namespace/ (`namespace_ops`: create, look up and remove a namespace), facade/, config/, database/ (the coordinator), wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
 src/error.rs           — `KVError`, the engine's error type
 src/layout.rs          — the one place that knows the on-disk directory layout
-src/storage/           — LSM tree, value log
-src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
+src/storage/           — the LSM tree (lsm/) and the value log (value_log/)
 src/kv_store/          — one namespace's LSM tree, value log and live field indexes; sits below db and does not import it
 src/namespace/         — the saved list of namespaces with their schemas and field types (`registry`)
-src/field_index/       — folded field-indexing module (always compiled)
+src/field_index/       — RoaringBitmap field indexes, the row map and the predicate language (always compiled)
+src/db/                — the engine: facade/ (`Db`, `AsyncDb` and their namespace handles; `typed.rs`, the rkyv layer of the typed methods), database/ (the coordinator; tests/ holds its tests, one file per topic), namespace/ (`namespace_ops`: create, look up and remove a namespace), config/, wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
+src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
 src/vector_index/      — each store's vector-index settings (`vector_settings`), in its schema with or without semantic search   #[cfg(doc-store)]
-src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge), context.rs and workers/ (with doc-store; they reach the stores above through `WorkerHost`)   #[cfg(semantic-search)]
-src/doc_store/         — folded document-store module   #[cfg(doc-store)]
-tests/                 — integration tests only; unit tests live inline in each module
+src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge), partition_admin.rs, context.rs and workers/ (with doc-store; they reach the stores above through `WorkerHost`)   #[cfg(semantic-search)]
+src/doc_store/         — JSON document stores and typed KV stores: schema/, indexing/ (field-index builds, reindex-all, which builds are running), vector/ (each store's vector index: admin and lifecycle), lifecycle, queries   #[cfg(doc-store)]
+tests/                 — integration tests only; unit tests live beside their module (inline, or in its own tests.rs or tests/)
 ```
+
+## Code organisation
+
+The source tree should read like a table of contents: a reader new to the code
+finds where something lives from file and folder names alone.
+
+- **Name modules for what they do.** One responsibility per file; a folder for a
+  concept with several parts, named for the concept (`kv_store/`, `namespace/`,
+  `db/wal/`), and files named for their role in it (`recovery.rs`,
+  `reindex_all.rs`, `running.rs`), not for their type (`utils.rs`, `helpers.rs`,
+  `misc.rs`). Every module starts with a `//!` comment saying what lives there.
+- **Keep files small: at most 800 lines, tests included.** When an inline test
+  module passes about 400 lines, move it to its own `tests.rs`, or a `tests/`
+  folder with one file per topic (`db/database/tests/`). A change that takes a
+  file past the limit splits it in that change, by responsibility, with the moves
+  in a commit of their own so the review sees no behaviour change mixed in.
+- **New code follows this from the start**, in every crate. Files already over
+  the limit (`storage/lsm/tree.rs`, `semantic_search/service/mod.rs` and about
+  twenty others) are split when they are next changed substantially, not all at
+  once.
+- **Keep layering visible in the tree:** a lower module never imports a higher
+  one (`kv_store` does not import `db`; `db` does not import `doc_store` or
+  `semantic_search`).
 
 ## Code conventions
 

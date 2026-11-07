@@ -29,7 +29,7 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 
 ### Chunking (done here, not by the service)
 
-The embedding service no longer chunks text — `src/chunking/mod.rs` does. **Only documents are chunked**: `chunk_document` splits on **sentence** boundaries and groups the sentences into overlapping **sliding windows** (`window_size` sentences per window, advancing `sliding_size`; the last window keeps the remainder), each joined into one payload string. **Queries are not chunked** — one whole-query embedding serves both passes (see *Search* below). The service receives a list of already-prepared payloads and returns one embedding per payload.
+The embedding service does not chunk text — `chunking/mod.rs` does. **Only documents are chunked**: `chunk_document` splits on **sentence** boundaries and groups the sentences into overlapping **sliding windows** (`window_size` sentences per window, advancing `sliding_size`; the last window keeps the remainder), each joined into one payload string. **Queries are not chunked** — one whole-query embedding serves both passes (see *Search* below). The service receives a list of already-prepared payloads and returns one embedding per payload.
 
 ### Indexing (dual quantisation)
 

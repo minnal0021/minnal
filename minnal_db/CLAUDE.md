@@ -11,6 +11,8 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | `src/lib.rs` | Public re-exports only — all types surfaced here |
 | `src/db/facade/` | `Db`, `AsyncDb` and their `Namespace` handles, one file each — the only entry points callers use |
 | `src/db/database/` | Internal coordinator: owns all subsystems, routes ops. `open`, `writes`, `wal_ops`, `workers`, `stats`, `shutdown`, `flush_observers` |
+| `src/db/database/tests/` | The coordinator's unit tests, one file per topic (`crash`, `recovery`, `in_flight`, `field_index`, `namespaces`, `writes`, `merge`, …); `acknowledged_writes_survive_a_process_kill` re-execs itself by its path `db::database::tests::crash::…` |
+| `src/db/facade/typed.rs` | The rkyv layer of the typed methods: `RkyvEncode` / `RkyvDecode` (the bounds, named once) and the byte conversions. `Db` and `AsyncDb` forward their typed methods to the default namespace's handle |
 | `src/layout.rs` | **The one place that knows the on-disk directory layout.** Nothing above it should `join("field-index")` or `format!("ns_{}", ..)` |
 | `src/db/indexing/index_fields.rs` | Registering, activating, dropping and measuring field indexes (`Database` methods) |
 | `src/db/wal/recovery.rs` | Replaying both logs at open (`Database` methods) |
@@ -394,4 +396,4 @@ There is **one** async wrapper. A second (`AsyncDatabase`) existed for a long ti
 
 `Database`, `AsyncDatabase`, and `KVStore` are **internal** types: `Database`/`AsyncDatabase` is the coordinator behind `Db`/`AsyncDb`; `KVStore` is the per-namespace store behind `Namespace`. They are no longer re-exported from the crate root (the deprecated `pub use` aliases were removed). Refer to them only via internal paths (`crate::db::database::Database`, `crate::db::kv_store::KVStore`).
 
-`MinnalStore` / `AsyncMinnalStore` have been removed entirely. `src/db/db.rs` now holds only integration tests for the facade.
+`MinnalStore` / `AsyncMinnalStore` have been removed entirely. The facade's integration tests are in `src/db/facade/integration_tests.rs`.

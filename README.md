@@ -354,10 +354,14 @@ minnal/
 │   ├── QUICKSTART.md       ← embedded quickstart + feature selection
 │   ├── README.md           ← detailed KV engine documentation
 │   └── src/
-│       ├── db/ storage/    ← LSM + value-log KV engine
+│       ├── storage/        ← LSM tree and value log
+│       ├── kv_store/       ← one namespace's storage and live field indexes
+│       ├── namespace/      ← the saved list of namespaces and their schemas
 │       ├── field_index/    ← RoaringBitmap field indexing (part of kv-store)
+│       ├── db/             ← the engine: Db / AsyncDb, the coordinator, both WALs, workers
+│       ├── vector_index/   ← each store's vector-index settings (doc-store)
 │       ├── semantic_search/← IVF clustering, RaBitQ quantisation, vector↔KV bridge (semantic-search)
-│       └── doc_store/      ← JSON document store (doc-store)
+│       └── doc_store/      ← JSON document and typed KV stores (doc-store)
 ├── minnal_db_api/          ← Axum REST API server (binary)
 │   └── README.md           ← full REST API reference with curl examples
 ├── minnal_tools/            ← minnal_tools binary (bulk_load and future tools)

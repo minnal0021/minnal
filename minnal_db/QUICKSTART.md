@@ -505,7 +505,8 @@ bytes in `document_id`.
 # use minnal_db::*;
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-# let store = DocStore::open("/tmp/sem").await?;
+# let config = minnal_db::semantic_search::service::SemanticSearchConfig { embedding_service_url: "http://localhost:8001".into(), ..Default::default() };
+# let store = DocStore::open("/tmp/sem").await?.with_semantic_search(SemanticSearchContext::new(config));
 // A doc store whose `body` field is embedded with gemma (768 dimensions).
 let schema = DocStoreSchema {
     namespace: "articles".into(),
@@ -550,7 +551,8 @@ rather than encoded key bytes.
 # use minnal_db::*;
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-# let store = DocStore::open("/tmp/sem").await?;
+# let config = minnal_db::semantic_search::service::SemanticSearchConfig { embedding_service_url: "http://localhost:8001".into(), ..Default::default() };
+# let store = DocStore::open("/tmp/sem").await?.with_semantic_search(SemanticSearchContext::new(config));
 # let top5 = SearchSpec { top_k: Some(5), ..Default::default() };
 // A KV store whose string values are embedded, with the default settings (gemma, 768).
 let kv_schema = KvStoreSchema {

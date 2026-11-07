@@ -695,7 +695,7 @@ pub struct ProbeTrace {
 /// Ranking every posting is cheap; only the window is read and scored, so a
 /// window far down the order costs what one near the query does. Holds every
 /// scanned entry until it returns, as a search does, and takes a
-/// [`SCORING_GATE`] permit for its scoring only.
+/// `SCORING_GATE` permit for its scoring only.
 pub async fn pass1_probe_trace<K, L>(
     config: &SemanticSearchConfig,
     namespace: &str,
