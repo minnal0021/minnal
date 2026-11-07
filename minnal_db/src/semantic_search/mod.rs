@@ -15,6 +15,8 @@ pub(crate) mod simd_support;
 // Vector-index storage bridge (`DbVectorStore`, upsert/delete, embed queue,
 // query-embedding cache) over raw namespaces: usable with `kv-store` alone, no
 // `doc-store`.
+#[cfg(feature = "doc-store")]
+mod partition_admin;
 pub mod vector_kv;
 pub mod vector_math;
 #[cfg(feature = "doc-store")]

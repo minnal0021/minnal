@@ -6,36 +6,6 @@ use super::*;
 impl DocStore {
     // ── Query ─────────────────────────────────────────────────────────────
 
-    /// Fetch the query embeddings needed for a two-pass semantic search.
-    ///
-    /// Returns `(dense, sparse)`: the single whole-query embedding used in Pass 2
-    /// dense re-ranking, and Pass 1's query vectors (that same vector: queries are
-    /// not chunked).
-    /// Uses the system-wide TTL cache when possible, falling back to the embedding
-    /// service (then populating the cache) on a miss.
-    #[cfg(feature = "semantic-search")]
-    /// `pub(super)` rather than private: called from a sibling module that was
-    /// the same file before the split.
-    pub(super) async fn cached_query_embeddings(
-        &self,
-        ns: &NamespaceSemantics,
-        query_text: &str,
-    ) -> Result<(Vec<f32>, Vec<Vec<f32>>), DocStoreError> {
-        let config = &ns.config;
-        let ttl = config.query_embedding_cache_ttl;
-        // Queries are not chunked: one whole-query vector serves both passes.
-        if let Some(dense) = vector_kv::get_cached_query_embedding(&self.db, &config.model_name, query_text, config.embedding_dim, ttl).await {
-            debug!("query embedding cache hit");
-            return Ok((dense.clone(), vec![dense]));
-        }
-        debug!("query embedding cache miss, calling embedding service");
-        let q = crate::semantic_search::service::embed_query(config, query_text)
-            .await
-            .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
-        vector_kv::put_cached_query_embedding(&self.db, &config.model_name, query_text, &q.dense, ttl).await;
-        Ok((q.dense, q.sparse))
-    }
-
     /// The per-call config and partition for semantic namespace `namespace`
     /// (`ns_id`, from its schema) with `settings`, with one request's search
     /// `overrides` applied.
@@ -113,7 +83,7 @@ impl DocStore {
             .await?;
 
         debug!("semantic search namespace='{}' top_k={}", namespace, ns.config.top_k_results);
-        let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
+        let (query_dense, query_sparse) = ns.query_embeddings(&self.db, query_text).await?;
 
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await
@@ -188,7 +158,7 @@ impl DocStore {
         let allowed_ids: std::collections::HashSet<Vec<u8>> = all_keys.into_iter().collect();
 
         // Phase 2: ANN search with the filter closure.
-        let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
+        let (query_dense, query_sparse) = ns.query_embeddings(&self.db, query_text).await?;
 
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await

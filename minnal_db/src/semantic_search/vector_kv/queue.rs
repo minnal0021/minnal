@@ -591,3 +591,17 @@ pub async fn reset_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8
         Err(e) => Err(e),
     }
 }
+
+/// Reset the retry count of every entry of `namespace` that has reached
+/// `max_retries`, so the worker picks them up again. Returns how many were reset.
+pub async fn reset_exhausted_queue_entries(db: &AsyncDb, namespace: &str, max_retries: u32) -> Result<usize, crate::KVError> {
+    let entries = list_queue_entries(db).await?;
+    let exhausted: Vec<_> = entries
+        .into_iter()
+        .filter(|e| e.namespace == namespace && e.retry_count >= max_retries)
+        .collect();
+    for entry in &exhausted {
+        reset_queue_entry(db, &entry.namespace, &entry.doc_id_bytes).await?;
+    }
+    Ok(exhausted.len())
+}

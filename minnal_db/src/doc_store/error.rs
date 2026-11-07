@@ -145,6 +145,8 @@ impl From<crate::semantic_search::context::ContextError> for DocStoreError {
             E::VectorIndexNotSeeded { namespace } => Self::VectorIndexNotSeeded { namespace },
             E::SemanticSearchNotEnabled { namespace } => Self::SemanticSearchNotEnabled { namespace },
             E::VecRebuildInProgress { namespace } => Self::VecRebuildInProgress { namespace },
+            E::EmbeddingFailed(reason) => Self::EmbeddingFailed(reason),
+            E::InvalidProbeTrace { namespace, reason } => Self::InvalidProbeTrace { namespace, reason },
             E::Settings(e) => e.into(),
             E::Db(e) => Self::Db(e),
         }

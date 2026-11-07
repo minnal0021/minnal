@@ -221,7 +221,7 @@ impl DocStore {
             .namespace_semantics(namespace, schema.ns_id, &self.schemas.vector_settings(namespace)?.0, overrides)
             .await?;
 
-        let (query_dense, query_sparse) = self.cached_query_embeddings(&ns, query_text).await?;
+        let (query_dense, query_sparse) = ns.query_embeddings(&self.db, query_text).await?;
 
         let db_store = vector_kv::DbVectorStore::new(&self.db, namespace)
             .await

@@ -19,6 +19,7 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 | `service/embedding_service.rs` | Raw HTTP client for the embedding service (`/embedding/{model}/…`, `/healthcheck`) |
 | `metrics/corruption.rs` | Per-namespace counters of corrupt index entries search skipped (`GET /admin/indices/vector/corruption-metrics`); re-exported as `semantic_search::metrics` |
 | `eval/beir.rs` | `#[ignore]`d BEIR relevance eval through the live embedding service against a given centroid file (`MINNAL_BEIR_CENTROIDS`); the frozen-embedding `eval_frozen` is the one gates use |
+| `partition_admin.rs` | `SemanticSearchContext`'s partition admin: health, centres, recall check, probe trace, server settings, history, background rebuild (`DocStore` checks the namespace and passes the call on) |
 | `vector_kv/` | Vector↔KV bridge over raw namespaces: `mod.rs` (namespace names, sparse meta, upsert/delete, `DbVectorStore`), `queue.rs` (embed queue), `partition.rs` (centres, postings), `query_cache.rs`, `crash_point.rs`, `tests/`. The path stays flat: `pub use` keeps everything at `vector_kv::` |
 | `eval/` | `#[cfg(test)]` search-quality evaluations, `#[ignore]`d and run by hand (`eval/mod.rs` lists them): they need crate internals, so they live here, not in `benches/` |
 | `docs/query-embedding-report.md` | BEIR evaluation behind whole-query Pass-1 embedding (vs chunked queries) |

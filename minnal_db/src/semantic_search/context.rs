@@ -34,6 +34,15 @@ pub enum ContextError {
     #[error("a partition rebuild for namespace '{namespace}' is already running")]
     VecRebuildInProgress { namespace: String },
 
+    /// The embedding service could not embed a query, or a query's stores could
+    /// not be opened.
+    #[error("embedding failed: {0}")]
+    EmbeddingFailed(String),
+
+    /// A probe trace was asked for something it cannot show.
+    #[error("invalid probe trace for namespace '{namespace}': {reason}")]
+    InvalidProbeTrace { namespace: String, reason: String },
+
     /// A vector-index setting was rejected.
     #[error("schema error: {0}")]
     Settings(#[from] VectorSettingsError),
@@ -411,6 +420,31 @@ impl SemanticSearchContext {
 }
 
 impl NamespaceSemantics {
+    /// Fetch the query embeddings needed for a two-pass semantic search.
+    ///
+    /// Returns `(dense, sparse)`: the single whole-query embedding used in Pass 2
+    /// dense re-ranking, and Pass 1's query vectors (that same vector: queries are
+    /// not chunked).
+    /// Uses the system-wide TTL cache when possible, falling back to the embedding
+    /// service (then populating the cache) on a miss.
+    pub(crate) async fn query_embeddings(&self, db: &crate::AsyncDb, query_text: &str) -> Result<(Vec<f32>, Vec<Vec<f32>>), ContextError> {
+        let config = &self.config;
+        let ttl = config.query_embedding_cache_ttl;
+        // Queries are not chunked: one whole-query vector serves both passes.
+        if let Some(dense) =
+            crate::semantic_search::vector_kv::get_cached_query_embedding(db, &config.model_name, query_text, config.embedding_dim, ttl).await
+        {
+            log::debug!("query embedding cache hit");
+            return Ok((dense.clone(), vec![dense]));
+        }
+        log::debug!("query embedding cache miss, calling embedding service");
+        let q = crate::semantic_search::service::embed_query(config, query_text)
+            .await
+            .map_err(|e| ContextError::EmbeddingFailed(e.to_string()))?;
+        crate::semantic_search::vector_kv::put_cached_query_embedding(db, &config.model_name, query_text, &q.dense, ttl).await;
+        Ok((q.dense, q.sparse))
+    }
+
     /// This namespace's config with one request's search overrides applied
     /// (validated against the same ranges as the schema).
     pub fn with_overrides(mut self, overrides: &SearchSpec) -> Result<Self, ContextError> {
