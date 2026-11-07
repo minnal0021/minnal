@@ -2,7 +2,7 @@
 //! write-ahead log in the engine shares.
 //!
 //! Both logs are built on it — the main WAL (`db/wal/main_wal.rs`) and the vector index
-//! WAL (`db/wal/vector_index_wal.rs`) — and a new one needs only a [`LogFormat`]
+//! WAL (`db/wal/vector_index_wal/mod.rs`) — and a new one needs only a [`LogFormat`]
 //! (its magic and body version) and a body encoding. Everything about how
 //! bytes reach the disk and come back after a crash lives here, once:
 //! segments, frames, positions, preallocation, commit rounds, the torn-tail and

@@ -707,7 +707,7 @@ async fn copy_into_batch(db: &AsyncDb, namespace: &str, items: Vec<(Vec<u8>, Mov
 /// Called before the batch releases its documents' vector locks, so no
 /// foreground write (a re-embed, a delete) builds on a maintenance write a
 /// crash could still lose. What survives a crash is a prefix of the log
-/// (`db/wal/vector_index_wal.rs`), so within a batch the meta-before-key order
+/// (`db/wal/vector_index_wal/mod.rs`), so within a batch the meta-before-key order
 /// holds across the two namespaces.
 async fn sync_batch(db: &AsyncDb) -> Result<(), crate::KVError> {
     crash_point!();

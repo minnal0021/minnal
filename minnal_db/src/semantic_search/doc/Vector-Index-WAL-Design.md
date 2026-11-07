@@ -475,7 +475,7 @@ The barrier tests (`crash_before_reembed_is_synced_keeps_new_vectors`,
 Each step is its own commit, tested in all four feature combinations, with the
 main WAL's tests untouched and passing.
 
-1. **The log** (`db/wal/vector_index_wal.rs`): segments, record format, append, `sync`,
+1. **The log** (`db/wal/vector_index_wal/mod.rs`): segments, record format, append, `sync`,
    torn-tail reading. Unit tests, including corrupt and torn records.
 2. **Retirement and GC:** the observer (seal/flush, ceiling, version order), the
    cut marker, segment deletion, flushing idle namespaces, and the log's stats
@@ -631,7 +631,7 @@ above, so the full M5 run checks both.
 
 ## Decisions (review, 2026-10-15)
 
-1. **Code location:** `db/wal/vector_index_wal.rs` holds the log (record body,
+1. **Code location:** `db/wal/vector_index_wal/mod.rs` holds the log (record body,
    observer, retirement, replay) on the segmented log shared with the main WAL
    (`db/wal/segmented_log.rs`: segments, frames, append, sync, open, GC);
    `database/mod.rs` calls it at open and from the GC tick.

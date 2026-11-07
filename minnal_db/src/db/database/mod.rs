@@ -804,7 +804,7 @@ pub struct Database {
     pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
 
     /// The vector index WAL: the vector worker's payload writes, one per
-    /// database, shared by every namespace (`db/wal/vector_index_wal.rs`).
+    /// database, shared by every namespace (`db/wal/vector_index_wal/mod.rs`).
     pub(crate) vector_index_wal: Arc<VectorIndexWal>,
 
     // Namespace registry

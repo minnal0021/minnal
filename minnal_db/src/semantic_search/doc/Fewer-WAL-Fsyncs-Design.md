@@ -26,7 +26,7 @@ The ones this note leans on most:
   time: about 400 a second here, where an fsync took about 2.3 ms. Concurrent
   writes now share fsyncs (group commit; `Main-WAL-Rework-Design.md`).
 - **Vector index WAL** — a second log, one per database, in
-  `<db_path>/vector_index_wal/` (`db/wal/vector_index_wal.rs`, design in
+  `<db_path>/vector_index_wal/` (`db/wal/vector_index_wal/mod.rs`, design in
   `Vector-Index-WAL-Design.md`). It has its own lock, so client writes never
   wait on it. It holds the vector worker's chunk codes and whole-document codes
   and, after Part 2, partition maintenance's per-document writes; a record is a
