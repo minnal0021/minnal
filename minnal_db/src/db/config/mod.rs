@@ -5,54 +5,7 @@ use crate::support::DEFAULT_NUM_BUCKETS;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// How many insert/update/delete operations to batch between fsyncs of the
-/// value log.
-///
-/// * `records_per_sync = 0` — sync only when it is required (see below).
-/// * `records_per_sync = 1` — sync after every single write.
-/// * Any other value N — sync every N writes.
-///
-/// This is a throughput knob, not a durability one. Every write returns only once
-/// a WAL fsync covers it, and the WAL holds each value until it is retired;
-/// before that happens — whenever a memtable reaches L0, at GC, on shutdown, and
-/// whenever a value-log segment is sealed — the value log is fsynced
-/// unconditionally. So no setting here can lose an acknowledged write.
-///
-/// `commit_delay_us` is the main WAL's optional **commit delay**: before a
-/// commit round's fsync, its leader waits this long so more concurrent writes
-/// can share it, but only when another write is already waiting for a round
-/// (a lone writer never waits). Default 0: rounds already form under load
-/// without one, and a delay lowers throughput when clients wait for each write
-/// before sending the next.
-#[derive(Debug, Clone, Copy)]
-pub struct SyncConfig {
-    pub records_per_sync: usize,
-    pub commit_delay_us: u64,
-}
-
-impl Default for SyncConfig {
-    fn default() -> Self {
-        Self {
-            records_per_sync: 1000,
-            commit_delay_us: 0,
-        }
-    }
-}
-
-impl SyncConfig {
-    pub fn new(records_per_sync: usize) -> Self {
-        Self {
-            records_per_sync,
-            commit_delay_us: 0,
-        }
-    }
-
-    /// Set the main WAL's commit delay (see the type's docs).
-    pub fn with_commit_delay_us(mut self, commit_delay_us: u64) -> Self {
-        self.commit_delay_us = commit_delay_us;
-        self
-    }
-}
+pub use crate::db::kv_store::SyncConfig;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScheduledTaskConfig {
@@ -288,7 +241,7 @@ impl ThresholdConfig {
 impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
-            value_log_waste_threshold: 30.0,
+            value_log_waste_threshold: crate::db::kv_store::DEFAULT_VALUE_LOG_WASTE_THRESHOLD,
             segment_gc_threshold: DEFAULT_SEGMENT_GC_THRESHOLD,
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,

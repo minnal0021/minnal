@@ -6,7 +6,7 @@ pub mod indexing;
 pub mod kv_store;
 pub(crate) mod layout;
 pub mod namespace;
-pub mod stats;
+pub use crate::db::kv_store::stats;
 pub mod wal;
 pub(crate) mod workers;
 

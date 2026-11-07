@@ -34,7 +34,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | `src/db/wal/power_loss_tests.rs` | Power-loss model (`Database::power_loss_image`), group-commit and preallocation tests, randomised power-loss stress, repeated-SIGKILL harness |
 | `src/db/wal/vector_index_wal/mod.rs` | The vector index WAL on `SegmentedLog` (magic `MVIW`): the vector worker's payload writes, one fsync per batch (rules below, *WAL ownership*) |
 | `src/db/wal/wal_fail_log.rs` | Recovery fail-log writer — JSON files for entries that fail after retry |
-| `src/db/error.rs` | `KVError` — the single error type for all operations |
+| `src/error.rs` | `KVError` — the single error type for all operations |
 | `src/storage/lsm/tree.rs` | LSM tree + compaction logic |
 | `src/storage/lsm/skip_list.rs` | In-memory memtable (skip list) |
 | `src/storage/lsm/manifest.rs` | SSTable manifest (public, returned by `Db::lsm_manifests`) |

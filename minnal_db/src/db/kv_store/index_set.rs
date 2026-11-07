@@ -16,6 +16,34 @@ use parking_lot::RwLock;
 use crate::field_index::FieldId;
 use crate::field_index::{DynFieldIndex, IndexValue};
 
+/// Write-path sink for field-index updates that were **rejected**.
+///
+/// A rejected update leaves the row silently absent from that field forever. The
+/// write path knows the namespace, field and key exactly, so it is the cheapest
+/// gap in FR-001 to capture — but it must not pay for durability inline, so the
+/// sink only buffers and the index checkpoint persists what it collected.
+///
+/// That is sound because the buffer and the index have the *same* durability
+/// point: if a crash loses the buffered key, it also lost the index update, and
+/// WAL replay re-runs the write, re-rejects it, and re-buffers the key.
+///
+/// Mirrors the WAL/LSM observer pattern: the write path holds a cheap handle and
+/// signals, rather than knowing how a gap is recorded.
+pub trait IndexGapSink: Send + Sync {
+    /// Note that `field_id` in `namespace_id` refused to index `key`.
+    fn note_rejected_update(&self, namespace_id: u32, field_id: FieldId, key: &[u8]);
+}
+
+/// Write-path requests for an early index checkpoint. Both are O(1), non-blocking
+/// and debounced by whoever runs the checkpoints.
+pub(crate) trait CheckpointRequests: Send + Sync {
+    /// Request one if a field's reclaimable `dead_bytes` has reached the
+    /// configured cap.
+    fn request_if_over_cap(&self, dead_bytes: u64);
+    /// Request one regardless of any cap.
+    fn request(&self);
+}
+
 // ── Extractor closure ──────────────────────────────────────────────────────
 
 /// Caller-provided closure that extracts an indexed value from raw document

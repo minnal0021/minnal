@@ -10,13 +10,12 @@ pub mod index_set;
 mod maintenance;
 mod reads;
 mod row_ids;
+pub mod stats;
 mod writes;
 
 pub use reads::PrefixScan;
 
-use crate::db::stats::{GCStats, Stats};
-use crate::db::workers::index_checkpoint::IndexCheckpointTrigger;
-use crate::db::workers::lsm_compaction::LsmCompactionCommand;
+use self::stats::{GCStats, Stats};
 use crate::error::{KVError, Result};
 use crate::storage::lsm::tree::{LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
 use crate::storage::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
@@ -33,8 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::support::metrics::Metrics;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::db::config::SyncConfig;
-use crate::db::kv_store::index_set::{NamespaceIndexSet, RowIdFn, RowToKeyFn};
+use crate::db::kv_store::index_set::{CheckpointRequests, IndexGapSink, NamespaceIndexSet, RowIdFn, RowToKeyFn};
 use std::time::Duration;
 
 /// A resolved key/value pair: both the key and the value bytes read from the value log.
@@ -64,6 +62,67 @@ pub(crate) fn current_epoch_millis() -> u64 {
 fn decode_sharded_pointer(offset_u128: u128) -> Option<ShardedValuePointer> {
     let p = ShardedValuePointer::from_u128(offset_u128);
     (p.location.segment_id != 0).then_some(p)
+}
+
+/// Value-log waste percentage at which a namespace is due for GC, unless
+/// configured otherwise (`ThresholdConfig::value_log_waste_threshold`).
+pub const DEFAULT_VALUE_LOG_WASTE_THRESHOLD: f64 = 30.0;
+
+/// How many insert/update/delete operations to batch between fsyncs of the
+/// value log.
+///
+/// * `records_per_sync = 0` — sync only when it is required (see below).
+/// * `records_per_sync = 1` — sync after every single write.
+/// * Any other value N — sync every N writes.
+///
+/// This is a throughput knob, not a durability one. Every write returns only once
+/// a WAL fsync covers it, and the WAL holds each value until it is retired;
+/// before that happens — whenever a memtable reaches L0, at GC, on shutdown, and
+/// whenever a value-log segment is sealed — the value log is fsynced
+/// unconditionally. So no setting here can lose an acknowledged write.
+///
+/// `commit_delay_us` is the main WAL's optional **commit delay**: before a
+/// commit round's fsync, its leader waits this long so more concurrent writes
+/// can share it, but only when another write is already waiting for a round
+/// (a lone writer never waits). Default 0: rounds already form under load
+/// without one, and a delay lowers throughput when clients wait for each write
+/// before sending the next.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncConfig {
+    pub records_per_sync: usize,
+    pub commit_delay_us: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            records_per_sync: 1000,
+            commit_delay_us: 0,
+        }
+    }
+}
+
+impl SyncConfig {
+    pub fn new(records_per_sync: usize) -> Self {
+        Self {
+            records_per_sync,
+            commit_delay_us: 0,
+        }
+    }
+
+    /// Set the main WAL's commit delay (see the type's docs).
+    pub fn with_commit_delay_us(mut self, commit_delay_us: u64) -> Self {
+        self.commit_delay_us = commit_delay_us;
+        self
+    }
+}
+
+/// Commands that can be sent to the LSM compaction worker
+pub enum LsmCompactionCommand {
+    /// Trigger an immediate compaction check
+    Trigger,
+    /// Shutdown the worker gracefully
+    Shutdown,
 }
 
 /// Per-namespace key-value store with its own LSM tree and value log.
@@ -114,10 +173,10 @@ pub struct KVStore {
     // accumulates too much reclaimable dead blob space, or when field-index write
     // buffers pass the overlay budget's soft limit. `None` until
     // the checkpoint worker is enabled (set via `set_index_checkpoint_trigger`).
-    pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
+    pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<dyn CheckpointRequests>>>>,
     // Where rejected field-index updates are reported so they become durable gap
     // records instead of a log line (set via `set_index_gap_sink`).
-    pub(crate) index_gap_sink: Arc<RwLock<Option<Arc<dyn crate::db::indexing::manager::IndexGapSink>>>>,
+    pub(crate) index_gap_sink: Arc<RwLock<Option<Arc<dyn IndexGapSink>>>>,
 
     // Optional TTL for automatic record expiry
     pub(crate) ttl: Option<Duration>,
@@ -352,13 +411,13 @@ impl KVStore {
     }
 
     /// Set (or clear) the index-checkpoint backpressure valve for this store.
-    pub(crate) fn set_index_checkpoint_trigger(&self, trigger: Option<Arc<IndexCheckpointTrigger>>) {
+    pub(crate) fn set_index_checkpoint_trigger(&self, trigger: Option<Arc<dyn CheckpointRequests>>) {
         *self.index_checkpoint_trigger.write() = trigger;
     }
 
     /// Wire where rejected field-index updates are reported. See
-    /// [`IndexGapSink`](crate::db::indexing::manager::IndexGapSink).
-    pub(crate) fn set_index_gap_sink(&self, sink: Option<Arc<dyn crate::db::indexing::manager::IndexGapSink>>) {
+    /// [`IndexGapSink`](IndexGapSink).
+    pub(crate) fn set_index_gap_sink(&self, sink: Option<Arc<dyn IndexGapSink>>) {
         *self.index_gap_sink.write() = sink;
     }
 

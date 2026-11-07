@@ -85,13 +85,7 @@ impl CompactionTally {
     }
 }
 
-/// Commands that can be sent to the LSM compaction worker
-pub enum LsmCompactionCommand {
-    /// Trigger an immediate compaction check
-    Trigger,
-    /// Shutdown the worker gracefully
-    Shutdown,
-}
+pub use crate::db::kv_store::LsmCompactionCommand;
 
 /// LSM compaction worker that runs in the background
 pub struct LsmCompactionWorker {

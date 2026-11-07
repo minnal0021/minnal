@@ -51,7 +51,7 @@ impl Database {
         // view is the sum of all stores' snapshots plus the global instance.
         kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
         kv_store.set_index_gap_sink(Some(
-            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::indexing::manager::IndexGapSink>
+            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::kv_store::index_set::IndexGapSink>
         ));
 
         // Wire up flush observer
@@ -69,7 +69,7 @@ impl Database {
         }
         // Inherit the index-checkpoint backpressure valve if the worker is running.
         if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
-            kv_store.set_index_checkpoint_trigger(Some(Arc::clone(trigger)));
+            kv_store.set_index_checkpoint_trigger(Some(Arc::clone(trigger) as Arc<dyn crate::db::kv_store::index_set::CheckpointRequests>));
         }
 
         self.stores.write().insert(ns_id, Arc::new(kv_store));

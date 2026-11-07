@@ -134,6 +134,16 @@ impl IndexCheckpointTrigger {
     }
 }
 
+impl crate::db::kv_store::index_set::CheckpointRequests for IndexCheckpointTrigger {
+    fn request_if_over_cap(&self, dead_bytes: u64) {
+        IndexCheckpointTrigger::request_if_over_cap(self, dead_bytes);
+    }
+
+    fn request(&self) {
+        IndexCheckpointTrigger::request(self);
+    }
+}
+
 /// Background worker that periodically checkpoints index state to disk.
 ///
 /// Spawns a Tokio task on construction.  Call [`shutdown`] to stop it cleanly.

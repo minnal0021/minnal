@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::db::error::{KVError, Result};
+use crate::db::kv_store::index_set::IndexGapSink;
 use crate::field_index::FieldId;
 
 /// What a field's on-disk `checkpoint` marker says.
@@ -236,24 +237,6 @@ impl FieldIndexHealth {
     pub fn is_degraded(&self) -> bool {
         self.gap.is_some()
     }
-}
-
-/// Write-path sink for field-index updates that were **rejected**.
-///
-/// A rejected update leaves the row silently absent from that field forever. The
-/// write path knows the namespace, field and key exactly, so it is the cheapest
-/// gap in FR-001 to capture — but it must not pay for durability inline, so the
-/// sink only buffers and the index checkpoint persists what it collected.
-///
-/// That is sound because the buffer and the index have the *same* durability
-/// point: if a crash loses the buffered key, it also lost the index update, and
-/// WAL replay re-runs the write, re-rejects it, and re-buffers the key.
-///
-/// Mirrors the WAL/LSM observer pattern: the write path holds a cheap handle and
-/// signals, rather than knowing how a gap is recorded.
-pub trait IndexGapSink: Send + Sync {
-    /// Note that `field_id` in `namespace_id` refused to index `key`.
-    fn note_rejected_update(&self, namespace_id: u32, field_id: FieldId, key: &[u8]);
 }
 
 /// Buffers rejected field-index updates until the next index checkpoint turns
