@@ -226,8 +226,8 @@ impl AsyncNamespace {
     /// for what that does and does not guarantee about immediate readability.
     pub async fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        V: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        K: RkyvEncode,
+        V: RkyvEncode,
     {
         let kb = rkyv_serialize(key)?;
         let vb = rkyv_serialize(value)?;
@@ -237,9 +237,8 @@ impl AsyncNamespace {
     /// Look up a typed value by typed key.
     pub async fn get_typed<K, V>(&self, key: &K) -> Result<Option<V>>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        V: rkyv::Archive,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvEncode,
+        V: RkyvDecode,
     {
         let kb = rkyv_serialize(key)?;
         match self.get(kb).await? {
@@ -254,7 +253,7 @@ impl AsyncNamespace {
     /// for what that does and does not guarantee about immediate readability.
     pub async fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        K: RkyvEncode,
     {
         let kb = rkyv_serialize(key)?;
         self.delete(kb).await
@@ -265,9 +264,8 @@ impl AsyncNamespace {
     /// The typed twin of [`Db::merge`]; see [`Db::merge_typed`] for an example.
     pub async fn merge_typed<K, V, F>(&self, key: &K, value: &V, merge_fn: F) -> Result<Option<V>>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        V: rkyv::Archive + for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>> + Send + 'static,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvEncode,
+        V: RkyvEncode + RkyvDecode + Send + 'static,
         F: FnOnce(Option<V>, V) -> Result<Option<V>> + Send + 'static,
     {
         let kb = rkyv_serialize(key)?;
@@ -300,10 +298,8 @@ impl AsyncNamespace {
     /// Iterate over all typed key-value pairs.
     pub async fn iter_typed<K, V>(&self) -> Result<Vec<(K, V)>>
     where
-        K: rkyv::Archive,
-        K::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<K, Strategy<rkyv::de::Pool, RkyvError>>,
-        V: rkyv::Archive,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvDecode,
+        V: RkyvDecode,
     {
         deserialize_pairs(self.iter().await?)
     }
@@ -311,8 +307,7 @@ impl AsyncNamespace {
     /// Iterate over all typed keys.
     pub async fn keys_typed<K>(&self) -> Result<Vec<K>>
     where
-        K: rkyv::Archive,
-        K::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<K, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvDecode,
     {
         deserialize_keys(self.keys().await?)
     }
@@ -320,10 +315,8 @@ impl AsyncNamespace {
     /// Iterate over typed key-value pairs in `[start, end)`.
     pub async fn range_typed<K, V>(&self, start: &K, end: Option<&K>) -> Result<Vec<(K, V)>>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>> + rkyv::Archive,
-        K::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<K, Strategy<rkyv::de::Pool, RkyvError>>,
-        V: rkyv::Archive,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvEncode + RkyvDecode,
+        V: RkyvDecode,
     {
         let start_bytes = rkyv_serialize(start)?;
         let end_bytes = end.map(|e| rkyv_serialize(e)).transpose()?;
@@ -334,10 +327,8 @@ impl AsyncNamespace {
     /// Iterate over typed key-value pairs whose keys start with `prefix`.
     pub async fn scan_prefix_typed<K, V>(&self, prefix: Vec<u8>) -> Result<Vec<(K, V)>>
     where
-        K: rkyv::Archive,
-        K::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<K, Strategy<rkyv::de::Pool, RkyvError>>,
-        V: rkyv::Archive,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvDecode,
+        V: RkyvDecode,
     {
         deserialize_pairs(self.scan_prefix(prefix).await?)
     }

@@ -133,6 +133,10 @@ pub use db::facade::Namespace;
 /// Scoped handle to a single namespace (async).
 pub use db::facade::AsyncNamespace;
 
+/// What the typed methods (`put_typed`, `get_typed` and the rest) need of a key
+/// or value type: every rkyv-derived type qualifies.
+pub use db::facade::{RkyvDecode, RkyvEncode};
+
 /// A prefix-batch scan's entries, packed into a few buffers
 /// ([`Namespace::scan_prefixes_batch`], [`AsyncNamespace::scan_prefixes_batch`]).
 pub use kv_store::PrefixScan;

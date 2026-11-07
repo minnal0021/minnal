@@ -473,6 +473,13 @@ impl Db {
     }
 
     // ── Typed CRUD (rkyv ser/de) ──────────────────────────────────────
+    //
+    // On the default namespace: each forwards to its twin on that namespace's
+    // handle, which holds the one implementation.
+
+    fn default_namespace(&self) -> Result<Namespace<'_>> {
+        self.namespace(crate::namespace::DEFAULT_NAMESPACE)
+    }
 
     /// Insert a typed key-value pair, serialized via rkyv.
     ///
@@ -480,26 +487,19 @@ impl Db {
     /// for what that does and does not guarantee about immediate readability.
     pub fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        V: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        K: RkyvEncode,
+        V: RkyvEncode,
     {
-        let kb = rkyv_serialize(key)?;
-        let vb = rkyv_serialize(value)?;
-        self.put(&kb, &vb)
+        self.default_namespace()?.put_typed(key, value)
     }
 
     /// Look up a typed value by typed key.
     pub fn get_typed<K, V>(&self, key: &K) -> Result<Option<V>>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        V: rkyv::Archive,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvEncode,
+        V: RkyvDecode,
     {
-        let kb = rkyv_serialize(key)?;
-        match self.get(&kb)? {
-            Some(vb) => Ok(Some(rkyv_deserialize::<V>(&vb)?)),
-            None => Ok(None),
-        }
+        self.default_namespace()?.get_typed(key)
     }
 
     /// Delete by typed key.
@@ -508,10 +508,9 @@ impl Db {
     /// for what that does and does not guarantee about immediate readability.
     pub fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        K: RkyvEncode,
     {
-        let kb = rkyv_serialize(key)?;
-        self.delete(&kb)
+        self.default_namespace()?.delete_typed(key)
     }
 
     /// Atomically merge a typed value, serialized via rkyv.
@@ -534,36 +533,11 @@ impl Db {
     /// ```
     pub fn merge_typed<K, V, F>(&self, key: &K, value: &V, merge_fn: F) -> Result<Option<V>>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        V: rkyv::Archive + for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvEncode,
+        V: RkyvEncode + RkyvDecode,
         F: FnOnce(Option<V>, V) -> Result<Option<V>>,
     {
-        let kb = rkyv_serialize(key)?;
-        let vb = rkyv_serialize(value)?;
-        // The new `V` is carried out of the closure rather than deserialized back
-        // from the bytes `merge` returns — it already exists in there, and a
-        // second round-trip on every call would be pure waste.
-        let mut produced: Option<V> = None;
-        {
-            let slot = &mut produced;
-            self.merge(&kb, &vb, move |existing, operand| {
-                let current = match existing {
-                    Some(bytes) => Some(rkyv_deserialize::<V>(bytes)?),
-                    None => None,
-                };
-                let operand = rkyv_deserialize::<V>(operand)?;
-                match merge_fn(current, operand)? {
-                    Some(new) => {
-                        let bytes = rkyv_serialize(&new)?;
-                        *slot = Some(new);
-                        Ok(Some(bytes))
-                    }
-                    None => Ok(None),
-                }
-            })?;
-        }
-        Ok(produced)
+        self.default_namespace()?.merge_typed(key, value, merge_fn)
     }
 
     // ── Typed Iteration (rkyv ser/de) ─────────────────────────────────
@@ -571,45 +545,36 @@ impl Db {
     /// Iterate over all key-value pairs, deserializing into typed pairs.
     pub fn iter_typed<K, V>(&self) -> Result<Vec<(K, V)>>
     where
-        K: rkyv::Archive,
-        K::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<K, Strategy<rkyv::de::Pool, RkyvError>>,
-        V: rkyv::Archive,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvDecode,
+        V: RkyvDecode,
     {
-        deserialize_pairs(self.iter()?)
+        self.default_namespace()?.iter_typed()
     }
 
     /// Iterate over all keys, deserializing into typed keys.
     pub fn keys_typed<K>(&self) -> Result<Vec<K>>
     where
-        K: rkyv::Archive,
-        K::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<K, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvDecode,
     {
-        deserialize_keys(self.keys()?)
+        self.default_namespace()?.keys_typed()
     }
 
     /// Iterate over typed key-value pairs in `[start, end)`.
     pub fn range_typed<K, V>(&self, start: &K, end: Option<&K>) -> Result<Vec<(K, V)>>
     where
-        K: for<'a> rkyv::Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>> + rkyv::Archive,
-        K::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<K, Strategy<rkyv::de::Pool, RkyvError>>,
-        V: rkyv::Archive,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvEncode + RkyvDecode,
+        V: RkyvDecode,
     {
-        let start_bytes = rkyv_serialize(start)?;
-        let end_bytes = end.map(|e| rkyv_serialize(e)).transpose()?;
-        deserialize_pairs(self.range(&start_bytes, end_bytes.as_deref())?)
+        self.default_namespace()?.range_typed(start, end)
     }
 
     /// Iterate over typed key-value pairs whose keys start with `prefix`.
     pub fn scan_prefix_typed<K, V>(&self, prefix: &[u8]) -> Result<Vec<(K, V)>>
     where
-        K: rkyv::Archive,
-        K::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<K, Strategy<rkyv::de::Pool, RkyvError>>,
-        V: rkyv::Archive,
-        V::Archived: for<'a> bytecheck::CheckBytes<HighValidator<'a, RkyvError>> + rkyv::Deserialize<V, Strategy<rkyv::de::Pool, RkyvError>>,
+        K: RkyvDecode,
+        V: RkyvDecode,
     {
-        deserialize_pairs(self.scan_prefix(prefix)?)
+        self.default_namespace()?.scan_prefix_typed(prefix)
     }
 
     // ── Index ─────────────────────────────────────────────────────────
