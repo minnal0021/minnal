@@ -44,6 +44,11 @@ pub(crate) enum WorkerError {
     #[error("embedding failed: {0}")]
     EmbeddingFailed(String),
 
+    /// The namespace has no store: it was dropped, or never existed. Holds the
+    /// host's description.
+    #[error("{0}")]
+    StoreGone(String),
+
     /// The host's own error, as it describes itself.
     #[error("{0}")]
     Host(String),

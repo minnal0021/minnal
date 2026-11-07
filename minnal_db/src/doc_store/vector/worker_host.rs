@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::AsyncDb;
+use crate::doc_store::error::{DocStoreError, SchemaError};
 use crate::doc_store::schema::store::SchemaStore;
 use crate::doc_store::write_gate::InFlightWrites;
 use crate::semantic_search::workers::{DocumentText, WorkerError, WorkerHost};
@@ -17,7 +18,10 @@ pub(crate) struct DocStoreWorkerHost {
 
 impl WorkerHost for DocStoreWorkerHost {
     fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, u32), WorkerError> {
-        self.schemas.vector_settings(namespace).map_err(|e| WorkerError::Host(e.to_string()))
+        self.schemas.vector_settings(namespace).map_err(|e| match e {
+            DocStoreError::Schema(SchemaError::NotFound { .. }) => WorkerError::StoreGone(e.to_string()),
+            e => WorkerError::Host(e.to_string()),
+        })
     }
 
     fn store_exists(&self, namespace: &str) -> bool {

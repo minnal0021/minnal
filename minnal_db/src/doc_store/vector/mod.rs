@@ -1510,6 +1510,20 @@ mod tests {
         assert!(!in_flight.contains("ns", b"x"), "a cancelled write left its entry behind");
     }
 
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn a_store_with_no_schema_reads_as_gone_to_the_workers() {
+        use crate::semantic_search::workers::{WorkerError, WorkerHost};
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
+        // Partition maintenance logs this at debug level: a drop is not a failure.
+        assert!(matches!(
+            store.worker_host().vector_settings("never_created"),
+            Err(WorkerError::StoreGone(_))
+        ));
+        store.shutdown().await.unwrap();
+    }
+
     /// The race the in-progress check closes. A writer queues new text and the
     /// worker embeds and completes it before the writer's document write lands;
     /// a reindex holding an older snapshot then queues the old text. Checked

@@ -124,7 +124,7 @@ async fn maintain<H: WorkerHost>(db: &AsyncDb, ctx: &SemanticSearchContext, host
             r.splits, r.merges
         ),
         // Dropped (or its semantic search disabled) since the request was sent.
-        Err(e @ WorkerError::Context(ContextError::SemanticSearchNotEnabled { .. })) => {
+        Err(e @ (WorkerError::StoreGone(_) | WorkerError::Context(ContextError::SemanticSearchNotEnabled { .. }))) => {
             debug!("partition maintenance: namespace='{namespace}' skipped: {e}")
         }
         Err(e) => warn!("partition maintenance: namespace='{namespace}' failed: {e}"),
