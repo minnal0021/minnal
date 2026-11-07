@@ -724,7 +724,7 @@ returns `Ok(())` regardless (`database/mod.rs:760-773`); `delete_ns` mirrors it 
 open. But between the failed apply and the next restart, the write is invisible
 to reads while the caller has been told it succeeded.
 
-`Db::put`'s public doc comment (`facade.rs:132`) is a bare one-liner — "Insert or
+`Db::put`'s public doc comment (`facade/db.rs`) is a bare one-liner — "Insert or
 update a key-value pair" — and says nothing about this. The behaviour is only
 described in internal comments.
 

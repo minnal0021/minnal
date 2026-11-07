@@ -12,11 +12,3 @@ pub(crate) mod workers;
 /// Shared fixtures for this module's unit tests.
 #[cfg(test)]
 pub(crate) mod test_support;
-
-/// Integration tests for the `Db` / `AsyncDb` facade.
-///
-/// Test-only, and named for what it holds. It was `db::db` — which read as a
-/// module of database code rather than 25 tests for a type defined elsewhere,
-/// and needed an `allow(clippy::module_inception)` to say so.
-#[cfg(test)]
-mod facade_tests;

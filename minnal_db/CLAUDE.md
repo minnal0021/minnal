@@ -9,7 +9,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | File | Role |
 |---|---|
 | `src/lib.rs` | Public re-exports only — all types surfaced here |
-| `src/db/facade.rs` | `Db` and `AsyncDb` — the only entry points callers use |
+| `src/db/facade/` | `Db`, `AsyncDb` and their `Namespace` handles, one file each — the only entry points callers use |
 | `src/db/database/mod.rs` | Internal coordinator: owns all subsystems, routes ops |
 | `src/db/layout.rs` | **The one place that knows the on-disk directory layout.** Nothing above it should `join("field-index")` or `format!("ns_{}", ..)` |
 | `src/db/indexing/query.rs` | Predicate evaluation against the field indices (`Database` methods) |

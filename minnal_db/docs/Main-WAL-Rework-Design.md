@@ -923,7 +923,7 @@ Each step is built, tested and reviewed before the next.
 4. **Group commit** (C1, then C2's setting at default 0), with the
    drop-unsynced crash helper and the mutation checks; `config/sample.toml`
    gains `commit_delay_us` under `[sync]`. Update `minnal_db/README.md` (*Durability model*, *WAL
-   terms*), `minnal_db/CLAUDE.md`, the `Db` doc comment in `facade.rs` and the
+   terms*), `minnal_db/CLAUDE.md`, the `Db` doc comment in `facade/db.rs` and the
    bench comments that describe per-write fsync.
 5. **minnal_ui** (change D): the admin console reads the WAL fields A1 and
    C change (per-segment entry counts, `wal_fsyncs`, the GC result's
