@@ -12,6 +12,13 @@ use std::time::Duration;
 impl Database {
     /// Create a new namespace. Returns the namespace ID.
     pub fn create_namespace(&self, name: &str) -> Result<u32> {
+        self.create_namespace_with_ttl(name, None)
+    }
+
+    /// Create a new namespace with an optional TTL. Returns the namespace ID.
+    /// The TTL is recorded on the store; the single global TTL worker (started by
+    /// the async facade's `namespace_with_ttl`) expires records older than it.
+    pub fn create_namespace_with_ttl(&self, name: &str, ttl: Option<Duration>) -> Result<u32> {
         self.check_closed()?;
 
         // Held until this function returns, so no one can observe the window
@@ -22,60 +29,6 @@ impl Database {
         // (`Db::namespace`), which checks for the name and creates it if absent —
         // two of them racing a brand-new name both see it absent, and without
         // this the loser would get a spurious "already exists" from the registry.
-        if let Some(existing) = self.registry.read().get_id(name) {
-            return Ok(existing);
-        }
-
-        let ns_id = self.registry.write().create(name)?;
-
-        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
-        let kv_store = KVStore::open(
-            ns_id,
-            name,
-            &ns_path,
-            self.config.lsm_config.clone(),
-            self.config.sync_config,
-            self.config.segment_size_bytes,
-        )?;
-        kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
-        kv_store.set_seq_counter(self.next_seq.clone());
-        // Per-namespace metrics: each store owns its own counters; the engine-wide
-        // view is the sum of all stores' snapshots plus the global instance.
-        kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
-        kv_store.set_index_gap_sink(Some(
-            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::indexing::manager::IndexGapSink>
-        ));
-
-        // Wire up flush observer
-        let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(
-            ns_id,
-            Arc::clone(&self.wal_flush_observer),
-            Arc::clone(&self.vector_index_wal),
-            Arc::clone(&kv_store.lsm_compaction_trigger),
-        ));
-        kv_store.set_flush_observer(Some(observer));
-
-        // Wire compaction trigger if a worker is already running
-        if let Some(sender) = self.lsm_compaction_sender.read().as_ref() {
-            kv_store.set_compaction_trigger(sender.clone());
-        }
-        // Inherit the index-checkpoint backpressure valve if the worker is running.
-        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
-            kv_store.set_index_checkpoint_trigger(Some(Arc::clone(trigger)));
-        }
-
-        self.stores.write().insert(ns_id, Arc::new(kv_store));
-        Ok(ns_id)
-    }
-
-    /// Create a new namespace with an optional TTL. Returns the namespace ID.
-    /// The TTL is recorded on the store; the single global TTL worker (started by
-    /// the async facade's `namespace_with_ttl`) expires records older than it.
-    pub fn create_namespace_with_ttl(&self, name: &str, ttl: Option<Duration>) -> Result<u32> {
-        self.check_closed()?;
-
-        // Same contract as `create_namespace` — see its comments.
-        let _create = self.namespace_create_lock.lock();
         if let Some(existing) = self.registry.read().get_id(name) {
             return Ok(existing);
         }
