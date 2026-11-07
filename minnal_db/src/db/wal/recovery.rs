@@ -1,6 +1,11 @@
 //! Replaying both logs at open.
 
-use super::*;
+use crate::db::database::{Database, display_key};
+use crate::db::error::Result;
+use crate::db::wal::{WalEntry, WalOperationType};
+
+use log::{debug, error, info, warn};
+use std::sync::atomic::Ordering;
 
 impl Database {
     /// Replay the vector index WAL's unretired records into their memtables,
@@ -22,7 +27,7 @@ impl Database {
     /// record whose delete the compaction erased, and the key would come
     /// back (`a_second_crash_does_not_bring_back_a_deleted_key`). It would
     /// also leave an idle namespace holding the cut.
-    pub(super) fn recover_from_vector_index_wal(&self) -> Result<()> {
+    pub(in crate::db) fn recover_from_vector_index_wal(&self) -> Result<()> {
         // A new write must never draw a seq below a replayed record's, or it
         // would lose to it.
         self.next_seq
@@ -90,7 +95,7 @@ impl Database {
         Ok(())
     }
 
-    pub(super) fn recover_from_wal(&self) -> Result<()> {
+    pub(in crate::db) fn recover_from_wal(&self) -> Result<()> {
         let wal_metadata = self.wal_metadata.read().clone();
         let tail = wal_metadata.tail;
         let start = wal_metadata.cut.max(wal_metadata.head);

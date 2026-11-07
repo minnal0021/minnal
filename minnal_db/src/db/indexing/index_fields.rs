@@ -1,6 +1,15 @@
 //! The field registry: registering, activating, dropping and measuring field indexes.
 
-use super::*;
+use crate::db::database::Database;
+use crate::db::error::{KVError, Result};
+use crate::db::kv_store::KVStore;
+use crate::db::kv_store::index_set::{ExtractorFn, IndexEntry};
+use crate::db::namespace::{FieldId, FieldMeta, FieldReindexOutcome};
+use crate::field_index::{DynFieldIndex, IndexValueType};
+
+use log::{debug, error, info, warn};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 impl Database {
     /// Register an indexed field for a namespace.
@@ -522,7 +531,7 @@ impl Database {
     /// Failures are logged, not propagated: a leftover directory wastes disk but
     /// cannot affect correctness, and refusing to open the database over it would
     /// be a far worse outcome.
-    pub(super) fn complete_interrupted_field_drops(&self) {
+    pub(in crate::db) fn complete_interrupted_field_drops(&self) {
         let dropped: Vec<(u32, FieldId)> = {
             let registry = self.registry.read();
             registry

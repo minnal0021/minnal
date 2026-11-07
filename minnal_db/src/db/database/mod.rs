@@ -4,11 +4,9 @@
 //! Each namespace has independent LSM + value log storage.
 
 mod flush_observers;
-mod index_fields;
 pub(crate) mod key_locks;
 mod namespaces;
 mod open;
-mod recovery;
 mod shutdown;
 mod stats;
 #[cfg(test)]
@@ -24,18 +22,16 @@ use crate::db::database::key_locks::KeyLocks;
 use crate::db::error::{KVError, Result};
 use crate::db::indexing::manager::IndexManager;
 use crate::db::kv_store::KVStore;
-use crate::db::kv_store::index_set::{ExtractorFn, IndexEntry};
-use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
+use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, NamespaceRegistry};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::wal::segmented_log::LogError;
 use crate::db::wal::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
-use crate::db::wal::{Wal, WalEntry, WalError, WalMetadata, WalOperationType};
+use crate::db::wal::{Wal, WalEntry, WalError, WalMetadata};
 use crate::db::workers::index_checkpoint::{IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::workers::lsm_compaction::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
 use crate::db::workers::ttl::{TtlTarget, TtlWorker};
 use crate::db::workers::value_log_gc::{GCWorker, ValueLogGcTarget};
 use crate::db::workers::wal_gc::{WalGcTarget, WalGcWorker};
-use crate::field_index::{DynFieldIndex, IndexValueType};
 use crate::storage::lsm::tree::LsmFlushObserver;
 use crate::storage::value_log::ValueLogMetadata;
 
@@ -48,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Format a key for log output: UTF-8 string if valid, otherwise `hex:<hex>`.
-fn display_key(key: &[u8]) -> String {
+pub(in crate::db) fn display_key(key: &[u8]) -> String {
     match std::str::from_utf8(key) {
         Ok(s) => s.to_owned(),
         Err(_) => format!("hex:{}", key.iter().map(|b| format!("{:02x}", b)).collect::<String>()),
@@ -94,7 +90,7 @@ pub(crate) enum OpenStoreLookup {
 /// - A namespace registry (name → id mapping)
 /// - A collection of KVStore instances (one per namespace)
 pub struct Database {
-    db_path: PathBuf,
+    pub(in crate::db) db_path: PathBuf,
     pub(crate) config: DbConfig,
 
     // Shared WAL
@@ -150,7 +146,7 @@ pub struct Database {
     /// **Lock ordering: taken only AFTER `get_store` returns**, never around it —
     /// `get_store` may wait on `namespace_create_lock`, which is strictly
     /// outermost (see above).
-    index_activate_lock: Mutex<()>,
+    pub(in crate::db) index_activate_lock: Mutex<()>,
 
     // Per-namespace stores: namespace_id -> KVStore
     pub(crate) stores: RwLock<HashMap<u32, Arc<KVStore>>>,
@@ -203,10 +199,10 @@ pub struct Database {
     // lock is released, so making the merge atomic with it would invert the
     // established order. The stripe sits above both, giving one uniform order
     // `stripe -> wal_metadata -> (released) -> bucket`. See `key_locks`.
-    key_locks: KeyLocks,
+    pub(in crate::db) key_locks: KeyLocks,
 
     // Directory for recovery fail-log files.
-    fail_log_dir: PathBuf,
+    pub(in crate::db) fail_log_dir: PathBuf,
 
     // Global operational counters that belong to no single namespace: the
     // WAL-GC counters plus a fold of every dropped namespace's final totals.

@@ -7,8 +7,9 @@
 
 use super::*;
 use crate::db::config::SyncConfig;
+use crate::db::kv_store::index_set::ExtractorFn;
 use crate::db::test_support::*;
-use crate::field_index::IndexValue;
+use crate::field_index::{IndexValue, IndexValueType};
 use tempfile::TempDir;
 
 // ── Process-level crash durability ─────────────────────────────────
