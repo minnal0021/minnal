@@ -22,7 +22,7 @@ leaves open (`Dynamic-RaBitQ-Index-Design.md`, *M3-pre*):
 BEIR SciFact (5,183 docs, 22,787 chunks, 300 queries) and FiQA (57,600 docs,
 172,998 chunks, 648 queries), dumped by the frozen eval at M0. Simulator:
 `work/bench/analysis/m3pre/` (`sim.py`, stages 1–3, `fidelity.py`); charts are
-drawn from [`m3pre/data.json`](data.json) by
+drawn from [`data.json`](data.json) by
 [`../charts.py`](../charts.py). Branch `dynamic-rabitq-index` at
 `4c602bb`.*
 
