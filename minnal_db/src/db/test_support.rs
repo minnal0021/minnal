@@ -1,6 +1,6 @@
 //! Shared fixtures for the `db` module's unit tests.
 //!
-//! These used to live inside `database.rs`'s test module, which is why every
+//! These used to live inside `database/`'s test module, which is why every
 //! test needing one had to live there too — that is what kept a 3,300-line test
 //! block attached to a file whose code had already been split up.
 //!
@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
 use crate::db::database::Database;
-use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
-use crate::db::namespace::FieldId;
-use crate::db::namespace_index::ExtractorFn;
-use crate::index::{IndexValue, IndexValueType};
-use crate::store::lsm::lsm_tree::LSMConfig;
+use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
+use crate::field_index::FieldId;
+use crate::field_index::{IndexValue, IndexValueType};
+use crate::kv_store::index_set::ExtractorFn;
+use crate::storage::lsm::tree::LSMConfig;
 
 pub(crate) fn create_db_config() -> DbConfig {
     let gc_interval = Duration::from_secs(5);
@@ -96,14 +96,14 @@ pub(crate) fn record_test_gap(db: &Database, ns: u32, field_id: FieldId) {
 }
 
 /// Open a main WAL by hand as a database with no saved progress would.
-pub(crate) const FRESH_WAL: crate::db::segmented_log::OpenFrom = crate::db::segmented_log::OpenFrom { cut: None, furthest: 0 };
+pub(crate) const FRESH_WAL: crate::db::wal::segmented_log::OpenFrom = crate::db::wal::segmented_log::OpenFrom { cut: None, furthest: 0 };
 
 /// The main WAL's saved metadata file in the database at `db_path`.
 pub(crate) fn wal_metadata_path(db_path: &std::path::Path) -> std::path::PathBuf {
-    crate::db::layout::main_wal_dir(db_path).join(crate::db::wal::METADATA_FILE)
+    crate::layout::main_wal_dir(db_path).join(crate::db::wal::METADATA_FILE)
 }
 
 /// Main-WAL segment `segment_id`'s file in the database at `db_path`.
 pub(crate) fn wal_segment_path(db_path: &std::path::Path, segment_id: u64) -> std::path::PathBuf {
-    crate::db::segmented_log::segment_path(&crate::db::layout::main_wal_dir(db_path), segment_id)
+    crate::db::wal::segmented_log::segment_path(&crate::layout::main_wal_dir(db_path), segment_id)
 }

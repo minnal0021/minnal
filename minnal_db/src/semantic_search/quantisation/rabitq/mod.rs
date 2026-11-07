@@ -21,9 +21,8 @@
 pub(crate) mod quantisation_support;
 
 use crate::semantic_search::cluster::{Cluster, ClusterIndexError, find_closest_cluster_id};
+use crate::semantic_search::simd_support::{reconstruct_bit_planes_best, reconstruct_single_bit_best};
 use log::debug;
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::ParallelIterator;
 use simsimd::SpatialSimilarity;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -203,13 +202,7 @@ pub fn reconstruct_single_bit_into(vi: &VectorIndex, rotated_centre: &[f32], out
     if vi.quantisation_style != QuantisationStyle::SingleBit || vi.packed_vector.len() < rotated_centre.len().div_ceil(64) {
         return false;
     }
-    let s = vi.scaling_factor;
-    out.extend(
-        rotated_centre
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| if (vi.packed_vector[i / 64] >> (i % 64)) & 1 == 1 { c + s } else { c - s }),
-    );
+    reconstruct_single_bit_best(&vi.packed_vector, rotated_centre, vi.scaling_factor, out);
     true
 }
 
@@ -232,7 +225,6 @@ pub fn reconstruct_code(vi: &VectorIndex, rotated_centre: &[f32]) -> Option<Vec<
 /// `None`.
 pub fn reconstruct_code_into(vi: &VectorIndex, rotated_centre: &[f32], out: &mut Vec<f32>) -> bool {
     use crate::semantic_search::index::vector_index::QuantisationStyle;
-    use crate::semantic_search::quantisation::rabitq::quantisation_support::bit_plane_code;
     match vi.quantisation_style {
         QuantisationStyle::SingleBit => reconstruct_single_bit_into(vi, rotated_centre, out),
         QuantisationStyle::BitPlanes { number_of_bits: bits } => {
@@ -243,14 +235,7 @@ pub fn reconstruct_code_into(vi: &VectorIndex, rotated_centre: &[f32], out: &mut
             {
                 return false;
             }
-            let shift = -(((1u32 << (bits - 1)) as f32) - 0.5);
-            let s = vi.scaling_factor;
-            out.extend(
-                rotated_centre
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| c - s * (bit_plane_code(&vi.packed_vector, dim, bits, i) as f32 + shift)),
-            );
+            reconstruct_bit_planes_best(&vi.packed_vector, rotated_centre, vi.scaling_factor, bits, out);
             true
         }
         QuantisationStyle::MultiBit { .. } => false,
@@ -304,10 +289,9 @@ fn setup_initial_computation_values(normalised_residual_vector: &[f32], rescale_
 fn best_rescale_factor(normalised_residual_vector: &[f32], number_of_bits_for_quantisation: usize) -> f32 {
     let dimension = normalised_residual_vector.len();
 
-    let max_value = normalised_residual_vector
-        .into_par_iter()
-        .fold(|| f32::NEG_INFINITY, |acc, &x| acc.max(x))
-        .reduce(|| f32::NEG_INFINITY, |a, b| a.max(b));
+    // Serial on purpose: under a microsecond of work, and this runs on the embed
+    // worker's async thread, which a rayon job would block for milliseconds.
+    let max_value = normalised_residual_vector.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
     let rescale_factor_end = ((1 << number_of_bits_for_quantisation) - 1 + NO_ENUMERATIONS) as f32 / max_value;
     let rescale_factor_start = rescale_factor_end * START[number_of_bits_for_quantisation];

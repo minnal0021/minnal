@@ -10,6 +10,9 @@ pub enum SchemaError {
     #[error("namespace must be non-empty and contain only alphanumerics, underscores, or hyphens")]
     InvalidNamespace,
 
+    #[error("store name is {len} bytes; the limit is {max}")]
+    StoreNameTooLong { len: usize, max: usize },
+
     #[error("too many indices: {count} specified, maximum is {max}")]
     TooManyIndices { count: usize, max: usize },
 
@@ -124,9 +127,44 @@ pub enum SchemaError {
 
 // ── Doc-store-level errors ─────────────────────────────────────────────────
 
+impl From<crate::vector_index::vector_settings::VectorSettingsError> for SchemaError {
+    fn from(e: crate::vector_index::vector_settings::VectorSettingsError) -> Self {
+        use crate::vector_index::vector_settings::VectorSettingsError as E;
+        match e {
+            E::Invalid { field, reason } => Self::InvalidVectorSetting { field, reason },
+            E::Fixed { field, current, requested } => Self::VectorSettingFixed { field, current, requested },
+            E::NotConfigured { namespace } => Self::VectorIndexNotConfigured { namespace },
+        }
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+impl From<crate::semantic_search::context::ContextError> for DocStoreError {
+    fn from(e: crate::semantic_search::context::ContextError) -> Self {
+        use crate::semantic_search::context::ContextError as E;
+        match e {
+            E::UnsupportedEmbeddingModel { model, supported } => Self::UnsupportedEmbeddingModel { model, supported },
+            E::EmbeddingDimMismatch { model, dim, expected } => Self::EmbeddingDimMismatch { model, dim, expected },
+            E::VectorIndexNotSeeded { namespace } => Self::VectorIndexNotSeeded { namespace },
+            E::SemanticSearchNotEnabled { namespace } => Self::SemanticSearchNotEnabled { namespace },
+            E::VecRebuildInProgress { namespace } => Self::VecRebuildInProgress { namespace },
+            E::EmbeddingFailed(reason) => Self::EmbeddingFailed(reason),
+            E::InvalidProbeTrace { namespace, reason } => Self::InvalidProbeTrace { namespace, reason },
+            E::Settings(e) => e.into(),
+            E::Db(e) => Self::Db(e),
+        }
+    }
+}
+
+impl From<crate::vector_index::vector_settings::VectorSettingsError> for DocStoreError {
+    fn from(e: crate::vector_index::vector_settings::VectorSettingsError) -> Self {
+        Self::Schema(e.into())
+    }
+}
+
 /// Errors produced by [`DocStore`] operations.
 ///
-/// [`DocStore`]: crate::doc_store::store::DocStore
+/// [`DocStore`]: crate::doc_store::DocStore
 #[derive(Debug, Error)]
 pub enum DocStoreError {
     /// A namespace names an embedding model this server's `supported_models`
@@ -140,7 +178,7 @@ pub enum DocStoreError {
     EmbeddingModelUnavailable { model: String, dim: u32, reason: String },
 
     /// A semantic namespace has no centres and postings to search or index with.
-    #[error("namespace '{namespace}' has no seeded centres; re-enable its vector index")]
+    #[error("namespace '{namespace}' has no seeded centres; restart to seed them, or drop its vector index and enable it again")]
     VectorIndexNotSeeded { namespace: String },
 
     /// A namespace's embedding dimension is not the one the server lists for
@@ -228,6 +266,16 @@ pub enum DocStoreError {
     /// Poll `GET /admin/indices/{namespace}/progress` and retry when it finishes.
     #[error("a vector index reindex for namespace '{namespace}' is already in progress")]
     VecReindexInProgress { namespace: String },
+
+    /// A store cannot take this name: a namespace of that name, with no store,
+    /// holds keys written directly through [`Db`](crate::Db).
+    #[error("namespace '{namespace}' already holds keys and is not a store; remove it or choose another name")]
+    NamespaceNotEmpty { namespace: String },
+
+    /// The namespace's vector index is still being removed. Enabling it again
+    /// now would lose what is written before the removal finishes.
+    #[error("the vector index of namespace '{namespace}' is still being removed; retry when it finishes")]
+    VectorCleanupInProgress { namespace: String },
 
     /// A partition rebuild is already running for this namespace.
     #[error("a partition rebuild for namespace '{namespace}' is already running")]

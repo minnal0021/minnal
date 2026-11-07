@@ -132,6 +132,7 @@ pub fn pack_bit_planes(codes: &[u8], bits: usize) -> Vec<u64> {
 }
 
 /// The code of dimension `i` in a [`pack_bit_planes`] layout of `dim` dimensions.
+#[cfg(test)]
 #[inline]
 pub fn bit_plane_code(packed: &[u64], dim: usize, bits: usize, i: usize) -> u8 {
     let words = dim.div_ceil(64);

@@ -46,8 +46,7 @@ pub(crate) fn encode_cursor(key: &[u8]) -> String {
 pub(crate) fn decode_cursor(s: &str) -> Result<Vec<u8>, AppError> {
     // Byte-level decode (`hex_to_bytes`): slicing the `str` at byte offsets
     // panicked on multi-byte input, and the server aborts on panic.
-    minnal_db::doc_store::hex::hex_to_bytes(s)
-        .ok_or_else(|| minnal_db::DocStoreError::InvalidId("cursor must be an even-length string of hex digits".into()).into())
+    minnal_db::hex_to_bytes(s).ok_or_else(|| minnal_db::DocStoreError::InvalidId("cursor must be an even-length string of hex digits".into()).into())
 }
 
 pub fn router() -> Router<AppState> {

@@ -8,9 +8,9 @@
 # work/ is gitignored. Small datasets that suit the eval: scifact (5k docs),
 # nfcorpus (3.6k docs, graded qrels), fiqa (57k docs — slow to embed).
 #
-# Then run the eval (see minnal_db/src/semantic_search/beir_eval.rs):
+# Then run the eval (see minnal_db/src/semantic_search/eval/beir.rs):
 #   MINNAL_EMBED_URL=http://localhost:8001 \
-#     cargo test -p minnal_db --all-features --release --lib beir_rank_fusion_eval -- --ignored --nocapture
+#     cargo test -p minnal_db --all-features --release --lib eval_beir -- --ignored --nocapture
 
 set -euo pipefail
 

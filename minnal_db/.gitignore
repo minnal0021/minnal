@@ -3,5 +3,5 @@
 .idea
 sharded_value_log_db/
 my_db/
-benchmark/reports
+benches/script/reports
 .claude/

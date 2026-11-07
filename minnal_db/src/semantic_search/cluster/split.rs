@@ -7,7 +7,7 @@
 //! are kept as the **means** of their members, where SPTAG replaces each with
 //! its nearest member. In minnal the members are reconstructions of 1-bit codes,
 //! and a single member's reconstruction carries its full code error; the mean
-//! averages it away (`report/m3-pre-simulation/spfresh-comparison.md`).
+//! averages it away (`docs/m3-pre-simulation/spfresh-comparison.md`).
 //!
 //! Each step:
 //!
@@ -24,6 +24,8 @@
 //!    without a lower total distance.
 //! 4. **Assign** every member to the nearer centre without the balance term.
 //!    `None` if one side is empty.
+
+use crate::semantic_search::vector_math::{add_to_sum, sq_dist};
 
 /// The parameters of a split (the namespace's `maintenance` settings).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,16 +102,6 @@ impl SplitRng {
     }
 }
 
-fn sq_dist(a: &[f32], b: &[f32]) -> f64 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| {
-            let d = f64::from(*x) - f64::from(*y);
-            d * d
-        })
-        .sum()
-}
-
 /// Assign `members` to the nearer of `centres` with balance weight `lambda` on
 /// cluster sizes `sizes`. Returns each member's label and its (weighted)
 /// distance.
@@ -183,9 +175,7 @@ pub fn balanced_two_means(points: &[Vec<f32>], params: &SplitParams, rng: &mut S
         }
         let mut sums = [vec![0.0f64; dim], vec![0.0f64; dim]];
         for (&i, &l) in batch.iter().zip(&labels) {
-            for (acc, &x) in sums[l as usize].iter_mut().zip(&points[i]) {
-                *acc += f64::from(x);
-            }
+            add_to_sum(&mut sums[l as usize], &points[i]);
         }
         let mut next = centres.clone();
         for k in 0..2 {

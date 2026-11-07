@@ -1,4 +1,4 @@
-"""Report for an engine_bench run (minnal_db/benches/engine_bench).
+"""Report for an engine_bench run (minnal_db/benches/under_load).
 
     python3 report.py RUN_DIR [QRELS]
 

@@ -84,25 +84,33 @@
 compile_error!("minnal_db supports only Linux and macOS (its storage engine uses Unix pread/pwrite)");
 
 pub mod db;
-mod store;
+pub mod error;
+mod storage;
 mod support;
 
 // ── Folded layers ─────────────────────────────────────────────────────────────
-// `index` is part of the base engine (field indexing is core). `semantic_search`
+// `field_index` is part of the base engine (field indexing is core). `semantic_search`
 // and `doc_store` are opt-in via cargo features.
 #[cfg(feature = "doc-store")]
 pub mod doc_store;
-pub mod index;
+pub mod field_index;
+pub mod kv_store;
+pub(crate) mod layout;
+pub mod namespace;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;
-// Vector-index storage bridge (`DbVectorStore`, upsert/delete, query-embedding
-// cache) over raw namespaces — usable with `kv-store` alone, no `doc-store`.
-#[cfg(feature = "semantic-search")]
-pub mod vector_kv;
-// Splitting a namespace's postings: the maintenance journal, the split
-// executor and its crash recovery (design doc M3a).
-#[cfg(feature = "semantic-search")]
-pub mod ivf_split;
+// Sits outside both optional layers: a store's schema carries these settings
+// with or without semantic search compiled, and `semantic_search` runs on them
+// without depending on `doc_store`.
+#[cfg(feature = "doc-store")]
+pub mod vector_index;
+
+// Compiles every Rust example in QUICKSTART.md (`no_run`: they name fixed paths and
+// some need the embedding service). The examples use both optional layers, so
+// `cargo test --all-features` is what checks them.
+#[cfg(all(doctest, feature = "doc-store", feature = "semantic-search"))]
+#[doc = include_str!("../QUICKSTART.md")]
+pub struct QuickstartExamples;
 
 // ── Facade API (primary entry points) ─────────────────────────────────────────
 
@@ -125,9 +133,13 @@ pub use db::facade::Namespace;
 /// Scoped handle to a single namespace (async).
 pub use db::facade::AsyncNamespace;
 
+/// What the typed methods (`put_typed`, `get_typed` and the rest) need of a key
+/// or value type: every rkyv-derived type qualifies.
+pub use db::facade::{RkyvDecode, RkyvEncode};
+
 /// A prefix-batch scan's entries, packed into a few buffers
 /// ([`Namespace::scan_prefixes_batch`], [`AsyncNamespace::scan_prefixes_batch`]).
-pub use db::kv_store::PrefixScan;
+pub use kv_store::PrefixScan;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -143,7 +155,7 @@ pub use db::config::{
     DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
 };
 
-pub use store::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
+pub use storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
 
 /// Default index checkpoint interval in milliseconds (the crash-replay window).
 pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS: u64 = db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL.as_millis() as u64;
@@ -152,7 +164,7 @@ pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS: u64 = db::config::DEFAULT_INDEX_
 ///
 /// Exposed because keys are arbitrary bytes and several surfaces carry them as
 /// hex: scan cursors at the REST boundary, and the field-index gap record's
-/// row-scoped repair worklist ([`db::index_manager::RepairMode`]). A caller
+/// row-scoped repair worklist ([`db::indexing::manager::RepairMode`]). A caller
 /// reading either needs the matching decoder.
 pub use support::hex::{bytes_to_hex, hex_to_bytes};
 
@@ -163,80 +175,80 @@ pub use db::config::ScheduledTaskConfig;
 pub use db::config::SyncConfig;
 
 /// TOML configuration file parser.
-pub use db::toml_config::MinnalTomlConfig;
+pub use db::config::toml::MinnalTomlConfig;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// The unified error type returned by all operations.
-pub use db::error::KVError;
+pub use error::KVError;
 
 /// The subsystem errors carried by [`KVError`]'s variants.
 ///
 /// These are re-exported so those variants are actually usable: `LSMError`,
-/// `ValueLogError` and `ShardedValueLogError` live inside the private `store`
+/// `ValueLogError` and `ShardedValueLogError` live inside the private `storage`
 /// module, so without this a caller could match on `KVError::LsmError(_)` but
 /// never name or inspect the value inside it. `WalError` is reachable via
 /// `minnal_db::db::wal`, and is lifted here too so all four payloads are
 /// namable from one place.
 ///
-/// Re-exporting the types does not open the `store` module itself.
+/// Re-exporting the types does not open the `storage` module itself.
 pub use db::wal::WalError;
-pub use store::lsm::lsm_tree::LSMError;
-pub use store::value_log::ValueLogError;
-pub use store::value_log::sharded::ShardedValueLogError;
+pub use storage::lsm::tree::LSMError;
+pub use storage::value_log::ValueLogError;
+pub use storage::value_log::sharded::ShardedValueLogError;
 
 // ── Index types ───────────────────────────────────────────────────────────────
 
 /// Discriminant used when registering a field index.
-pub use crate::index::IndexValueType;
+pub use crate::field_index::IndexValueType;
 
 /// A typed field value extracted from a document by an extractor closure.
-pub use crate::index::IndexValue;
+pub use crate::field_index::IndexValue;
 
 /// On-disk blob growth/waste metrics for one field index (logical vs. live
 /// bytes + waste ratios), returned by [`Db::field_index_blob_stats`].
-pub use crate::index::IndexBlobStats;
+pub use crate::field_index::IndexBlobStats;
 /// Field-index write-buffer use and limits ([`Db::index_overlay_stats`]).
-pub use crate::index::IndexOverlayStats;
+pub use crate::field_index::IndexOverlayStats;
 
 /// Unique identifier for a registered field within a namespace.
-pub use db::namespace::FieldId;
+pub use crate::field_index::FieldId;
 /// Metadata for a registered field: id, name, and value type.
-pub use db::namespace::FieldMeta;
+pub use crate::field_index::FieldMeta;
 /// Outcome of a targeted single-field reindex ([`Db::reindex_field`]).
-pub use db::namespace::FieldReindexOutcome;
+pub use crate::field_index::FieldReindexOutcome;
 /// What a field-index repair did ([`Db::repair_field_index`]).
-pub use db::namespace::FieldRepairOutcome;
+pub use crate::field_index::FieldRepairOutcome;
 /// A field-index query result: matching keys plus whether the indices that
 /// produced them are known to be incomplete.
-pub use db::namespace::QueryOutcome;
+pub use crate::field_index::QueryOutcome;
 
 /// Health of one field index, including any outstanding gap
 /// ([`Db::index_health`]).
-pub use db::index_manager::FieldIndexHealth;
+pub use db::indexing::manager::FieldIndexHealth;
 /// Why a field index is incomplete, and what repair it needs.
-pub use db::index_manager::{GapCause, GapRecord, RepairMode};
+pub use db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
 /// Extractor closure type: maps raw document bytes to an [`IndexValue`].
-pub use db::namespace_index::ExtractorFn;
+pub use kv_store::index_set::ExtractorFn;
 
 /// Row-ID function type: derives a stable 128-bit row ID from raw key bytes.
 ///
 /// Register one via [`Db::set_row_id_fn`] to replace the default dense row-ID
 /// map with an explicit identifier (e.g. a UUID embedded in the key).
-pub use db::namespace_index::RowIdFn;
+pub use kv_store::index_set::RowIdFn;
 
 /// Inverse of [`RowIdFn`]: reconstructs the raw key bytes from a row ID.
 ///
 /// Registering this alongside [`RowIdFn`] enables O(|hits|) query resolution
 /// in [`Db::query_index`] with zero memory overhead — no in-memory map needed.
-pub use db::namespace_index::RowToKeyFn;
+pub use kv_store::index_set::RowToKeyFn;
 
 /// Namespace ID for the implicit default namespace.
-pub use db::namespace::DEFAULT_NAMESPACE_ID;
+pub use namespace::DEFAULT_NAMESPACE_ID;
 
 /// Name and ID for the system-wide namespace (always present, never removable).
-pub use db::namespace::{SYSTEM_NAMESPACE, SYSTEM_NAMESPACE_ID};
+pub use namespace::{SYSTEM_NAMESPACE, SYSTEM_NAMESPACE_ID};
 
 /// Snapshot statistics returned by [`Db::stats`].
 pub use db::stats::Stats;
@@ -246,34 +258,34 @@ pub use db::stats::GCStats;
 
 /// Engine-wide operational metrics (runtime counters) and their serializable
 /// snapshot, returned by [`Db::ops_metrics`].
-pub use db::metrics::{Metrics, MetricsSnapshot};
+pub use support::metrics::{Metrics, MetricsSnapshot};
 
-pub use db::segmented_log::LogPosition;
+pub use db::wal::segmented_log::LogPosition;
 /// Snapshot of WAL state returned by [`Db::wal_metadata`].
-pub use db::vector_index_wal::{VectorIndexWalHolder, VectorIndexWalPosition, VectorIndexWalSegment, VectorIndexWalStats};
+pub use db::wal::vector_index_wal::{VectorIndexWalHolder, VectorIndexWalPosition, VectorIndexWalSegment, VectorIndexWalStats};
 pub use db::wal::{WalMetadata, WalNamespaceProgress, WalSegmentState, WalStats};
 
 /// Live LSM manifest snapshot returned by [`Db::lsm_manifests`].
-pub use store::lsm::lsm_manifest::LsmManifest;
+pub use storage::lsm::manifest::LsmManifest;
 
 /// Per-bucket entry inside a [`ManifestLevel`].
-pub use store::lsm::lsm_manifest::ManifestBucket;
+pub use storage::lsm::manifest::ManifestBucket;
 /// Per-file entry inside a [`ManifestBucket`].
-pub use store::lsm::lsm_manifest::ManifestFile;
+pub use storage::lsm::manifest::ManifestFile;
 /// Per-level entry in an [`LsmManifest`].
-pub use store::lsm::lsm_manifest::ManifestLevel;
+pub use storage::lsm::manifest::ManifestLevel;
 /// In-memory (non-SSTable) LSM statistics, returned by [`Db::lsm_runtime_stats`].
-pub use store::lsm::lsm_tree::LSMStats;
+pub use storage::lsm::tree::LSMStats;
 
 /// Per-bucket value-log metadata returned by [`Db::value_log_shard_stats`].
-pub use store::value_log::ValueLogMetadata;
+pub use storage::value_log::ValueLogMetadata;
 
 /// Physical (on-disk) value-log shard footprint, returned by
 /// [`Db::value_log_physical_stats`].
-pub use store::value_log::sharded::ShardPhysicalStats;
+pub use storage::value_log::sharded::ShardPhysicalStats;
 
 /// Per-page value-log garbage breakdown, returned by [`Db::value_log_segment_stats`].
-pub use store::value_log::SegmentStats;
+pub use storage::value_log::SegmentStats;
 
 // ── Document store (folded layer) ─────────────────────────────────────────────
 //
@@ -323,5 +335,5 @@ pub use rkyv::Archived;
 
 /// LSM-tree configuration (compaction threshold, thread count, data dir).
 pub mod lsm {
-    pub use crate::store::lsm::lsm_tree::LSMConfig;
+    pub use crate::storage::lsm::tree::LSMConfig;
 }

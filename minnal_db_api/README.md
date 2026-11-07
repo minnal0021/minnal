@@ -299,7 +299,7 @@ When a store has `semantic_search_enabled = true`, embedding happens **asynchron
 
 **Robust search results.** The document and its vector index are separate writes that can drift — a crash window on write, or a delete racing the async indexer can leave an index entry whose document is gone. To keep results trustworthy, semantic search **fetches each candidate's document and drops any that no longer exist**, so a search hit always resolves to a live document; orphaned index entries never surface as dangling results.
 
-**Crash recovery.** Writing the document and queuing its embed job are two separate steps, so the queue entry always comes first. A crash between them leaves a queue entry for a write that never landed, never a changed document with nothing queued. Before acting on an entry, the worker compares it with the stored document and rewrites it to match. Deletes follow the same rule: the vectors go first, the document last. After a restart the worker just drains the queue; nothing scans the documents, so no manual step is needed. Details: [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#crash-recovery-the-queue-comes-first).
+**Crash recovery.** Writing the document and queuing its embed job are two separate steps, so the queue entry always comes first. A crash between them leaves a queue entry for a write that never landed, never a changed document with nothing queued. Before acting on an entry, the worker compares it with the stored document and rewrites it to match. Deletes follow the same rule: the vectors go first, the document last. After a restart the worker just drains the queue; nothing scans the documents, so no manual step is needed. Details: [`Semantic-Search-Architecture.md`](../minnal_db/src/semantic_search/docs/Semantic-Search-Architecture.md#crash-recovery-the-queue-comes-first).
 
 To re-embed every document of one namespace (for example after corruption), use [`POST /admin/indices/{ns}/vector/reindex-all`](#post-adminindicesnsvectorreindex-all).
 
@@ -393,7 +393,7 @@ for a document store (body fields below) or `"kv"` for a KV store (see
 | Field        | Type             | Required | Description                          |
 |-------------|-----------------|----------|--------------------------------------|
 | `store_type` | `"doc"`          | yes      | Selects a document store             |
-| `namespace`  | string           | yes      | Unique name (`[a-zA-Z0-9_-]+`)       |
+| `namespace`  | string           | yes      | Unique name (`[a-zA-Z0-9_-]+`, at most 128 bytes) |
 | `key_type`   | `uuid`/`u64`/`u128`/`str` | yes | Primary key type                |
 | `indices`    | array            | yes      | Zero to 5 index specs (may be empty) |
 | `attributes` | array            | no       | Non-indexed field declarations       |
@@ -475,7 +475,7 @@ curl -X POST http://localhost:8080/stores \
 Wider chunk codes make the first search pass rank its candidates better and
 keep chunks in their nearest partition, at the cost of more storage (1.7× at
 2 bits, 3× at 4) and, at 4 bits, slower searches; how to choose is in
-[Semantic-Search-Architecture.md, *Choosing a Pass-1 width*](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
+[Semantic-Search-Architecture.md, *Choosing a Pass-1 width*](../minnal_db/src/semantic_search/docs/Semantic-Search-Architecture.md#choosing-a-pass-1-width).
 The fixed settings are kept if the vector index is dropped, and re-enabling it
 (`enable_vector_index`) with a different value for one of them returns `409`.
 
@@ -588,7 +588,8 @@ vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
 `enable_vector_index` with the new field set. A field that is already a `str`
 attribute (as the old embedding fields are after the drop) becomes an
 embedding field; any other name is added as a `str` attribute. It returns `409`
-if a vector index already exists, and `400` if `fields` is empty, contains
+if a vector index already exists or the previous one is still being removed, and
+`400` if `fields` is empty, contains
 duplicates, or names an index field or an attribute of another type.
 
 **Change search or partition settings:** once semantic search is enabled, the
@@ -613,7 +614,7 @@ this many), `min_probes` (a floor for requests that lower `max_probes`),
 `maintenance` accepts `target_posting_size`, `reassign_range`, `merge_ratio`,
 `skip_uncertain_moves`, `split_samples`, `split_init_trials`, `split_max_iters`
 and `split_lambda_factor`. What each one does, its default and its allowed range
-are in [Semantic-Search-Architecture.md §3.4](../minnal_db/src/semantic_search/report/Semantic-Search-Architecture.md#34-parameters).
+are in [Semantic-Search-Architecture.md §3.4](../minnal_db/src/semantic_search/docs/Semantic-Search-Architecture.md#34-parameters).
 The embedding model, dimension, chunking and Pass-1 code width
 (`quantisation.pass1_bits`) are fixed once semantic search is enabled and cannot
 be changed here. A value out of range returns `400`; a store
@@ -1902,7 +1903,7 @@ curl -X POST http://localhost:8080/admin/indices/users/attribute/reindex-all
 # → 202 Accepted
 ```
 
-Returns `409` when an attribute operation is already active for `{ns}`. Returns `422` when the namespace has no indices to rebuild.
+Returns `409` when an attribute operation is already active for `{ns}`, or while one of its index builds is still running (including the builds an earlier `reindex-all` started); retry when the builds finish. Returns `422` when the namespace has no indices to rebuild.
 
 ---
 
@@ -2032,6 +2033,8 @@ Disable semantic search and clear all vector index data: queue entries and the `
 curl -X DELETE http://localhost:8080/admin/indices/products/vector/drop-all
 # → 202 Accepted
 ```
+
+Works for both document stores and semantic-search KV stores. A document store can turn semantic search back on by amending its schema; a KV store chooses it when it is created, so turning it back on means re-creating the store.
 
 Returns `409` when a cleanup or campaign is already running. Returns `422` when semantic search is not enabled.
 
@@ -2536,7 +2539,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   ns_system_pending_vec_index/       ← queue of documents waiting to be embedded
   ns_system_qemb_cache/              ← cached query embeddings
   ns_system_schema/                  ← every store's schema, keyed by store name
-  index/
+  field-index/
     {ns_id}/                  ← doc stores only; KV stores have no field indices
       {field_id}/
         blobs.keys, blobs.vals ← one RoaringBitmap per field value (append-only blob store)
@@ -2552,4 +2555,8 @@ them from an in-memory copy that each schema change updates. Every schema
 declares a mandatory `store_type` field — `"doc"` or `"kv"` — which tells the
 two kinds apart. Both kinds share the namespace names, so a doc store and a KV
 store cannot have the same name, and no store may be named `system` or start
-with `system_`.
+with `system_`. Creating a store answers `409` if a namespace of that name already
+holds keys written directly through the library. A store's name also cannot end in `_sparse_vector`,
+`_sparse_vector_meta`, `_dense_vector`, `_ivf_centres`, `_ivf_postings` or
+`_ivf_journal`: those namespaces hold the vector index of the store named by the
+rest.

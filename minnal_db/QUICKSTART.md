@@ -122,7 +122,7 @@ background workers and flushes buffered writes.
 
 ### The synchronous API
 
-```rust
+```rust,no_run
 use minnal_db::Db;
 
 let db = Db::open("/tmp/mydb")?;
@@ -139,6 +139,7 @@ let ns = db.namespace("orders")?;
 ns.put(b"o1", b"shipped")?;
 
 db.shutdown()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### Read-modify-write with `merge`
@@ -151,7 +152,8 @@ value, and whichever writes second wipes out the other's increment.
 `merge` is that sequence done atomically. It takes the same `(key, value)` as
 `put` plus a closure, and the closure decides what actually gets stored:
 
-```rust
+```rust,no_run
+# use minnal_db::Db;
 let db = Db::open("/tmp/mydb")?;
 
 // Increment a counter by the operand, creating it at zero.
@@ -161,6 +163,7 @@ let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
     Ok(Some((current + step).to_le_bytes().to_vec()))
 })?;
 // → Some(new count). Run it from ten threads and none of them is lost.
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The closure receives `(existing, operand)` — `existing` is `None` when the key is
@@ -175,7 +178,8 @@ absent — and its return value drives the write:
 `Err` is how you decline a write, and `KVError::MergeAborted` exists for exactly
 that so you needn't borrow an error variant that means something else:
 
-```rust
+```rust,no_run
+# let db = minnal_db::Db::open("/tmp/mydb")?;
 // A counter that refuses to go past a cap.
 let result = db.merge(b"quota", &1u64.to_le_bytes(), |existing, operand| {
     let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
@@ -185,15 +189,18 @@ let result = db.merge(b"quota", &1u64.to_le_bytes(), |existing, operand| {
     let step = u64::from_le_bytes(operand.try_into().unwrap());
     Ok(Some((current + step).to_le_bytes().to_vec()))
 });
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `merge_typed` is the same thing over rkyv values, so the closure works with your
 own type instead of bytes:
 
-```rust
+```rust,no_run
+# let db = minnal_db::Db::open("/tmp/mydb")?;
 let total: Option<u64> = db.merge_typed(&"visits".to_string(), &1u64, |current, step| {
     Ok(Some(current.unwrap_or(0) + step))
 })?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Both are available on `Db`, `Namespace`, `AsyncDb` and `AsyncNamespace`. Three
@@ -219,7 +226,9 @@ things to know:
 identical; the calls take owned buffers and are awaited. `merge` additionally
 needs its closure to be `Send + 'static`, because it runs on a blocking worker.
 
-```rust
+```rust,no_run
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
 use minnal_db::AsyncDb;
 
 let db = AsyncDb::open("/tmp/mydb").await?;
@@ -234,6 +243,8 @@ db.merge(b"visits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
 .await?;
 
 db.shutdown().await?;
+# Ok(())
+# }
 ```
 
 ---
@@ -251,7 +262,7 @@ Setting this up is four steps, shown in full below: declare the fields you want
 indexed, activate each one with its extractor, write records as usual, and query
 with the predicate DSL.
 
-```rust
+```rust,no_run
 use std::sync::Arc;
 use minnal_db::{Db, ExtractorFn, IndexValue, IndexValueType, KVError, DEFAULT_NAMESPACE_ID};
 
@@ -321,7 +332,7 @@ store wires up the rest. The schema is the same shape as the REST create payload
 documented in [`minnal_db_api`](../minnal_db_api/README.md), so what you learn
 here carries over to the server.
 
-```rust
+```rust,no_run
 use minnal_db::{DocId, DocStore, DocStoreSchema, IndexSpec, IndexType, KeyType, Pagination, StoreType};
 
 #[tokio::main]
@@ -344,6 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         semantic_search_enabled: false,
         embedding_fields: vec![],
+        vector_index: None,
     };
     store.create(schema).await?;
 
@@ -378,7 +390,13 @@ empty.** The cap is counted in bytes, not characters, so a 20-character key of
 3-byte code points is 60 bytes and is rejected. `StrKey::new` is the only
 constructor and does the validation, so an invalid key cannot reach storage:
 
-```rust
+```rust,no_run
+# use minnal_db::*;
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let store = DocStore::open("/tmp/docs").await?;
+use minnal_db::StrKey;
+
 let schema = DocStoreSchema {
     namespace: "slugs".into(),
     store_type: StoreType::Doc,
@@ -388,6 +406,7 @@ let schema = DocStoreSchema {
     indices: vec![IndexSpec { field: "status".into(), index_type: IndexType::Str }],
     semantic_search_enabled: false,
     embedding_fields: vec![],
+    vector_index: None,
 };
 store.create(schema).await?;
 
@@ -396,6 +415,8 @@ store.put("slugs", id, serde_json::json!({ "status": "active" })).await?;
 
 // Prefix scans take the raw key bytes, which for a string store is the string.
 let page = store.scan_prefix("slugs", b"acme-".to_vec(), None, 100).await?;
+# Ok(())
+# }
 ```
 
 The same cap applies to `KvKeyType::Str` keys in a KV store.
@@ -446,8 +467,8 @@ naming the embedding service and hand it to the store as a
 `SemanticSearchContext`. Attach it once, at startup — it is also what spawns the
 embed-worker and the partition maintenance task.
 
-```rust
-use minnal_db::doc_store::vector_settings::{SearchSpec, VectorIndexSpec};
+```rust,no_run
+use minnal_db::doc_store::schema::vector_settings::{SearchSpec, VectorIndexSpec};
 use minnal_db::semantic_search::service::SemanticSearchConfig;
 use minnal_db::{
     AttributeDef, AttributeType, DocId, DocStore, DocStoreSchema, KeyType, KvKeyType,
@@ -466,6 +487,9 @@ let config = SemanticSearchConfig {
 let store = DocStore::open("/tmp/sem")
     .await?
     .with_semantic_search(SemanticSearchContext::new(config));
+# Ok(())
+# }
+# fn main() {}
 ```
 
 ### Searching a document store
@@ -476,7 +500,13 @@ an embed job automatically, and `search_semantic` runs the two-pass ANN search
 over what has been indexed so far. Results come back with the document's key
 bytes in `document_id`.
 
-```rust
+```rust,no_run
+# use minnal_db::doc_store::schema::vector_settings::{SearchSpec, VectorIndexSpec};
+# use minnal_db::*;
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let config = minnal_db::semantic_search::service::SemanticSearchConfig { embedding_service_url: "http://localhost:8001".into(), ..Default::default() };
+# let store = DocStore::open("/tmp/sem").await?.with_semantic_search(SemanticSearchContext::new(config));
 // A doc store whose `body` field is embedded with gemma (768 dimensions).
 let schema = DocStoreSchema {
     namespace: "articles".into(),
@@ -505,6 +535,8 @@ for r in hits.results {
     let id = u64::from_be_bytes(r.document_id[..8].try_into().unwrap());
     println!("doc {id}  score={:.4}", r.dot_product);
 }
+# Ok(())
+# }
 ```
 
 ### Searching a KV store
@@ -514,7 +546,14 @@ A KV store works the same way with less ceremony: declare it with
 write gets embedded. Here `document_id` in the results is the raw string key
 rather than encoded key bytes.
 
-```rust
+```rust,no_run
+# use minnal_db::doc_store::schema::vector_settings::SearchSpec;
+# use minnal_db::*;
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let config = minnal_db::semantic_search::service::SemanticSearchConfig { embedding_service_url: "http://localhost:8001".into(), ..Default::default() };
+# let store = DocStore::open("/tmp/sem").await?.with_semantic_search(SemanticSearchContext::new(config));
+# let top5 = SearchSpec { top_k: Some(5), ..Default::default() };
 // A KV store whose string values are embedded, with the default settings (gemma, 768).
 let kv_schema = KvStoreSchema {
     namespace: "notes".into(),
@@ -537,7 +576,8 @@ for r in hits.results {
 }
 
 store.shutdown().await?; // stops the embed-worker cleanly
-# Ok(()) }
+# Ok(())
+# }
 ```
 
 ---
@@ -568,7 +608,7 @@ tikv-jemallocator = "0.7"
 and declare it once in `src/main.rs`. Nothing else changes: every allocation in
 the process, minnal's included, now goes through jemalloc.
 
-```rust
+```rust,no_run
 use minnal_db::Db;
 
 // Every heap allocation in this program, minnal's background workers included,

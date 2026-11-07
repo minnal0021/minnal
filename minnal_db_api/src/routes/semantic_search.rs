@@ -68,7 +68,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_db::doc_store::vector_settings::SearchSpec;
+use minnal_db::doc_store::schema::vector_settings::SearchSpec;
 use minnal_db::{DocId, DocStoreError, Pagination};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;

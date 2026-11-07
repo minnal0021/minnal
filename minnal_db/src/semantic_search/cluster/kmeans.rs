@@ -21,6 +21,7 @@
 use rayon::prelude::*;
 
 use super::split::SplitRng;
+use crate::semantic_search::vector_math::{add_to_sum, sq_dist};
 
 /// How k-means runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,11 +55,6 @@ pub struct KmeansResult {
     pub sizes: Vec<u64>,
     /// Lloyd iterations run.
     pub iterations: usize,
-}
-
-fn sq_dist(a: &[f32], b: &[f32]) -> f64 {
-    use simsimd::SpatialSimilarity;
-    f32::sqeuclidean(a, b).expect("equal dimensions")
 }
 
 /// The nearest of `centres` to `x` (ties to the lower index) and its distance.
@@ -159,9 +155,7 @@ where
         let mut buf = Vec::with_capacity(dim);
         for (i, &l) in labels.iter().enumerate() {
             point(i, &mut buf);
-            for (acc, &x) in sums[l as usize].iter_mut().zip(&buf) {
-                *acc += f64::from(x);
-            }
+            add_to_sum(&mut sums[l as usize], &buf);
         }
         for (c, (sum, &size)) in centres.iter_mut().zip(sums.iter().zip(&sizes)) {
             *c = if size > 0 {

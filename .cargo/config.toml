@@ -27,3 +27,9 @@ RUST_TEST_THREADS = "5"
 #   cargo test --config 'target."cfg(target_os = \"macos\")".runner=[]'
 [target.'cfg(target_os = "macos")']
 runner = ["/usr/bin/env", "RUST_TEST_THREADS=1"]
+
+# On Linux (WSL included), tests write their temporary databases to tmpfs. The
+# script says when it applies and how to run on a real disk instead. macOS has no
+# /dev/shm and no such runner, so its tests stay on the normal temporary directory.
+[target.'cfg(target_os = "linux")']
+runner = ".cargo/test-runner.sh"

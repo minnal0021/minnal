@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "doc-store")]
 pub(crate) mod file_lock;
 pub mod hex;
+pub mod metrics;
 #[cfg(test)]
 pub(crate) mod runtime_probe;
 pub(crate) mod simd_support;
@@ -101,13 +102,45 @@ pub(crate) const TEST_NUM_BUCKETS: usize = 2;
 
 /// Test-only `DbConfig` with the small [`TEST_NUM_BUCKETS`] bucket count.
 ///
-/// Used by the `vector_kv` tests so the fd mitigation above applies there too.
-/// See [`TEST_NUM_BUCKETS`] for the why.
-#[cfg(all(test, feature = "semantic-search"))]
+/// Used by the document-store and vector tests so the fd mitigation above applies
+/// there too. See [`TEST_NUM_BUCKETS`] for the why.
+#[cfg(all(test, any(feature = "doc-store", feature = "semantic-search")))]
 pub(crate) fn test_db_config() -> crate::DbConfig {
     crate::DbConfig {
         num_buckets: TEST_NUM_BUCKETS,
         ..Default::default()
+    }
+}
+
+/// Test-only: the files this process has open under `dir`, deleted ones included.
+///
+/// It looks only under `dir`, so tests running alongside cannot disturb the answer.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn open_files_under(dir: &std::path::Path) -> Vec<String> {
+    let dir = dir.to_string_lossy().into_owned();
+    let inside = format!("{dir}/");
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .map(|target| target.to_string_lossy().into_owned())
+        .filter(|target| target.starts_with(&inside))
+        .collect()
+}
+
+/// Test-only: wait for every file under `dir` to be closed, and fail naming those
+/// still open. It waits because a worker's last pass can hold a database for a
+/// moment after its last handle goes, and it yields to the runtime so that pass
+/// can finish.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) async fn assert_no_open_files_under(dir: &std::path::Path, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let open = open_files_under(dir);
+        if open.is_empty() {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what}: {} files still open: {open:#?}", open.len());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
@@ -138,4 +171,55 @@ pub fn key_prefix_of(bytes: &[u8]) -> u64 {
     let n = bytes.len().min(8);
     buf[..n].copy_from_slice(&bytes[..n]);
     u64::from_be_bytes(buf)
+}
+
+/// Smallest key strictly greater than every key beginning with `prefix` — the
+/// exclusive upper bound for a prefix scan expressed as a range `[prefix, …)`.
+///
+/// Increments the last byte that is not `0xFF` and drops the all-`0xFF` tail.
+/// Returns `None` when `prefix` is empty or all `0xFF`: there is no finite
+/// exclusive bound, so the scan runs open-ended to the last key.
+pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.last_mut() {
+        if *last != 0xFF {
+            *last += 1;
+            return Some(upper);
+        }
+        upper.pop();
+    }
+    None
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch.
+#[cfg(any(feature = "doc-store", feature = "semantic-search"))]
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::prefix_upper_bound;
+
+    #[test]
+    fn upper_bound_increments_last_byte() {
+        assert_eq!(prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
+    }
+
+    #[test]
+    fn upper_bound_carries_over_trailing_ff() {
+        assert_eq!(prefix_upper_bound(&[b'a', 0xFF, 0xFF]), Some(vec![b'b']));
+    }
+
+    #[test]
+    fn upper_bound_all_ff_is_open_ended() {
+        assert_eq!(prefix_upper_bound(&[0xFF, 0xFF]), None);
+    }
+
+    #[test]
+    fn upper_bound_empty_is_open_ended() {
+        assert_eq!(prefix_upper_bound(b""), None);
+    }
 }

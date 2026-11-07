@@ -76,7 +76,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
                                       ▼
                       ┌──────────────────────────────┐
                       │ Database coordinator         │
-                      │ (db/database.rs)             │
+                      │ (db/database/)             │
                       │                              │
                       │ • namespace registry         │
                       │ • the shared WAL             │
@@ -261,7 +261,7 @@ The WAL is the safety net beneath every write. It is a single, global, append-on
 
 **Durability model.** Every `put`/`delete`/`merge` returns only once a WAL `fsync` that started after its entry was written has finished, so each acknowledged write is durable against power loss the moment the call returns. Concurrent writes **share** fsyncs (**group commit**): each appends its entry under the WAL lock and releases it, then waits for a **commit round** — one fsync, issued by whichever waiting writer finds no round running, that covers every entry appended before it started. A lone writer pays one fsync per write; under load one fsync covers many. No write is acknowledged early: the fsync is shared, not skipped or deferred. A failed fsync stops the WAL (**poisoned**): every writer in that round, and every later one, gets an error until the database is reopened. (`sync.commit_delay_us` can make a round's leader wait briefly for more writers when others are already waiting; it is 0 by default. Separately, `records_per_sync` tunes only the *value-log* `fsync` cadence, which is safe to batch precisely because the WAL holds a durable copy until the entry is retired.)
 
-Both logs — this one and the [vector index WAL](#vector-index-wal) — use one on-disk format, the **segmented log** (`db/segmented_log.rs`); they differ only in a four-byte magic and in what a record's body holds. A log is a directory of **segment files** `{segment_id:010}.log`. Each segment starts with a header naming the log, its format version and its own id, so a file from another log, or from another format version, fails loudly instead of being parsed. Each record is a **frame**: its length, a CRC32 of its body, then the body. Once written, a frame never changes: the log is append-only.
+Both logs — this one and the [vector index WAL](#vector-index-wal) — use one on-disk format, the **segmented log** (`db/wal/segmented_log.rs`); they differ only in a four-byte magic and in what a record's body holds. A log is a directory of **segment files** `{segment_id:010}.log`. Each segment starts with a header naming the log, its format version and its own id, so a file from another log, or from another format version, fails loudly instead of being parsed. Each record is a **frame**: its length, a CRC32 of its body, then the body. Once written, a frame never changes: the log is append-only.
 
 ```
 segment: [magic "MWAL" | format_version u32 | segment_id u64]   ← 16-byte header
@@ -350,12 +350,12 @@ The WAL lock is held only to append, never across an fsync. On the NVMe drive th
 
 ### Vector index WAL
 
-Semantic search (the `semantic-search` feature) writes a lot per document: each document's chunk codes and its whole-document code, plus the copies, rewrites and deletes partition maintenance makes as it splits and merges postings. These are large or frequent, and all of them can be made again (by re-embedding the document, or by redoing a maintenance step). Sending each one through the main WAL would make every one of them wait for a main-WAL fsync, and put their bulk in the log every client write shares. They go to a second log instead, the **vector index WAL** (`db/vector_index_wal.rs`):
+Semantic search (the `semantic-search` feature) writes a lot per document: each document's chunk codes and its whole-document code, plus the copies, rewrites and deletes partition maintenance makes as it splits and merges postings. These are large or frequent, and all of them can be made again (by re-embedding the document, or by redoing a maintenance step). Sending each one through the main WAL would make every one of them wait for a main-WAL fsync, and put their bulk in the log every client write shares. They go to a second log instead, the **vector index WAL** (`db/wal/vector_index_wal/mod.rs`):
 
 - **One per database**, shared by every namespace, in `<db_path>/vector_index_wal/`. Each record names its namespace.
 - **No fsync per write.** `Database::put_ns_logged` / `delete_ns_logged` (called through a namespace as `put_logged` / `delete_logged`) append the record and apply it to the memtable, and return. A later `sync_vector_index_wal` makes every record appended before it durable with one fsync. The vector worker syncs once per batch of up to 256 documents before it removes their queue entries; partition maintenance syncs once per batch of 16 documents.
 - **Its own lock.** Appends take the log's append lock only to write the bytes, and the fsync runs outside it. A client's main-WAL write never waits on this log.
-- **Syncs share fsyncs**, through the same commit rounds as the main WAL (`db/commit_rounds.rs`): when the vector worker, partition maintenance and a flush sync at once, one fsync covers them all.
+- **Syncs share fsyncs**, through the same commit rounds as the main WAL (`db/wal/commit_rounds.rs`): when the vector worker, partition maintenance and a flush sync at once, one fsync covers them all.
 - **Same seq counter, same key stripe** as every other write, so writes to one key through either log apply in seq order, and the highest seq wins after a crash too.
 
 ```mermaid
@@ -399,22 +399,22 @@ sequenceDiagram
 
 **A failed fsync stops the log** until the database is reopened: the kernel may have dropped the unwritten pages, so a later successful fsync proves nothing about them. Appends and syncs then fail, vector indexing stops, and documents stay queued.
 
-The design and its measurements are in `src/semantic_search/report/Vector-Index-WAL-Design.md` and `Fewer-WAL-Fsyncs-Design.md`.
+The design and its measurements are in `src/semantic_search/docs/Vector-Index-WAL-Design.md` and `Fewer-WAL-Fsyncs-Design.md`.
 
 ### WAL terms
 
-- **WAL (main WAL)** — the database's write-ahead log, `db/wal.rs`. Every ordinary write appends one entry and returns only once an fsync covers it.
+- **WAL (main WAL)** — the database's write-ahead log, `db/wal/main_wal.rs`. Every ordinary write appends one entry and returns only once an fsync covers it.
 - **fsync** — the system call that waits until a file's written bytes are on stable storage. The cost that matters here, on the NVMe drive the benchmarks use: about 2.3 ms when the fsync must also commit file metadata (a new file size, or a newly allocated block), about 0.7 ms when it need not, as in a zero-filled WAL segment.
 - **WAL lock** (`Database::wal_metadata`) — the lock every main-WAL write takes to take its seq and append its entry, so seq order is log order. Inside it the append takes the log's own append lock, which is never contended (every main-WAL append already holds the WAL lock) and which a commit round takes briefly to read the tail. Both are released before the fsync.
 - **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
-- **Commit round** — one fsync and the callers it releases, in either log (`db/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
+- **Commit round** — one fsync and the callers it releases, in either log (`db/wal/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
 - **Sequence (seq)** — the global write counter (`next_seq`) every write draws from, whichever log it uses. The highest seq for a key wins everywhere: memtable, L0, L1, and replay of either log.
-- **Key stripe lock** (`db/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
+- **Key stripe lock** (`db/database/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
 - **Memtable** — a namespace's in-memory sorted buffer of recent writes (a skip list). **Seal:** turning a full one read-only so it can be flushed. **Flush:** writing a sealed memtable to L0 files and fsyncing them.
 - **L0 / L1** — the LSM tree's on-disk levels: L0 holds one file per flush per bucket, L1 one merged file per bucket. **Compaction** merges L0 into L1 and may drop tombstones there.
 - **Tombstone** — the record a delete leaves, so the key reads as absent until compaction removes both.
 - **WAL consumer** (main WAL) — anything that needs the WAL from some position on, and reports by an event when that position moves: each namespace's memtables (moved by a flush) and each active field index (moved by its checkpoint). WAL GC keeps the log from the lowest of them.
-- **Segmented log** — the on-disk format and mechanics both logs share (`db/segmented_log.rs`): segment files with a header, checksummed frames, an end marker on every sealed segment, preallocation, commit rounds, and the rules open uses to tell a torn tail from damage.
+- **Segmented log** — the on-disk format and mechanics both logs share (`db/wal/segmented_log.rs`): segment files with a header, checksummed frames, an end marker on every sealed segment, preallocation, commit rounds, and the rules open uses to tell a torn tail from damage.
 - **Position** — a place in a log, `(segment_id << 32) | byte`, in either log; shown as `{segment_id, byte}`.
 - **Cut** (main WAL) — every entry below this position is in an SSTable: the lowest safe offset of any namespace with unflushed writes, capped at the oldest write still in flight. WAL GC deletes segments wholly below it, once every field index has checkpointed past them. Saved, with each namespace's safe offset, in the WAL metadata file by the flush that moves it, before its L0 files are registered.
 - **No-WAL write** — `put_no_wal` / `delete_no_wal` / `merge_no_wal`: applied to the memtable with no log entry at all. It is durable only once its memtable is flushed (the LSM worker flushes such namespaces every tick, 60 s by default), and lost if the process dies first. Used only where losing it is harmless: the query-embedding cache, and the embed queue's completions.
@@ -518,7 +518,7 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 ├── fail_logs/                  # Recovery fail-log files (one per recovery run)
 │   └── fail_log_<timestamp>.json
 │
-├── index/                      # Field indexes, keyed by namespace ID
+├── field-index/                # Field indexes, keyed by namespace ID
 │   └── <ns_id>/
 │       ├── <field_id>/         # One field: bitmaps, value→bitmap map, checkpoint
 │       └── rowmap/             # Dense row-ID map shared by the namespace's fields
@@ -813,10 +813,23 @@ cargo bench --bench bench_sstable_lookup
 cargo bench --bench bench_predicate       # field-index query evaluation
 cargo bench --bench bench_bitmap_paging   # paginating query results
 cargo bench --bench bench_distance_estimation --features semantic-search
+cargo bench --bench bench_pass1_search --features semantic-search
 
 # All benchmarks
 cargo bench -p minnal_db --all-features
 ```
+
+The sources in `benches/` are grouped by what they measure:
+
+| Folder | Measures |
+|---|---|
+| `kv/` | The key-value API: writes, reads, merge, scans, mixed workloads, the typed API |
+| `storage/` | Engine internals: WAL appends, point lookups across storage tiers |
+| `field_index/` | Field-index query evaluation and result paging |
+| `semantic_search/` | Distance estimation and the two-pass vector search |
+| `under_load/` | The `engine_bench` target: document-store operations with every background worker running, described in [`benchmark.md`](benchmark.md#the-engine-at-work) |
+
+`benches/script/run_benchmarks.sh` runs every Criterion suite with `-C target-cpu=native`, and with AVX-512 when the CPU has it, builds with at most 4 jobs unless `CARGO_BUILD_JOBS` says otherwise, and writes a summary to `benches/script/reports/`. It accepts `--filter`, `--baseline`, `--compare`, `--no-avx512` and `--quick`; `--help` describes them.
 
 Benchmark reports are written to `target/criterion/`. The helpers in `benches/common.rs` disable background workers and use `target/bench_tmp/` (rather than `/tmp/`) to avoid skew from RAM-backed filesystems.
 

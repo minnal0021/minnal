@@ -11,7 +11,7 @@
 and the measurements in §14. Preallocated segments (§15) built after; the vector index
 WAL's syncs coalesced the same way (§16); zero-filled segments (§17, §18); one
 log format for both WALs (§19) and the review that followed it (§20).
-**Scope:** the main WAL (`db/wal.rs`, its append in `Database::put_ns_locked` /
+**Scope:** the main WAL (`db/wal/main_wal.rs`, its append in `Database::put_ns_locked` /
 `delete_ns_locked`, its recovery and its GC). Three changes, built in order:
 
 - **A. Retire by cut.** Everything that needs the WAL reports, by an event, how
@@ -123,7 +123,7 @@ with the drive about 92% busy (`Fewer-WAL-Fsyncs-Design.md`, §14).
 An entry can leave the log once its write is in an L0 file. The WAL works that
 out in two stages: it keeps a **cut** (every entry below it is in an SSTable)
 and records it; WAL GC later deletes segments wholly below it.
-`WalPersistObserver` in `db/database.rs` does the first stage, driven by the
+`WalPersistObserver` in `db/database/` does the first stage, driven by the
 flush events.
 
 **While writes come in.** Each write is appended to the WAL, then applied to
@@ -800,7 +800,7 @@ What does not change:
 
 ## 9. Tests
 
-**Change A** (`db/database_tests.rs`, `db/wal_gc.rs`):
+**Change A** (`db/database/tests.rs`, `db/wal/gc.rs`):
 
 - After a flush the saved cut equals the observer's cut, and a crash then
   replays nothing below it.
@@ -821,7 +821,7 @@ What does not change:
   every segment's bytes before and after a flush and a GC pass and checks the
   frames are unchanged.
 
-**A2** (`db/wal_gc.rs`, `db/database_tests.rs`):
+**A2** (`db/wal/gc.rs`, `db/database/tests.rs`):
 
 - A field whose checkpoint is behind a segment holds it; after its
   *checkpointed* event moves past, GC deletes it.
@@ -836,14 +836,14 @@ What does not change:
   `wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable` and the
   rest) keep passing.
 
-**Change B** (`db/wal.rs`):
+**Change B** (`db/wal/main_wal.rs`):
 
 - A frame with one changed byte in its key or value is rejected, and recovery
   stops there.
 - Open truncates a torn tail: after a torn record and a shorter new record, a
   second open replays only the new one.
 
-**Change C** (`db/wal.rs`, `db/database_tests.rs`):
+**Change C** (`db/wal/main_wal.rs`, `db/database/tests.rs`):
 
 - Sixteen threads writing concurrently: every write is readable and replays
   after a crash, and `wal_commit_rounds` < writes.
@@ -923,7 +923,7 @@ Each step is built, tested and reviewed before the next.
 4. **Group commit** (C1, then C2's setting at default 0), with the
    drop-unsynced crash helper and the mutation checks; `config/sample.toml`
    gains `commit_delay_us` under `[sync]`. Update `minnal_db/README.md` (*Durability model*, *WAL
-   terms*), `minnal_db/CLAUDE.md`, the `Db` doc comment in `facade.rs` and the
+   terms*), `minnal_db/CLAUDE.md`, the `Db` doc comment in `facade/db.rs` and the
    bench comments that describe per-write fsync.
 5. **minnal_ui** (change D): the admin console reads the WAL fields A1 and
    C change (per-segment entry counts, `wal_fsyncs`, the GC result's
@@ -982,7 +982,7 @@ The copy is then opened, which runs recovery. Writers are stopped either between
 operations or inside a commit (`Wal::freeze_commits`), with their entry
 appended but not yet covered, which is where a power loss would catch them.
 
-**Tests** (`db/power_loss_tests.rs`, plus the per-change tests in §9):
+**Tests** (`db/wal/power_loss_tests.rs`, plus the per-change tests in §9):
 
 - deterministic: an unacknowledged write is not readable and does not survive;
   concurrent writers share fsyncs and all survive; a lone writer issues one
@@ -1168,7 +1168,7 @@ covering the same bytes is running.
 **Design.**
 
 - The round logic moves out of `Wal` into one small type, `CommitRounds`
-  (`db/commit_rounds.rs`): the durable position, whether a round is running,
+  (`db/wal/commit_rounds.rs`): the durable position, whether a round is running,
   how many wait, the condition variable, the poisoned state, and the test
   hooks (freezing commits, failing the next fsync). Its `commit(end, delay,
   round)` is §6.1's loop; `round` is the log's own step: take a snapshot of
@@ -1273,7 +1273,7 @@ greenfield, so a version-1 log fails the open (no conversion).
   background under `{id:010}.log.prep`, with its header, and fsynced; rotation
   renames it into place and fsyncs the directory, waiting for it if
   unfinished, or creates the segment sparse if there is none. This is §17's
-  mechanism, moved into one small shared type (`db/segment_prep.rs`) that both
+  mechanism, moved into one small shared type (`db/wal/segment_prep.rs`) that both
   logs use, as §16 did for commit rounds. Open deletes leftover `.prep` files;
   the `.prep` name keeps a half-written file from looking like the next
   segment.
@@ -1379,7 +1379,7 @@ above covers what matters.
 ## 19. One log format for both WALs
 
 **What.** The main WAL and the vector index WAL are one log, the segmented
-log (`db/segmented_log.rs`, `SegmentedLog`), configured by a `LogFormat`
+log (`db/wal/segmented_log.rs`, `SegmentedLog`), configured by a `LogFormat`
 (name, magic, body version). Everything about how bytes reach the disk and
 come back after a crash is there once: segment files `{id:010}.log` with a
 16-byte header (magic, version, segment id), `[len][crc32(body)][body]`

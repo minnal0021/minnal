@@ -1,0 +1,1610 @@
+//! Memory-mapped two-file blob store.
+//!
+//! Stores a `u128 → raw-bytes` map in two memory-mapped regions.
+//!
+//! Used by `FieldIndex` to hold per-distinct-value `RoaringBitmap` data
+//! off-heap so the heap only carries the small `BTreeMap<V, u128>` ordering
+//! index.
+//!
+//! A store has one of two layouts (`BlobLayout`). In the **flat** layout
+//! (the keymap) a slot's blob is the whole value. In the **directory** layout
+//! (bitmaps) a slot's blob is a directory listing container blobs elsewhere in
+//! the same value region (format in `field_index::bitmap::codec`), so replacing one
+//! container appends that container and a new directory, not the whole bitmap.
+//! The store reads directories only to account for space: dead bytes, live
+//! bytes, compaction, and open-time repair.
+//!
+//! **Key file** (`blobs.keys`):
+//! - 64-byte header (magic, version, capacity, counts, value write pos)
+//! - Fixed-size 48-byte slots forming an open-addressing linear-probing hash table
+//!
+//! **Value file** (`blobs.vals`):
+//! - Append-only sequence of raw byte blobs
+//! - Each slot records the byte offset and length of its blob
+//!
+//! # Write order (crash safety)
+//!
+//! Replacing a blob never overwrites it: the new blob is appended
+//! (`BlobStore::append_value`) and the slot is then pointed at it
+//! (`BlobStore::set_slot`), leaving the old copy as dead space for
+//! `BlobStore::compact`. Both files are shared memory maps that the kernel
+//! writes back in any order, so a persistent owner sequences the two steps
+//! itself: append every blob, `BlobStore::sync_values`, set the slots,
+//! `BlobStore::sync_keys`. A slot then never reaches disk ahead of its blob.
+//!
+//! Slots are still rewritten in place, so a crash can tear one. Each live slot
+//! carries a CRC-32 of its other bytes (state byte 3; state 1 is a slot written
+//! without one, still read). `BlobStore::open` tombstones any torn slot or
+//! slot pointing past the value file, counts it in
+//! `BlobStore::damaged_at_open`, and recomputes the header (counts and the
+//! write cursor) from the slots, so a stale header cannot make a new append
+//! overwrite live data. Growing the key table (rehash) builds the new table in
+//! a separate file and renames it into place; compaction stages both files and
+//! commits with a marker (see `BlobStore::compact`).
+
+use std::fs::File;
+use std::io;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use crate::field_index::bitmap::codec::{self, DirEntry};
+use crate::field_index::growable_mmap::GrowableMmap;
+
+/// What a slot's blob is (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobLayout {
+    /// The blob is the whole value.
+    Flat,
+    /// The blob is a directory of container blobs (`field_index::bitmap::codec`).
+    Directory,
+}
+
+// ── Layout constants ──────────────────────────────────────────────────────────
+
+const MAGIC: u64 = 0x4D494E4E414C4253; // "MINNALBS"
+/// On-disk format version. 2: bitmap stores use the directory layout.
+const VERSION: u32 = 2;
+const HEADER_SIZE: usize = 64;
+const SLOT_SIZE: usize = 48;
+const INITIAL_CAPACITY: usize = 16;
+const INITIAL_KEY_SIZE: usize = HEADER_SIZE + INITIAL_CAPACITY * SLOT_SIZE;
+const INITIAL_VAL_SIZE: usize = 4096;
+const VALUE_ALIGNMENT: usize = 16;
+
+const STATE_EMPTY: u8 = 0;
+/// A live slot without a checksum (written before checksums existed). Read as
+/// live; never written any more.
+const STATE_OCCUPIED: u8 = 1;
+const STATE_TOMBSTONE: u8 = 2;
+/// On-disk state byte of a live slot that carries a checksum. [`read_slot`]
+/// reports it as [`STATE_OCCUPIED`]; [`write_slot`] always writes it.
+const STATE_OCCUPIED_CHECKED: u8 = 3;
+
+// ── Header ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+struct Header {
+    capacity: u64,
+    count: u64,
+    tombstone_count: u64,
+    value_write_pos: u64,
+}
+
+fn read_header(data: &[u8]) -> Header {
+    Header {
+        capacity: u64::from_le_bytes(data[16..24].try_into().unwrap()),
+        count: u64::from_le_bytes(data[24..32].try_into().unwrap()),
+        tombstone_count: u64::from_le_bytes(data[32..40].try_into().unwrap()),
+        value_write_pos: u64::from_le_bytes(data[48..56].try_into().unwrap()),
+    }
+}
+
+fn write_header(data: &mut [u8], h: &Header) {
+    data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+    data[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    data[12..16].fill(0);
+    data[16..24].copy_from_slice(&h.capacity.to_le_bytes());
+    data[24..32].copy_from_slice(&h.count.to_le_bytes());
+    data[32..40].copy_from_slice(&h.tombstone_count.to_le_bytes());
+    data[40..48].fill(0); // reserved
+    data[48..56].copy_from_slice(&h.value_write_pos.to_le_bytes());
+    data[56..64].fill(0);
+}
+
+fn init_header(data: &mut [u8], capacity: usize) {
+    write_header(
+        data,
+        &Header {
+            capacity: capacity as u64,
+            count: 0,
+            tombstone_count: 0,
+            value_write_pos: 0,
+        },
+    );
+}
+
+// ── Slot ──────────────────────────────────────────────────────────────────────
+//
+// Byte layout (48 bytes):
+//   0       state: u8
+//   1..8    pad
+//   8..24   key: u128  (LE)
+//   24..32  offset: u64 (LE)
+//   32..36  len: u32   (LE)
+//   36..40  crc32 of bytes 0..36 (live slots written with STATE_OCCUPIED_CHECKED)
+//   40..48  pad
+//
+// The checksum catches a slot torn by a crash: slots are rewritten in place in
+// a shared memory map, and a 48-byte slot can straddle a disk-sector boundary,
+// so after a power loss half of it can be old and half new.
+
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    state: u8,
+    key: u128,
+    offset: u64,
+    len: u32,
+}
+
+fn slot_byte_offset(i: usize) -> usize {
+    HEADER_SIZE + i * SLOT_SIZE
+}
+
+fn read_slot(data: &[u8], i: usize) -> Slot {
+    let b = slot_byte_offset(i);
+    Slot {
+        state: if data[b] == STATE_OCCUPIED_CHECKED { STATE_OCCUPIED } else { data[b] },
+        key: u128::from_le_bytes(data[b + 8..b + 24].try_into().unwrap()),
+        offset: u64::from_le_bytes(data[b + 24..b + 32].try_into().unwrap()),
+        len: u32::from_le_bytes(data[b + 32..b + 36].try_into().unwrap()),
+    }
+}
+
+fn write_slot(data: &mut [u8], i: usize, s: &Slot) {
+    let b = slot_byte_offset(i);
+    data[b] = if s.state == STATE_OCCUPIED { STATE_OCCUPIED_CHECKED } else { s.state };
+    data[b + 1..b + 8].fill(0);
+    data[b + 8..b + 24].copy_from_slice(&s.key.to_le_bytes());
+    data[b + 24..b + 32].copy_from_slice(&s.offset.to_le_bytes());
+    data[b + 32..b + 36].copy_from_slice(&s.len.to_le_bytes());
+    let crc = crc32fast::hash(&data[b..b + 36]);
+    data[b + 36..b + 40].copy_from_slice(&crc.to_le_bytes());
+    data[b + 40..b + 48].fill(0);
+}
+
+/// False only for a checksummed live slot whose checksum does not match: a
+/// slot torn by a crash. Unchecked (older) slots and non-live slots pass.
+fn slot_checksum_ok(data: &[u8], i: usize) -> bool {
+    let b = slot_byte_offset(i);
+    if data[b] != STATE_OCCUPIED_CHECKED {
+        return true;
+    }
+    let stored = u32::from_le_bytes(data[b + 36..b + 40].try_into().unwrap());
+    stored == crc32fast::hash(&data[b..b + 36])
+}
+
+// ── Open-time validation ───────────────────────────────────────────────────────
+
+fn invalid(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("blob store: {msg}"))
+}
+
+/// Validate a just-opened store's on-disk images before any read trusts them.
+///
+/// Without this, a corrupt or wrong file silently feeds garbage into the hot
+/// path: a zero `capacity` divides by zero in the hash modulo, a `capacity`
+/// larger than the key file slices out of bounds, and a slot whose `offset+len`
+/// runs past the value region reads arbitrary bytes. Every failure here is a
+/// controlled [`io::ErrorKind::InvalidData`], never a panic.
+fn validate_open(key: &[u8], val_len: usize) -> io::Result<()> {
+    if key.len() < HEADER_SIZE {
+        return Err(invalid("key file smaller than header"));
+    }
+    let magic = u64::from_le_bytes(key[0..8].try_into().unwrap());
+    if magic != MAGIC {
+        return Err(invalid(format!("bad magic {magic:#018x} (not a minnal blob store)")));
+    }
+    let version = u32::from_le_bytes(key[8..12].try_into().unwrap());
+    if version != VERSION {
+        return Err(invalid(format!("unsupported on-disk version {version} (expected {VERSION})")));
+    }
+    let hdr = read_header(key);
+    if hdr.capacity == 0 || !hdr.capacity.is_power_of_two() {
+        return Err(invalid(format!("capacity {} is not a non-zero power of two", hdr.capacity)));
+    }
+    // The key file must hold the full header + slot array for `capacity`.
+    let need = hdr
+        .capacity
+        .checked_mul(SLOT_SIZE as u64)
+        .and_then(|s| s.checked_add(HEADER_SIZE as u64))
+        .ok_or_else(|| invalid("capacity overflows key-file size"))?;
+    if (key.len() as u64) < need {
+        return Err(invalid(format!(
+            "key file {} bytes too small for capacity {} (need {need})",
+            key.len(),
+            hdr.capacity
+        )));
+    }
+    // Slots and the write cursor are checked by `BlobStore::repair_at_open`,
+    // which drops a damaged slot instead of refusing the whole store.
+    let _ = val_len;
+    Ok(())
+}
+
+// ── Length narrowing ───────────────────────────────────────────────────────────
+
+/// Narrow a byte length to the `u32` the on-disk slot/entry headers use,
+/// panicking with a clear message rather than silently truncating.
+///
+/// The store formats record blob/key lengths as `u32`, so a value at or beyond
+/// 4 GiB cannot be represented. That is pathological (a single index blob or key
+/// that large), but a silent `as u32` truncation would write a wrong length and
+/// corrupt the store on the next read — so fail loudly instead. Shared by
+/// [`BlobStore`] and `RowMap`.
+pub(crate) fn u32_len(len: usize, what: &str) -> u32 {
+    u32::try_from(len).unwrap_or_else(|_| panic!("{what} length {len} exceeds the u32 on-disk limit ({})", u32::MAX))
+}
+
+// ── Hash ──────────────────────────────────────────────────────────────────────
+
+fn hash_key(key: u128) -> usize {
+    let lo = key as u64;
+    let hi = (key >> 64) as u64;
+    lo.wrapping_add(hi.rotate_left(17))
+        .wrapping_mul(0x9e3779b97f4a7c15)
+        .wrapping_add(hi ^ lo.rotate_right(13)) as usize
+}
+
+// ── BlobStore ─────────────────────────────────────────────────────────────────
+
+/// Open-addressing hash table mapping `u128` keys to raw byte blobs stored in
+/// a companion value region.
+///
+/// Can be backed by anonymous mmaps (transient, in-memory) or persistent files
+/// (`blobs.keys` / `blobs.vals`) in a given directory.
+pub(crate) struct BlobStore {
+    key: GrowableMmap,
+    val: GrowableMmap,
+    /// Backing directory for persistent stores (`None` for anonymous ones).
+    /// Used by [`compact`](BlobStore::compact) to stage and atomically swap in
+    /// the rewritten `blobs.keys` / `blobs.vals` files.
+    dir: Option<PathBuf>,
+    /// Running count of reclaimable dead value-region bytes (blobs orphaned by
+    /// `set_slot`/`remove_key` since the last [`compact`](BlobStore::compact)).
+    /// Maintained incrementally so it is O(1) to read on the hot write path —
+    /// `waste_ratio`/`live_bytes` are O(capacity) and too costly per write. It is
+    /// an **in-memory hint** for the checkpoint-backpressure trigger, not
+    /// persisted: seeded from the on-disk state at [`open`](BlobStore::open) and
+    /// reset to 0 by `compact`. Equals `logical_bytes() - live_bytes()`.
+    dead_bytes: u64,
+    /// Slots dropped at open because they were damaged (torn by a crash, or
+    /// pointing outside the value file). The owner must rebuild from the source
+    /// of truth: the dropped entries are gone.
+    damaged_at_open: usize,
+    layout: BlobLayout,
+}
+
+impl BlobStore {
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    /// Create a new anonymous (transient) store with the flat layout.
+    #[cfg(test)]
+    pub fn new_anon() -> Self {
+        Self::new_anon_with(BlobLayout::Flat)
+    }
+
+    /// Create a new anonymous (transient) store with `layout`.
+    pub fn new_anon_with(layout: BlobLayout) -> Self {
+        let mut key = GrowableMmap::new_anon(INITIAL_KEY_SIZE).expect("anon key mmap alloc failed");
+        init_header(key.as_mut_slice(), INITIAL_CAPACITY);
+        let val = GrowableMmap::new_anon(INITIAL_VAL_SIZE).expect("anon val mmap alloc failed");
+        Self {
+            key,
+            val,
+            dir: None,
+            dead_bytes: 0,
+            damaged_at_open: 0,
+            layout,
+        }
+    }
+
+    /// Create a new persistent flat-layout store in `dir`, creating
+    /// `blobs.keys` and `blobs.vals`.
+    pub fn create(dir: &Path) -> io::Result<Self> {
+        Self::create_with(dir, BlobLayout::Flat)
+    }
+
+    /// Create a new persistent store with `layout` in `dir`.
+    pub fn create_with(dir: &Path, layout: BlobLayout) -> io::Result<Self> {
+        let mut key = GrowableMmap::create_file(&dir.join("blobs.keys"), INITIAL_KEY_SIZE)?;
+        init_header(key.as_mut_slice(), INITIAL_CAPACITY);
+        key.flush()?;
+        let val = GrowableMmap::create_file(&dir.join("blobs.vals"), INITIAL_VAL_SIZE)?;
+        Ok(Self {
+            key,
+            val,
+            dir: Some(dir.to_path_buf()),
+            dead_bytes: 0,
+            damaged_at_open: 0,
+            layout,
+        })
+    }
+
+    /// Open an existing persistent flat-layout store from `dir`.
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::open_with(dir, BlobLayout::Flat)
+    }
+
+    /// Open an existing persistent store with `layout` from `dir`.
+    pub fn open_with(dir: &Path, layout: BlobLayout) -> io::Result<Self> {
+        // Complete or discard any compaction that was interrupted by a crash
+        // before its file swap finished, so we always map a consistent pair.
+        Self::recover_compaction(dir)?;
+        let key = GrowableMmap::open_file(&dir.join("blobs.keys"))?;
+        let val = GrowableMmap::open_file(&dir.join("blobs.vals"))?;
+        validate_open(key.as_slice(), val.as_slice().len())?;
+        let mut store = Self {
+            key,
+            val,
+            dir: Some(dir.to_path_buf()),
+            dead_bytes: 0,
+            damaged_at_open: 0,
+            layout,
+        };
+        store.repair_at_open();
+        // Seed the dead-bytes hint from the loaded state (one O(capacity) scan at
+        // open) so backpressure is accurate immediately, even for a store that
+        // was already bloated when the process started.
+        store.dead_bytes = store.logical_bytes().saturating_sub(store.live_bytes());
+        Ok(store)
+    }
+
+    /// Make a just-opened store safe to use after any crash.
+    ///
+    /// Slots are rewritten in place in a shared memory map, and the kernel may
+    /// write those pages back at any time and in any order, so the files can
+    /// hold a mix of states. This drops (tombstones) every live slot that is
+    /// torn (checksum mismatch) or points outside the value file, counting them
+    /// in `damaged_at_open`, and recomputes the header from the slots: the
+    /// counts, and a write cursor past every live blob, so that a stale header
+    /// can never let a new append overwrite live data.
+    fn repair_at_open(&mut self) {
+        let val_len = self.val.as_slice().len() as u64;
+        let cap = self.header().capacity as usize;
+        let (mut live, mut tombs, mut damaged, mut max_end) = (0u64, 0u64, 0usize, 0u64);
+        for i in 0..cap {
+            let ok = slot_checksum_ok(self.key.as_slice(), i);
+            let s = read_slot(self.key.as_slice(), i);
+            match s.state {
+                STATE_OCCUPIED => {
+                    let end = s.offset.checked_add(s.len as u64).filter(|&e| ok && e <= val_len);
+                    // In the directory layout the slot's directory and every
+                    // container it lists must be intact and inside the file.
+                    let end = end.and_then(|end| match self.layout {
+                        BlobLayout::Flat => Some(end),
+                        BlobLayout::Directory => {
+                            let entries = codec::decode_dir(&self.val.as_slice()[s.offset as usize..end as usize]).ok()?;
+                            entries.iter().try_fold(end, |m, e| {
+                                let c_end = e.offset.checked_add(e.len as u64).filter(|&c| c <= val_len)?;
+                                Some(m.max(c_end))
+                            })
+                        }
+                    });
+                    match end {
+                        Some(end) => {
+                            live += 1;
+                            max_end = max_end.max(end);
+                        }
+                        _ => {
+                            self.key.as_mut_slice()[slot_byte_offset(i)] = STATE_TOMBSTONE;
+                            tombs += 1;
+                            damaged += 1;
+                        }
+                    }
+                }
+                STATE_TOMBSTONE => tombs += 1,
+                _ => {}
+            }
+        }
+        let mut h = self.header();
+        h.count = live;
+        h.tombstone_count = tombs;
+        h.value_write_pos = h.value_write_pos.min(val_len).max(max_end);
+        self.set_header(&h);
+        if damaged > 0 {
+            log::error!(
+                "blob store {:?}: dropped {damaged} damaged slot(s) at open (torn by a crash, or pointing outside the value file); \
+                 the owner must rebuild this store",
+                self.dir
+            );
+        }
+        self.damaged_at_open = damaged;
+    }
+
+    /// Number of slots dropped at open as damaged (see `repair_at_open`). Non-zero
+    /// means entries were lost and the owner must rebuild.
+    pub fn damaged_at_open(&self) -> usize {
+        self.damaged_at_open
+    }
+
+    /// Returns `true` if persistent store files exist in `dir`.
+    pub fn exists(dir: &Path) -> bool {
+        dir.join("blobs.keys").exists() && dir.join("blobs.vals").exists()
+    }
+
+    // ── Header accessors ──────────────────────────────────────────────────────
+
+    fn header(&self) -> Header {
+        read_header(self.key.as_slice())
+    }
+
+    fn set_header(&mut self, h: &Header) {
+        write_header(self.key.as_mut_slice(), h);
+    }
+
+    // ── Public metrics ────────────────────────────────────────────────────────
+
+    /// Number of live (occupied) entries.
+    pub fn count(&self) -> usize {
+        self.header().count as usize
+    }
+
+    /// Total bytes occupied by the value region — i.e. live blobs **plus** the
+    /// stale copies left by the append-only `upsert`. This is the figure that
+    /// balloons for low-cardinality fields (a value rewritten per document leaves
+    /// one dead copy each time) until [`compact`] reclaims it.
+    ///
+    /// Reported on the same `VALUE_ALIGNMENT` convention as [`live_bytes`]: the
+    /// write cursor (`value_write_pos`) is end-unpadded after the last blob, but
+    /// `live_bytes` rounds every blob up to alignment, so the raw cursor can read
+    /// *below* `live_bytes` for a freshly written store. Rounding the cursor up to
+    /// alignment keeps the documented invariant `logical_bytes ≥ live_bytes`.
+    ///
+    /// [`compact`]: BlobStore::compact
+    /// [`live_bytes`]: BlobStore::live_bytes
+    pub fn logical_bytes(&self) -> u64 {
+        align_up(self.header().value_write_pos as usize, VALUE_ALIGNMENT) as u64
+    }
+
+    /// Bytes the value region would occupy after [`compact`] — the live blobs
+    /// only. `logical_bytes() - live_bytes()` is the reclaimable dead space.
+    ///
+    /// [`compact`]: BlobStore::compact
+    pub fn live_bytes(&self) -> u64 {
+        self.compacted_value_bytes()
+    }
+
+    /// Reclaimable dead value-region bytes since the last [`compact`], tracked
+    /// incrementally so this is **O(1)** — unlike [`waste_ratio`] / [`live_bytes`]
+    /// which scan every slot. Used by the write path to decide whether to request
+    /// an early index checkpoint (backpressure) without a per-write O(capacity)
+    /// scan. Equal in value to `logical_bytes() - live_bytes()`.
+    ///
+    /// [`compact`]: BlobStore::compact
+    /// [`waste_ratio`]: BlobStore::waste_ratio
+    /// [`live_bytes`]: BlobStore::live_bytes
+    pub fn dead_bytes(&self) -> u64 {
+        self.dead_bytes
+    }
+
+    /// Size the value region would shrink to if compacted now: each live blob's
+    /// length rounded up to `VALUE_ALIGNMENT` (matching [`compact`]'s layout).
+    ///
+    /// [`compact`]: BlobStore::compact
+    fn compacted_value_bytes(&self) -> u64 {
+        let cap = self.header().capacity as usize;
+        let kdata = self.key.as_slice();
+        (0..cap)
+            .map(|i| read_slot(kdata, i))
+            .filter(|s| s.state == STATE_OCCUPIED)
+            .map(|s| self.owned_bytes(&s))
+            .sum()
+    }
+
+    /// The directory a directory-layout slot points at (`None` for the flat
+    /// layout, or a directory that does not decode).
+    fn dir_entries(&self, offset: u64, len: u32) -> Option<Vec<DirEntry>> {
+        if self.layout != BlobLayout::Directory {
+            return None;
+        }
+        codec::decode_dir(self.value_slice(offset, len)?).ok()
+    }
+
+    /// Value-region bytes a live slot owns, each blob rounded up to
+    /// `VALUE_ALIGNMENT`: its blob, plus the containers its directory lists.
+    fn owned_bytes(&self, s: &Slot) -> u64 {
+        let own = align_up(s.len as usize, VALUE_ALIGNMENT) as u64;
+        let containers: u64 = self
+            .dir_entries(s.offset, s.len)
+            .map_or(0, |es| es.iter().map(|e| align_up(e.len as usize, VALUE_ALIGNMENT) as u64).sum());
+        own + containers
+    }
+
+    /// Fraction (`0.0..1.0`) of the value region that is reclaimable dead space
+    /// left by overwritten or removed blobs. Returns `0.0` for an empty store.
+    ///
+    /// `upsert` appends every new blob and never reclaims the old bytes, so a
+    /// key re-written N times leaves N−1 stale copies behind. This ratio drives
+    /// the compaction trigger; it reads back to ≈0 immediately after [`compact`]
+    /// (alignment padding is counted as live, not waste).
+    ///
+    /// [`compact`]: BlobStore::compact
+    pub fn waste_ratio(&self) -> f64 {
+        // Use the alignment-rounded total so it shares a convention with
+        // `compacted_value_bytes` (which pads every blob); otherwise the trailing
+        // pad of the last blob makes `compacted` exceed `total` for a freshly
+        // written store and the subtraction would underflow to a spurious 0.
+        let total = self.logical_bytes();
+        if total == 0 {
+            return 0.0;
+        }
+        let compacted = self.compacted_value_bytes();
+        total.saturating_sub(compacted) as f64 / total as f64
+    }
+
+    // ── Probe ─────────────────────────────────────────────────────────────────
+
+    fn probe(&self, key: u128) -> (usize, bool) {
+        let cap = self.header().capacity as usize;
+        let start = hash_key(key) % cap;
+        let kdata = self.key.as_slice();
+        let mut first_tombstone: Option<usize> = None;
+        let mut i = start;
+        loop {
+            let s = read_slot(kdata, i);
+            match s.state {
+                STATE_EMPTY => {
+                    return (first_tombstone.unwrap_or(i), false);
+                }
+                STATE_OCCUPIED if s.key == key => {
+                    return (i, true);
+                }
+                STATE_TOMBSTONE if first_tombstone.is_none() => {
+                    first_tombstone = Some(i);
+                }
+                _ => {}
+            }
+            i = (i + 1) % cap;
+            if i == start {
+                return (first_tombstone.unwrap_or(start), false);
+            }
+        }
+    }
+
+    // ── Rehash ────────────────────────────────────────────────────────────────
+
+    fn needs_rehash(&self) -> bool {
+        let hdr = self.header();
+        let used = hdr.count + hdr.tombstone_count;
+        used * 10 > hdr.capacity * 7 // > 70% load
+    }
+
+    fn rehash(&mut self) {
+        let hdr = self.header();
+        let old_cap = hdr.capacity as usize;
+        let new_cap = old_cap * 2;
+        let new_key_size = HEADER_SIZE + new_cap * SLOT_SIZE;
+
+        let entries: Vec<Slot> = (0..old_cap)
+            .map(|i| read_slot(self.key.as_slice(), i))
+            .filter(|s| s.state == STATE_OCCUPIED)
+            .collect();
+
+        if let Some(dir) = self.dir.clone() {
+            // Persistent: never rewrite the live key table in place. A crash
+            // part-way through an in-place rehash leaves a scrambled table the
+            // owner cannot detect. Build the new table, write it to a new file,
+            // and rename it over the old one (atomic). The values every slot
+            // points at must be durable before the new table is, so sync them
+            // first.
+            self.val.flush().expect("rehash: value sync failed");
+            let buf = build_key_table(new_cap, hdr.value_write_pos, &entries);
+            let keys = dir.join("blobs.keys");
+            let keys_new = dir.join("blobs.keys.rehash");
+            write_file_sync(&keys_new, &buf).expect("rehash: staging the key table failed");
+            std::fs::rename(&keys_new, &keys).expect("rehash: swapping the key table failed");
+            fsync_dir(&dir).expect("rehash: directory sync failed");
+            self.key = GrowableMmap::open_file(&keys).expect("rehash: remapping the key table failed");
+            return;
+        }
+
+        self.key.ensure_capacity(new_key_size).expect("rehash key mmap grow failed");
+
+        let kdata = self.key.as_mut_slice();
+        kdata[HEADER_SIZE..HEADER_SIZE + new_cap * SLOT_SIZE].fill(0);
+        write_header(
+            kdata,
+            &Header {
+                capacity: new_cap as u64,
+                count: 0,
+                tombstone_count: 0,
+                value_write_pos: hdr.value_write_pos,
+            },
+        );
+
+        let live = entries.len() as u64;
+        for slot in &entries {
+            let start = hash_key(slot.key) % new_cap;
+            let kdata = self.key.as_mut_slice();
+            let mut i = start;
+            loop {
+                if read_slot(kdata, i).state == STATE_EMPTY {
+                    write_slot(kdata, i, slot);
+                    break;
+                }
+                i = (i + 1) % new_cap;
+            }
+        }
+
+        let kdata = self.key.as_mut_slice();
+        let mut h = read_header(kdata);
+        h.count = live;
+        write_header(kdata, &h);
+    }
+
+    // ── Mutation ──────────────────────────────────────────────────────────────
+
+    /// Insert or replace the blob for `key`: [`append_value`](Self::append_value)
+    /// then [`set_slot`](Self::set_slot).
+    ///
+    /// Returns `true` if this was a new key (false if an existing one was updated).
+    ///
+    /// Not crash-ordered: the slot can reach disk before the blob. Persistent
+    /// owners that need the order append, [`sync_values`](Self::sync_values),
+    /// then set slots. Test-only for that reason: production code goes through
+    /// the two steps.
+    #[cfg(test)]
+    pub fn upsert(&mut self, key: u128, blob: &[u8]) -> bool {
+        let (offset, len) = self.append_value(blob);
+        self.set_slot(key, offset, len)
+    }
+
+    /// Append `blob` to the value region without pointing any slot at it.
+    /// Returns its `(offset, len)` for a later [`set_slot`](Self::set_slot).
+    pub fn append_value(&mut self, blob: &[u8]) -> (u64, u32) {
+        let hdr = self.header();
+        let raw_offset = hdr.value_write_pos as usize;
+        let aligned_offset = align_up(raw_offset, VALUE_ALIGNMENT);
+        let new_val_end = aligned_offset + blob.len();
+
+        self.val.ensure_capacity(new_val_end).expect("val mmap grow failed");
+        self.val.as_mut_slice()[aligned_offset..aligned_offset + blob.len()].copy_from_slice(blob);
+
+        let mut h = self.header();
+        h.value_write_pos = new_val_end as u64;
+        self.set_header(&h);
+        (aligned_offset as u64, u32_len(blob.len(), "blob"))
+    }
+
+    /// Point `key` at a blob already in the value region (from
+    /// [`append_value`](Self::append_value)). Returns `true` if `key` is new.
+    pub fn set_slot(&mut self, key: u128, offset: u64, len: u32) -> bool {
+        if self.needs_rehash() {
+            self.rehash();
+        }
+
+        let (idx, found) = self.probe(key);
+
+        // Replacing an existing key orphans its previous blob — account those
+        // aligned bytes as reclaimable dead space (read the old slot before it is
+        // overwritten). This keeps `dead_bytes` O(1) and exact-since-compaction.
+        if found {
+            let old = read_slot(self.key.as_slice(), idx);
+            let mut dead = align_up(old.len as usize, VALUE_ALIGNMENT) as u64;
+            // Directory layout: the old directory's containers that the new
+            // one no longer lists are dead too.
+            if let Some(old_entries) = self.dir_entries(old.offset, old.len) {
+                let kept: std::collections::HashSet<u64> = self.dir_entries(offset, len).unwrap_or_default().iter().map(|e| e.offset).collect();
+                dead += old_entries
+                    .iter()
+                    .filter(|e| !kept.contains(&e.offset))
+                    .map(|e| align_up(e.len as usize, VALUE_ALIGNMENT) as u64)
+                    .sum::<u64>();
+            }
+            self.dead_bytes = self.dead_bytes.saturating_add(dead);
+        }
+
+        write_slot(
+            self.key.as_mut_slice(),
+            idx,
+            &Slot {
+                state: STATE_OCCUPIED,
+                key,
+                offset,
+                len,
+            },
+        );
+
+        if !found {
+            let mut h = self.header();
+            h.count += 1;
+            self.set_header(&h);
+        }
+
+        !found
+    }
+
+    /// True if `key` has a live slot.
+    #[cfg(test)]
+    pub fn contains_key(&self, key: u128) -> bool {
+        self.probe(key).1
+    }
+
+    /// Every live key, from the key table only (no blob reads).
+    pub fn keys(&self) -> Vec<u128> {
+        let cap = self.header().capacity as usize;
+        let kdata = self.key.as_slice();
+        (0..cap)
+            .map(|i| read_slot(kdata, i))
+            .filter(|s| s.state == STATE_OCCUPIED)
+            .map(|s| s.key)
+            .collect()
+    }
+
+    /// Mark the entry for `key` as a tombstone.
+    pub fn remove_key(&mut self, key: u128) {
+        let (idx, found) = self.probe(key);
+        if !found {
+            return;
+        }
+        // The removed key's blob is now dead — account it (aligned) as reclaimable.
+        let dead = self.owned_bytes(&read_slot(self.key.as_slice(), idx));
+        self.dead_bytes = self.dead_bytes.saturating_add(dead);
+
+        let kdata = self.key.as_mut_slice();
+        kdata[slot_byte_offset(idx)] = STATE_TOMBSTONE;
+
+        let mut h = read_header(kdata);
+        h.count -= 1;
+        h.tombstone_count += 1;
+        write_header(kdata, &h);
+    }
+
+    // ── Query ─────────────────────────────────────────────────────────────────
+
+    /// Return the blob for `key`, or `None` if the key is absent.
+    #[cfg(test)]
+    pub fn get(&self, key: u128) -> Option<Vec<u8>> {
+        let (idx, found) = self.probe(key);
+        if !found {
+            return None;
+        }
+        let s = read_slot(self.key.as_slice(), idx);
+        let bytes = &self.val.as_slice()[s.offset as usize..s.offset as usize + s.len as usize];
+        Some(bytes.to_vec())
+    }
+
+    /// Borrow the blob for `key`, or `None` if the key is absent.
+    pub fn get_ref(&self, key: u128) -> Option<&[u8]> {
+        let (idx, found) = self.probe(key);
+        if !found {
+            return None;
+        }
+        let s = read_slot(self.key.as_slice(), idx);
+        self.value_slice(s.offset, s.len)
+    }
+
+    /// Borrow `len` bytes of the value region at `offset`, or `None` if that
+    /// range runs past the region.
+    pub fn value_slice(&self, offset: u64, len: u32) -> Option<&[u8]> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len as usize)?;
+        self.val.as_slice().get(start..end)
+    }
+
+    /// Return all live `(key, blob)` pairs.
+    pub fn iter_entries(&self) -> Vec<(u128, Vec<u8>)> {
+        let cap = self.header().capacity as usize;
+        (0..cap)
+            .map(|i| read_slot(self.key.as_slice(), i))
+            .filter(|s| s.state == STATE_OCCUPIED)
+            .map(|s| {
+                let bytes = self.val.as_slice()[s.offset as usize..s.offset as usize + s.len as usize].to_vec();
+                (s.key, bytes)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn live_keys(&self) -> Vec<u128> {
+        self.iter_entries().into_iter().map(|(k, _)| k).collect()
+    }
+
+    // ── Compaction ──────────────────────────────────────────────────────────
+
+    /// Reclaim dead space in the value region.
+    ///
+    /// Rewrites only the live blobs into a compact value region (dropping the
+    /// bytes orphaned by overwrites and removals), rebuilds the key table to
+    /// clear tombstones, and shrinks the value file. Live `key -> blob`
+    /// mappings are preserved exactly. Returns the number of value-region bytes
+    /// reclaimed.
+    ///
+    /// **Crash safety (persistent stores).** The compacted `blobs.keys` /
+    /// `blobs.vals` are staged in `*.new` files (leaving the live pair
+    /// untouched), fsynced, and only then swapped in under cover of a
+    /// `compact.commit` marker. A crash at any point leaves the on-disk pair
+    /// either fully old or fully new — never a torn mix of new offsets against
+    /// an old value region. [`open`](BlobStore::open) finishes or rolls back an
+    /// interrupted swap. The caller must hold the field write lock (no
+    /// concurrent reader/writer touches the mmaps while they are remapped).
+    pub fn compact(&mut self) -> io::Result<u64> {
+        let before = self.header().value_write_pos;
+        let cap = self.header().capacity as usize;
+
+        // Build the compacted value region + slot placements directly from the
+        // mmap, so the only large heap allocation is the single compacted
+        // `val_buf` (≈ the live index size). No owned copy of the live blobs is
+        // materialised, and the value region is never copied again to pad it.
+        let mut val_buf: Vec<u8> = Vec::new();
+        let mut placements: Vec<Slot> = Vec::new();
+        let mut write_pos = 0usize;
+        {
+            let kdata = self.key.as_slice();
+            let vdata = self.val.as_slice();
+            for i in 0..cap {
+                let s = read_slot(kdata, i);
+                if s.state != STATE_OCCUPIED {
+                    continue;
+                }
+                let mut blob = &vdata[s.offset as usize..s.offset as usize + s.len as usize];
+                // Directory layout: copy the containers first, then a
+                // directory pointing at their new offsets.
+                let moved_dir;
+                if let Some(entries) = self.dir_entries(s.offset, s.len) {
+                    let mut moved = Vec::with_capacity(entries.len());
+                    for e in entries {
+                        let c = &vdata[e.offset as usize..e.offset as usize + e.len as usize];
+                        let aligned = align_up(write_pos, VALUE_ALIGNMENT);
+                        val_buf.resize(aligned, 0);
+                        val_buf.extend_from_slice(c);
+                        moved.push(DirEntry { offset: aligned as u64, ..e });
+                        write_pos = aligned + c.len();
+                    }
+                    moved_dir = codec::encode_dir(&moved);
+                    blob = &moved_dir;
+                }
+                let aligned = align_up(write_pos, VALUE_ALIGNMENT);
+                val_buf.resize(aligned, 0); // honour VALUE_ALIGNMENT padding
+                val_buf.extend_from_slice(blob);
+                placements.push(Slot {
+                    state: STATE_OCCUPIED,
+                    key: s.key,
+                    offset: aligned as u64,
+                    len: u32_len(blob.len(), "blob"),
+                });
+                write_pos = aligned + blob.len();
+            }
+        }
+        let key_buf = build_key_table(cap, write_pos as u64, &placements);
+
+        match self.dir.clone() {
+            // Persistent: stage the new pair and swap it in atomically.
+            Some(dir) => self.commit_compaction(&dir, &key_buf, &val_buf)?,
+            // Anonymous (transient) store: rewrite the in-memory mmaps in place
+            // — there is nothing on disk to make crash-safe.
+            None => self.rewrite_in_place(&key_buf, &val_buf)?,
+        }
+
+        // The value region now holds live blobs only; reset the reclaimable hint.
+        self.dead_bytes = 0;
+
+        Ok(before.saturating_sub(write_pos as u64))
+    }
+
+    /// Overwrite the in-memory mmaps with a freshly built key table and value
+    /// region (anonymous stores only).
+    fn rewrite_in_place(&mut self, key_buf: &[u8], val_buf: &[u8]) -> io::Result<()> {
+        self.key.as_mut_slice()[..key_buf.len()].copy_from_slice(key_buf);
+        self.val.truncate(val_buf.len().max(INITIAL_VAL_SIZE))?;
+        self.val.as_mut_slice()[..val_buf.len()].copy_from_slice(val_buf);
+        Ok(())
+    }
+
+    /// Atomically swap the staged compacted files into place for a persistent
+    /// store, then remap onto them. See [`compact`](BlobStore::compact) for the
+    /// crash-safety contract.
+    fn commit_compaction(&mut self, dir: &Path, key_buf: &[u8], val_buf: &[u8]) -> io::Result<()> {
+        let keys = dir.join("blobs.keys");
+        let vals = dir.join("blobs.vals");
+        let keys_new = dir.join("blobs.keys.new");
+        let vals_new = dir.join("blobs.vals.new");
+        let commit = dir.join("compact.commit");
+
+        // 1. Stage the new pair (the live files stay untouched) and fsync it.
+        //    Write val_buf directly and zero-extend the file to the minimum size
+        //    (so the reopened mmap is non-empty) rather than copying val_buf to
+        //    pad it — the header's value_write_pos marks the real end, so the
+        //    zero tail is just slack.
+        {
+            let mut f = File::create(&vals_new)?;
+            f.write_all(val_buf)?;
+            if (val_buf.len() as u64) < INITIAL_VAL_SIZE as u64 {
+                f.set_len(INITIAL_VAL_SIZE as u64)?;
+            }
+            f.sync_all()?;
+        }
+        write_file_sync(&keys_new, key_buf)?;
+        fsync_dir(dir)?;
+
+        // 2. Commit point: once this marker is durable, recovery *completes* the
+        //    swap; before it, recovery discards the staged files.
+        write_file_sync(&commit, &[])?;
+        fsync_dir(dir)?;
+
+        // 3. Swap both files into place (rename is atomic per file), then drop
+        //    the marker. An interrupt here is finished idempotently on open.
+        std::fs::rename(&vals_new, &vals)?;
+        std::fs::rename(&keys_new, &keys)?;
+        fsync_dir(dir)?;
+        std::fs::remove_file(&commit)?;
+        fsync_dir(dir)?;
+
+        // 4. Remap onto the new files (safe: the caller holds the write lock).
+        self.val = GrowableMmap::open_file(&vals)?;
+        self.key = GrowableMmap::open_file(&keys)?;
+        Ok(())
+    }
+
+    /// Finish or roll back a compaction interrupted before its swap completed.
+    ///
+    /// If the `compact.commit` marker is present the staged `*.new` files are
+    /// complete and fsynced, so the swap is replayed idempotently. Otherwise any
+    /// staged files are partial and are discarded, leaving the live pair intact.
+    fn recover_compaction(dir: &Path) -> io::Result<()> {
+        let keys = dir.join("blobs.keys");
+        let vals = dir.join("blobs.vals");
+        let keys_new = dir.join("blobs.keys.new");
+        let vals_new = dir.join("blobs.vals.new");
+        let commit = dir.join("compact.commit");
+
+        if commit.exists() {
+            if vals_new.exists() {
+                std::fs::rename(&vals_new, &vals)?;
+            }
+            if keys_new.exists() {
+                std::fs::rename(&keys_new, &keys)?;
+            }
+            fsync_dir(dir)?;
+            std::fs::remove_file(&commit)?;
+            fsync_dir(dir)?;
+        } else {
+            let mut changed = false;
+            for stale in [&keys_new, &vals_new] {
+                if stale.exists() {
+                    std::fs::remove_file(stale)?;
+                    changed = true;
+                }
+            }
+            if changed {
+                fsync_dir(dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+
+    /// Flush both mmaps to disk (no-op for anonymous stores): the value region
+    /// first, then the key table, so a durable slot never points at a blob that
+    /// is not. (The kernel may still write key pages back earlier on its own;
+    /// owners that need the order hold slot updates until after
+    /// [`sync_values`](Self::sync_values).)
+    pub fn flush(&self) -> io::Result<()> {
+        self.sync_values()?;
+        self.sync_keys()
+    }
+
+    /// Sync the value region to disk.
+    pub fn sync_values(&self) -> io::Result<()> {
+        self.val.flush()
+    }
+
+    /// Sync the key table to disk.
+    pub fn sync_keys(&self) -> io::Result<()> {
+        self.key.flush()
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+#[inline]
+fn align_up(offset: usize, align: usize) -> usize {
+    (offset + align - 1) & !(align - 1)
+}
+
+/// Build a fresh key-table image (header + `capacity` slots) holding exactly
+/// `placements`, with no tombstones. Used to stage a compacted `blobs.keys`.
+fn build_key_table(capacity: usize, value_write_pos: u64, placements: &[Slot]) -> Vec<u8> {
+    let mut buf = vec![0u8; HEADER_SIZE + capacity * SLOT_SIZE];
+    write_header(
+        &mut buf,
+        &Header {
+            capacity: capacity as u64,
+            count: placements.len() as u64,
+            tombstone_count: 0,
+            value_write_pos,
+        },
+    );
+    // Live count never exceeds the 70% rehash load factor, so an EMPTY slot
+    // always exists and the probe terminates.
+    for slot in placements {
+        let mut i = hash_key(slot.key) % capacity;
+        loop {
+            if read_slot(&buf, i).state == STATE_EMPTY {
+                write_slot(&mut buf, i, slot);
+                break;
+            }
+            i = (i + 1) % capacity;
+        }
+    }
+    buf
+}
+
+/// Write `bytes` to `path` (truncating any existing file) and fsync the file.
+fn write_file_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// fsync a directory so a contained rename/create/unlink is durable.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u32_len_accepts_in_range_lengths() {
+        assert_eq!(u32_len(0, "blob"), 0);
+        assert_eq!(u32_len(1234, "blob"), 1234);
+        // The boundary (exactly u32::MAX) is representable.
+        assert_eq!(u32_len(u32::MAX as usize, "blob"), u32::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds the u32 on-disk limit")]
+    fn u32_len_panics_instead_of_truncating() {
+        // One past the limit — checked as a plain integer, so no 4 GiB allocation.
+        let _ = u32_len(u32::MAX as usize + 1, "blob");
+    }
+
+    #[test]
+    fn insert_get_roundtrip() {
+        let mut store = BlobStore::new_anon();
+        assert!(store.upsert(42, b"hello world"));
+        assert_eq!(store.get(42).unwrap(), b"hello world");
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn update_existing_overwrites() {
+        let mut store = BlobStore::new_anon();
+        assert!(store.upsert(10, b"first"));
+        assert!(!store.upsert(10, b"second"));
+        assert_eq!(store.get(10).unwrap(), b"second");
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn remove_marks_tombstone() {
+        let mut store = BlobStore::new_anon();
+        store.upsert(1, b"data");
+        store.upsert(2, b"other");
+        store.remove_key(1);
+        assert_eq!(store.count(), 1);
+        assert!(store.get(1).is_none());
+        assert!(store.get(2).is_some());
+    }
+
+    #[test]
+    fn live_keys_returns_active_entries() {
+        let mut store = BlobStore::new_anon();
+        store.upsert(100, b"a");
+        store.upsert(200, b"b");
+        store.upsert(300, b"c");
+        store.remove_key(200);
+        let mut keys = store.live_keys();
+        keys.sort();
+        assert_eq!(keys, vec![100, 300]);
+    }
+
+    #[test]
+    fn rehash_preserves_entries() {
+        let mut store = BlobStore::new_anon();
+        for i in 0u128..20 {
+            store.upsert(i * 0x1_0000, format!("value_{}", i).as_bytes());
+        }
+        assert_eq!(store.count(), 20);
+        for i in 0u128..20 {
+            let got = store.get(i * 0x1_0000).unwrap();
+            assert_eq!(got, format!("value_{}", i).as_bytes());
+        }
+    }
+
+    #[test]
+    fn logical_bytes_never_below_live_bytes_for_unaligned_blob() {
+        // Regression: a fresh single blob whose length is not a VALUE_ALIGNMENT
+        // multiple used to report logical_bytes (raw write cursor, end-unpadded)
+        // below live_bytes (every blob rounded up to alignment), inverting the
+        // documented `logical ≥ live` invariant (the API surfaced 39 B < 48 B).
+        let mut store = BlobStore::new_anon();
+        let blob = vec![0xab_u8; 39]; // 39 is not a multiple of VALUE_ALIGNMENT (16)
+        store.upsert(7, &blob);
+
+        let logical = store.logical_bytes();
+        let live = store.live_bytes();
+        assert!(logical >= live, "logical_bytes ({logical}) must be ≥ live_bytes ({live})");
+        // No stale copies yet, so they should be exactly equal and waste 0.
+        assert_eq!(logical, live);
+        assert_eq!(store.waste_ratio(), 0.0);
+    }
+
+    #[test]
+    fn logical_bytes_at_least_live_bytes_with_stale_copies() {
+        // With overwrites leaving stale copies, logical (live + stale) must stay
+        // ≥ live regardless of blob alignment.
+        let mut store = BlobStore::new_anon();
+        store.upsert(1, &[1u8; 39]);
+        store.upsert(1, &[2u8; 17]); // overwrite → first copy is now stale
+        store.upsert(2, &[3u8; 5]);
+
+        assert!(store.logical_bytes() >= store.live_bytes());
+        assert!(store.waste_ratio() > 0.0, "the stale 39-byte copy should register as waste");
+    }
+
+    #[test]
+    fn waste_ratio_grows_with_overwrites_and_resets_after_compact() {
+        let mut store = BlobStore::new_anon();
+        // One key rewritten many times with a growing blob — the append-only
+        // value region accumulates dead copies.
+        for n in 1..=50usize {
+            store.upsert(7, &vec![0xABu8; n * 8]);
+        }
+        assert_eq!(store.count(), 1, "still a single live key");
+        assert!(
+            store.waste_ratio() > 0.8,
+            "heavy overwrite must show high waste, got {}",
+            store.waste_ratio()
+        );
+
+        let live_before = store.get(7).unwrap();
+        let reclaimed = store.compact().unwrap();
+        assert!(reclaimed > 0, "compaction must reclaim bytes");
+
+        assert_eq!(store.count(), 1);
+        assert_eq!(store.get(7).unwrap(), live_before, "live blob must survive compaction byte-for-byte");
+        assert!(
+            store.waste_ratio() < 0.01,
+            "waste must read ≈0 after compaction, got {}",
+            store.waste_ratio()
+        );
+    }
+
+    #[test]
+    fn dead_bytes_tracks_reclaimable_space_and_resets_on_compact() {
+        // The O(1) `dead_bytes` hint must agree with the O(capacity)
+        // `logical_bytes - live_bytes` computation across overwrites and removes,
+        // and reset to 0 after compaction — it drives checkpoint backpressure.
+        let mut store = BlobStore::new_anon();
+        assert_eq!(store.dead_bytes(), 0);
+
+        // Fresh inserts add no dead space.
+        store.upsert(1, &[0xAAu8; 40]);
+        store.upsert(2, &[0xBBu8; 24]);
+        assert_eq!(store.dead_bytes(), 0);
+
+        // Overwrites orphan the previous copies → dead space accrues.
+        for n in 1..=20usize {
+            store.upsert(1, &vec![0xCCu8; n * 8]);
+        }
+        // A remove tombstones a live blob → also reclaimable.
+        store.remove_key(2);
+
+        let expected = store.logical_bytes().saturating_sub(store.live_bytes());
+        assert_eq!(
+            store.dead_bytes(),
+            expected,
+            "incremental dead_bytes must match logical-live ({expected})"
+        );
+        assert!(store.dead_bytes() > 0);
+
+        store.compact().unwrap();
+        assert_eq!(store.dead_bytes(), 0, "compaction resets the dead-bytes hint");
+    }
+
+    #[test]
+    fn compact_preserves_all_live_entries_and_drops_tombstones() {
+        let mut store = BlobStore::new_anon();
+        for i in 0u128..30 {
+            store.upsert(i, format!("v{i}").as_bytes());
+        }
+        // Overwrite half (dead copies) and remove a third (tombstones).
+        for i in 0u128..15 {
+            store.upsert(i, format!("v{i}-updated-{}", "x".repeat(20)).as_bytes());
+        }
+        for i in 20u128..30 {
+            store.remove_key(i);
+        }
+        let expected: Vec<(u128, Vec<u8>)> = {
+            let mut e = store.iter_entries();
+            e.sort_by_key(|(k, _)| *k);
+            e
+        };
+
+        store.compact().unwrap();
+
+        let mut got = store.iter_entries();
+        got.sort_by_key(|(k, _)| *k);
+        assert_eq!(got, expected, "live set must be identical after compaction");
+        assert_eq!(store.count(), 20);
+        // The removed keys stay gone, and a fresh insert still works post-compact.
+        assert!(store.get(25).is_none());
+        assert!(store.upsert(99, b"fresh"));
+        assert_eq!(store.get(99).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn compact_persistent_shrinks_value_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = BlobStore::create(dir.path()).unwrap();
+        for n in 1..=200usize {
+            store.upsert(1, &vec![0x5Au8; n]);
+            store.upsert(2, &vec![0x3Cu8; n]);
+        }
+        store.flush().unwrap();
+        let bloated = std::fs::metadata(dir.path().join("blobs.vals")).unwrap().len();
+
+        store.compact().unwrap();
+        let compacted = std::fs::metadata(dir.path().join("blobs.vals")).unwrap().len();
+        assert!(compacted < bloated, "value file must shrink on disk: {compacted} !< {bloated}");
+
+        // Reopen and confirm the live data survived the shrink.
+        drop(store);
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.get(1).unwrap(), vec![0x5Au8; 200]);
+        assert_eq!(store.get(2).unwrap(), vec![0x3Cu8; 200]);
+    }
+
+    // Simulate a crash *after* the commit marker is durable but *before* the
+    // file swap finishes (staged files still present). open() must complete it.
+    #[test]
+    fn open_completes_interrupted_swap_after_commit_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut store = BlobStore::create(dir.path()).unwrap();
+            store.upsert(1, b"old-one");
+            store.upsert(2, b"old-two");
+            store.flush().unwrap();
+        }
+        // Hand-stage a newer compacted pair plus the commit marker, leaving the
+        // *old* live files in place (mid-swap state).
+        let mut newstore = BlobStore::create(dir.path()).unwrap();
+        newstore.upsert(1, b"NEW-one");
+        newstore.upsert(2, b"NEW-two");
+        newstore.upsert(3, b"NEW-three");
+        let key_img = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        let val_img = std::fs::read(dir.path().join("blobs.vals")).unwrap();
+        drop(newstore);
+        // Restore the OLD live pair, then stage the NEW pair as *.new + marker.
+        let mut old = BlobStore::create(dir.path()).unwrap();
+        old.upsert(1, b"old-one");
+        old.upsert(2, b"old-two");
+        old.flush().unwrap();
+        drop(old);
+        std::fs::write(dir.path().join("blobs.keys.new"), &key_img).unwrap();
+        std::fs::write(dir.path().join("blobs.vals.new"), &val_img).unwrap();
+        std::fs::write(dir.path().join("compact.commit"), []).unwrap();
+
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.get(1).unwrap(), b"NEW-one", "swap must be completed forward");
+        assert_eq!(store.get(2).unwrap(), b"NEW-two");
+        assert_eq!(store.get(3).unwrap(), b"NEW-three");
+        assert!(!dir.path().join("compact.commit").exists(), "marker cleared");
+        assert!(!dir.path().join("blobs.keys.new").exists(), "staged file consumed");
+    }
+
+    // Simulate a crash *before* the commit marker (staged files may be partial).
+    // open() must discard them and keep the intact live pair.
+    #[test]
+    fn open_discards_staged_files_without_commit_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut store = BlobStore::create(dir.path()).unwrap();
+            store.upsert(1, b"live-one");
+            store.flush().unwrap();
+        }
+        // Garbage half-written staging files, no commit marker.
+        std::fs::write(dir.path().join("blobs.keys.new"), b"partial-garbage").unwrap();
+        std::fs::write(dir.path().join("blobs.vals.new"), b"partial").unwrap();
+
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.get(1).unwrap(), b"live-one", "live pair must be untouched");
+        assert!(!dir.path().join("blobs.keys.new").exists(), "stale staging discarded");
+        assert!(!dir.path().join("blobs.vals.new").exists());
+    }
+
+    #[test]
+    fn persistent_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut store = BlobStore::create(dir.path()).unwrap();
+            store.upsert(1, b"one");
+            store.upsert(2, b"two");
+            store.flush().unwrap();
+        }
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.get(1).unwrap(), b"one");
+        assert_eq!(store.get(2).unwrap(), b"two");
+    }
+
+    // ── Header / bounds validation on open ──────────────────────────────────
+    //
+    // A corrupt or wrong-version key/value file must be rejected with
+    // io::ErrorKind::InvalidData, never opened (which would later panic or read
+    // out of bounds). Each test seeds a valid store, then mutates the on-disk
+    // image and asserts open() fails.
+
+    fn seed(dir: &Path) {
+        let mut store = BlobStore::create(dir).unwrap();
+        store.upsert(1, b"one");
+        store.upsert(2, b"two");
+        store.flush().unwrap();
+    }
+
+    fn assert_invalid(dir: &Path) {
+        let err = BlobStore::open(dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "expected InvalidData, got: {err}");
+    }
+
+    #[test]
+    fn open_rejects_bad_magic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        key[0] ^= 0xFF; // corrupt the magic
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_unsupported_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        key[8..12].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_truncated_header() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        std::fs::write(dir.path().join("blobs.keys"), [0u8; HEADER_SIZE - 1]).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_zero_capacity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        key[16..24].copy_from_slice(&0u64.to_le_bytes()); // capacity = 0
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    #[test]
+    fn open_rejects_capacity_larger_than_key_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        key[16..24].copy_from_slice(&(1u64 << 40).to_le_bytes()); // huge pow2 capacity
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        assert_invalid(dir.path());
+    }
+
+    fn first_live_slot(key: &[u8]) -> usize {
+        (0..INITIAL_CAPACITY)
+            .find(|&i| matches!(key[slot_byte_offset(i)], STATE_OCCUPIED | STATE_OCCUPIED_CHECKED))
+            .expect("seeded store has a live slot")
+    }
+
+    #[test]
+    fn open_clamps_a_write_cursor_past_the_value_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let val_len = std::fs::metadata(dir.path().join("blobs.vals")).unwrap().len();
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        key[48..56].copy_from_slice(&(val_len + 1).to_le_bytes());
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert!(store.header().value_write_pos <= val_len);
+        assert_eq!(store.damaged_at_open(), 0);
+        assert_eq!(store.count(), 2);
+    }
+
+    #[test]
+    fn open_moves_a_stale_write_cursor_past_every_live_blob() {
+        // A header written back before its slots can name a cursor behind live
+        // blobs; appending from there would overwrite them.
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        key[48..56].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        let mut store = BlobStore::open(dir.path()).unwrap();
+        let before: Vec<(u128, Vec<u8>)> = store.iter_entries();
+        store.upsert(99, &[7u8; 64]);
+        for (k, v) in before {
+            assert_eq!(store.get(k).unwrap(), v, "key {k} was overwritten by the new append");
+        }
+    }
+
+    #[test]
+    fn open_drops_a_torn_slot_and_reports_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        let b = slot_byte_offset(first_live_slot(&key));
+        key[b + 30] ^= 0x5A; // half-written offset: the checksum no longer matches
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.damaged_at_open(), 1);
+        assert_eq!(store.count(), 1, "the torn slot is dropped, the other survives");
+    }
+
+    #[test]
+    fn open_drops_a_slot_pointing_past_the_value_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        let i = first_live_slot(&key);
+        let val_len = std::fs::metadata(dir.path().join("blobs.vals")).unwrap().len();
+        let mut s = read_slot(&key, i);
+        s.offset = val_len + 16;
+        write_slot(&mut key, i, &s); // a valid checksum, but out of range
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.damaged_at_open(), 1);
+        assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn a_persistent_rehash_goes_through_a_new_file_and_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut store = BlobStore::create(dir.path()).unwrap();
+            for k in 0..100u128 {
+                store.upsert(k, &k.to_le_bytes());
+            }
+            store.flush().unwrap();
+        }
+        assert!(!dir.path().join("blobs.keys.rehash").exists(), "the staged table was renamed into place");
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.damaged_at_open(), 0);
+        for k in 0..100u128 {
+            assert_eq!(store.get(k).unwrap(), k.to_le_bytes(), "key {k} after rehash + reopen");
+        }
+    }
+
+    #[test]
+    fn append_then_set_slot_is_upsert_in_two_steps() {
+        let mut store = BlobStore::new_anon();
+        let (off, len) = store.append_value(b"hello");
+        assert!(!store.contains_key(1), "appending points no slot at the blob");
+        assert!(store.set_slot(1, off, len));
+        assert_eq!(store.get(1).unwrap(), b"hello");
+    }
+
+    // ── Directory layout ─────────────────────────────────────────────────────
+
+    /// Append `containers` (raw bytes) and a directory over them; return the
+    /// directory's `(offset, len)`.
+    fn append_dir(store: &mut BlobStore, containers: &[(u128, &[u8])]) -> (u64, u32) {
+        let entries: Vec<DirEntry> = containers
+            .iter()
+            .map(|&(key, bytes)| {
+                let (offset, len) = store.append_value(bytes);
+                DirEntry { key, offset, len }
+            })
+            .collect();
+        store.append_value(&codec::encode_dir(&entries))
+    }
+
+    #[test]
+    fn directory_layout_counts_containers_as_live_and_dead() {
+        let mut store = BlobStore::new_anon_with(BlobLayout::Directory);
+        let (d, l) = append_dir(&mut store, &[(0, &[1u8; 100]), (1, &[2u8; 100])]);
+        store.set_slot(7, d, l);
+        let dir_len = align_up(l as usize, VALUE_ALIGNMENT) as u64;
+        assert_eq!(store.live_bytes(), 2 * 112 + dir_len);
+        assert_eq!(store.dead_bytes(), 0);
+
+        // Replace container 1 only: the old directory and the old container 1
+        // become dead; container 0 is shared and stays live.
+        let old = codec::decode_dir(store.get_ref(7).unwrap()).unwrap();
+        let (off1, len1) = store.append_value(&[3u8; 50]);
+        let new_dir = codec::encode_dir(&[
+            old[0],
+            DirEntry {
+                key: 1,
+                offset: off1,
+                len: len1,
+            },
+        ]);
+        let (d2, l2) = store.append_value(&new_dir);
+        store.set_slot(7, d2, l2);
+        assert_eq!(store.dead_bytes(), dir_len + 112);
+        assert_eq!(store.live_bytes(), 112 + 64 + align_up(l2 as usize, VALUE_ALIGNMENT) as u64);
+
+        store.remove_key(7);
+        assert_eq!(store.live_bytes(), 0);
+        assert_eq!(store.dead_bytes(), store.logical_bytes(), "everything is dead once the slot is gone");
+    }
+
+    #[test]
+    fn directory_layout_compaction_moves_containers_and_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut store = BlobStore::create_with(dir.path(), BlobLayout::Directory).unwrap();
+            for round in 0..5u8 {
+                for slot in 0..3u128 {
+                    let (d, l) = append_dir(&mut store, &[(0, &[round; 40]), (9, &[slot as u8; 300])]);
+                    store.set_slot(slot, d, l);
+                }
+            }
+            let live = store.live_bytes();
+            assert!(store.compact().unwrap() > 0);
+            assert_eq!(store.logical_bytes(), live, "only the live containers and directories remain");
+            store.flush().unwrap();
+        }
+        let store = BlobStore::open_with(dir.path(), BlobLayout::Directory).unwrap();
+        assert_eq!(store.damaged_at_open(), 0);
+        for slot in 0..3u128 {
+            let entries = codec::decode_dir(store.get_ref(slot).unwrap()).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(store.value_slice(entries[0].offset, entries[0].len).unwrap(), &[4u8; 40]);
+            assert_eq!(store.value_slice(entries[1].offset, entries[1].len).unwrap(), &[slot as u8; 300][..]);
+        }
+    }
+
+    #[test]
+    fn open_drops_a_directory_that_is_torn_or_points_past_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (torn_at, far) = {
+            let mut store = BlobStore::create_with(dir.path(), BlobLayout::Directory).unwrap();
+            let (d, l) = append_dir(&mut store, &[(0, &[1u8; 64])]);
+            store.set_slot(1, d, l);
+            // Slot 2: a directory naming a container far past the file end.
+            let far = codec::encode_dir(&[DirEntry {
+                key: 0,
+                offset: 1 << 30,
+                len: 64,
+            }]);
+            let (d2, l2) = store.append_value(&far);
+            store.set_slot(2, d2, l2);
+            // Slot 3: fine.
+            let (d3, l3) = append_dir(&mut store, &[(5, &[3u8; 64])]);
+            store.set_slot(3, d3, l3);
+            store.flush().unwrap();
+            (d as usize + 4, 2u128)
+        };
+        // Tear slot 1's directory (its count field).
+        let mut vals = std::fs::read(dir.path().join("blobs.vals")).unwrap();
+        vals[torn_at] ^= 0xFF;
+        std::fs::write(dir.path().join("blobs.vals"), &vals).unwrap();
+
+        let store = BlobStore::open_with(dir.path(), BlobLayout::Directory).unwrap();
+        assert_eq!(store.damaged_at_open(), 2);
+        assert!(!store.contains_key(1) && !store.contains_key(far));
+        assert!(store.contains_key(3));
+    }
+}

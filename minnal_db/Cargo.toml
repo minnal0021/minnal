@@ -11,6 +11,9 @@ categories = ["database-implementations", "data-structures"]
 # (`#[cfg(test)]` `include_str!`) — never at consumer build time — so keep them
 # out of the published tarball.
 exclude = ["src/test_data/", "benches/data/", "src/**/*.md"]
+# Every bench target is declared below: `benches/common.rs` is shared helpers, not a
+# bench, and `benches/under_load/main.rs` would otherwise be found a second time.
+autobenches = false
 
 # docs.rs builds on supported (Unix) targets only, with all features enabled so
 # the doc-store and semantic-search modules are documented.
@@ -75,51 +78,63 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(minnal_bench_alloc, values
 
 [[bench]]
 name = "bench_merge"
+path = "benches/kv/bench_merge.rs"
 harness = false
 
 [[bench]]
 name = "bench_write"
+path = "benches/kv/bench_write.rs"
 harness = false
 
 [[bench]]
 name = "bench_read"
+path = "benches/kv/bench_read.rs"
 harness = false
 
 [[bench]]
 name = "bench_scan"
+path = "benches/kv/bench_scan.rs"
 harness = false
 
 [[bench]]
 name = "bench_mixed"
+path = "benches/kv/bench_mixed.rs"
 harness = false
 
 [[bench]]
 name = "bench_wal"
+path = "benches/storage/bench_wal.rs"
 harness = false
 
 [[bench]]
 name = "bench_typed"
+path = "benches/kv/bench_typed.rs"
 harness = false
 
 [[bench]]
 name = "bench_sstable_lookup"
+path = "benches/storage/bench_sstable_lookup.rs"
 harness = false
 
 [[bench]]
 name = "bench_predicate"
+path = "benches/field_index/bench_predicate.rs"
 harness = false
 
 [[bench]]
 name = "bench_bitmap_paging"
+path = "benches/field_index/bench_bitmap_paging.rs"
 harness = false
 
 [[bench]]
 name = "bench_distance_estimation"
+path = "benches/semantic_search/bench_distance_estimation.rs"
 harness = false
 required-features = ["semantic-search"]
 
 [[bench]]
 name = "bench_pass1_search"
+path = "benches/semantic_search/bench_pass1_search.rs"
 harness = false
 required-features = ["semantic-search"]
 
@@ -127,6 +142,6 @@ required-features = ["semantic-search"]
 # nothing without a command, so `cargo bench` over every suite skips it.
 [[bench]]
 name = "engine_bench"
-path = "benches/engine_bench/main.rs"
+path = "benches/under_load/main.rs"
 harness = false
 required-features = ["doc-store", "semantic-search"]

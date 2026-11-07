@@ -1,4 +1,4 @@
-"""Engine benchmark data (minnal_db/benches/engine_bench): FiQA (57,638 documents, gemma) with three synthetic indexed fields,
+"""Engine benchmark data (minnal_db/benches/under_load): FiQA (57,638 documents, gemma) with three synthetic indexed fields,
 split so that quality under load stays comparable with quality at rest.
 
   base.jsonl    40,000 documents loaded and indexed before a run. Every document

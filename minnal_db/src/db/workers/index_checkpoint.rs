@@ -1,0 +1,464 @@
+//! Index Checkpoint Worker
+//!
+//! Periodically snapshots in-memory field indices to disk so that crash
+//! recovery only needs to replay a bounded tail of the WAL.
+//!
+//! Uses the same trait-target pattern as [`WalGcWorker`]: the worker knows
+//! nothing about [`IndexManager`] or [`NamespaceRegistry`] directly — it
+//! calls through [`IndexCheckpointTarget`], which [`Database`] implements.
+//!
+//! Default interval: [`DEFAULT_INDEX_CHECKPOINT_INTERVAL`](crate::db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL)
+//! (1750 ms) — the interval is the crash-replay window, so it is deliberately short.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use log::{debug, error, info};
+
+/// A checkpoint slower than this is logged at INFO rather than DEBUG.
+///
+/// Routine checkpoints are ~10-20 ms and happen every `index_checkpoint_interval`,
+/// so logging each one drowns the log. A slow one is the useful signal: it means
+/// a field's blob store is compacting, or fsyncs are contending.
+const SLOW_CHECKPOINT: Duration = Duration::from_millis(250);
+
+/// At most one slow-checkpoint notice is logged per this period.
+///
+/// A store with many fields can be over [`SLOW_CHECKPOINT`] on every tick (14
+/// fields measured ~450 ms each), which logged one INFO line per tick. The
+/// notice now summarises the slow checkpoints since the last one instead.
+const SLOW_CHECKPOINT_NOTICE_PERIOD: Duration = Duration::from_secs(60);
+
+/// Rate limiter for the slow-checkpoint INFO notice. Owned by the worker task.
+#[derive(Default)]
+struct SlowCheckpointNotice {
+    last_logged: Option<std::time::Instant>,
+    /// Slow checkpoints since the last notice, including the one being logged.
+    slow_count: u64,
+    /// Slowest checkpoint since the last notice.
+    max_elapsed: Duration,
+}
+
+impl SlowCheckpointNotice {
+    /// Record a slow checkpoint; returns `(count, max)` when a notice is due.
+    fn record(&mut self, elapsed: Duration, now: std::time::Instant) -> Option<(u64, Duration)> {
+        self.slow_count += 1;
+        self.max_elapsed = self.max_elapsed.max(elapsed);
+        let due = self.last_logged.is_none_or(|t| now.duration_since(t) >= SLOW_CHECKPOINT_NOTICE_PERIOD);
+        if !due {
+            return None;
+        }
+        let summary = (self.slow_count, self.max_elapsed);
+        self.last_logged = Some(now);
+        self.slow_count = 0;
+        self.max_elapsed = Duration::ZERO;
+        Some(summary)
+    }
+}
+use tokio::sync::{Notify, mpsc};
+use tokio::time;
+
+use crate::db::error::Result;
+
+/// Trait implemented by the database coordinator to perform an index checkpoint.
+///
+/// Separates the worker's scheduling logic from the mechanics of collecting
+/// field metadata and writing checkpoint files.
+pub trait IndexCheckpointTarget: Send + Sync + 'static {
+    /// Returns `true` if the database has been closed and no further
+    /// checkpoints should be attempted.
+    fn is_closed(&self) -> bool;
+
+    /// Run a full index checkpoint: collect all registered fields from the
+    /// namespace registry and write their checkpoint markers via the index
+    /// manager.  Returns the number of fields checkpointed.
+    fn run_index_checkpoint(&self) -> Result<usize>;
+}
+
+/// Commands accepted by the checkpoint worker.
+pub enum IndexCheckpointCommand {
+    /// Trigger an immediate checkpoint without waiting for the next tick.
+    TriggerNow,
+    /// Shut down the worker gracefully.
+    Shutdown,
+}
+
+/// Write-path handle that requests an early index checkpoint when a field index
+/// accumulates too much reclaimable dead blob space (the backpressure valve), or
+/// when field-index write buffers pass their memory budget's soft limit.
+///
+/// Mirrors the WAL/LSM observer pattern: the write path holds this cheap handle
+/// and signals the background [`IndexCheckpointWorker`] rather than knowing how a
+/// checkpoint is performed. The request is **debounced** through a shared
+/// `pending` flag so a hot field over the cap enqueues at most one checkpoint at
+/// a time (the worker clears the flag when it starts one, re-arming the valve).
+pub struct IndexCheckpointTrigger {
+    tx: mpsc::UnboundedSender<IndexCheckpointCommand>,
+    pending: Arc<AtomicBool>,
+    cap_bytes: u64,
+}
+
+impl IndexCheckpointTrigger {
+    /// Request an early checkpoint iff a field's reclaimable `dead_bytes` has
+    /// reached the configured cap. O(1) and non-blocking; safe to call on the
+    /// hot write path. A cap of 0 disables the valve.
+    pub fn request_if_over_cap(&self, dead_bytes: u64) {
+        if self.cap_bytes == 0 || dead_bytes < self.cap_bytes {
+            return;
+        }
+        self.request();
+    }
+
+    /// Request an early checkpoint **unconditionally**, ignoring `cap_bytes`.
+    ///
+    /// Used by the write path when field-index write buffers pass the overlay
+    /// budget's soft limit (a checkpoint writes them out), and by WAL GC when
+    /// the index-replay watermark is holding segments back:
+    /// the pin can only drain when a checkpoint advances the fields' recorded
+    /// offsets, so retention tracks checkpoint latency instead of the periodic
+    /// timer. It must not be routed through
+    /// [`request_if_over_cap`](Self::request_if_over_cap), which returns early
+    /// when the backpressure valve is disabled (`cap_bytes == 0`) — that would
+    /// leave the WAL pinned until the periodic tick on any database that has not
+    /// configured the valve.
+    ///
+    /// Shares the same debounce flag, so a repeatedly-blocked GC enqueues at most
+    /// one checkpoint at a time.
+    pub fn request(&self) {
+        // Debounce: only the transition false→true sends, so repeated requests
+        // before the checkpoint runs don't flood the channel.
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            let _ = self.tx.send(IndexCheckpointCommand::TriggerNow);
+        }
+    }
+}
+
+impl crate::kv_store::index_set::CheckpointRequests for IndexCheckpointTrigger {
+    fn request_if_over_cap(&self, dead_bytes: u64) {
+        IndexCheckpointTrigger::request_if_over_cap(self, dead_bytes);
+    }
+
+    fn request(&self) {
+        IndexCheckpointTrigger::request(self);
+    }
+}
+
+/// Background worker that periodically checkpoints index state to disk.
+///
+/// Spawns a Tokio task on construction.  Call [`shutdown`] to stop it cleanly.
+pub struct IndexCheckpointWorker {
+    tx: mpsc::UnboundedSender<IndexCheckpointCommand>,
+    shutdown_notify: Arc<Notify>,
+    /// Shared with every [`IndexCheckpointTrigger`]: `true` means a backpressure
+    /// checkpoint is already queued. Cleared when the worker starts a checkpoint.
+    pending: Arc<AtomicBool>,
+}
+
+impl IndexCheckpointWorker {
+    /// Spawn a new checkpoint worker.
+    ///
+    /// # Arguments
+    /// * `target`   - The checkpoint target (typically `Arc<Database>`).
+    /// * `interval` - How often to run checkpoints (use [`DEFAULT_CHECKPOINT_INTERVAL`]).
+    pub fn new<T: IndexCheckpointTarget>(target: Arc<T>, interval: Duration) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let shutdown_notify = Arc::new(Notify::new());
+        let pending = Arc::new(AtomicBool::new(false));
+
+        tokio::spawn(Self::worker_loop(
+            Arc::downgrade(&target),
+            rx,
+            shutdown_notify.clone(),
+            interval,
+            pending.clone(),
+        ));
+
+        Self {
+            tx,
+            shutdown_notify,
+            pending,
+        }
+    }
+
+    /// Build a write-path [`IndexCheckpointTrigger`] that requests an early
+    /// checkpoint once a field's reclaimable dead blob bytes reach `cap_bytes`.
+    pub fn backpressure_trigger(&self, cap_bytes: u64) -> Arc<IndexCheckpointTrigger> {
+        Arc::new(IndexCheckpointTrigger {
+            tx: self.tx.clone(),
+            pending: Arc::clone(&self.pending),
+            cap_bytes,
+        })
+    }
+
+    /// Shut down the worker and wait for it to exit.
+    pub async fn shutdown(&self) {
+        let _ = self.tx.send(IndexCheckpointCommand::Shutdown);
+        self.shutdown_notify.notified().await;
+    }
+
+    // ── internals ─────────────────────────────────────────────────────────
+
+    async fn worker_loop<T: IndexCheckpointTarget>(
+        target: Weak<T>,
+        mut rx: mpsc::UnboundedReceiver<IndexCheckpointCommand>,
+        shutdown_notify: Arc<Notify>,
+        interval: Duration,
+        pending: Arc<AtomicBool>,
+    ) {
+        info!("[IndexCheckpointWorker] started (interval={}ms)", interval.as_millis());
+        let mut ticker = time::interval(interval);
+        let mut notice = SlowCheckpointNotice::default();
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    match target.upgrade() {
+                        Some(t) => Self::perform_checkpoint(&t, &pending, &mut notice),
+                        None => break,
+                    }
+                }
+
+                Some(cmd) = rx.recv() => {
+                    match cmd {
+                        IndexCheckpointCommand::TriggerNow => {
+                            debug!("[IndexCheckpointWorker] immediate checkpoint triggered");
+                            match target.upgrade() {
+                                Some(t) => Self::perform_checkpoint(&t, &pending, &mut notice),
+                                None => break,
+                            }
+                        }
+                        IndexCheckpointCommand::Shutdown => {
+                            info!("[IndexCheckpointWorker] Shutting down");
+                            break;
+                        }
+                    }
+                }
+
+                else => {
+                    info!("[IndexCheckpointWorker] Channel closed, shutting down");
+                    break;
+                }
+            }
+        }
+
+        info!("[IndexCheckpointWorker] stopped");
+        shutdown_notify.notify_one();
+    }
+
+    /// A checkpoint is a pass of fsyncs (~55 ms with three fields): see
+    /// [`run_blocking_pass`](crate::support::run_blocking_pass).
+    fn perform_checkpoint<T: IndexCheckpointTarget>(target: &Arc<T>, pending: &AtomicBool, notice: &mut SlowCheckpointNotice) {
+        crate::support::run_blocking_pass(|| Self::checkpoint_pass(target, pending, notice));
+    }
+
+    fn checkpoint_pass<T: IndexCheckpointTarget>(target: &Arc<T>, pending: &AtomicBool, notice: &mut SlowCheckpointNotice) {
+        // Clear the debounce flag as we commit to running: any backpressure
+        // request arriving *during* this checkpoint re-arms the valve and queues a
+        // follow-up, so writes made while we run are not missed.
+        pending.store(false, Ordering::Release);
+        if target.is_closed() {
+            return;
+        }
+        // Routine ticks log at DEBUG, not INFO. This worker runs every
+        // `index_checkpoint_interval` — 1750 ms by default — so a per-tick INFO
+        // pair is ~98,000 lines a day of "nothing happened". These lines were
+        // written when the interval was 15 minutes and were reasonable then.
+        //
+        // What stays at INFO is a checkpoint that took long enough to be worth
+        // an operator's attention: it is the one signal in here that says the
+        // index is struggling (a large blob compaction, or fsync contention) —
+        // rate-limited to one summary per `SLOW_CHECKPOINT_NOTICE_PERIOD`, since
+        // a store with many fields can be slow on every tick.
+        debug!("[IndexCheckpointWorker] tick — starting index checkpoint");
+        let start = std::time::Instant::now();
+        match target.run_index_checkpoint() {
+            Ok(count) => {
+                let elapsed = start.elapsed();
+                if elapsed >= SLOW_CHECKPOINT {
+                    match notice.record(elapsed, std::time::Instant::now()) {
+                        Some((slow, max)) => info!(
+                            "[IndexCheckpointWorker] checkpoint took {:?} — {} field(s) flushed; \
+                             {} checkpoint(s) over the {:?} notice threshold since the last \
+                             notice, slowest {:?} (a field's blob may be compacting)",
+                            elapsed, count, slow, SLOW_CHECKPOINT, max
+                        ),
+                        None => debug!("[IndexCheckpointWorker] slow checkpoint in {:?} — {} field(s) flushed", elapsed, count),
+                    }
+                } else {
+                    debug!(
+                        "[IndexCheckpointWorker] checkpoint complete in {:?} — {} field(s) flushed",
+                        elapsed, count
+                    );
+                }
+            }
+            Err(e) => error!("[IndexCheckpointWorker] checkpoint failed: {:?}", e),
+        }
+    }
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[test]
+    fn slow_checkpoint_notice_is_logged_at_most_once_per_period() {
+        let mut notice = SlowCheckpointNotice::default();
+        let t0 = std::time::Instant::now();
+        let ms = Duration::from_millis;
+        // The first slow checkpoint is reported at once.
+        assert_eq!(notice.record(ms(300), t0), Some((1, ms(300))));
+        // Within the period: suppressed, but counted.
+        assert_eq!(notice.record(ms(500), t0 + ms(1_750)), None);
+        assert_eq!(notice.record(ms(400), t0 + ms(3_500)), None);
+        // Once the period has passed, one summary covers all three.
+        let t1 = t0 + SLOW_CHECKPOINT_NOTICE_PERIOD;
+        assert_eq!(notice.record(ms(260), t1), Some((3, ms(500))));
+        assert_eq!(notice.record(ms(260), t1 + ms(1)), None);
+    }
+
+    struct FakeTarget {
+        closed: AtomicBool,
+        checkpoint_count: AtomicU64,
+    }
+
+    impl FakeTarget {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                closed: AtomicBool::new(false),
+                checkpoint_count: AtomicU64::new(0),
+            })
+        }
+    }
+
+    impl IndexCheckpointTarget for FakeTarget {
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+        fn run_index_checkpoint(&self) -> Result<usize> {
+            self.checkpoint_count.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_starts_and_shuts_down() {
+        let target = FakeTarget::new();
+        let worker = IndexCheckpointWorker::new(target, Duration::from_secs(3600));
+        worker.shutdown().await;
+    }
+
+    struct SlowTarget(Arc<crate::support::runtime_probe::Busy>);
+
+    impl IndexCheckpointTarget for SlowTarget {
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn run_index_checkpoint(&self) -> Result<usize> {
+            self.0.block();
+            Ok(0)
+        }
+    }
+
+    /// The checkpoint is a pass of fsyncs; on a runtime thread it held up the
+    /// requests scheduled behind it (M5: get p99 4-10 ms, every 1.75 s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_checkpoint_does_not_block_the_runtime() {
+        use crate::support::runtime_probe::{Busy, assert_runtime_free_during_pass};
+        let busy = Busy::new();
+        // The worker holds only a `Weak`: keep the target alive.
+        let target = Arc::new(SlowTarget(Arc::clone(&busy)));
+        let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+        assert_runtime_free_during_pass(&busy).await;
+        worker.shutdown().await;
+    }
+
+    /// Uses the write-path trigger handle, which is how an immediate checkpoint
+    /// is actually requested in production. (This previously called a
+    /// `Worker::trigger` method whose only other caller was a since-deleted
+    /// async wrapper — so it tested a path nothing shipped.)
+    #[tokio::test]
+    async fn test_trigger_calls_checkpoint() {
+        let target = FakeTarget::new();
+        let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+
+        worker.backpressure_trigger(1000).request();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        worker.shutdown().await;
+
+        assert!(target.checkpoint_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_skips_checkpoint_when_closed() {
+        let target = FakeTarget::new();
+        target.closed.store(true, Ordering::SeqCst);
+        let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+
+        worker.backpressure_trigger(1000).request();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        worker.shutdown().await;
+
+        assert_eq!(target.checkpoint_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn backpressure_trigger_respects_cap_and_debounces() {
+        // Long interval so only backpressure drives further checkpoints. (The
+        // interval's first tick fires immediately, so measure deltas from a
+        // post-startup baseline.)
+        let target = FakeTarget::new();
+        let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+        let trigger = worker.backpressure_trigger(1000);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let base = target.checkpoint_count.load(Ordering::SeqCst);
+
+        // Below the cap: no additional checkpoint.
+        trigger.request_if_over_cap(999);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(target.checkpoint_count.load(Ordering::SeqCst), base, "under-cap must not fire");
+
+        // Over the cap fires once; repeated over-cap requests before the worker
+        // runs are debounced into that single queued checkpoint.
+        trigger.request_if_over_cap(1000);
+        trigger.request_if_over_cap(5000);
+        trigger.request_if_over_cap(5000);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            target.checkpoint_count.load(Ordering::SeqCst),
+            base + 1,
+            "over-cap must fire exactly once (debounced) until the worker consumes it"
+        );
+
+        // After the worker ran (and cleared the pending flag), a new over-cap
+        // request arms and fires again.
+        trigger.request_if_over_cap(2000);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            target.checkpoint_count.load(Ordering::SeqCst),
+            base + 2,
+            "valve re-arms after a checkpoint"
+        );
+
+        worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn backpressure_cap_zero_disables_the_valve() {
+        let target = FakeTarget::new();
+        let worker = IndexCheckpointWorker::new(Arc::clone(&target), Duration::from_secs(3600));
+        let trigger = worker.backpressure_trigger(0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let base = target.checkpoint_count.load(Ordering::SeqCst);
+
+        trigger.request_if_over_cap(u64::MAX);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(target.checkpoint_count.load(Ordering::SeqCst), base, "cap 0 disables backpressure");
+
+        worker.shutdown().await;
+    }
+}

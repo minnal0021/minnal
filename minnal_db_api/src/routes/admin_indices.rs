@@ -33,8 +33,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_db::doc_store::hex::hex_to_bytes;
-use minnal_db::doc_store::index_progress::IndexBuildSnapshot;
+use minnal_db::doc_store::indexing::progress::IndexBuildSnapshot;
+use minnal_db::hex_to_bytes;
 use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, QueueEntryKind, VectorReindexOutcome};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -72,8 +72,11 @@ pub async fn progress_all(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// `GET /admin/indices/{ns}/progress` — index progress for one namespace.
-pub async fn progress_ns(State(state): State<AppState>, Path(ns): Path<String>) -> impl IntoResponse {
-    Json(build_progress_response(&state, Some(&ns)).await)
+pub async fn progress_ns(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, crate::error::AppError> {
+    // Unknown stores are a 404, as on every other per-store route, rather than an
+    // empty report that reads like a store with nothing running.
+    state.store.store_type(&ns).map_err(|e| crate::error::AppError::from(e).with_ns(&ns))?;
+    Ok(Json(build_progress_response(&state, Some(&ns)).await))
 }
 
 async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> IndexProgressResponse {
@@ -166,6 +169,16 @@ pub async fn attribute_reindex_all(
                 })),
             ));
         }
+    }
+
+    // Dropping an index whose build is running would delete its files under it.
+    if let Some(field) = state.store.field_index_build_running(&ns) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("the index build of field '{field}' in '{ns}' is still running; retry when it finishes")
+            })),
+        ));
     }
 
     let schema = state.store.get_schema(&ns).map_err(|e| {
@@ -308,7 +321,7 @@ pub async fn field_blob_stats(
 ) -> Result<Json<FieldBlobStatsResponse>, (StatusCode, Json<serde_json::Value>)> {
     match state.store.field_index_blob_stats(&ns, &field) {
         Some(stats) => {
-            let waste_threshold = state.store.index_blob_waste_threshold();
+            let waste_threshold = state.db.index_blob_waste_threshold();
             let over_threshold = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
             Ok(Json(FieldBlobStatsResponse {
                 namespace: ns,
@@ -378,9 +391,18 @@ pub async fn attribute_reindex_doc(
 
 // ── Vector index operations ───────────────────────────────────────────────────
 
+/// Whether a vector reindex of store `ns` (document or KV) is still enqueueing.
+pub(crate) fn vector_reindex_running(state: &AppState, ns: &str) -> bool {
+    let check = match state.store.store_type(ns) {
+        Ok(minnal_db::StoreType::Kv) => state.store.check_kv_index_all_preconditions(ns),
+        _ => state.store.check_index_all_preconditions(ns),
+    };
+    matches!(check, Err(DocStoreError::VecReindexInProgress { .. }))
+}
+
 /// `DELETE /admin/indices/{ns}/vector/drop-all`
 ///
-/// Clears all vector index data for `{ns}`: embedding queue entries and the
+/// Clears all vector index data for `{ns}`, a document or KV store: embedding queue entries and the
 /// `{ns}_sparse_vector`, `{ns}_dense_vector`, and `{ns}_sparse_vector_meta` companion stores.
 /// The schema is updated synchronously (semantic search disabled) before the
 /// background cleanup runs, preventing new embeddings from being enqueued.
@@ -388,21 +410,23 @@ pub async fn attribute_reindex_doc(
 /// Returns `409` when a cleanup or reindex is already in progress.
 /// Returns `422` when semantic search is not enabled for `{ns}`.
 pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // Block if cleanup already running.
-    {
-        let ops = state.vec_index_cleanup.lock();
-        if ops.contains(&ns) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("vector index cleanup already in progress for '{ns}'")
-                })),
-            ));
-        }
+    // Claim the cleanup before semantic search goes off, atomically with the check:
+    // an enable landing in between would see nothing running.
+    if !state.vec_index_cleanup.lock().insert(ns.clone()) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("vector index cleanup already in progress for '{ns}'")
+            })),
+        ));
     }
+    let release = || {
+        state.vec_index_cleanup.lock().remove(&ns);
+    };
 
-    // Block if a reindex reindex is running.
-    if let Err(DocStoreError::VecReindexInProgress { .. }) = state.store.check_index_all_preconditions(&ns) {
+    // Block if a reindex is running.
+    if vector_reindex_running(&state, &ns) {
+        release();
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -413,6 +437,7 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
 
     // Disable semantic search in the schema immediately so new writes stop enqueuing.
     state.store.disable_semantic_search(&ns).map_err(|e| {
+        release();
         let status = if matches!(e, DocStoreError::SemanticSearchNotEnabled { .. }) {
             StatusCode::UNPROCESSABLE_ENTITY
         } else if matches!(e, DocStoreError::NotFound { .. }) {
@@ -424,7 +449,6 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
         (status, Json(serde_json::json!({ "error": e.to_string() })))
     })?;
 
-    state.vec_index_cleanup.lock().insert(ns.clone());
     info!(namespace = %ns, "vector drop-all accepted — running in background");
 
     let store = Arc::clone(&state.store);
@@ -666,7 +690,7 @@ pub struct PartitionParams {
     pub codes: bool,
 }
 
-fn maintenance_json(m: &minnal_db::doc_store::vector_settings::MaintenanceSettings) -> serde_json::Value {
+fn maintenance_json(m: &minnal_db::doc_store::schema::vector_settings::MaintenanceSettings) -> serde_json::Value {
     serde_json::json!({
         "target_posting_size": m.target_posting_size,
         "split_limit": m.split_limit(),
@@ -693,7 +717,7 @@ pub async fn vector_partition(
     // The last recall check, from the history (never run here: it is costly).
     let last_check = state
         .store
-        .vector_partition_history(&ns, Some(minnal_db::ivf_split::history::RecordKind::RecallCheck), 1)
+        .vector_partition_history(&ns, Some(minnal_db::semantic_search::ivf_split::history::RecordKind::RecallCheck), 1)
         .await
         .ok()
         .and_then(|mut r| r.pop());
@@ -763,7 +787,7 @@ pub async fn vector_recall_check(
     Path(ns): Path<String>,
     Query(params): Query<RecallCheckParams>,
 ) -> axum::response::Response {
-    use minnal_db::ivf_split::recall_check as rc;
+    use minnal_db::semantic_search::ivf_split::recall_check as rc;
     let bad = |msg: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
     let defaults = rc::RecallCheckParams::default();
     let sample = params.sample.unwrap_or(defaults.sample);
@@ -832,7 +856,7 @@ fn vector_id_json(state: &AppState, ns: &str) -> impl Fn(&[u8]) -> serde_json::V
             Some(minnal_db::doc_store::StoredSchema::Kv(s)) => s.key_type.deserialize_key(bytes).ok(),
             None => None,
         };
-        decoded.unwrap_or_else(|| serde_json::Value::String(minnal_db::doc_store::hex::bytes_to_hex(bytes)))
+        decoded.unwrap_or_else(|| serde_json::Value::String(minnal_db::bytes_to_hex(bytes)))
     }
 }
 
@@ -912,8 +936,8 @@ pub struct HistoryParams {
     pub limit: Option<usize>,
 }
 
-fn parse_history_kind(kind: &str) -> Option<minnal_db::ivf_split::history::RecordKind> {
-    use minnal_db::ivf_split::history::RecordKind;
+fn parse_history_kind(kind: &str) -> Option<minnal_db::semantic_search::ivf_split::history::RecordKind> {
+    use minnal_db::semantic_search::ivf_split::history::RecordKind;
     match kind {
         "codes" => Some(RecordKind::Codes),
         "recall_check" => Some(RecordKind::RecallCheck),
@@ -936,10 +960,10 @@ pub async fn vector_history(State(state): State<AppState>, Path(ns): Path<String
         },
     };
     let limit = params.limit.unwrap_or(50);
-    if !(1..=minnal_db::ivf_split::history::MAX_HISTORY_LIMIT).contains(&limit) {
+    if !(1..=minnal_db::semantic_search::ivf_split::history::MAX_HISTORY_LIMIT).contains(&limit) {
         return bad(format!(
             "limit must be between 1 and {}, got {limit}",
-            minnal_db::ivf_split::history::MAX_HISTORY_LIMIT
+            minnal_db::semantic_search::ivf_split::history::MAX_HISTORY_LIMIT
         ));
     }
     match state.store.vector_partition_history(&ns, kind, limit).await {
@@ -1064,7 +1088,7 @@ pub async fn vector_postings(
     if let Some(s) = params.state.as_deref() {
         postings.retain(|p| p.state == s);
     }
-    let key = |p: &minnal_db::ivf_split::health::PostingHealth| -> f64 {
+    let key = |p: &minnal_db::semantic_search::ivf_split::health::PostingHealth| -> f64 {
         match sort {
             "entries" => p.entries as f64,
             "chunks" => p.chunks as f64,
@@ -1169,7 +1193,7 @@ pub async fn vector_centres(State(state): State<AppState>, Path(ns): Path<String
     if let Some(s) = params.state.as_deref() {
         centres.retain(|c| c.state == s);
     }
-    let key = |c: &minnal_db::ivf_split::health::CentreHealth| -> u64 {
+    let key = |c: &minnal_db::semantic_search::ivf_split::health::CentreHealth| -> u64 {
         match sort {
             "codes" => c.codes.unwrap_or(0),
             "postings" => c.postings.len() as u64,
@@ -1213,7 +1237,7 @@ pub struct QueueEntryInfo {
 
 impl From<QueueEntry> for QueueEntryInfo {
     fn from(e: QueueEntry) -> Self {
-        let doc_id_hex = minnal_db::doc_store::hex::bytes_to_hex(&e.doc_id_bytes);
+        let doc_id_hex = minnal_db::bytes_to_hex(&e.doc_id_bytes);
         let doc_id_str = std::str::from_utf8(&e.doc_id_bytes)
             .ok()
             .filter(|s| s.chars().all(|c| c.is_ascii_graphic() || c == ' '))
@@ -1510,6 +1534,9 @@ pub async fn rowmap_stats(
     let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
     let stats = state.store.rowmap_stats(&ns).await.map_err(|e| match e {
         DocStoreError::NotFound { .. } | DocStoreError::MissingNsId { .. } => err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found")),
+        // A KV store has no field indexes, so no row map: as for the doc-only
+        // row count, this store is the wrong kind.
+        DocStoreError::Schema(minnal_db::SchemaError::WrongStoreType { .. }) => err(StatusCode::CONFLICT, e.to_string()),
         other => err(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
     Ok(Json(match stats {

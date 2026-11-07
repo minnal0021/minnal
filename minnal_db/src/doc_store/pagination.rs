@@ -102,48 +102,6 @@ impl<T> CursorPage<T> {
     }
 }
 
-/// Smallest key strictly greater than every key beginning with `prefix` — the
-/// exclusive upper bound for a prefix scan expressed as a range `[prefix, …)`.
-///
-/// Returns `None` when `prefix` is empty or all `0xFF`: there is no finite
-/// exclusive bound, so the scan runs open-ended to the last key.
-pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(&last) = end.last() {
-        if last != 0xFF {
-            *end.last_mut().unwrap() = last + 1;
-            return Some(end);
-        }
-        end.pop();
-    }
-    None
-}
-
-#[cfg(test)]
-mod cursor_tests {
-    use super::prefix_upper_bound;
-
-    #[test]
-    fn upper_bound_increments_last_byte() {
-        assert_eq!(prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
-    }
-
-    #[test]
-    fn upper_bound_carries_over_trailing_ff() {
-        assert_eq!(prefix_upper_bound(&[b'a', 0xFF, 0xFF]), Some(vec![b'b']));
-    }
-
-    #[test]
-    fn upper_bound_all_ff_is_open_ended() {
-        assert_eq!(prefix_upper_bound(&[0xFF, 0xFF]), None);
-    }
-
-    #[test]
-    fn upper_bound_empty_is_open_ended() {
-        assert_eq!(prefix_upper_bound(b""), None);
-    }
-}
-
 /// Where a cursor-paginated scan over `[start, …)` resumes: the caller's cursor,
 /// but never before `start`.
 ///

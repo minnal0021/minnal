@@ -93,7 +93,7 @@ impl MultiBitQuanDotProductEstimator {
     /// so it never allocates an owned `VectorIndex` per candidate. `estimate_distance`
     /// is the same computation over an owned entry.
     pub fn estimate_from_parts(&self, query_embedding: &[f32], packed_vector: &[u64], addition_factor: f32, scaling_factor: f32) -> f32 {
-        let dot_product = crate::semantic_search::simd::multi_bit_dot_best(packed_vector, query_embedding, query_embedding.len());
+        let dot_product = crate::semantic_search::simd_support::multi_bit_dot_best(packed_vector, query_embedding, query_embedding.len());
         let query_addition_factor = dot_product + self.0.scaled_query_sum;
         let estimated_distance = -self.0.query_to_centroid_dot_product + addition_factor + (scaling_factor * query_addition_factor);
         1.0 - estimated_distance
@@ -117,7 +117,7 @@ impl SingleBitQuanDotProductEstimator {
     /// `scaling_factor`. See [`MultiBitQuanDotProductEstimator::estimate_from_parts`]
     /// for why the hot path avoids materialising an owned entry.
     pub fn estimate_from_parts(&self, query_embedding: &[f32], packed_vector: &[u64], scaling_factor: f32) -> f32 {
-        let ip = crate::semantic_search::simd::packed_ip_best(packed_vector, query_embedding, query_embedding.len());
+        let ip = crate::semantic_search::simd_support::packed_ip_best(packed_vector, query_embedding, query_embedding.len());
         let est_residual_ip = scaling_factor * (2.0 * ip - self.0.scaled_query_sum);
         self.0.query_to_centroid_dot_product + est_residual_ip
     }
@@ -131,7 +131,7 @@ impl DistanceEstimator for SingleBitQuanDotProductEstimator {
     ///   `est_ip = f_rescale · (2·ip − sum_q)`  where `ip = Σ_{b_i=1} q_i`
     ///
     /// Dispatches to the best available SIMD backend (AVX-512F → AVX2 → NEON → scalar)
-    /// via `crate::semantic_search::simd::packed_ip_best`.
+    /// via `crate::semantic_search::simd_support::packed_ip_best`.
     fn estimate_distance(&self, query_embedding: &[f32], vector_index: &VectorIndex) -> f32 {
         self.estimate_from_parts(query_embedding, &vector_index.packed_vector, vector_index.scaling_factor)
     }
@@ -142,7 +142,7 @@ impl DistanceEstimator for SingleBitQuanDotProductEstimator {
 /// codes, and the multi-bit estimator over bit planes for
 /// [`BitPlanes`](crate::semantic_search::QuantisationStyle::BitPlanes) codes, whose
 /// dot product is `Σ_j 2^j · ⟨plane_j, q⟩`, computed for every plane in one
-/// pass (`simd::bit_planes_ip_best`).
+/// pass (`simd_support::bit_planes_ip_best`).
 #[derive(Clone, Debug)]
 pub enum Pass1Estimator {
     /// 1-bit codes.
@@ -198,7 +198,7 @@ impl Pass1Estimator {
         match self {
             Self::Single(e) => e.estimate_from_parts(query_embedding, packed_vector, scaling_factor),
             Self::Planes { estimator, bits } => {
-                let dot = crate::semantic_search::simd::bit_planes_ip_best(packed_vector, query_embedding, query_embedding.len(), *bits);
+                let dot = crate::semantic_search::simd_support::bit_planes_ip_best(packed_vector, query_embedding, query_embedding.len(), *bits);
                 let query_addition_factor = dot + estimator.0.scaled_query_sum;
                 let estimated_distance = -estimator.0.query_to_centroid_dot_product + addition_factor + (scaling_factor * query_addition_factor);
                 1.0 - estimated_distance

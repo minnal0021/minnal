@@ -604,7 +604,7 @@ pub struct SemanticSearchSection {
     /// Search defaults copied into a namespace's schema (`vector_index.search`)
     /// when it enables semantic search.
     #[serde(default)]
-    pub search_defaults: minnal_db::doc_store::vector_settings::SearchSpec,
+    pub search_defaults: minnal_db::doc_store::schema::vector_settings::SearchSpec,
 }
 
 /// `[semantic_search.maintenance]`: how each namespace's partition is split,
@@ -641,8 +641,8 @@ pub struct MaintenanceSection {
 pub const DEFAULT_MAINTENANCE_THREADS: usize = 2;
 
 impl MaintenanceSection {
-    fn spec(&self) -> minnal_db::doc_store::vector_settings::MaintenanceSpec {
-        use minnal_db::doc_store::vector_settings::{MaintenanceSpec, Ratio};
+    fn spec(&self) -> minnal_db::doc_store::schema::vector_settings::MaintenanceSpec {
+        use minnal_db::doc_store::schema::vector_settings::{MaintenanceSpec, Ratio};
         MaintenanceSpec {
             target_posting_size: self.target_posting_size,
             reassign_range: self.reassign_range,
@@ -665,9 +665,9 @@ impl MaintenanceSection {
     }
 
     /// Rebuild threads, defaulted and checked (1 to
-    /// [`MAX_REBUILD_THREADS`](minnal_db::ivf_split::rebuild::MAX_REBUILD_THREADS)).
+    /// [`MAX_REBUILD_THREADS`](minnal_db::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS)).
     pub fn rebuild_threads(&self) -> Result<usize, String> {
-        let max = minnal_db::ivf_split::rebuild::MAX_REBUILD_THREADS;
+        let max = minnal_db::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS;
         let t = self.rebuild_threads.unwrap_or(max);
         if !(1..=max).contains(&t) {
             return Err(format!("maintenance.rebuild_threads must be between 1 and {max}, got {t}"));
@@ -735,8 +735,8 @@ impl SemanticSearchSection {
     /// The defaults a namespace's vector-index settings are filled with, built
     /// from `search_defaults` and `maintenance` over the built-in values and
     /// validated (also checks `maintenance.threads`).
-    pub fn index_defaults(&self) -> Result<minnal_db::doc_store::vector_settings::IndexDefaults, String> {
-        use minnal_db::doc_store::vector_settings::IndexDefaults;
+    pub fn index_defaults(&self) -> Result<minnal_db::doc_store::schema::vector_settings::IndexDefaults, String> {
+        use minnal_db::doc_store::schema::vector_settings::IndexDefaults;
         let builtin = IndexDefaults::default();
         self.maintenance.threads()?;
         self.maintenance.rebuild_threads()?;
@@ -862,7 +862,7 @@ mod tests {
         let base = "[storage]\ndb_path = \"/tmp/x\"\n";
         let cfg: DocStoreApiConfig = toml::from_str(base).unwrap();
         let d = cfg.semantic_search.index_defaults().unwrap();
-        assert_eq!(d, minnal_db::doc_store::vector_settings::IndexDefaults::default());
+        assert_eq!(d, minnal_db::doc_store::schema::vector_settings::IndexDefaults::default());
         assert_eq!(cfg.semantic_search.maintenance.threads().unwrap(), DEFAULT_MAINTENANCE_THREADS);
 
         let toml = format!(
@@ -923,7 +923,7 @@ mod tests {
             .join("\n");
         let cfg: DocStoreApiConfig = toml::from_str(&uncommented).unwrap();
         let d = cfg.semantic_search.index_defaults().unwrap();
-        let builtin = minnal_db::doc_store::vector_settings::IndexDefaults::default();
+        let builtin = minnal_db::doc_store::schema::vector_settings::IndexDefaults::default();
         assert_eq!(d.search, builtin.search);
         assert_eq!(d.maintenance.target_posting_size, builtin.maintenance.target_posting_size);
         assert!((d.maintenance.merge_ratio.0 - builtin.maintenance.merge_ratio.0).abs() < 1e-4);

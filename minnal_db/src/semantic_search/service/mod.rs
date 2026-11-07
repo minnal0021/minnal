@@ -71,7 +71,7 @@ pub use embedding_service::{EmbeddingError, EmbeddingTarget};
 /// chunks, about 960 postings, the largest corpus measured) 256 is the smallest
 /// count within 0.001 nDCG of a full read at every cutoff from 10 to 100 on
 /// gemma and qwen; it reads 28% of the entries in 6.4 ms warm (192: up to
-/// 0.0024 behind). SciFact (about 135 postings) is read in full (vector bench,
+/// 0.0024 behind). SciFact (about 135 postings) is read in full (frozen eval,
 /// 2026-10-19).
 pub const DEFAULT_PROBE: ProbeSettings = ProbeSettings {
     min_probes: 1,
@@ -163,7 +163,7 @@ impl Default for SemanticSearchConfig {
             sliding_size: 2,
             first_pass_sparse_search_top_k: 1000,
             query_embedding_cache_ttl: std::time::Duration::from_secs(86_400),
-            partition_history_ttl: crate::ivf_split::history::DEFAULT_HISTORY_TTL,
+            partition_history_ttl: crate::semantic_search::ivf_split::history::DEFAULT_HISTORY_TTL,
             embedding_request_timeout: std::time::Duration::from_secs(30),
             embedding_connect_timeout: std::time::Duration::from_secs(10),
         }
@@ -244,7 +244,7 @@ pub async fn embed_document_floats(config: &SemanticSearchConfig, text: &str) ->
 /// ([`QuantisationStyle::pass1`]) assigned to its nearest IVF cluster.
 ///
 /// This is everything [`embed_document`] does after the embedding-service call.
-/// It is separate so the vector benchmark can index saved embeddings through the
+/// It is separate so the frozen eval can index saved embeddings through the
 /// exact production path without calling the service.
 pub fn index_embeddings<L: IvfLayout + ?Sized>(
     config: &SemanticSearchConfig,
@@ -273,7 +273,7 @@ pub fn index_embeddings<L: IvfLayout + ?Sized>(
 ///
 /// Queries used to be split into 4-word sliding windows, each embedded on its
 /// own. A BEIR evaluation (SciFact, NFCorpus, ArguAna; see
-/// `semantic_search/report/query-embedding-report.md`) found the whole-query vector
+/// `semantic_search/docs/query-embedding-report.md`) found the whole-query vector
 /// never worse and often better. With a tight first-pass cut it kept more
 /// relevant documents: ArguAna candidate recall 0.991 vs 0.870, nDCG@10 +0.038.
 /// It is also much cheaper: one embedding instead of 1 + N, and one vector's
@@ -695,7 +695,7 @@ pub struct ProbeTrace {
 /// Ranking every posting is cheap; only the window is read and scored, so a
 /// window far down the order costs what one near the query does. Holds every
 /// scanned entry until it returns, as a search does, and takes a
-/// [`SCORING_GATE`] permit for its scoring only.
+/// `SCORING_GATE` permit for its scoring only.
 pub async fn pass1_probe_trace<K, L>(
     config: &SemanticSearchConfig,
     namespace: &str,
@@ -1580,14 +1580,15 @@ mod tests {
             .await
             .unwrap();
         db.namespace("docs".to_string()).await.unwrap();
+        crate::semantic_search::vector_kv::create_vector_namespaces(&db, "docs").await.unwrap();
         let docs: Vec<Vec<f32>> = (0..300).map(|d| unit_vec(768, d)).collect();
         for (d, v) in docs.iter().enumerate() {
             let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
-            crate::vector_kv::upsert_vectors(&db, "docs", &(d as u64).to_be_bytes(), "t", &vis)
+            crate::semantic_search::vector_kv::upsert_vectors(&db, "docs", &(d as u64).to_be_bytes(), "t", &vis)
                 .await
                 .unwrap();
         }
-        let store = crate::vector_kv::DbVectorStore::new(&db, "docs").await.unwrap();
+        let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, "docs").await.unwrap();
         for d in (0..300u64).step_by(15) {
             // The source document plus a little noise.
             let mut q: Vec<f32> = docs[d as usize].iter().zip(unit_vec(768, 9000 + d)).map(|(a, n)| a + 0.3 * n).collect();
@@ -1635,17 +1636,18 @@ mod tests {
                 .unwrap();
             let ns = format!("docs{bits}");
             db.namespace(ns.clone()).await.unwrap();
+            crate::semantic_search::vector_kv::create_vector_namespaces(&db, &ns).await.unwrap();
             let docs: Vec<Vec<f32>> = (0..200).map(|d| unit_vec(768, d)).collect();
             for (d, v) in docs.iter().enumerate() {
                 let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
                 let chunk = &vis[1];
                 assert_eq!(chunk.quantisation_style, QuantisationStyle::pass1(bits));
                 assert_eq!(chunk.packed_vector.len(), 12 * bits, "768 dims at {bits} bits");
-                crate::vector_kv::upsert_vectors(&db, &ns, &(d as u64).to_be_bytes(), "t", &vis)
+                crate::semantic_search::vector_kv::upsert_vectors(&db, &ns, &(d as u64).to_be_bytes(), "t", &vis)
                     .await
                     .unwrap();
             }
-            let store = crate::vector_kv::DbVectorStore::new(&db, &ns).await.unwrap();
+            let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, &ns).await.unwrap();
             let run = |config: SemanticSearchConfig, q: Vec<f32>| {
                 let (index, store, ns) = (&index, &store, ns.clone());
                 async move {
@@ -1692,14 +1694,15 @@ mod tests {
             .unwrap();
         let ns = "trace";
         db.namespace(ns.to_string()).await.unwrap();
+        crate::semantic_search::vector_kv::create_vector_namespaces(&db, ns).await.unwrap();
         let docs: Vec<Vec<f32>> = (0..200).map(|d| unit_vec(768, d)).collect();
         for (d, v) in docs.iter().enumerate() {
             let vis = index_embeddings(&config, &index, v, std::slice::from_ref(v)).unwrap();
-            crate::vector_kv::upsert_vectors(&db, ns, &(d as u64).to_be_bytes(), "t", &vis)
+            crate::semantic_search::vector_kv::upsert_vectors(&db, ns, &(d as u64).to_be_bytes(), "t", &vis)
                 .await
                 .unwrap();
         }
-        let store = crate::vector_kv::DbVectorStore::new(&db, ns).await.unwrap();
+        let store = crate::semantic_search::vector_kv::DbVectorStore::new(&db, ns).await.unwrap();
         for d in [0u64, 70, 150] {
             let mut q: Vec<f32> = docs[d as usize].iter().zip(unit_vec(768, 9000 + d)).map(|(a, n)| a + 0.3 * n).collect();
             let n = q.iter().map(|x| x * x).sum::<f32>().sqrt();

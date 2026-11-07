@@ -14,11 +14,17 @@ re-check them before starting work.
 | [FR-001](#fr-001--prevent-capture-surface-and-remediate-field-index-replay-gaps) | Prevent, capture, surface and remediate field-index replay gaps | `minnal_db`, `minnal_db_api` | High | ✅ **Done — 2026-08-01** |
 | [FR-002](#fr-002--api-authentication-tls-and-a-safe-bind-default) | API authentication, TLS, and a safe bind default | `minnal_db_api` | **Critical** | Proposed |
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
-| [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
+| [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | ✅ **Done — 2026-11-07** |
 | [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | ✅ **Done — 2026-10-09** |
 | [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | ✅ **Done — 2026-10-09** |
 | [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
 | [FR-008](#fr-008--collect-unused-ivf-centres) | Collect unused IVF centres | `minnal_db` (`ivf_split`, `semantic_search`) | Low | Proposed |
+| [FR-009](#fr-009--a-blocked-simd-bloom-filter-for-l1-lookups) | A blocked SIMD Bloom filter for L1 lookups | `minnal_db` (`storage/lsm`) | Low | Proposed |
+| [FR-010](#fr-010--refuse-an-enable-for-as-long-as-a-vector-index-drop-is-pending) | Refuse an enable for as long as a vector-index drop is pending | `minnal_db` (`doc_store`), `minnal_db_api` | Low | Proposed |
+| [FR-011](#fr-011--a-test-harness-for-api-routes) | A test harness for API routes | `minnal_db_api` | Low | Proposed |
+| [FR-012](#fr-012--make-a-skipped-upsert_vectors-visible-to-its-caller) | Make a skipped `upsert_vectors` visible to its caller | `minnal_db` (`vector_kv`) | Low | Proposed |
+| [FR-013](#fr-013--namespace-identity-without-a-central-registry-file) | Namespace identity without a central registry file | `minnal_db` (`db`), `minnal_db_api` | Medium | Proposed |
+| [FR-014](#fr-014--run-a-fraction-of-the-partition-crash-audits-by-default) | Run a fraction of the partition crash audits by default | `minnal_db` (`ivf_split` tests) | Low | Proposed |
 
 ---
 
@@ -104,7 +110,7 @@ still required; see *Implementation order*.
   *Implementation order*.)
 - **Dropping an index must delete its files and release the WAL.** Today
   `deactivate_field_index` only deregisters the in-memory index; the whole
-  `index/{ns_id}/{field_id}/` subtree survives — bitmap blob, keymap **and a
+  `field-index/{ns_id}/{field_id}/` subtree survives — bitmap blob, keymap **and a
   frozen checkpoint marker**. That is both a disk leak (reclaimed only when the
   entire namespace is dropped) and the thing that would poison the watermark
   above. Dropping a field must reclaim its directory and stop it holding WAL GC.
@@ -129,7 +135,7 @@ still required; see *Implementation order*.
   that is not true, which is worse than no signal at all.
 - **A rejected index update is a gap.** *(added 2026-08-01)* `update_indices_on_put`
   currently `warn!`s and continues when a field's `insert`/`update`/`set` returns
-  `Err` (`kv_store.rs`), leaving the row silently absent with nothing recorded.
+  `Err` (`kv_store/writes.rs`), leaving the row silently absent with nothing recorded.
   Once the gap-record machinery exists this is the cheapest case in the whole FR
   to capture — it is a one-key row-scoped gap and the key is already in hand.
 
@@ -194,14 +200,14 @@ root cause is that dropping an index leaves everything behind:
 an index leaves its files behind") is true of the engine but not of the whole
 system, and the real defect is sharper than a disk leak:
 
-- `Database::deactivate_field_index` (`database.rs`) is a two-line in-memory
+- `Database::deactivate_field_index` (`database/`) is a two-line in-memory
   deregister that never touches disk, and `IndexManager` has
   `remove_namespace_path` (whole namespace) but **no per-field removal**. So an
   embedder driving the engine directly does leak the whole
-  `index/{ns_id}/{field_id}/` subtree until the namespace is dropped.
-- But `doc_store::drop_index` (`doc_store/store/index_build.rs`) **already
+  `field-index/{ns_id}/{field_id}/` subtree until the namespace is dropped.
+- But `doc_store::drop_index` (`doc_store/indexing/build.rs`) **already
   deletes the directory** — by hand-building the path
-  (`db_path/index/{ns_id}/{field_id}`) and calling `remove_dir_all` directly,
+  (`db_path/field-index/{ns_id}/{field_id}`) and calling `remove_dir_all` directly,
   reaching straight past `IndexManager` into a layer it does not own.
 - **The live defect is the ordering, and it is exactly the one predicted below.**
   `drop_index` deactivates, deletes the files, and *then* calls `schema.save()`.
@@ -389,7 +395,7 @@ persist, surface, or repair anything.
 
 Note the check is segment-presence based, not `checkpoint_offset < wal_head`:
 WAL GC reclaims fully-persisted segments **out of order**, and `scan_entries`
-deliberately skips missing segments as holes (`wal.rs`), so a gap can open in the
+deliberately skips missing segments as holes (`wal/main_wal.rs`), so a gap can open in the
 middle of the replay window while `head` still sits below the checkpoint offset.
 Any future work here should keep that in mind — comparing against `head` alone
 under-reports.
@@ -511,13 +517,13 @@ the row map*.
 ### Acceptance criteria
 
 All met as of 2026-08-01. The test pinning each one is named beside it; all live
-in `minnal_db/src/db/database.rs` unless stated.
+in `minnal_db/src/db/database/` unless stated.
 
 - [x] WAL GC does not reclaim a segment that any active field index still needs
   for replay, proven by the inverse of
   `wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable`. —
   `wal_gc_does_not_reclaim_segments_an_active_field_index_still_needs`
-- [x] A dropped field index leaves no files under `index/{ns_id}/{field_id}/` and
+- [x] A dropped field index leaves no files under `field-index/{ns_id}/{field_id}/` and
   does not pin WAL GC; a crash mid-drop never yields a registered field whose
   data is gone, and the leftover directory is reclaimed at the next open. —
   `test_drop_field_index_deletes_its_directory`,
@@ -708,17 +714,17 @@ are the engine's call.
 `put` can return `Ok(())` for a write that a subsequent `get` reports as absent.
 
 The write path is: WAL append + fsync (durability barrier), then a best-effort
-in-memory apply with bounded retry. `apply_with_retry` (`database.rs:688`) tries
+in-memory apply with bounded retry. `apply_with_retry` (`database/`) tries
 `APPLY_RETRY_ATTEMPTS` (3) times, logs an `error!` on final failure, and returns
 `bool`. `put_ns` bumps the `apply_failures` metric on that `false` and then
-returns `Ok(())` regardless (`database.rs:760-773`); `delete_ns` mirrors it at
+returns `Ok(())` regardless (`database/`); `delete_ns` mirrors it at
 `:846`.
 
 **The data is not lost** — it is durable in the WAL and replayed on the next
 open. But between the failed apply and the next restart, the write is invisible
 to reads while the caller has been told it succeeded.
 
-`Db::put`'s public doc comment (`facade.rs:132`) is a bare one-liner — "Insert or
+`Db::put`'s public doc comment (`facade/db.rs`) is a bare one-liner — "Insert or
 update a key-value pair" — and says nothing about this. The behaviour is only
 described in internal comments.
 
@@ -776,6 +782,12 @@ documented.
 **Severity:** Low — layering; no defect, no user-visible symptom
 **Source:** engine correctness review 2026-07-25, item 5 (the half the
 decomposition could not reach)
+**✅ Implemented:** 2026-11-07, as a breaking change to `DocStore`'s public methods.
+`DocStore::db()` returns the engine handle, `AppState` holds it, and the 21 passthroughs
+are gone; `doc_store/diagnostics.rs` keeps the operations scoped to one store. The REST
+API is unchanged: every `/admin/storage` route `minnal_ui` calls returned the same status
+and response shape (and the same error bodies) before and after. The repo has no
+changelog to record it in, so the commit message carries the breaking change.
 **Reaffirmed:** 2026-08-01 tech-debt review — the priority is right, but record
 *why*. The cost is not confusion today; it is that the document layer cannot be
 changed or replaced without dragging along a pile of forwarders that have
@@ -800,7 +812,7 @@ don't reach across modules* — because the API server reaches the engine
 **through** `DocStore` rather than alongside it. `routes/admin_storage.rs` is
 almost entirely calls of this shape.
 
-They are now collected in `doc_store/store/diagnostics.rs` with a module doc
+They are now collected in `doc_store/diagnostics.rs` with a module doc
 comment pointing here, so at least the coupling is visible in one place.
 
 ### Why this is a feature, not a bug fix
@@ -836,7 +848,7 @@ by construction.
 ### Acceptance criteria
 
 - No route in `minnal_db_api` reaches the engine through `DocStore`.
-- `doc_store/store/diagnostics.rs` shrinks to the genuinely document-scoped
+- `doc_store/diagnostics.rs` shrinks to the genuinely document-scoped
   operations (`count_docs`, the `field_index_*` helpers, `reindex_doc_*`), or
   disappears.
 - The removal is a single, clearly-labelled breaking commit.
@@ -846,12 +858,12 @@ by construction.
 ## FR-005 — Container-granular field-index files
 
 **Filed:** 2026-10-08
-**Area:** `minnal_db` (`src/index/`)
+**Area:** `minnal_db` (`src/field_index/`)
 **Severity:** Low — affects only fields whose changed bitmaps together exceed
 `thresholds.index_overlay_hard_bytes` (64 MiB by default)
 **Source:** field-index write-back work on branch `roaring_bit_map_fixes`
 (steps 1–3a done; this is step 3b–3d of
-`minnal_db/src/index/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
+`minnal_db/src/field_index/docs/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
 **✅ Implemented:** 2026-10-09 (`0c04268`) — see *Implementation* below.
 
 ### Summary
@@ -878,7 +890,7 @@ would have to be rebuilt).
 - Crash tests: crash before each write step, with a random subset of dirty pages
   written back; reopen + replay must equal a full rebuild.
 
-The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
+The design is in `minnal_db/src/field_index/docs/Field-Index-Write-Back-Evaluation.md`
 (option 4, step 3).
 
 ### Acceptance criteria
@@ -890,14 +902,14 @@ The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
 
 ### Implementation
 
-- **Format** (`index/storage.rs`): each container is its own rkyv blob; a value's
+- **Format** (`field_index/bitmap/codec.rs`): each container is its own rkyv blob; a value's
   slot points at a checksummed directory (`MBD1`, container key → offset, len).
   `BlobStore` gained `BlobLayout::{Flat, Directory}` (keymap / bitmaps); dead and
   live bytes, open-time repair (a torn directory, or one listing a container past
   the file, counts as damaged → full-rebuild gap) and compaction read
   directories. On-disk version 1 → 2: older stores refuse to open (greenfield;
   delete and rebuild).
-- **Overlay** (`index/field/field_index.rs`): `slot → container key →
+- **Overlay** (`field_index/typed_index.rs`): `slot → container key →
   Option<Container>`, with the slot's decoded directory cached; a spill appends
   only the changed containers and a new directory.
 - **Tests:** `every_spill_phase_crash_recovers_to_the_ground_truth` (crash after
@@ -916,7 +928,7 @@ The design is in `minnal_db/src/index/Field-Index-Write-Back-Evaluation.md`
 ## FR-006 — `reindex-all` compacts the row map
 
 **Filed:** 2026-10-09
-**Area:** `minnal_db` (`src/index/rowmap.rs`, `src/db/`), `minnal_db_api`
+**Area:** `minnal_db` (`src/field_index/rowmap.rs`, `src/db/`), `minnal_db_api`
 (`POST /admin/indices/{ns}/attribute/reindex-all`)
 **Severity:** Low — disk and page cache only; affects namespaces that write many
 short-lived keys
@@ -925,7 +937,7 @@ short-lived keys
 
 ### Summary
 
-A namespace's row map (`index/{ns}/rowmap/`) gives each key a dense row ID and
+A namespace's row map (`field-index/{ns}/rowmap/`) gives each key a dense row ID and
 never frees one: a deleted key keeps its ID, and a key that comes back gets the
 same ID again. The files (`rows.keybytes`, `rows.idarray`, `rows.slots`) are
 memory-mapped, not heap, but they grow with **every distinct key ever written**,
@@ -942,7 +954,7 @@ any field still holds it. A bit can survive a delete: a field whose delete was
 not yet on disk at a crash, a field with an unrepaired gap, or one field rebuilt
 before or after the row map. WAL replay only re-applies writes and never clears a
 bit it does not know about, so a reused ID would make the new key match queries
-for the old key's values, silently. See the module docs in `index/rowmap.rs`.
+for the old key's values, silently. See the module docs in `field_index/rowmap.rs`.
 
 ### Why the existing rebuilds do not fix it
 
@@ -997,7 +1009,7 @@ document ID, so they are unaffected.
   namespace is dropped; `RowMap::reset` removes the marker first (the commit
   point), then truncates the files.
 - `DocStore::reindex_all_attribute_indices`: intent file
-  `index/{ns_id}/reindex_all.json` → drop all → reset → re-add all → remove the
+  `field-index/{ns_id}/reindex_all.json` → drop all → reset → re-add all → remove the
   file; `resume_pending_builds` finishes an interrupted run. `drop-all` also
   resets. `add_index` now records its build before saving the schema, closing a
   window where a crash left a half-built index nothing resumed.
@@ -1014,8 +1026,8 @@ document ID, so they are unaffected.
 ## FR-007 — A recall check that says when a rebuild helps
 
 **Filed:** 2026-10-12
-**Area:** `minnal_db` (`src/ivf_split/recall_check.rs`, `src/ivf_split/history.rs`,
-`src/doc_store/store/vector.rs`), `minnal_db_api`
+**Area:** `minnal_db` (`src/semantic_search/ivf_split/recall_check.rs`, `src/semantic_search/ivf_split/history.rs`,
+`src/doc_store/vector/mod.rs`), `minnal_db_api`
 (`GET /admin/indices/{ns}/vector/recall-check`, `GET /admin/indices/{ns}/vector/history`)
 **Severity:** Low — operators had no measured way to decide on a rebuild
 **Source:** design-doc review of M4: "the product has no cutoff that starts a
@@ -1132,7 +1144,7 @@ above it the reference reads the nearest postings up to the cap
 ## FR-008 — Collect unused IVF centres
 
 **Filed:** 2026-10-18
-**Area:** `minnal_db` (`src/ivf_split/rebuild.rs`, `src/semantic_search/cluster/layout.rs`,
+**Area:** `minnal_db` (`src/semantic_search/ivf_split/rebuild.rs`, `src/semantic_search/cluster/layout.rs`,
 `{ns}_ivf_centres`)
 **Severity:** Low — memory and disk only; no effect on search results or speed
 **Source:** dynamic RaBitQ index, design decision 14 (deferred 2026-10-17)
@@ -1222,5 +1234,510 @@ patch.
   and FiQA after a rebuild with collection, against one without.
 
 The design and its risk table are in
-`minnal_db/src/semantic_search/report/Dynamic-RaBitQ-Index-Design.md` →
+`minnal_db/src/semantic_search/docs/Dynamic-RaBitQ-Index-Design.md` →
 *Known limitation: centres are never collected*.
+
+---
+
+## FR-009 — A blocked SIMD Bloom filter for L1 lookups
+
+**Filed:** 2026-11-04
+**Area:** `minnal_db` (`src/storage/lsm/bloom.rs`)
+**Severity:** Low — read latency on misses; no effect on results
+**Source:** SIMD survey, 2026-11-04. Needs a bare-metal measurement before any
+decision.
+
+### Summary
+
+A point lookup that misses asks the Bloom filter of each candidate L1 file whether
+the key can be there. Today's filter (`BloomFilter`) hashes the key twice and tests
+7 bit positions spread over the whole filter, each found with a 64-bit modulo.
+
+A blocked filter hashes once and tests 8 bits inside one 256-bit block: one cache
+line, tested in one AVX2 instruction. A miss was 2.6 times faster in a prototype,
+at the price of a higher false-positive rate.
+
+### Measurements so far
+
+One million 12-byte keys and a 1.25 MB filter at 10 bits per key, on an AMD Ryzen AI
+9 HX 375 under WSL2. Times exclude fetching the key.
+
+| | Hit | Miss | False positives | Build, 1M keys |
+|---|---|---|---|---|
+| Today | 95 ns | 87 ns | 0.82% | 54 ms |
+| Blocked, AVX2 | 36 ns | 34 ns | 1.30% | 19 ms |
+
+These numbers are not enough to decide on, for three reasons:
+
+- **Noise.** With another load on the machine the same code measured 121 ns and
+  66 ns for a miss, so the ratio moved from 2.6 to 1.8.
+- **Cache size.** The filter is little larger than this CPU's 1 MB per-core L2 cache
+  and well inside its 16 MB L3. The blocked filter's main advantage (one cache miss
+  against up to seven) grows on filters beyond those, and no such size was measured.
+- **The filter alone.** Nothing measured a whole `get`, where a false positive costs
+  a sparse-index search and a scan of the file: 0.48 more false positives per 100
+  misses may cancel part of the gain.
+
+Much of the gain is not SIMD: one hash instead of two (a hash costs about 23 ns here)
+and no modulo. A scalar blocked filter should be measured alongside the AVX2 one.
+
+### Prototype
+
+The hash is `mm3h::Murmur3Hasher`, whose `finish()` holds only **32 bits**. Taking the
+block from `h >> 32` puts every key in block 0 and reports 100% false positives, so
+both the block and the bit positions must come from the low 32 bits.
+
+```rust
+const SALT: [u32; 8] = [0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d,
+                        0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31];
+
+struct Blocked { blocks: Vec<[u32; 8]>, n: u64 } // n = keys * 10 / 256 + 1
+
+/// The block index (`(h * n) >> 32`) comes from `h`, the bit positions from `x`.
+fn mix(hash: u64) -> (u64, u32) {
+    let h = hash as u32;
+    (u64::from(h), (h ^ (h >> 15)).wrapping_mul(0x2c1b3c6d))
+}
+// insert: for j in 0..8 { block[j] |= 1 << (x.wrapping_mul(SALT[j]) >> 27) }
+
+#[target_feature(enable = "avx2")]
+unsafe fn may_contain(&self, hash: u64) -> bool {
+    use std::arch::x86_64::*;
+    let (h, x) = mix(hash);
+    let block = &self.blocks[((h * self.n) >> 32) as usize];
+    let positions = _mm256_srli_epi32(
+        _mm256_mullo_epi32(_mm256_set1_epi32(x as i32), _mm256_loadu_si256(SALT.as_ptr().cast())),
+        27,
+    );
+    let wanted = _mm256_sllv_epi32(_mm256_set1_epi32(1), positions);
+    _mm256_testc_si256(_mm256_loadu_si256(block.as_ptr().cast()), wanted) == 1
+}
+```
+
+### Why it can be tried cheaply
+
+The filter is derived and in memory: it is rebuilt from the file on open and after a
+compaction, and never written to disk. Changing its layout needs no format change, and
+a crash cannot leave one layout on disk for the other to read.
+
+### What to measure on bare metal
+
+- Whole lookups: `cargo bench --bench bench_sstable_lookup` (its L1 misses) and
+  `cargo bench --bench bench_read` (`read/get_miss`).
+- Filters above and below the L2 and L3 cache sizes (1M, 10M and 100M keys).
+- Today's filter, a scalar blocked filter and the AVX2 one, at 10 and 12 bits per key,
+  as more bits would buy back the false-positive rate.
+- Inputs varied between iterations, as a repeated input lets the branch predictor
+  memorise it.
+
+### Acceptance criteria
+
+- No false negatives, by test, on every path.
+- A blocked path for AVX2 (runtime-detected), for NEON and scalar: each path gives the
+  same answers for the same filter.
+- A whole-`get` miss measurably faster than today across the sizes above, including
+  the cost of false positives. If it is not, close this request.
+
+---
+
+## FR-010 — Refuse an enable for as long as a vector-index drop is pending
+
+**Filed:** 2026-11-05
+**Area:** `minnal_db` (`src/doc_store/lifecycle.rs`), `minnal_db_api`
+(`src/routes/stores.rs`, `indices.rs`, `admin_indices.rs`)
+**Severity:** Low — needs an enable and a drop of one store within moments of each
+other; the affected documents are repaired by a reindex
+**Source:** Review of store and vector-index lifecycle races. Found by reading the
+code; no test reproduces it yet.
+
+### Summary
+
+A vector-index drop has two steps. The route saves the schema with semantic search
+off, then records the store in `vec_index_cleanup` and starts the removal in the
+background. An enable that lands before the removal starts is accepted, and writes
+after it queue their embeddings. The removal then clears the queue, so those
+documents are stored and acknowledged but never embedded.
+
+The partition itself is safe: `DocStore::lifecycle` serialises the two operations,
+and a drop that finds semantic search on seeds a new partition when it finishes.
+
+### Why the route's check is not enough
+
+The enable route answers `409` (`VectorCleanupInProgress`) when the store is in
+`vec_index_cleanup`, but that set lives in the API server and is checked apart from
+the schema change, which leaves two windows:
+
+- A request arriving between the schema save and the insert into the set (for example
+  `routes/admin_indices.rs:415` and `:427`) passes the check.
+- An enable that passed the check before the drop route ran goes on to `amend` after
+  the schema save.
+
+Library users have no such check at all.
+
+### Proposed direction
+
+Have `DocStore` own the pending state: `disable_semantic_search` and
+`remove_attribute` record the drop in the same step as the schema change, `amend`
+refuses to turn semantic search on while a drop is recorded, and
+`drop_vector_index_data` clears it when done. `vec_index_cleanup` then reports this
+state rather than holding its own copy.
+
+### Open questions
+
+- Should the record survive a restart? `finish_interrupted_vector_index_drops` already
+  finishes a drop at open, which suggests not, but it runs only for a store whose
+  schema says semantic search is off.
+- A caller that disables and never calls `drop_vector_index_data` would block enables
+  for good. Either the two become one library call, or the record needs a way out.
+
+### Acceptance criteria
+
+- A test: disable, enable, write, then run the drop. The enable is refused, or the
+  written document ends up indexed.
+- The same result for every interleaving of the two routes, in a racing test.
+- Re-enabling after the drop finishes keeps working, with its settings kept.
+
+---
+
+## FR-011 — A test harness for API routes
+
+**Filed:** 2026-11-05
+**Area:** `minnal_db_api` (`src/routes/`, `src/main.rs`)
+**Severity:** Low — test coverage; no known defect
+**Source:** Adding the `409` on the enable route, which could not be tested.
+
+### Summary
+
+Route handlers have no test harness: the tests in `minnal_db_api/src/routes/` cover
+helpers such as cursor decoding, not requests. Behaviour that lives only in a handler
+is checked by compiling it. The enable route's `409` while a cleanup runs has never
+been exercised by a request.
+
+### Proposed direction
+
+A test-only helper that builds an `AppState` over a temporary `DocStore` and drives
+the router in process, with no socket (`tower::ServiceExt::oneshot`), plus a mock
+embedding service for routes that need one. `tower` as a dev-dependency needs
+agreement first, as any new dependency does.
+
+### First routes to cover
+
+- The enable route answers `409` while the store is in `vec_index_cleanup`, and
+  succeeds once it is out.
+- Both vector-index drop routes answer `202`, then `409` for a second drop.
+- A store name ending in a companion suffix answers with the reserved-name error.
+
+### Acceptance criteria
+
+- The routes above are tested by request, on every run of `cargo test --workspace`.
+- A new route test is a few lines, with no port or external service.
+
+---
+
+## FR-012 — Make a skipped `upsert_vectors` visible to its caller
+
+**Filed:** 2026-11-05
+**Area:** `minnal_db` (`src/semantic_search/vector_kv/`, `src/semantic_search/workers/vec_index.rs`)
+**Severity:** Low — affects direct users of `vector_kv`; the document store creates
+the namespaces itself
+**Source:** Review of store and vector-index lifecycle races.
+
+### Summary
+
+`upsert_vectors` never creates a store's vector namespaces, so that a write outliving
+a drop cannot bring them back. When they are absent it logs at debug level and returns
+`Ok` with an empty `PostingDelta`.
+
+The vector worker needs that skip. A direct user of `vector_kv` who has not called
+`create_vector_namespaces` or `init_ivf` gets the same answer: every upsert succeeds,
+nothing is written, and searches return nothing. The only record is a debug log line.
+`finish_embed` goes on to complete the queue entry in the same way, and so does the
+worker, so a skipped document leaves no trace in the queue.
+
+### Why this is an API change
+
+An `Ok` with an empty delta also means "nothing to write" (an empty `vector_indexes`),
+so a caller cannot tell the two apart. `upsert_vectors` is public, and telling them
+apart changes what it returns.
+
+### Proposed direction
+
+Return a new `KVError` variant when the namespaces are
+absent. The worker treats it as `Processed::Dropped`, as it does a dropped partition;
+everyone else sees the failure. A smaller alternative keeps the return value and logs
+at `warn`, but a drop racing the worker would then warn in normal operation.
+
+### Acceptance criteria
+
+- `upsert_vectors` on a namespace that was never seeded returns an error a caller can
+  match on, and creates nothing.
+- A drop racing the worker still logs no warning and fails no queue entry
+  (`a_drop_stops_the_worker_pass_on_its_store`).
+- The `create_vector_namespaces` requirement is in the `vector_kv` module docs.
+
+---
+
+## FR-013 — Namespace identity without a central registry file
+
+**Filed:** 2026-11-05
+**Area:** `minnal_db` (`src/namespace/`, `src/db/namespace/namespace_ops.rs`, `database/`, `wal/main_wal.rs`,
+`wal/vector_index_wal/mod.rs`, `src/layout.rs`, `indexing/manager.rs`), `minnal_db_api` (README)
+**Severity:** Medium — a damaged registry stops the whole database opening; no data
+is at risk from the design as it stands
+**Source:** Design discussion on how `ns_id` is generated. Not prototyped or measured.
+
+### Summary
+
+Replace the `u32` namespace id with a UUID, and remove the binary `namespace_registry`
+file. Each namespace's directory becomes the record of its own existence, id and TTL.
+
+Goals:
+
+- **No single point of failure.** One damaged file should not stop every namespace
+  opening.
+- **Less to maintain.** No binary format, no saved counter, no list of namespaces kept
+  apart from the namespaces themselves.
+- **Ids that stay unique across databases,** which copying a namespace to another
+  database or running several nodes would need. Neither is part of this request.
+
+### What the registry does today
+
+`{db_path}/namespace_registry` is a binary file: a header with a CRC checksum, then an
+rkyv payload (`RegistryData`, `namespace/registry.rs:240`). Every change rewrites it through
+`write_atomic_durable`. It has four jobs:
+
+| Job | Where it goes |
+|---|---|
+| `next_id`, the counter behind every id | Removed: a random id needs no counter |
+| Which id each name has | The namespace's `config.json` |
+| TTL settings | The namespace's `config.json` |
+| **Deciding which namespaces exist** | The namespace directories (see below) |
+
+The last job is the hard one. Saving the registry is the moment a drop becomes
+permanent (step 1 of `remove_namespace`), and recovery skips WAL entries whose
+namespace it does not list (`database/`).
+
+`next_id` cannot be replaced by the highest id plus one. Dropping the newest namespace
+would free its id, and the WAL would replay the dropped namespace's records into the
+next namespace to take it.
+
+### Proposed direction
+
+**Layout.** Add `id` and `ttl` to `NamespaceConfig`, the existing per-namespace
+`config.json` (`namespace/registry.rs:54`). Opening a database scans for `ns_*` directories and
+reads each one's config, which it already does once per namespace (`load_config`). The
+registry stays as an in-memory map, built by that scan.
+
+**Create.** Build the directory under a temporary name (`creating_{id}`), with its
+config written and synced. Then rename it to `ns_{name}` and fsync the parent. The
+rename is the moment the namespace exists. Open removes any `creating_*` it finds.
+
+**Drop.** Stop and close the store, then rename `ns_{name}` to `dropped_{id}` and fsync
+the parent. The rename is the moment the drop is permanent. File deletion stays
+best-effort, and open finishes it by sweeping `dropped_*`. This is a change of order:
+the store closes before the durable step, because a flush after the rename would write
+to a path that no longer exists.
+
+**Ids.** `NamespaceId(u128)`, a `Copy` newtype, replaces the `u32` everywhere (about 150
+declarations). `default` and `system` get fixed reserved values in place of 0 and 1.
+Field indexes move to `field-index/{id}/`, and `ns_id` in a schema becomes a string.
+
+**Logs.** Both WALs carry the full 16-byte id, so each record grows by 12 bytes. A
+small per-database id mapped to the UUID would avoid that, but it needs its own durable
+mapping, which is the file this request removes.
+
+### Costs and risks
+
+- **Crash safety moves.** This code decides what recovery replays, and every crash
+  point needs a test. The bugs recently fixed around namespace lifetimes are the reason
+  for caution here: start from the crash tests, not the refactor.
+- **A drop interrupted before the rename is undone.** The namespace is still live at
+  the next open. A store drop has not answered its caller at that point and removes the
+  schema last, so it can be retried; the crash tests must confirm this.
+- **Log size.** 12 more bytes per record costs most on small values, such as the embed
+  queue and document metas. Measure WAL throughput before and after.
+- **Readability.** Logs and directory names carry long ids instead of small numbers.
+- **Complexity may not fall much.** About 80 lines of binary persistence go, and the
+  create and drop rename protocols and the sweep arrive. The result is simpler to
+  inspect, but the amount of crash-sensitive code is similar. If the prototype is no
+  smaller, the first option below may be enough.
+
+### Not removed by this request
+
+- **`WalMetadata`** (`wal/main_wal.rs:250`) is also one file holding every namespace's saved
+  offsets, so a damaged copy still affects the whole database. It should be reviewed
+  separately, including whether it can be rebuilt from the log.
+- **`system_schema`** holds every store's schema, though it is a namespace with its own
+  durability rather than a special file.
+
+### Open questions
+
+- **Generating ids:** `minnal_db` has no UUID crate, `rand` is only a dev-dependency,
+  and new dependencies need agreement. `getrandom` alone would be enough, since nothing
+  needs to parse a UUID.
+- **A smaller first step:** keep `u32` ids and write each namespace's id and TTL to its
+  `config.json` as well, then make the registry rebuildable by a scan. That removes the
+  single point of failure with no change to the logs, but keeps the counter, which would
+  need a copy of its own, and the binary file. It could also be taken as stage one of
+  this request.
+- **Directory names:** should a namespace's data directory move to `ns_{id}`, matching
+  `field-index/{id}`? Renaming a namespace would become cheap, but directories would no longer
+  be readable by name.
+
+### Acceptance criteria
+
+- `namespace_registry` and `next_id` are gone, and an open rebuilds the namespace list
+  from the directories alone.
+- A damaged `config.json` affects that namespace only: the others open, and the damaged
+  one is reported by name. What the database does about its WAL records is decided and
+  tested, and they are never replayed into another namespace.
+- A SIGKILL at every step of create and drop leaves the namespace either fully there or
+  fully gone after reopening, with no acknowledged write lost in any other namespace.
+- A name dropped and recreated never receives the old namespace's WAL records.
+- WAL throughput is measured against today's on small and typical values, and the
+  result is recorded here. A large drop is a reason to stop and reconsider.
+- `minnal_db_api/README.md`'s on-disk layout describes the new files.
+
+---
+
+## FR-014 — Run a fraction of the partition crash audits by default
+
+**Filed:** 2026-11-06
+**Area:** `minnal_db` (`ivf_split` tests), plus somewhere to run a nightly job
+**Severity:** Low. The audits pass; they make the test suite slow.
+**Source:** Analysis of the slow tests, with 15 injected bugs run against the full audits in a
+scratch copy. Blocked on deciding where the nightly run lives.
+
+### Summary
+
+The three partition crash audits run 4,816 cases and take most of the suite's time.
+By default they should run about 850 of them, chosen per write site, and a nightly job
+should run them all. The change is test-only. It takes the `minnal_db` library tests
+from about 207 s to about 77 s under nextest on tmpfs.
+
+### Why this is a feature, not a bug fix
+
+Nothing is wrong today. This trades coverage on every run for speed, and that coverage
+then depends on a scheduled job the repo does not yet have. Both are decisions to make,
+not defects to fix.
+
+### Where the time goes
+
+Each audit crashes an operation before every write, under four flush patterns, and most
+write positions are the same few writes repeated per document. In the 1-bit rebuild, four
+sites account for 192 of the 222 positions.
+
+| Test | Scenario | Positions | Cases |
+|---|---|---:|---:|
+| `reassign_and_merge_survive_a_crash_before_any_write` | Reassign, 1-bit | 283 | 1,132 |
+| | Merge, 1-bit | 22 | 88 |
+| | Reassign, 4-bit | 315 | 1,260 |
+| `a_rebuild_survives_a_crash_before_any_write` | 1-bit | 222 | 888 |
+| | 4-bit | 258 | 1,032 |
+| `a_split_survives_a_crash_before_any_write` | 1-bit | 104 | 416 |
+
+Positions include the final run, where no crash fires. The six
+`vector_kv::tests::crash_audit` stay as they are: about 50 to 105 cases each, 1 to 2.5 s
+each on tmpfs.
+
+### Which cases to keep
+
+Each option below was scored by replaying the full audit's per-case results for 10
+injected bugs, the ones the full audit detects.
+
+| Option | Cases kept | Bugs caught |
+|---|---:|---:|
+| Per site: first 4, last 4, every 16th; flushes `None` + `All` (**proposed**) | 852 (17.7%) | 10 |
+| Per site: first and last only; flushes `None` + `All` | 296 (6.1%) | 10 |
+| Flushes `None` + `All` only | 2,420 (50.2%) | 10 |
+| Every 8th position, all flushes | 612 (12.7%) | 8 (worst offset) |
+| Drop the 4-bit scenarios | 2,532 (52.6%) | 9 |
+| Flush `None` only | 1,222 (25.4%) | 8 |
+
+First and last only also caught everything, but the bugs were chosen by hand, so that
+result is too thin to rely on. Both flush patterns are needed: two bugs (a skipped batch
+sync, and one skipped every third batch) fail only with `None`, and two (a key deleted
+or shrunk before its meta) never fail with `None`.
+
+Measured at `8636575` on WSL2, tmpfs, each test alone:
+
+| Test | Full | Proposed |
+|---|---:|---:|
+| `reassign_and_merge_survive_a_crash_before_any_write` | 159.7 s | 27.5 s |
+| `a_rebuild_survives_a_crash_before_any_write` | 101.0 s | 16.9 s |
+| `a_split_survives_a_crash_before_any_write` | 13.9 s | 4.0 s |
+
+### Proposed direction
+
+All in test code, except for the nightly job.
+
+1. **Record each crash point's site.** Both `crash_point!` macros (`vector_kv/mod.rs`,
+   `semantic_search/ivf_split/mod.rs`) pass their `file:line` to the `crash_point` module, and
+   `crash_point::trace()` runs with no crash and returns the ordered list of sites.
+   Tests that call `arm(n)` directly are unaffected.
+2. **Pick the cases with a pure function** in `semantic_search/ivf_split/tests.rs`, with its own unit
+   tests: `select_cases(trace, mode) -> Vec<(Flushed, usize)>`. The default mode keeps
+   the proposed set. Full mode, set by `MINNAL_FULL_CRASH_AUDIT=1`, keeps every position
+   under all four flushes. Both include the final no-crash run.
+3. **Run from the list.** `crash_audit` copies the template, runs the operation once for
+   its trace, builds the list and shares it across its threads by index, replacing the
+   `(first..).step_by(step)` loop in `crash_cases`. Each case's body is unchanged, and
+   `writes` becomes `trace.len()`, so the `writes > N` assertions still hold.
+4. **Refuse to test less silently.** Each case must crash if `n < writes` and must not on
+   the final run, which catches a trace that varies between runs. Every site in the trace
+   must fire at least once.
+5. **Schedule the nightly run:**
+
+   ```sh
+   MINNAL_FULL_CRASH_AUDIT=1 cargo nextest run -p minnal_db --all-features -E 'test(a_crash_before_any_write)'
+   TMPDIR=/var/tmp cargo nextest run --workspace --all-features
+   ```
+
+   The audit can stay on tmpfs: its crash is simulated in-process, so the page cache
+   survives and a real disk adds nothing to what it checks. The second command is the
+   real-disk run of the whole suite.
+6. **Update the crash audit notes** in `CLAUDE.md` and `minnal_db/src/semantic_search/CLAUDE.md`,
+   including how to run the full audit.
+
+Do not merge steps 1 to 4 until the nightly job exists, so there is never a gap in
+coverage.
+
+### Risks
+
+- **The nightly job does not run.** Skipped positions would then never run at all. This
+  is the main risk, and why the job comes first.
+- **A bug at one mid-run position.** About 4 in 5 positions at a 48-position site are
+  skipped by default, so only the full run reliably catches it.
+- **A bug that needs a partial flush.** `Sparse` and `Meta` alone are dropped by default.
+  No injected bug needed them, but only 10 were tried, all chosen by hand.
+- **The selection code itself is wrong.** Step 4 and the unit tests guard against it.
+
+### Open questions
+
+- **Where does the nightly run live?** The repo has no CI. GitHub Actions runs without
+  anyone's machine being on and keeps a history, but hosted runners have limited memory
+  and `/dev/shm`, so the tmpfs guard in `.cargo/test-runner.sh` may send tests to disk
+  there, which is slow. A local cron job in WSL is quickest to set up, but runs only
+  while the machine is up, so missed nights are easy not to notice.
+- **Should the "every 16th" offset rotate between runs?** Skipped positions would be
+  covered over time, at the cost of default runs that differ. The offset would have to be
+  printed on failure. Not tested; identical runs are easier to debug at first.
+- **Are the maintenance barriers needed?** Removing any of the three durability barriers
+  (`rebuild::finish`, `reassign::run`, `finish_drain`) is not detected even by the full
+  audit, nor is writing the copy's meta after its key, or ignoring an already recorded
+  reassignment in `finish_drain`. Each batch syncs already, which may make the barriers
+  redundant, but this was not confirmed: either they are, or the audit has a gap. Worth
+  settling separately, and this request does not depend on the answer.
+
+### Acceptance criteria
+
+- With `MINNAL_FULL_CRASH_AUDIT=1`, the audits run every position under all four flushes
+  and pass.
+- By default they run about 850 cases, and the three tests together take under 60 s alone
+  on tmpfs.
+- The 10 injected bugs, re-applied to a scratch copy, are each caught by the default set
+  running through the real selection code, not only by replaying logged results.
+- An audit fails if a planned crash does not fire, or if a site in its trace never fires.
+- The nightly job exists, has run the full audit at least once, and a failure in it
+  reaches someone.
+- The test suite passes, and clippy is clean on every feature combination.
