@@ -57,7 +57,8 @@ mod tests;
 mod vector;
 mod write_gate;
 
-pub use self::indexing::progress::{DiskBuildProgress, IndexBuildHandle, IndexBuildProgress, RowMapStats};
+pub use self::diagnostics::RowMapStats;
+pub use self::indexing::progress::{DiskBuildProgress, IndexBuildHandle, IndexBuildProgress};
 pub(crate) use self::indexing::progress::{build_progress_path, read_disk_progress};
 #[cfg(feature = "semantic-search")]
 pub use self::vector::VectorReindexOutcome;
