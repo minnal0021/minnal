@@ -76,7 +76,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
                                       ▼
                       ┌──────────────────────────────┐
                       │ Database coordinator         │
-                      │ (db/database/mod.rs)             │
+                      │ (db/database/)             │
                       │                              │
                       │ • namespace registry         │
                       │ • the shared WAL             │

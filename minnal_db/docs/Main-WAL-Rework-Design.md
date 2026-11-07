@@ -123,7 +123,7 @@ with the drive about 92% busy (`Fewer-WAL-Fsyncs-Design.md`, §14).
 An entry can leave the log once its write is in an L0 file. The WAL works that
 out in two stages: it keeps a **cut** (every entry below it is in an SSTable)
 and records it; WAL GC later deletes segments wholly below it.
-`WalPersistObserver` in `db/database/mod.rs` does the first stage, driven by the
+`WalPersistObserver` in `db/database/` does the first stage, driven by the
 flush events.
 
 **While writes come in.** Each write is appended to the WAL, then applied to

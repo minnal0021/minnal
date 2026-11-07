@@ -1,6 +1,6 @@
 //! Field-index health, repair, and the durable gap records behind them.
 //!
-//! Split out of `database/mod.rs`. This is the remediation half of FR-001: an index
+//! Split out of `database/`. This is the remediation half of FR-001: an index
 //! that is missing updates records the fact durably, reports it to anyone who
 //! queries it, and can be repaired without re-putting documents.
 //!

@@ -1,6 +1,6 @@
 //! Unit tests for the database coordinator.
 //!
-//! Split out of `database/mod.rs`. Everything here exercises the coordinator itself
+//! Split out of `database/`. Everything here exercises the coordinator itself
 //! — namespace lifecycle, recovery, WAL bookkeeping, sequence allocation, stats,
 //! the async facade, and process-level crash durability. Tests for the pieces
 //! that moved to sibling modules moved with them.

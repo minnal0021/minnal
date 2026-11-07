@@ -56,7 +56,7 @@ INGEST (synchronous, on the write path)                    [minnal_doc_store →
           after a crash the overlay is rebuilt by WAL replay from the checkpoint offset)
 
 CHECKPOINT (background, every 1.75 s by default / soft limit / backpressure / shutdown / Db::checkpoint_index)
-  IndexCheckpointWorker → Database::run_index_checkpoint   (database/mod.rs)
+  IndexCheckpointWorker → Database::run_index_checkpoint   (database/)
     wal_tail = wal_cut_ceiling()           (below any in-flight write)
     flush every row map first (its marker before any field's)
     per active field — spill, crash-ordered, no fsync under the write lock:
