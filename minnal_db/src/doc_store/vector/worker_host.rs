@@ -7,7 +7,7 @@ use crate::doc_store::error::{DocStoreError, SchemaError};
 use crate::doc_store::schema::store::SchemaStore;
 use crate::doc_store::write_gate::InFlightWrites;
 use crate::semantic_search::workers::{DocumentText, WorkerError, WorkerHost};
-use crate::vector_settings::VectorIndexSettings;
+use crate::vector_index::vector_settings::VectorIndexSettings;
 
 /// The document store's side of [`WorkerHost`].
 pub(crate) struct DocStoreWorkerHost {

@@ -1,6 +1,6 @@
 pub mod kv;
 pub mod store;
-pub use crate::vector_settings;
+pub use crate::vector_index::vector_settings;
 
 use json_dotpath::DotPaths;
 use serde::{Deserialize, Serialize};

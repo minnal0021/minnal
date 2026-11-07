@@ -591,7 +591,7 @@ measured on frozen BEIR embeddings by the frozen eval
 | Split, reassignment, merge, rebuild and their journal | `minnal_db/src/semantic_search/ivf_split/` |
 | Recall check and partition history | `minnal_db/src/semantic_search/ivf_split/recall_check.rs`, `minnal_db/src/semantic_search/ivf_split/history.rs` |
 | Background maintenance task and crash recovery | `minnal_db/src/semantic_search/workers/ivf_maintenance.rs` |
-| Per-store vector-index settings (defaults, validation) | `minnal_db/src/vector_settings.rs` |
+| Per-store vector-index settings (defaults, validation) | `minnal_db/src/vector_index/vector_settings.rs` |
 | Balanced 2-means and k-means | `minnal_db/src/semantic_search/cluster/split.rs`, `cluster/kmeans.rs` |
 | Composite key encoding (posting ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
 | Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/semantic_search/bench_distance_estimation.rs` |

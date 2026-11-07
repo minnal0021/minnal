@@ -124,9 +124,9 @@ pub enum SchemaError {
 
 // ── Doc-store-level errors ─────────────────────────────────────────────────
 
-impl From<crate::vector_settings::VectorSettingsError> for SchemaError {
-    fn from(e: crate::vector_settings::VectorSettingsError) -> Self {
-        use crate::vector_settings::VectorSettingsError as E;
+impl From<crate::vector_index::vector_settings::VectorSettingsError> for SchemaError {
+    fn from(e: crate::vector_index::vector_settings::VectorSettingsError) -> Self {
+        use crate::vector_index::vector_settings::VectorSettingsError as E;
         match e {
             E::Invalid { field, reason } => Self::InvalidVectorSetting { field, reason },
             E::Fixed { field, current, requested } => Self::VectorSettingFixed { field, current, requested },
@@ -151,8 +151,8 @@ impl From<crate::semantic_search::context::ContextError> for DocStoreError {
     }
 }
 
-impl From<crate::vector_settings::VectorSettingsError> for DocStoreError {
-    fn from(e: crate::vector_settings::VectorSettingsError) -> Self {
+impl From<crate::vector_index::vector_settings::VectorSettingsError> for DocStoreError {
+    fn from(e: crate::vector_index::vector_settings::VectorSettingsError) -> Self {
         Self::Schema(e.into())
     }
 }

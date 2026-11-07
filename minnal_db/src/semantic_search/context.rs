@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::semantic_search::PartitionHandle;
 use crate::semantic_search::service::SemanticSearchConfig;
-use crate::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings, VectorSettingsError};
+use crate::vector_index::vector_settings::{SearchSettings, SearchSpec, VectorIndexSettings, VectorSettingsError};
 
 /// Why the [`SemanticSearchContext`] refused or could not serve a namespace. The
 /// document store reports each one as its matching `DocStoreError`.
@@ -77,7 +77,7 @@ pub struct SemanticSearchContext {
     pub supported_models: std::collections::BTreeMap<String, u32>,
     /// What a namespace's vector-index settings are filled with when it first
     /// enables semantic search (the server's TOML defaults, or built-in).
-    pub index_defaults: crate::vector_settings::IndexDefaults,
+    pub index_defaults: crate::vector_index::vector_settings::IndexDefaults,
     /// Namespaces maintained at once by the partition maintenance task.
     pub maintenance_threads: usize,
     /// Threads a partition rebuild's k-means uses (at most
@@ -114,7 +114,7 @@ pub struct NamespaceSemantics {
     /// (kept so a request's overrides apply to them, not to the computed budget).
     pub search: SearchSettings,
     /// The namespace's partition maintenance settings.
-    pub maintenance: crate::vector_settings::MaintenanceSettings,
+    pub maintenance: crate::vector_index::vector_settings::MaintenanceSettings,
 }
 
 impl SemanticSearchContext {
@@ -123,7 +123,7 @@ impl SemanticSearchContext {
         Self {
             config,
             supported_models: std::collections::BTreeMap::new(),
-            index_defaults: crate::vector_settings::IndexDefaults::default(),
+            index_defaults: crate::vector_index::vector_settings::IndexDefaults::default(),
             maintenance_threads: crate::semantic_search::workers::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
             rebuild_threads: crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS,
             rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -215,7 +215,7 @@ impl SemanticSearchContext {
     }
 
     /// Use `defaults` for namespaces that enable semantic search from now on.
-    pub fn with_index_defaults(mut self, defaults: crate::vector_settings::IndexDefaults) -> Self {
+    pub fn with_index_defaults(mut self, defaults: crate::vector_index::vector_settings::IndexDefaults) -> Self {
         self.index_defaults = defaults;
         self
     }

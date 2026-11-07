@@ -99,7 +99,7 @@ pub mod semantic_search;
 // with or without semantic search compiled, and `semantic_search` runs on them
 // without depending on `doc_store`.
 #[cfg(feature = "doc-store")]
-pub mod vector_settings;
+pub mod vector_index;
 
 // Compiles every Rust example in QUICKSTART.md (`no_run`: they name fixed paths and
 // some need the embedding service). The examples use both optional layers, so

@@ -12,7 +12,7 @@ pub(crate) mod vec_index;
 use std::future::Future;
 
 use crate::semantic_search::context::ContextError;
-use crate::vector_settings::VectorIndexSettings;
+use crate::vector_index::vector_settings::VectorIndexSettings;
 
 /// What the workers ask of the stores above them.
 pub(crate) trait WorkerHost: Send + Sync + 'static {
