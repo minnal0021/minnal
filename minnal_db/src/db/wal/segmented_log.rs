@@ -1,8 +1,8 @@
 //! A segmented, checksummed, append-only log: the format and mechanics every
 //! write-ahead log in the engine shares.
 //!
-//! Both logs are built on it — the main WAL (`db/wal.rs`) and the vector index
-//! WAL (`db/vector_index_wal.rs`) — and a new one needs only a [`LogFormat`]
+//! Both logs are built on it — the main WAL (`db/wal/main_wal.rs`) and the vector index
+//! WAL (`db/wal/vector_index_wal.rs`) — and a new one needs only a [`LogFormat`]
 //! (its magic and body version) and a body encoding. Everything about how
 //! bytes reach the disk and come back after a crash lives here, once:
 //! segments, frames, positions, preallocation, commit rounds, the torn-tail and
@@ -23,7 +23,7 @@
 //!
 //! All integers are little-endian. Segments are created at their full size,
 //! and from a log's second segment on they are zero-filled ahead
-//! (`db/segment_prep.rs`), so a sync commits no new file size or block
+//! (`db/wal/segment_prep.rs`), so a sync commits no new file size or block
 //! allocation. A length of 0 is therefore **unwritten space** — the segment's
 //! records end there — and the end marker is a length no frame can have. Every
 //! segment but the last is **sealed**: it ends with the end marker, and space
@@ -41,7 +41,7 @@
 //! # Durability
 //!
 //! [`commit`](SegmentedLog::commit) and [`sync`](SegmentedLog::sync) run as
-//! commit rounds (`db/commit_rounds.rs`): concurrent callers share one fsync,
+//! commit rounds (`db/wal/commit_rounds.rs`): concurrent callers share one fsync,
 //! run outside the append lock. A segment is fsynced as it is sealed, before
 //! the next one is created, so only the last segment can ever hold bytes no
 //! fsync covered. A failed fsync, or a failed rotation, **poisons** the log:
@@ -77,8 +77,8 @@
 //! replay would skip them, so `open` seals the last segment at the tail and
 //! starts the next one when the furthest saved position is past the tail.
 
-use crate::db::commit_rounds::CommitRounds;
-use crate::db::segment_prep::{self, SegmentPrep};
+use crate::db::wal::commit_rounds::CommitRounds;
+use crate::db::wal::segment_prep::{self, SegmentPrep};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -945,7 +945,7 @@ impl SegmentedLog {
     }
 
     /// Waits until every byte below `end` is durable, as a commit round's
-    /// leader or follower (`db/commit_rounds.rs`); `delay` is the round's
+    /// leader or follower (`db/wal/commit_rounds.rs`); `delay` is the round's
     /// optional wait for more callers. Returns `true` if this caller issued
     /// the round's fsync. A failed fsync poisons the log.
     pub(crate) fn commit(&self, end: u64, delay: Duration) -> Result<bool> {

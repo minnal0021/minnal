@@ -2,15 +2,15 @@
 
 minnal has two write-ahead logs, built on one shared implementation:
 
-- **The main WAL** (`db/wal.rs`, `<db_path>/wal/`): every `put`, `delete` and
+- **The main WAL** (`db/wal/main_wal.rs`, `<db_path>/wal/`): every `put`, `delete` and
   `merge` that is not a no-WAL write. Each returns only once an fsync covers
   its record.
-- **The vector index WAL** (`db/vector_index_wal.rs`,
+- **The vector index WAL** (`db/wal/vector_index_wal.rs`,
   `<db_path>/vector_index_wal/`): the vector worker's payload writes and
   partition maintenance's per-document writes, made durable by one fsync per
   batch (`sync`).
 
-Both are a **segmented log** (`db/segmented_log.rs`, `SegmentedLog`). It owns
+Both are a **segmented log** (`db/wal/segmented_log.rs`, `SegmentedLog`). It owns
 everything about how bytes reach the disk and come back after a crash. Each
 log adds only a `LogFormat` (its name, a four-byte magic and a body version),
 the encoding of its records' bodies, and its own rule for when records are
@@ -46,7 +46,7 @@ frame:   [len u32][crc32(body) u32][body]
 
 All integers are little-endian. A segment is created at its full size, and
 from the second segment on it is written in full with zeros ahead of need
-(`db/segment_prep.rs`: under a `.prep` name, renamed into place when the log
+(`db/wal/segment_prep.rs`: under a `.prep` name, renamed into place when the log
 reaches it). So an fsync never commits a new file size or block allocation,
 and a zero length always means unwritten space. The end marker is a length no
 frame can have; its four bytes are reserved in every segment.
@@ -90,7 +90,7 @@ the next segment created or installed. So only the last segment can ever hold
 bytes no fsync covered. Any failure while sealing poisons the log.
 
 `commit(end, delay)` and `sync()` run as **commit rounds**
-(`db/commit_rounds.rs`): a caller whose bytes are not yet durable either waits
+(`db/wal/commit_rounds.rs`): a caller whose bytes are not yet durable either waits
 for the round in progress or, if none is, leads one — it reads the active
 segment's file and tail under the append lock, fsyncs outside every lock, and
 publishes the durable tail. Concurrent callers share one fsync. A round that
@@ -165,7 +165,7 @@ merged into L1, where its tombstone is dropped.
   `max_pinned_wal_segments` backstop forces out (see `minnal_db/CLAUDE.md`).
 - **Vector index WAL**: each namespace's retirement is tracked separately
   (seal records, a per-namespace ceiling); see the module docs of
-  `db/vector_index_wal.rs` and `semantic_search/doc/Vector-Index-WAL-Design.md`.
+  `db/wal/vector_index_wal.rs` and `semantic_search/doc/Vector-Index-WAL-Design.md`.
 
 `delete_segments_below` never deletes the active segment and stops at the
 first failure, so what is left is always one run of segments.
@@ -207,5 +207,5 @@ records what each fsync covered and cuts every segment back to it
 (`lose_unsynced`, `Database::power_loss_image`). A test-only fsync delay
 (`set_fsync_delay`) and a pause point in `CommitRounds` keep the fsync-sharing
 and poisoning tests independent of the machine. Each log keeps its own tests
-on top, and `db/power_loss_tests.rs` runs the main WAL through power losses
+on top, and `db/wal/power_loss_tests.rs` runs the main WAL through power losses
 and repeated `SIGKILL`s.

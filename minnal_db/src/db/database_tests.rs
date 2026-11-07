@@ -564,7 +564,7 @@ fn test_value_log_sync_does_not_mark_wal_entries_persisted() {
     assert!(meta.tail > 0, "expected every write to be journalled");
     assert_eq!(
         meta.cut,
-        crate::db::segmented_log::segment_start(0),
+        crate::db::wal::segmented_log::segment_start(0),
         "a value-log fsync moved the cut to {} (tail {}), but nothing has reached an SSTable — \
              recovery would skip those entries and lose acknowledged writes",
         meta.cut,
@@ -2362,7 +2362,7 @@ fn a_missing_middle_wal_segment_fails_the_open() -> Result<()> {
     }
     std::fs::remove_file(wal_segment_path(temp_dir.path(), 1))?;
     match Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 256) {
-        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::segmented_log::LogError::Corruption(why)))) => {
+        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::wal::segmented_log::LogError::Corruption(why)))) => {
             assert!(why.contains("segment 1 is missing"), "{why}");
         }
         Err(e) => panic!("expected a corruption error, got {e}"),
@@ -2475,7 +2475,7 @@ fn unreadable_wal_metadata_with_l1_data_fails_the_open() {
     assert!(any_level1_data_for_test(dir.path()), "setup: shutdown should leave L1 data");
     damage_wal_metadata(dir.path());
     match Database::open(dir.path(), create_db_config()) {
-        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::segmented_log::LogError::Corruption(why)))) => {
+        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::wal::segmented_log::LogError::Corruption(why)))) => {
             assert!(
                 why.contains("unreadable") && why.contains("L1 data") && why.contains("remove the `wal` directory"),
                 "{why}"
@@ -2556,7 +2556,7 @@ fn the_head_is_the_oldest_segment_on_disk_after_a_reopen() {
     };
     assert!(oldest >= 2, "setup: some segments should be deleted");
     let db = Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512).unwrap();
-    assert_eq!(db.wal_metadata.read().head, crate::db::segmented_log::segment_start(oldest));
+    assert_eq!(db.wal_metadata.read().head, crate::db::wal::segmented_log::segment_start(oldest));
     assert_eq!(db.wal_stats().head.segment_id, oldest);
     assert_eq!(db.get(b"k099").unwrap(), Some(vec![b'v'; 40]));
 }
@@ -3416,7 +3416,7 @@ fn open_truncates_a_torn_tail_so_stale_frames_cannot_replay() {
     // Tear the second frame: change its CRC, so the log's valid frames end at k1.
     {
         use std::os::unix::fs::FileExt;
-        let (segment, byte) = crate::db::segmented_log::split(second);
+        let (segment, byte) = crate::db::wal::segmented_log::split(second);
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -3493,7 +3493,7 @@ fn lost_wal_metadata_after_gc_fails_the_open() {
     }
     std::fs::remove_file(wal_metadata_path(dir.path())).unwrap();
     match Database::open_with_wal_segment_size(dir.path(), create_db_config(), 512) {
-        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::segmented_log::LogError::Corruption(why)))) => {
+        Err(KVError::WalError(crate::db::wal::WalError::Log(crate::db::wal::segmented_log::LogError::Corruption(why)))) => {
             assert!(why.contains("missing") && why.contains("L1 data"), "{why}")
         }
         Err(e) => panic!("expected a corruption error, got {e}"),
@@ -3526,7 +3526,7 @@ fn both_logs_report_positions_as_segment_and_byte() {
     }
     let s = db.wal_stats();
     let m = db.wal_metadata.read().clone();
-    assert_eq!(s.tail, crate::db::segmented_log::LogPosition::of(m.tail));
+    assert_eq!(s.tail, crate::db::wal::segmented_log::LogPosition::of(m.tail));
     assert!(s.tail.segment_id >= 2);
     assert_eq!(s.pending_bytes, db.wal.bytes_between(m.cut, m.tail));
     assert!(s.pending_bytes > 0 && s.segments.iter().any(|seg| !seg.retired));

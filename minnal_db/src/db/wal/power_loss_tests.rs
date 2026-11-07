@@ -251,7 +251,7 @@ fn leaving_a_segment_makes_it_durable() {
 /// otherwise have no fsync behind it. Found by the power-loss stress below.
 #[test]
 fn a_segment_filled_to_its_last_byte_is_durable_when_left() {
-    use crate::db::segmented_log::{END_MARKER_LEN, FRAME_HEADER_LEN, split};
+    use crate::db::wal::segmented_log::{END_MARKER_LEN, FRAME_HEADER_LEN, split};
     const SEGMENT: u64 = 512;
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::open_with_wal_segment_size(dir.path(), create_db_config(), SEGMENT).unwrap());
@@ -674,7 +674,7 @@ fn acknowledged_writes_survive_repeated_kills() {
     for round in 0..4u64 {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "db::power_loss_tests::kill_child_writes_until_killed",
+                "db::wal::power_loss_tests::kill_child_writes_until_killed",
                 "--exact",
                 "--ignored",
                 "--nocapture",
@@ -767,7 +767,7 @@ fn reopening_zeroes_past_the_tail_and_keeps_the_segment_preallocated() {
         tail
     };
     // Garbage past the tail, as a torn write would leave.
-    let (segment, byte) = crate::db::segmented_log::split(tail);
+    let (segment, byte) = crate::db::wal::segmented_log::split(tail);
     let wal = wal_segment_path(dir.path(), segment);
     std::fs::OpenOptions::new()
         .write(true)

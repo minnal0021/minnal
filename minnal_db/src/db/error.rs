@@ -1,5 +1,5 @@
-use crate::db::vector_index_wal::VectorIndexWalError;
 use crate::db::wal::WalError;
+use crate::db::wal::vector_index_wal::VectorIndexWalError;
 use crate::storage::lsm::tree::LSMError;
 use crate::storage::value_log::ValueLogError;
 use crate::storage::value_log::sharded::ShardedValueLogError;

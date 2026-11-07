@@ -395,7 +395,7 @@ persist, surface, or repair anything.
 
 Note the check is segment-presence based, not `checkpoint_offset < wal_head`:
 WAL GC reclaims fully-persisted segments **out of order**, and `scan_entries`
-deliberately skips missing segments as holes (`wal.rs`), so a gap can open in the
+deliberately skips missing segments as holes (`wal/main_wal.rs`), so a gap can open in the
 middle of the replay window while `head` still sits below the checkpoint offset.
 Any future work here should keep that in mind — comparing against `head` alone
 under-reports.
@@ -1474,7 +1474,7 @@ at `warn`, but a drop racing the worker would then warn in normal operation.
 ## FR-013 — Namespace identity without a central registry file
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/db/namespace.rs`, `database.rs`, `wal.rs`,
+**Area:** `minnal_db` (`src/db/namespace.rs`, `database.rs`, `wal/main_wal.rs`,
 `vector_index_wal.rs`, `layout.rs`, `index_manager.rs`), `minnal_db_api` (README)
 **Severity:** Medium — a damaged registry stops the whole database opening; no data
 is at risk from the design as it stands
@@ -1558,7 +1558,7 @@ mapping, which is the file this request removes.
 
 ### Not removed by this request
 
-- **`WalMetadata`** (`wal.rs:250`) is also one file holding every namespace's saved
+- **`WalMetadata`** (`wal/main_wal.rs:250`) is also one file holding every namespace's saved
   offsets, so a damaged copy still affects the whole database. It should be reviewed
   separately, including whether it can be rebuilt from the log.
 - **`system_schema`** holds every store's schema, though it is a namespace with its own

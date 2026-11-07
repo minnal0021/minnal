@@ -10,9 +10,9 @@ use crate::db::key_locks::KeyLocks;
 use crate::db::kv_store::KVStore;
 use crate::db::namespace::{DEFAULT_NAMESPACE_ID, FieldId, FieldMeta, FieldReindexOutcome, NamespaceRegistry};
 use crate::db::namespace_index::{ExtractorFn, IndexEntry};
-use crate::db::segmented_log::LogError;
 use crate::db::stats::{GCStats, Stats};
-use crate::db::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
+use crate::db::wal::segmented_log::LogError;
+use crate::db::wal::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
 use crate::db::wal::{Wal, WalEntry, WalError, WalMetadata, WalOperationType};
 use crate::db::workers::index_checkpoint::{IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::workers::lsm_compaction::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
@@ -636,7 +636,7 @@ impl LsmFlushObserver for LsmFlushObserverHub {
     // logged write the log could still lose.
     fn on_ro_memtable_flushing(&self, _version: u64) -> std::io::Result<()> {
         self.vector_index_wal.before_memtable_written(self.namespace_id).map_err(|e| match e {
-            crate::db::vector_index_wal::VectorIndexWalError::Log(LogError::Io(io)) => io,
+            crate::db::wal::vector_index_wal::VectorIndexWalError::Log(LogError::Io(io)) => io,
             other => std::io::Error::other(other.to_string()),
         })
     }
@@ -661,7 +661,7 @@ impl LsmFlushObserver for LsmFlushObserverHub {
             Err(e) => {
                 prepared.abort();
                 Err(match e {
-                    crate::db::vector_index_wal::VectorIndexWalError::Log(LogError::Io(io)) => io,
+                    crate::db::wal::vector_index_wal::VectorIndexWalError::Log(LogError::Io(io)) => io,
                     other => std::io::Error::other(other.to_string()),
                 })
             }
@@ -704,7 +704,7 @@ fn open_main_wal(db_path: &Path, segment_size: u32) -> Result<(Arc<Wal>, WalMeta
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
         Err(e) => return Err(e.into()),
     };
-    if saved.is_none() && crate::db::segmented_log::has_segments(&dir)? && any_level1_data(db_path)? {
+    if saved.is_none() && crate::db::wal::segmented_log::has_segments(&dir)? && any_level1_data(db_path)? {
         let state = match &unreadable {
             Some(e) => format!("unreadable ({e})"),
             None => "missing".to_owned(),
@@ -720,7 +720,7 @@ fn open_main_wal(db_path: &Path, segment_size: u32) -> Result<(Arc<Wal>, WalMeta
     let (wal, report) = Wal::open(
         &dir,
         segment_size,
-        crate::db::segmented_log::Progress::open_from(saved.as_ref().map(|m| m.progress()).as_ref()),
+        crate::db::wal::segmented_log::Progress::open_from(saved.as_ref().map(|m| m.progress()).as_ref()),
     )?;
     if let Some(e) = unreadable {
         warn!("[WAL] the WAL metadata was unreadable ({e}); the log was read from its start (no L1 data yet)");
@@ -802,7 +802,7 @@ pub struct Database {
     pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
 
     /// The vector index WAL: the vector worker's payload writes, one per
-    /// database, shared by every namespace (`db/vector_index_wal.rs`).
+    /// database, shared by every namespace (`db/wal/vector_index_wal.rs`).
     pub(crate) vector_index_wal: Arc<VectorIndexWal>,
 
     // Namespace registry
@@ -1073,7 +1073,7 @@ impl Database {
     ) -> Result<VectorIndexWal> {
         let (wal, report) = VectorIndexWal::open(
             &crate::db::layout::vector_index_wal_dir(db_path),
-            crate::db::vector_index_wal::DEFAULT_SEGMENT_SIZE,
+            crate::db::wal::vector_index_wal::DEFAULT_SEGMENT_SIZE,
             Arc::clone(metrics),
         )?;
         if report.torn_bytes_dropped > 0 {
@@ -1318,7 +1318,7 @@ impl Database {
             crate::support::metrics::Metrics::bump(&m.wal_writes);
             crate::support::metrics::Metrics::add(
                 &m.wal_bytes_appended,
-                wal_pointer.size as u64 + u64::from(crate::db::segmented_log::FRAME_HEADER_LEN),
+                wal_pointer.size as u64 + u64::from(crate::db::wal::segmented_log::FRAME_HEADER_LEN),
             );
         }
 
@@ -1666,7 +1666,7 @@ impl Database {
             crate::support::metrics::Metrics::bump(&m.wal_writes);
             crate::support::metrics::Metrics::add(
                 &m.wal_bytes_appended,
-                wal_pointer.size as u64 + u64::from(crate::db::segmented_log::FRAME_HEADER_LEN),
+                wal_pointer.size as u64 + u64::from(crate::db::wal::segmented_log::FRAME_HEADER_LEN),
             );
         }
 
@@ -2799,7 +2799,7 @@ impl Database {
                 failed.len()
             );
             let failures: Vec<(&WalEntry, String)> = failed.iter().map(|(e, msg)| (e, msg.clone())).collect();
-            crate::db::fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
+            crate::db::wal::wal_fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
         }
 
         // Every namespace still holding the cut had its records replayed above
@@ -2929,7 +2929,7 @@ impl Database {
         // Write any persistent failures to the fail log — one record per failed op.
         if !failed_entries.is_empty() {
             let failures: Vec<(&WalEntry, String)> = failed_entries.iter().map(|(e, msg)| (e, msg.clone())).collect();
-            crate::db::fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
+            crate::db::wal::wal_fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
         }
 
         // Flush all namespaces that had recovered entries, then retire the whole

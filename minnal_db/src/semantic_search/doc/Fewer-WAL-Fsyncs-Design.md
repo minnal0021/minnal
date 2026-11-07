@@ -19,14 +19,14 @@ The ones this note leans on most:
 
 **The two logs and how writes reach them**
 
-- **Main WAL** — the database's write-ahead log (`db/wal.rs`). Every ordinary
+- **Main WAL** — the database's write-ahead log (`db/wal/main_wal.rs`). Every ordinary
   write appends one entry and returns only once an fsync covers it. When this
   note's measurements were taken, every such write in every namespace held one
   lock (`Database::wal_metadata`) across its own fsync, so they ran one at a
   time: about 400 a second here, where an fsync took about 2.3 ms. Concurrent
   writes now share fsyncs (group commit; `Main-WAL-Rework-Design.md`).
 - **Vector index WAL** — a second log, one per database, in
-  `<db_path>/vector_index_wal/` (`db/vector_index_wal.rs`, design in
+  `<db_path>/vector_index_wal/` (`db/wal/vector_index_wal.rs`, design in
   `Vector-Index-WAL-Design.md`). It has its own lock, so client writes never
   wait on it. It holds the vector worker's chunk codes and whole-document codes
   and, after Part 2, partition maintenance's per-document writes; a record is a

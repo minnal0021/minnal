@@ -112,7 +112,7 @@
 //!
 //! One log per database, in `{db_path}/vector_index_wal/`. Segments, frames,
 //! positions, the torn-tail and corruption rules and durability are the shared
-//! segmented log's (`db/segmented_log.rs`), with magic `MVIW`. A record's body
+//! segmented log's (`db/wal/segmented_log.rs`), with magic `MVIW`. A record's body
 //! is:
 //!
 //! ```text
@@ -124,7 +124,7 @@
 //! passes its CRC but does not decode is corruption: the CRC says these are
 //! the bytes written.
 
-use crate::db::segmented_log::{self, LogError, LogFormat, Progress, ProgressFile, SegmentedLog, segment_of};
+use crate::db::wal::segmented_log::{self, LogError, LogFormat, Progress, ProgressFile, SegmentedLog, segment_of};
 use crate::support::metrics::Metrics;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -334,7 +334,7 @@ pub(crate) struct OpenReport {
 
 /// The vector index WAL. See the module docs.
 pub(crate) struct VectorIndexWal {
-    /// The segments, frames and syncs (`db/segmented_log.rs`).
+    /// The segments, frames and syncs (`db/wal/segmented_log.rs`).
     pub(crate) log: SegmentedLog,
     /// Highest seq of any record appended since open, or found at open at or
     /// above the retired cut.
@@ -520,7 +520,7 @@ impl VectorIndexWal {
 
     /// Makes every append that returned before this call durable.
     ///
-    /// A commit round (`db/commit_rounds.rs`): the fsync runs outside the
+    /// A commit round (`db/wal/commit_rounds.rs`): the fsync runs outside the
     /// append lock, so appends carry on meanwhile, and concurrent syncs share
     /// one fsync. Does no I/O when nothing was appended since the last one. A
     /// failure poisons the log (see the module docs).
@@ -891,7 +891,7 @@ impl VectorIndexWal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::segmented_log::{END_MARKER, END_MARKER_LEN, FRAME_HEADER_LEN, SEGMENT_HEADER_LEN, position, prep_path, segment_path, split};
+    use crate::db::wal::segmented_log::{END_MARKER, END_MARKER_LEN, FRAME_HEADER_LEN, SEGMENT_HEADER_LEN, position, prep_path, segment_path, split};
     use std::fs::{File, OpenOptions};
     use std::os::unix::fs::FileExt;
     use std::sync::atomic::Ordering::Relaxed;

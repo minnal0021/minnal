@@ -11,7 +11,7 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
 
 **Writes and logs**
 
-- **Main WAL** — the database's write-ahead log (`db/wal.rs`). Every ordinary
+- **Main WAL** — the database's write-ahead log (`db/wal/main_wal.rs`). Every ordinary
   write appends one entry and fsyncs it before the call returns, under one lock
   for the whole database.
 - **Vector index WAL** — the log this note designs: one per database, in
@@ -475,7 +475,7 @@ The barrier tests (`crash_before_reembed_is_synced_keeps_new_vectors`,
 Each step is its own commit, tested in all four feature combinations, with the
 main WAL's tests untouched and passing.
 
-1. **The log** (`db/vector_index_wal.rs`): segments, record format, append, `sync`,
+1. **The log** (`db/wal/vector_index_wal.rs`): segments, record format, append, `sync`,
    torn-tail reading. Unit tests, including corrupt and torn records.
 2. **Retirement and GC:** the observer (seal/flush, ceiling, version order), the
    cut marker, segment deletion, flushing idle namespaces, and the log's stats
@@ -631,9 +631,9 @@ above, so the full M5 run checks both.
 
 ## Decisions (review, 2026-10-15)
 
-1. **Code location:** `db/vector_index_wal.rs` holds the log (record body,
+1. **Code location:** `db/wal/vector_index_wal.rs` holds the log (record body,
    observer, retirement, replay) on the segmented log shared with the main WAL
-   (`db/segmented_log.rs`: segments, frames, append, sync, open, GC);
+   (`db/wal/segmented_log.rs`: segments, frames, append, sync, open, GC);
    `database.rs` calls it at open and from the GC tick.
    `minnal_db/CLAUDE.md`'s WAL-ownership rule names both files.
 2. **Fsync policy:** one `sync` per completion batch; no time bound.

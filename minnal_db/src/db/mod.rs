@@ -1,9 +1,7 @@
-pub(crate) mod commit_rounds;
 pub mod config;
 pub mod database;
 pub mod error;
 pub mod facade;
-pub(crate) mod fail_log;
 pub(crate) mod index_health;
 pub mod index_manager;
 pub(crate) mod key_locks;
@@ -12,13 +10,9 @@ pub(crate) mod layout;
 pub mod namespace;
 pub mod namespace_index;
 pub(crate) mod query;
-pub(crate) mod segment_prep;
-pub(crate) mod segmented_log;
 pub mod stats;
 pub mod toml_config;
-pub(crate) mod vector_index_wal;
 pub mod wal;
-pub(crate) mod wal_gc;
 pub(crate) mod workers;
 
 /// Shared fixtures for this module's unit tests.
@@ -32,8 +26,3 @@ pub(crate) mod test_support;
 /// and needed an `allow(clippy::module_inception)` to say so.
 #[cfg(test)]
 mod facade_tests;
-
-/// Power-loss and kill tests for the main WAL's write path (group commit,
-/// retirement, checksummed frames).
-#[cfg(test)]
-mod power_loss_tests;

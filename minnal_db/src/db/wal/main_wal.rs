@@ -1,6 +1,6 @@
 //! The main write-ahead log: every WAL-backed `put`, `delete` and `merge`.
 //!
-//! The log itself is the shared segmented log (`db/segmented_log.rs`), with
+//! The log itself is the shared segmented log (`db/wal/segmented_log.rs`), with
 //! magic `MWAL`: segments, checksummed frames, positions
 //! `(segment_id << 32) | byte`, preallocation, group commit, the torn-tail and
 //! corruption rules, and deleting retired segments all live there, the same as
@@ -16,7 +16,7 @@
 //! What is retired, and when, is decided by `WalPersistObserver` in
 //! `database.rs`.
 
-use crate::db::segmented_log::{self, LogError, LogFormat, LogPosition, OpenFrom, SegmentedLog};
+use crate::db::wal::segmented_log::{self, LogError, LogFormat, LogPosition, OpenFrom, SegmentedLog};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::path::Path;
 #[cfg(test)]
@@ -667,7 +667,7 @@ fn undecodable(at: u64, e: WalError) -> WalError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::segmented_log::{SEGMENT_HEADER_LEN, segment_start};
+    use crate::db::wal::segmented_log::{SEGMENT_HEADER_LEN, segment_start};
     use tempfile::TempDir;
 
     const FRESH: OpenFrom = OpenFrom { cut: None, furthest: 0 };
@@ -899,7 +899,7 @@ mod tests {
         drop(wal);
         let seg0 = segmented_log::segment_path(dir.path(), 0);
         let mut bytes = std::fs::read(&seg0)?;
-        bytes[..SEGMENT_HEADER_LEN as usize].copy_from_slice(&segmented_log::header_bytes(&crate::db::vector_index_wal::FORMAT, 0));
+        bytes[..SEGMENT_HEADER_LEN as usize].copy_from_slice(&segmented_log::header_bytes(&crate::db::wal::vector_index_wal::FORMAT, 0));
         std::fs::write(&seg0, bytes)?;
         match open(dir.path(), 512) {
             Err(WalError::Log(LogError::Corruption(why))) => assert!(why.contains("main WAL"), "{why}"),

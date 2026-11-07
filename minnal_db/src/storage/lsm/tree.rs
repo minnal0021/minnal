@@ -52,7 +52,7 @@ struct WrittenLevel0File {
 /// 3. `on_ro_memtable_written` — every bucket's L0 file is written and fsynced,
 ///    and **none is registered yet**: nothing can read or merge them, so no
 ///    merge can have dropped a tombstone they hold. The vector index WAL makes
-///    its progress durable here (`db/vector_index_wal.rs`). An error **vetoes
+///    its progress durable here (`db/wal/vector_index_wal.rs`). An error **vetoes
 ///    the flush**: the files are removed, the memtable stays read-only and
 ///    unflushed, and a later flush retries it under the same version;
 /// 4. `on_ro_memtable_flushed_to_level0` — the files are registered and the

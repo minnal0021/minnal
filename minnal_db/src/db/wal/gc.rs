@@ -22,7 +22,7 @@ use log::{debug, error, warn};
 use crate::db::database::Database;
 use crate::db::error::Result;
 use crate::db::namespace::FieldId;
-use crate::db::segmented_log::{LogPosition, segment_start};
+use crate::db::wal::segmented_log::{LogPosition, segment_start};
 use crate::db::wal::{WalMetadata, WalNamespaceProgress, WalSegmentState, WalStats};
 
 /// What one WAL GC pass may reclaim, after the index-replay watermark has had
