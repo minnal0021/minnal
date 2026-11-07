@@ -88,11 +88,32 @@ impl DocStore {
     /// stopping after `stop_after` steps (each drop, the reset and each re-add
     /// is one step) to simulate a crash in tests.
     pub(super) async fn reindex_all_until(&self, namespace: &str, stop_after: Option<usize>) -> Result<Vec<IndexBuildHandle>, DocStoreError> {
+        // One reindex-all of a store at a time, apart from its amendments and drop.
+        let _lifecycle = self.lifecycle.lock(namespace).await;
         let _write = self.writes.enter(namespace)?;
         let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
+        // Dropping an index whose build is running deletes its directory under
+        // it; refuse before anything changes.
+        if let Some(field) = self.builds.any(namespace) {
+            return Err(DocStoreError::IndexBuildInProgress {
+                namespace: namespace.to_owned(),
+                field,
+            });
+        }
+        let path = intent_path(&self.db_path, ns_id);
+        // A run that stopped part-way left its intent, which lists every index it
+        // set out to rebuild, some of them dropped already. Finish that one: a new
+        // intent from the schema as it is now would leave those out for good.
+        if let Some(intent) = read_intent(&path) {
+            log::warn!(
+                "reindex-all '{namespace}': finishing an earlier run that stopped part-way (phase {:?})",
+                intent.phase
+            );
+            return self.drive_reindex_all(namespace, ns_id, intent, stop_after).await;
+        }
         if schema.indices.is_empty() {
             return Ok(Vec::new());
         }
@@ -100,7 +121,6 @@ impl DocStore {
             specs: schema.indices.clone(),
             phase: Phase::Dropping,
         };
-        let path = intent_path(&self.db_path, ns_id);
         write_intent(&path, &intent)?;
         info!("reindex-all '{namespace}': rebuilding {} index(es)", intent.specs.len());
         self.drive_reindex_all(namespace, ns_id, intent, stop_after).await
@@ -408,6 +428,42 @@ mod tests {
             before.bytes_on_disk,
             after.bytes_on_disk
         );
+    }
+
+    /// While a build of the store runs, `reindex-all` is refused before it
+    /// changes anything. It used to drop the indexes, delete the running build's
+    /// directory under it, fail, and leave the indexes out of the schema.
+    #[tokio::test]
+    async fn reindex_all_is_refused_while_a_build_runs() {
+        let db_dir = TempDir::new().unwrap();
+        let (store, _) = seeded(db_dir.path()).await;
+        let running = store.builds.claim("events", "tier").unwrap();
+        assert!(matches!(
+            store.reindex_all_attribute_indices("events").await,
+            Err(DocStoreError::IndexBuildInProgress { field, .. }) if field == "tier"
+        ));
+        assert_eq!(store.load_schema("events").unwrap().indices.len(), 2);
+        drop(running);
+        for h in store.reindex_all_attribute_indices("events").await.unwrap() {
+            h.wait().await.unwrap();
+        }
+        assert_eq!(store.load_schema("events").unwrap().indices.len(), 2);
+    }
+
+    /// A run that stopped after dropping some indexes is finished by the next
+    /// call, from its own list. Starting over from the schema, which no longer
+    /// listed the dropped ones, lost them for good.
+    #[tokio::test]
+    async fn a_reindex_all_that_stopped_part_way_is_finished_by_the_next_call() {
+        let db_dir = TempDir::new().unwrap();
+        let (store, live) = seeded(db_dir.path()).await;
+        store.reindex_all_until("events", Some(1)).await.unwrap();
+        assert_eq!(store.load_schema("events").unwrap().indices.len(), 1, "one index dropped, then stopped");
+        for h in store.reindex_all_attribute_indices("events").await.unwrap() {
+            h.wait().await.unwrap();
+        }
+        assert_eq!(store.load_schema("events").unwrap().indices.len(), 2);
+        assert_rebuilt(&store, &live, "after finishing the earlier run").await;
     }
 
     /// Writers changing and deleting keys while `reindex-all` runs: afterwards

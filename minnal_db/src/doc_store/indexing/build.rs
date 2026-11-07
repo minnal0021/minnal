@@ -92,6 +92,16 @@ impl DocStore {
         // Held by the build task until it ends: registering the field creates
         // its index directory, and the build reads and writes the store.
         let write = self.writes.enter(namespace)?;
+        // Also held until the build ends. An earlier build of this field can
+        // still be running after a drop until it notices; adding the field
+        // again meanwhile would give one index two builders.
+        let claim = self
+            .builds
+            .claim(namespace, &spec.field)
+            .ok_or_else(|| DocStoreError::IndexBuildInProgress {
+                namespace: namespace.to_owned(),
+                field: spec.field.clone(),
+            })?;
         let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
@@ -229,6 +239,7 @@ impl DocStore {
                 fail_observer.on_status(BuildStatus::Failed, Some(&e.to_string()));
             }
             drop(write);
+            drop(claim);
             result
         });
 
@@ -272,6 +283,9 @@ impl DocStore {
                 }
                 // Being dropped: nothing to resume.
                 let Ok(write) = self.writes.enter(&schema.namespace) else { continue };
+                let Some(claim) = self.builds.claim(&schema.namespace, &spec.field) else {
+                    continue;
+                };
                 let ivt = to_ivt(spec.index_type);
                 let field_id = self.db.register_index_field(ns_id, &spec.field, ivt)?;
                 let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
@@ -310,6 +324,7 @@ impl DocStore {
                         fail_observer.on_status(BuildStatus::Failed, Some(&e.to_string()));
                     }
                     drop(write);
+                    drop(claim);
                     result
                 });
 
@@ -323,6 +338,12 @@ impl DocStore {
         }
 
         Ok(handles)
+    }
+
+    /// A field of `namespace` whose index build is running in this process, if
+    /// any. `reindex-all` is refused while there is one.
+    pub fn field_index_build_running(&self, namespace: &str) -> Option<String> {
+        self.builds.any(namespace)
     }
 
     /// Return the persisted build progress for a specific index, or `None` if

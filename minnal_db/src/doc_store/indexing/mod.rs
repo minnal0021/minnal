@@ -6,3 +6,6 @@ pub mod build_manager;
 pub mod observer;
 pub mod progress;
 mod reindex_all;
+mod running;
+
+pub(crate) use running::RunningBuilds;

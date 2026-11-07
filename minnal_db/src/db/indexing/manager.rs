@@ -384,10 +384,20 @@ impl IndexManager {
     /// `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
     pub fn remove_field_path(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
         let path = self.field_path(namespace_id, field_id);
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(KVError::Io(e)),
+        // A build or a checkpoint can still be writing a file there when the drop
+        // runs; `remove_dir_all` then finds the directory refilled and fails. The
+        // field is deregistered by now, so the writer stops: try again.
+        let mut attempt = 0;
+        loop {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < 20 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(KVError::Io(e)),
+            }
         }
     }
 

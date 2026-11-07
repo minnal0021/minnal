@@ -168,6 +168,16 @@ pub async fn attribute_reindex_all(
         }
     }
 
+    // Dropping an index whose build is running would delete its files under it.
+    if let Some(field) = state.store.field_index_build_running(&ns) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("the index build of field '{field}' in '{ns}' is still running; retry when it finishes")
+            })),
+        ));
+    }
+
     let schema = state.store.get_schema(&ns).map_err(|e| {
         let status = if matches!(e, DocStoreError::NotFound { .. }) {
             StatusCode::NOT_FOUND

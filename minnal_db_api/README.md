@@ -1903,7 +1903,7 @@ curl -X POST http://localhost:8080/admin/indices/users/attribute/reindex-all
 # → 202 Accepted
 ```
 
-Returns `409` when an attribute operation is already active for `{ns}`. Returns `422` when the namespace has no indices to rebuild.
+Returns `409` when an attribute operation is already active for `{ns}`, or while one of its index builds is still running (including the builds an earlier `reindex-all` started); retry when the builds finish. Returns `422` when the namespace has no indices to rebuild.
 
 ---
 

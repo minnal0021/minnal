@@ -150,6 +150,8 @@ pub struct DocStore {
     writes: Arc<WriteGate>,
     /// Keeps a store's create, amendments and drop apart ([`LifecycleLocks`]).
     lifecycle: LifecycleLocks,
+    /// Field-index builds running in this process ([`RunningBuilds`]).
+    builds: Arc<self::indexing::RunningBuilds>,
     /// Documents of semantic-search stores with a write in progress, which the
     /// vector worker skips (see [`InFlightWrites`]).
     #[cfg(feature = "semantic-search")]
@@ -207,6 +209,7 @@ impl DocStore {
             vector_index_config: VectorIndexConfig::default(),
             writes: Arc::default(),
             lifecycle: LifecycleLocks::default(),
+            builds: Arc::default(),
             #[cfg(feature = "semantic-search")]
             in_flight: Arc::default(),
         };
