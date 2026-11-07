@@ -393,7 +393,7 @@ for a document store (body fields below) or `"kv"` for a KV store (see
 | Field        | Type             | Required | Description                          |
 |-------------|-----------------|----------|--------------------------------------|
 | `store_type` | `"doc"`          | yes      | Selects a document store             |
-| `namespace`  | string           | yes      | Unique name (`[a-zA-Z0-9_-]+`)       |
+| `namespace`  | string           | yes      | Unique name (`[a-zA-Z0-9_-]+`, at most 128 bytes) |
 | `key_type`   | `uuid`/`u64`/`u128`/`str` | yes | Primary key type                |
 | `indices`    | array            | yes      | Zero to 5 index specs (may be empty) |
 | `attributes` | array            | no       | Non-indexed field declarations       |

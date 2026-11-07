@@ -33,6 +33,28 @@ const NAMESPACE_DIR_PREFIX: &str = "ns_";
 /// Name of the index subtree at the database root.
 const INDEX_DIR: &str = "field-index";
 
+/// The longest namespace name in bytes: its directory `ns_{name}` must fit a file
+/// name, which is 255 bytes on Linux and macOS.
+pub(crate) const MAX_NAMESPACE_NAME_BYTES: usize = 255 - NAMESPACE_DIR_PREFIX.len();
+
+/// Why `name` cannot be a namespace, or `None` if it can: it becomes one path
+/// component, `ns_{name}`, so it must fit one and must not hold a separator.
+pub(crate) fn namespace_name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("a namespace name cannot be empty".to_owned());
+    }
+    if name.len() > MAX_NAMESPACE_NAME_BYTES {
+        return Some(format!(
+            "a namespace name can be at most {MAX_NAMESPACE_NAME_BYTES} bytes, got {}",
+            name.len()
+        ));
+    }
+    if name.contains(['/', '\0']) {
+        return Some(format!("namespace name '{name}' contains a path separator or a NUL"));
+    }
+    None
+}
+
 /// A namespace's data directory: `{db_path}/ns_{name}`.
 ///
 /// Holds the LSM SSTables, the value-log segments, and `config.json`. Keyed by

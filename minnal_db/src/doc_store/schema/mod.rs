@@ -581,12 +581,23 @@ impl AttributeType {
 /// Words the query lexer reads as keywords, whatever their case.
 const QUERY_KEYWORDS: [&str; 6] = ["and", "or", "not", "in", "true", "false"];
 
-/// Check a store name: non-empty, only ASCII alphanumerics, `_` or `-`, and not
-/// a system namespace's (`system`, or starting with `system_`, such as
-/// `system_schema`, where every store's schema is kept).
+/// The longest store name, in bytes. A store's namespaces include its vector
+/// companions (`{name}_sparse_vector_meta` and the like), and each must fit a file
+/// name; this leaves them ample room.
+pub const MAX_STORE_NAME_LEN: usize = 128;
+
+/// Check a store name: non-empty, at most [`MAX_STORE_NAME_LEN`] bytes, only ASCII
+/// alphanumerics, `_` or `-`, and not a system namespace's (`system`, or starting
+/// with `system_`, such as `system_schema`, where every store's schema is kept).
 pub fn validate_store_name(name: &str) -> Result<(), SchemaError> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return Err(SchemaError::InvalidNamespace);
+    }
+    if name.len() > MAX_STORE_NAME_LEN {
+        return Err(SchemaError::StoreNameTooLong {
+            len: name.len(),
+            max: MAX_STORE_NAME_LEN,
+        });
     }
     if name == crate::SYSTEM_NAMESPACE || name.starts_with("system_") {
         return Err(SchemaError::ReservedNamespace { namespace: name.to_owned() });
@@ -727,6 +738,19 @@ mod tests {
     #[test]
     fn valid_schema_passes_validation() {
         assert!(valid_schema().validate().is_ok());
+    }
+
+    #[test]
+    fn a_store_name_has_a_length_limit_that_leaves_room_for_its_companions() {
+        let longest = "x".repeat(MAX_STORE_NAME_LEN);
+        assert!(validate_store_name(&longest).is_ok());
+        for suffix in crate::namespace::VECTOR_COMPANION_SUFFIXES {
+            assert!(crate::layout::namespace_name_problem(&format!("{longest}{suffix}")).is_none(), "{suffix}");
+        }
+        assert!(matches!(
+            validate_store_name(&format!("{longest}x")),
+            Err(SchemaError::StoreNameTooLong { len, max }) if len == MAX_STORE_NAME_LEN + 1 && max == MAX_STORE_NAME_LEN
+        ));
     }
 
     #[test]

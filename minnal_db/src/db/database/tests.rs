@@ -3619,3 +3619,24 @@ fn removing_a_namespace_does_not_hold_up_lookups_of_others() {
     assert_eq!(found, Ok(true), "the lookup waited for the removal");
     db.shutdown().unwrap();
 }
+
+/// A create that fails after the registry saved the name must take the name back:
+/// the next open of the database would try to open that namespace and fail.
+#[test]
+fn a_failed_namespace_create_leaves_the_database_openable() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        // A file where the namespace's directory has to go makes the open fail.
+        std::fs::write(crate::layout::namespace_data_dir(dir.path(), "blocked"), b"in the way").unwrap();
+        assert!(db.create_namespace("blocked").is_err());
+        assert!(!db.list_namespaces().iter().any(|(name, _)| name == "blocked"));
+        // Without the name in the registry, a later attempt starts over.
+        std::fs::remove_file(crate::layout::namespace_data_dir(dir.path(), "blocked")).unwrap();
+        db.create_namespace("blocked").unwrap();
+        db.remove_namespace("blocked").unwrap();
+        std::fs::write(crate::layout::namespace_data_dir(dir.path(), "blocked"), b"in the way").unwrap();
+        assert!(db.create_namespace("blocked").is_err());
+    }
+    Database::open(dir.path(), create_db_config()).expect("the database still opens");
+}

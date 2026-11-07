@@ -36,7 +36,8 @@ impl Database {
         let ns_id = self.registry.write().create(name)?;
 
         let ns_path = crate::layout::namespace_data_dir(&self.db_path, name);
-        let kv_store = KVStore::open_with_ttl(
+        let dir_existed = ns_path.exists();
+        let kv_store = match KVStore::open_with_ttl(
             ns_id,
             name,
             &ns_path,
@@ -44,7 +45,20 @@ impl Database {
             self.config.sync_config,
             self.config.segment_size_bytes,
             ttl,
-        )?;
+        ) {
+            Ok(store) => store,
+            Err(e) => {
+                // The registry is durable already: left there, the next open of
+                // the database would try this store again, and fail the same way.
+                if let Err(undo) = self.registry.write().remove(name) {
+                    warn!("namespace '{name}': create failed and could not be undone in the registry: {undo:?}");
+                }
+                if !dir_existed {
+                    let _ = std::fs::remove_dir_all(&ns_path);
+                }
+                return Err(e);
+            }
+        };
         kv_store.set_verify_checksums_on_read(self.config.verify_checksums_on_read);
         kv_store.set_seq_counter(self.next_seq.clone());
         // Per-namespace metrics: each store owns its own counters; the engine-wide

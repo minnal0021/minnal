@@ -294,7 +294,16 @@ impl NamespaceRegistry {
             let mut namespaces = HashMap::new();
             let mut id_to_name = HashMap::new();
             let mut schemas = HashMap::new();
+            let mut stranded = false;
             for (name, id) in data.names.iter().zip(data.ids.iter()) {
+                // A name that cannot be a directory never held data. A failed
+                // create used to leave one behind, and opening it would fail
+                // every start of the database, so it goes instead.
+                if let Some(problem) = crate::layout::namespace_name_problem(name) {
+                    log::error!("[namespace registry] removing namespace id {id}, which can hold no data: {problem}");
+                    stranded = true;
+                    continue;
+                }
                 namespaces.insert(name.clone(), *id);
                 id_to_name.insert(*id, name.clone());
                 let schema = match Self::load_config(db_path, name)? {
@@ -308,7 +317,7 @@ impl NamespaceRegistry {
                 .iter()
                 .map(|c| (c.ns_id, (Duration::from_millis(c.ttl_millis), c.max_deletes as usize)))
                 .collect();
-            Ok(Self {
+            let registry = Self {
                 db_path: db_path.to_path_buf(),
                 path,
                 namespaces,
@@ -316,7 +325,11 @@ impl NamespaceRegistry {
                 next_id: data.next_id,
                 schemas,
                 ttl_configs,
-            })
+            };
+            if stranded {
+                registry.persist()?;
+            }
+            Ok(registry)
         } else {
             let mut registry = Self {
                 db_path: db_path.to_path_buf(),
@@ -346,6 +359,9 @@ impl NamespaceRegistry {
     /// Create a new namespace and return its ID.
     /// Returns an error if the name already exists.
     pub fn create(&mut self, name: &str) -> Result<u32> {
+        if let Some(problem) = crate::layout::namespace_name_problem(name) {
+            return Err(KVError::Serialization(problem));
+        }
         if self.namespaces.contains_key(name) {
             return Err(KVError::Serialization(format!("Namespace '{}' already exists", name)));
         }
@@ -658,6 +674,49 @@ impl NamespaceRegistry {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_name_that_cannot_be_a_directory_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
+        let longest = "x".repeat(crate::layout::MAX_NAMESPACE_NAME_BYTES);
+        registry.create(&longest).unwrap();
+        fs::create_dir_all(crate::layout::namespace_data_dir(dir.path(), &longest)).unwrap();
+        for bad in [
+            "x".repeat(crate::layout::MAX_NAMESPACE_NAME_BYTES + 1),
+            String::new(),
+            "a/b".to_owned(),
+            "../up".to_owned(),
+        ] {
+            assert!(registry.create(&bad).is_err(), "{bad:?}");
+            assert!(!registry.exists(&bad));
+        }
+    }
+
+    /// A failed create used to leave such an entry, and opening it failed every
+    /// later start of the database.
+    #[test]
+    fn an_entry_that_cannot_be_a_directory_is_removed_at_open() {
+        let dir = TempDir::new().unwrap();
+        let too_long = "x".repeat(300);
+        let kept = {
+            let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
+            let kept = registry.create("kept").unwrap();
+            let next = registry.next_id;
+            registry.next_id += 1;
+            registry.namespaces.insert(too_long.clone(), next);
+            registry.id_to_name.insert(next, too_long.clone());
+            registry.persist().unwrap();
+            kept
+        };
+        for _ in 0..2 {
+            let registry = NamespaceRegistry::open(dir.path()).expect("the database opens");
+            assert!(!registry.exists(&too_long));
+            assert_eq!(registry.get_id("kept"), Some(kept));
+        }
+        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
+        assert!(registry.create("next").unwrap() > kept + 1, "ids are never reused");
+    }
 
     #[test]
     fn test_ttl_config_persists_across_reopen() {

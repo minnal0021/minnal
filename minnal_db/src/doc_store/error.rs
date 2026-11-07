@@ -10,6 +10,9 @@ pub enum SchemaError {
     #[error("namespace must be non-empty and contain only alphanumerics, underscores, or hyphens")]
     InvalidNamespace,
 
+    #[error("store name is {len} bytes; the limit is {max}")]
+    StoreNameTooLong { len: usize, max: usize },
+
     #[error("too many indices: {count} specified, maximum is {max}")]
     TooManyIndices { count: usize, max: usize },
 
