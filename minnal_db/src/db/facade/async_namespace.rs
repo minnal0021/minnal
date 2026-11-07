@@ -100,7 +100,7 @@ impl AsyncNamespace {
     /// into a few buffers (see [`PrefixScan`](crate::PrefixScan)). A storage error is
     /// returned as such — it used to become an empty map, indistinguishable from
     /// "no entries under these prefixes".
-    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<crate::db::kv_store::PrefixScan> {
+    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<crate::kv_store::PrefixScan> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_prefixes_batch(&prefix_ids))
             .await

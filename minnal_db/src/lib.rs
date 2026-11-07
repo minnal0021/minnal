@@ -94,6 +94,7 @@ mod support;
 #[cfg(feature = "doc-store")]
 pub mod doc_store;
 pub mod field_index;
+pub mod kv_store;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;
 // Sits outside both optional layers: a store's schema carries these settings
@@ -132,7 +133,7 @@ pub use db::facade::AsyncNamespace;
 
 /// A prefix-batch scan's entries, packed into a few buffers
 /// ([`Namespace::scan_prefixes_batch`], [`AsyncNamespace::scan_prefixes_batch`]).
-pub use db::kv_store::PrefixScan;
+pub use kv_store::PrefixScan;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -223,19 +224,19 @@ pub use db::indexing::manager::FieldIndexHealth;
 pub use db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
 /// Extractor closure type: maps raw document bytes to an [`IndexValue`].
-pub use db::kv_store::index_set::ExtractorFn;
+pub use kv_store::index_set::ExtractorFn;
 
 /// Row-ID function type: derives a stable 128-bit row ID from raw key bytes.
 ///
 /// Register one via [`Db::set_row_id_fn`] to replace the default dense row-ID
 /// map with an explicit identifier (e.g. a UUID embedded in the key).
-pub use db::kv_store::index_set::RowIdFn;
+pub use kv_store::index_set::RowIdFn;
 
 /// Inverse of [`RowIdFn`]: reconstructs the raw key bytes from a row ID.
 ///
 /// Registering this alongside [`RowIdFn`] enables O(|hits|) query resolution
 /// in [`Db::query_index`] with zero memory overhead — no in-memory map needed.
-pub use db::kv_store::index_set::RowToKeyFn;
+pub use kv_store::index_set::RowToKeyFn;
 
 /// Namespace ID for the implicit default namespace.
 pub use db::namespace::DEFAULT_NAMESPACE_ID;

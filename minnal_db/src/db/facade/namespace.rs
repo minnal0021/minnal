@@ -70,7 +70,7 @@ impl<'db> Namespace<'db> {
     /// Scan several 4-byte big-endian `u32` prefixes in one pass, returning every
     /// `(prefix_id, key, value)` in key order. Mirrors
     /// [`AsyncNamespace::scan_prefixes_batch`].
-    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<crate::db::kv_store::PrefixScan> {
+    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<crate::kv_store::PrefixScan> {
         self.store.scan_prefixes_batch(prefix_ids)
     }
 

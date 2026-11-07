@@ -129,7 +129,7 @@ impl Database {
                 kv_store.set_seq_counter(db.next_seq.clone());
                 kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
                 kv_store.set_index_gap_sink(Some(
-                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::kv_store::index_set::IndexGapSink>
+                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::kv_store::index_set::IndexGapSink>
                 ));
             }
         }

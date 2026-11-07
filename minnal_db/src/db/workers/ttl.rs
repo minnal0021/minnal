@@ -115,7 +115,7 @@ impl TtlWorker {
 mod tests {
     use super::{TtlTarget, TtlWorker};
     use crate::db::config::SyncConfig;
-    use crate::db::kv_store::KVStore;
+    use crate::kv_store::KVStore;
     use crate::storage::lsm::tree::LSMConfig;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -19,7 +19,7 @@ binary crates on top.
 minnal_db_api          ← Axum REST API server (binary; enables doc-store + semantic-search)
 minnal_tools           ← standalone bulk-loader binary
 minnal_db  (library, features: kv-store [default], doc-store, semantic-search)
-    src/db/ src/storage/   ← LSM + value-log KV engine (WiscKey-style)   [always]
+    src/db/ src/kv_store/ src/storage/   ← LSM + value-log KV engine (WiscKey-style)   [always]
     src/field_index/      ← RoaringBitmap field indices + predicate evaluator   [always, part of kv-store]
     src/semantic_search/  ← IVF clustering, RaBitQ quantisation, ANN search, and vector_kv/: the vector↔KV bridge (DbVectorStore, upsert/delete, embed queue, qemb cache)   #[cfg(semantic-search)]
     src/doc_store/        ← JSON schema, doc lifecycle, KV store lifecycle, index builders   #[cfg(doc-store)]
@@ -61,10 +61,11 @@ When touching feature-gated code, verify each combo compiles: default / `--featu
 
 ```
 src/lib.rs             — public API surface (re-exports; feature-gated)
-src/db/                — stats, layout; namespace/ (registry, schema, create and remove), facade/, config/, database/ (the coordinator), kv_store/ (one namespace's LSM tree, value log and live field indexes), wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
+src/db/                — layout; namespace/ (registry, schema, create and remove), facade/, config/, database/ (the coordinator), wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
 src/error.rs           — `KVError`, the engine's error type
 src/storage/           — LSM tree, value log
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
+src/kv_store/          — one namespace's LSM tree, value log and live field indexes; sits below db and does not import it
 src/field_index/       — folded field-indexing module (always compiled)
 src/vector_index/      — each store's vector-index settings (`vector_settings`), in its schema with or without semantic search   #[cfg(doc-store)]
 src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge), context.rs and workers/ (with doc-store; they reach the stores above through `WorkerHost`)   #[cfg(semantic-search)]

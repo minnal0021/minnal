@@ -118,7 +118,7 @@ Before starting, re-run the search; the list below is what it found on
       `config_report.rs` (reported knobs)
 - [x] 4e. **Code doc comments not touched in steps 1–3**: `bitmap/mod.rs` type docs,
       `typed_index.rs`, `dyn_index.rs` (crash-atomicity section),
-      `blob_store.rs`, `db/kv_store/writes.rs` and `db/database/` (replay and
+      `blob_store.rs`, `kv_store/writes.rs` and `db/database/` (replay and
       backpressure comments), `db/workers/index_checkpoint.rs`,
       `db/indexing/manager.rs`, admin route docs in
       `minnal_db_api/src/routes/admin_indices.rs` / `admin_storage.rs`,

@@ -85,7 +85,7 @@ impl CompactionTally {
     }
 }
 
-pub use crate::db::kv_store::LsmCompactionCommand;
+pub use crate::kv_store::LsmCompactionCommand;
 
 /// LSM compaction worker that runs in the background
 pub struct LsmCompactionWorker {

@@ -134,7 +134,7 @@ impl IndexCheckpointTrigger {
     }
 }
 
-impl crate::db::kv_store::index_set::CheckpointRequests for IndexCheckpointTrigger {
+impl crate::kv_store::index_set::CheckpointRequests for IndexCheckpointTrigger {
     fn request_if_over_cap(&self, dead_bytes: u64) {
         IndexCheckpointTrigger::request_if_over_cap(self, dead_bytes);
     }

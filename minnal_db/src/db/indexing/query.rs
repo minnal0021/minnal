@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use crate::db::database::Database;
 use crate::db::error::Result;
-use crate::db::kv_store::KVStore;
 use crate::field_index::{FieldId, QueryOutcome};
+use crate::kv_store::KVStore;
 
 impl Database {
     /// Evaluate a query string against the active field indices of a namespace
@@ -286,8 +286,8 @@ mod tests {
     /// value's bucket and leaves whatever it was in (including "nothing").
     #[test]
     fn test_field_index_update_field_appears_and_disappears() {
-        use crate::db::kv_store::index_set::ExtractorFn;
         use crate::field_index::{IndexValue, IndexValueType};
+        use crate::kv_store::index_set::ExtractorFn;
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -324,8 +324,8 @@ mod tests {
     /// (the field is filtered out of the queryable schema map).
     #[test]
     fn test_deactivate_field_index_makes_field_unqueryable() {
-        use crate::db::kv_store::index_set::ExtractorFn;
         use crate::field_index::{IndexValue, IndexValueType};
+        use crate::kv_store::index_set::ExtractorFn;
         use std::sync::Arc;
 
         let dir = TempDir::new().unwrap();
@@ -418,10 +418,10 @@ mod tests {
 #[cfg(test)]
 mod differential_tests {
     use crate::db::database::Database;
-    use crate::db::kv_store::index_set::ExtractorFn;
     use crate::db::namespace::DEFAULT_NAMESPACE_ID;
     use crate::db::test_support::create_db_config;
     use crate::field_index::{IndexValue, IndexValueType};
+    use crate::kv_store::index_set::ExtractorFn;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use tempfile::TempDir;

@@ -12,9 +12,9 @@ use std::time::Duration;
 use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
 use crate::db::database::Database;
 use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
-use crate::db::kv_store::index_set::ExtractorFn;
 use crate::field_index::FieldId;
 use crate::field_index::{IndexValue, IndexValueType};
+use crate::kv_store::index_set::ExtractorFn;
 use crate::storage::lsm::tree::LSMConfig;
 
 pub(crate) fn create_db_config() -> DbConfig {

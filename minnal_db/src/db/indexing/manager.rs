@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::db::error::{KVError, Result};
-use crate::db::kv_store::index_set::IndexGapSink;
 use crate::field_index::FieldId;
+use crate::kv_store::index_set::IndexGapSink;
 
 /// What a field's on-disk `checkpoint` marker says.
 ///

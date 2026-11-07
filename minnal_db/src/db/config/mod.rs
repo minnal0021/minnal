@@ -5,7 +5,7 @@ use crate::support::DEFAULT_NUM_BUCKETS;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use crate::db::kv_store::SyncConfig;
+pub use crate::kv_store::SyncConfig;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScheduledTaskConfig {
@@ -241,7 +241,7 @@ impl ThresholdConfig {
 impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
-            value_log_waste_threshold: crate::db::kv_store::DEFAULT_VALUE_LOG_WASTE_THRESHOLD,
+            value_log_waste_threshold: crate::kv_store::DEFAULT_VALUE_LOG_WASTE_THRESHOLD,
             segment_gc_threshold: DEFAULT_SEGMENT_GC_THRESHOLD,
             tail_gc_min_garbage_pct: None,
             index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
