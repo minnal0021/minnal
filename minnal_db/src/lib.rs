@@ -162,7 +162,7 @@ pub use db::config::ScheduledTaskConfig;
 pub use db::config::SyncConfig;
 
 /// TOML configuration file parser.
-pub use db::toml_config::MinnalTomlConfig;
+pub use db::config::toml::MinnalTomlConfig;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

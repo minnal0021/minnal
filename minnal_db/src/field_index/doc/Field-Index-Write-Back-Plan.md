@@ -113,8 +113,8 @@ Before starting, re-run the search; the list below is what it found on
       fields and limits; changed meaning of the backpressure setting);
       `minnal_db/README.md`, `QUICKSTART.md`s and `benchmark.md` if they mention
       index storage or its knobs
-- [x] 4d. **Config**: `config/sample.toml` comments; `minnal_db/src/db/config.rs`
-      and `toml_config.rs` doc comments; `minnal_db_api/src/config.rs` and
+- [x] 4d. **Config**: `config/sample.toml` comments; `minnal_db/src/db/config/mod.rs`
+      and `config/toml.rs` doc comments; `minnal_db_api/src/config.rs` and
       `config_report.rs` (reported knobs)
 - [x] 4e. **Code doc comments not touched in steps 1–3**: `bitmap/mod.rs` type docs,
       `typed_index.rs`, `dyn_index.rs` (crash-atomicity section),

@@ -3786,6 +3786,5 @@ impl TtlTarget for Database {
 }
 
 /// Unit tests for the coordinator.
-///
 #[cfg(test)]
 mod tests;

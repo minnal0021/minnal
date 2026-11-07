@@ -6,7 +6,6 @@ pub mod indexing;
 pub(crate) mod layout;
 pub mod namespace;
 pub mod stats;
-pub mod toml_config;
 pub mod wal;
 pub(crate) mod workers;
 

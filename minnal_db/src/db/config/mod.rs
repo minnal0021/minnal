@@ -1,3 +1,5 @@
+pub mod toml;
+
 use crate::storage::lsm::tree::LSMConfig;
 use crate::support::DEFAULT_NUM_BUCKETS;
 use std::path::PathBuf;

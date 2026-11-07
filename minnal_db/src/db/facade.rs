@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::db::config::DbConfig;
+use crate::db::config::toml::MinnalTomlConfig;
 use crate::db::database::{Database, OpenStoreLookup};
 use crate::db::error::{KVError, Result};
 use crate::db::indexing::manager::FieldIndexHealth;
@@ -16,7 +17,6 @@ use crate::db::namespace::index_set::ExtractorFn;
 use crate::db::namespace::kv_store::{KVStore, KeyValue, ScanPage};
 use crate::db::namespace::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 use crate::db::stats::{GCStats, Stats};
-use crate::db::toml_config::MinnalTomlConfig;
 use crate::db::workers::index_checkpoint::{IndexCheckpointTarget, IndexCheckpointWorker};
 use crate::db::workers::lsm_compaction::{LsmCompactionTarget, LsmCompactionWorker};
 use crate::db::workers::ttl::{TtlTarget, TtlWorker};
