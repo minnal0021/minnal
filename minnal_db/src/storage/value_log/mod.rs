@@ -1771,6 +1771,67 @@ mod tests {
     }
 
     #[test]
+    fn a_segment_longer_than_its_saved_count_is_flagged_for_rebuild() -> Result<()> {
+        // No roll here, unlike `stale_but_present_metadata_is_rebuilt_not_trusted`: a
+        // new segment has no saved accounting and is flagged for that reason, so that
+        // test passes even if a disagreeing size is ignored.
+        let dir = TempDir::new()?;
+        let value = vec![0x42; 1024];
+        let rec = ValueRecordHeader::record_len(b"k0".len(), value.len());
+        let seg = {
+            let log = ValueLog::open(dir.path(), 0, SEG)?;
+            let first = log.append(b"k0", &value, meta(0), true)?;
+            log.flush_metadata()?;
+            let second = log.append(b"k1", &value, meta(1), true)?;
+            assert_eq!(second.segment_id, first.segment_id, "setup: one segment only");
+            first.segment_id
+        };
+
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        assert!(
+            log.stats_need_rebuild(),
+            "a segment holding bytes its saved count does not cover must be flagged"
+        );
+        let stats = log.segment_stats().into_iter().find(|s| s.id == seg).unwrap();
+        assert_eq!(stats.total_bytes, 2 * rec, "the file is believed, not the saved count");
+        assert_eq!(stats.live_bytes, 2 * rec, "everything counts as live until the rebuild");
+        assert_eq!(stats.garbage_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_tail_cut_back_below_its_saved_count_is_flagged_for_rebuild() -> Result<()> {
+        // The file's length matches the saved count, so only walking the records shows
+        // the disagreement: a crash can keep a file's length and lose its last page.
+        let dir = TempDir::new()?;
+        let value = vec![0x42; 1024];
+        let rec = ValueRecordHeader::record_len(b"k0".len(), value.len());
+        let seg = {
+            let log = ValueLog::open(dir.path(), 0, SEG)?;
+            let first = log.append(b"k0", &value, meta(0), true)?;
+            log.append(b"k1", &value, meta(1), true)?;
+            log.flush_metadata()?;
+            first.segment_id
+        };
+        let path = ValueLog::segment_path(dir.path(), 0, seg);
+        let file = OpenOptions::new().write(true).open(&path)?;
+        let len = file.metadata()?.len();
+        file.write_all_at(&vec![0u8; rec as usize], len - rec)?;
+        drop(file);
+
+        let log = ValueLog::open(dir.path(), 0, SEG)?;
+        assert!(
+            log.stats_need_rebuild(),
+            "a tail shorter than the saved count must be flagged, even though the file length agrees"
+        );
+        let stats = log.segment_stats().into_iter().find(|s| s.id == seg).unwrap();
+        assert_eq!(stats.total_bytes, rec, "only the first record is left");
+        assert_eq!(stats.live_bytes, rec, "everything counts as live until the rebuild");
+        assert_eq!(stats.garbage_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
     fn stale_but_present_metadata_is_rebuilt_not_trusted() -> Result<()> {
         // Metadata is not flushed on every append. A crash can leave the metadata file
         // present and parseable but describing FEWER bytes than a segment actually

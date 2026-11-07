@@ -2664,6 +2664,46 @@ mod tests {
     // into a file that no longer exists, and the WAL entries that could replay those
     // writes are long gone. These tests pin both halves of that ordering.
 
+    /// Value-log metadata older than the log must not hide garbage: a segment's size
+    /// disagreeing with its saved count triggers the exact rebuild from the LSM at open.
+    /// Without it every byte counts as live, and GC, which triggers on garbage, would
+    /// leave the segment alone.
+    #[test]
+    fn stale_value_log_metadata_is_rebuilt_from_the_lsm_at_open() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = default_lsm_config();
+        cfg.num_buckets = 1;
+        let value = vec![0x5Au8; 1024];
+        let rec = crate::storage::value_log::ValueRecordHeader::record_len(b"k0".len(), value.len());
+        let open = || KVStore::open(0, "default", dir.path(), cfg.clone(), SyncConfig::default(), 1024 * 1024).unwrap();
+
+        let metadata = dir.path().join("value_logs").join("value_log_0.metadata");
+        let saved = {
+            let store = open();
+            store.put_to_storage(b"k0", &value).unwrap();
+            store.put_to_storage(b"k1", &value).unwrap();
+            store.lsm.flush_memtable_to_level0().unwrap();
+            store.value_log.flush_all_metadata().unwrap();
+            let saved = std::fs::read(&metadata).unwrap();
+            // Ten overwrites the saved metadata does not know about.
+            for _ in 0..10 {
+                store.put_to_storage(b"k1", &value).unwrap();
+            }
+            store.lsm.flush_memtable_to_level0().unwrap();
+            store.crash();
+            saved
+        };
+        std::fs::write(&metadata, &saved).unwrap();
+
+        let store = open();
+        use crate::storage::value_log::SegmentStats;
+        let stats: Vec<SegmentStats> = store.value_log.all_segment_stats().into_iter().flat_map(|(_, s)| s).collect();
+        let sum = |f: fn(&SegmentStats) -> u64| stats.iter().map(f).sum::<u64>();
+        assert_eq!(sum(|s| s.total_bytes), 12 * rec);
+        assert_eq!(sum(|s| s.live_bytes), 2 * rec, "only k0 and the newest k1 are live");
+        assert_eq!(sum(|s| s.garbage_bytes), 10 * rec, "the overwritten copies are garbage");
+    }
+
     /// A crash between GC's re-point and its unlink must lose nothing: the old segment
     /// is still on disk, and the durable LSM still points into it.
     ///
