@@ -290,7 +290,29 @@ impl DocStore {
                 let field_id = self.db.register_index_field(ns_id, &spec.field, ivt)?;
                 let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
 
-                let Some(disk) = read_disk_progress(&progress_path) else { continue };
+                // A missing record means no build of this field was ever started
+                // here. One that exists but cannot be read is what a power loss
+                // can leave behind (its writes are not fsynced): the build may have
+                // been anywhere, so it starts again from the first key. Skipping
+                // it would leave the index half built, with nothing to finish it.
+                let disk = match read_disk_progress(&progress_path) {
+                    Some(disk) => disk,
+                    None if !progress_path.exists() => continue,
+                    None => {
+                        log::warn!(
+                            "index build of namespace='{}' field='{}': its progress record is unreadable (a power loss can leave it so); rebuilding the field from the start",
+                            schema.namespace,
+                            spec.field
+                        );
+                        DiskBuildProgress {
+                            status: "in_progress".to_owned(),
+                            total: 0,
+                            indexed: 0,
+                            last_key_hex: None,
+                            error: None,
+                        }
+                    }
+                };
                 if disk.status != "in_progress" {
                     continue;
                 }

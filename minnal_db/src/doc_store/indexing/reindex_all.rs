@@ -430,6 +430,33 @@ mod tests {
         );
     }
 
+    /// A power loss can leave a build's progress record empty, as its writes
+    /// are not fsynced. The next start rebuilds that field from the first key;
+    /// it used to skip the field, leaving its index half built for good.
+    #[tokio::test]
+    async fn a_build_with_an_unreadable_progress_record_is_rebuilt_at_the_next_start() {
+        let db_dir = TempDir::new().unwrap();
+        let (store, live) = seeded(db_dir.path()).await;
+        for h in store.reindex_all_attribute_indices("events").await.unwrap() {
+            // The build is killed with the process.
+            h.task.abort();
+            let _ = h.task.await;
+        }
+        let ns_id = store.load_schema("events").unwrap().ns_id.unwrap();
+        for field in store.db.list_index_fields(ns_id) {
+            std::fs::write(build_progress_path(&store.db_path, ns_id, field.field_id), b"").unwrap();
+        }
+        drop(store);
+
+        let store = open_fresh(db_dir.path()).await;
+        let handles = store.resume_pending_builds().await.unwrap();
+        assert_eq!(handles.len(), 2, "both fields are rebuilt");
+        for h in handles {
+            h.wait().await.unwrap();
+        }
+        assert_rebuilt(&store, &live, "after rebuilding from an unreadable record").await;
+    }
+
     /// While a build of the store runs, `reindex-all` is refused before it
     /// changes anything. It used to drop the indexes, delete the running build's
     /// directory under it, fail, and leave the indexes out of the schema.
