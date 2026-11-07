@@ -9,7 +9,7 @@
 // measured the L1 tier by accident — their setup populated via a sync `Db`
 // then called `.shutdown()` before reopening as `AsyncDb`, and `shutdown()`
 // unconditionally flushes+compacts everything to L1 (`flush_and_compact_all`
-// in `kv_store.rs`), regardless of whether anything explicitly called
+// in `namespace/kv_store.rs`), regardless of whether anything explicitly called
 // `.compact()` first. Both now populate directly through `AsyncDb` so the
 // memtable tier is genuinely memtable-resident.
 

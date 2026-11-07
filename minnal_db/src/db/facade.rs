@@ -12,9 +12,9 @@ use crate::db::config::DbConfig;
 use crate::db::database::{Database, OpenStoreLookup};
 use crate::db::error::{KVError, Result};
 use crate::db::index_manager::FieldIndexHealth;
-use crate::db::kv_store::{KVStore, KeyValue, ScanPage};
+use crate::db::namespace::index_set::ExtractorFn;
+use crate::db::namespace::kv_store::{KVStore, KeyValue, ScanPage};
 use crate::db::namespace::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
-use crate::db::namespace_index::ExtractorFn;
 use crate::db::stats::{GCStats, Stats};
 use crate::db::toml_config::MinnalTomlConfig;
 use crate::db::workers::index_checkpoint::{IndexCheckpointTarget, IndexCheckpointWorker};
@@ -689,8 +689,8 @@ impl Db {
     pub fn set_row_id_fn(
         &self,
         namespace_id: u32,
-        row_id_fn: crate::db::namespace_index::RowIdFn,
-        row_to_key_fn: Option<crate::db::namespace_index::RowToKeyFn>,
+        row_id_fn: crate::db::namespace::index_set::RowIdFn,
+        row_to_key_fn: Option<crate::db::namespace::index_set::RowToKeyFn>,
     ) -> Result<()> {
         self.inner.set_row_id_fn(namespace_id, row_id_fn, row_to_key_fn)
     }
@@ -962,7 +962,7 @@ impl<'db> Namespace<'db> {
     /// Scan several 4-byte big-endian `u32` prefixes in one pass, returning every
     /// `(prefix_id, key, value)` in key order. Mirrors
     /// [`AsyncNamespace::scan_prefixes_batch`].
-    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<crate::db::kv_store::PrefixScan> {
+    pub fn scan_prefixes_batch(&self, prefix_ids: &[u32]) -> Result<crate::db::namespace::kv_store::PrefixScan> {
         self.store.scan_prefixes_batch(prefix_ids)
     }
 
@@ -1949,8 +1949,8 @@ impl AsyncDb {
     pub async fn set_row_id_fn(
         &self,
         namespace_id: u32,
-        row_id_fn: crate::db::namespace_index::RowIdFn,
-        row_to_key_fn: Option<crate::db::namespace_index::RowToKeyFn>,
+        row_id_fn: crate::db::namespace::index_set::RowIdFn,
+        row_to_key_fn: Option<crate::db::namespace::index_set::RowToKeyFn>,
     ) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.set_row_id_fn(namespace_id, row_id_fn, row_to_key_fn))
@@ -2147,7 +2147,7 @@ impl AsyncNamespace {
     /// into a few buffers (see [`PrefixScan`](crate::PrefixScan)). A storage error is
     /// returned as such — it used to become an empty map, indistinguishable from
     /// "no entries under these prefixes".
-    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<crate::db::kv_store::PrefixScan> {
+    pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<crate::db::namespace::kv_store::PrefixScan> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_prefixes_batch(&prefix_ids))
             .await

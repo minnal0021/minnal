@@ -37,7 +37,7 @@ Provides per-field bitmap indexes over document key-spaces and a predicate query
 ```
 INGEST (synchronous, on the write path)                    [minnal_doc_store → minnal_db]
   Db::put(ns, key, value)
-    └─ KVStore::put_to_storage_inner                       (kv_store.rs)
+    └─ KVStore::put_to_storage_inner                       (namespace/kv_store.rs)
          1. WAL append + fsync          ← durability barrier (the DOC is durable here)
          2. value-log write → pointer; memtable insert
          3. update_indices_on_put(key, value)              ← indexing runs INLINE, in memory

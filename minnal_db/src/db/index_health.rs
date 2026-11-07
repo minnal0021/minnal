@@ -236,7 +236,7 @@ impl Database {
         }
 
         let wal_tail = self.wal_metadata.read().tail;
-        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
+        let detected_at_ms = crate::db::namespace::kv_store::current_epoch_millis();
         for (ns_id, fields) in namespaces {
             for field_id in fields {
                 if self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail) == crate::db::index_manager::CheckpointState::Absent {
@@ -285,7 +285,7 @@ impl Database {
         if self.rejected_index_updates.is_empty() {
             return;
         }
-        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
+        let detected_at_ms = crate::db::namespace::kv_store::current_epoch_millis();
         for ((ns_id, field_id), rejected) in self.rejected_index_updates.drain() {
             let repair = if rejected.overflowed {
                 crate::db::index_manager::RepairMode::FullRebuild
@@ -452,7 +452,7 @@ mod tests {
     /// nothing.
     #[test]
     fn test_activating_a_dropped_field_is_rejected() {
-        use crate::db::namespace_index::ExtractorFn;
+        use crate::db::namespace::index_set::ExtractorFn;
         use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn test_reindex_field_repairs_and_reports_outcome() {
         use crate::db::namespace::FieldReindexOutcome;
-        use crate::db::namespace_index::ExtractorFn;
+        use crate::db::namespace::index_set::ExtractorFn;
         use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
@@ -552,7 +552,7 @@ mod tests {
     /// cause shutdown to fail with ENOENT when run_index_checkpoint is called.
     #[test]
     fn test_shutdown_after_drop_index_does_not_error() {
-        use crate::db::namespace_index::ExtractorFn;
+        use crate::db::namespace::index_set::ExtractorFn;
         use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn a_rejected_index_update_is_recorded_as_a_gap() -> Result<()> {
         use crate::db::index_manager::{GapCause, RepairMode};
-        use crate::db::namespace_index::ExtractorFn;
+        use crate::db::namespace::index_set::ExtractorFn;
         use crate::field_index::{IndexValue, IndexValueType};
 
         let temp_dir = TempDir::new()?;

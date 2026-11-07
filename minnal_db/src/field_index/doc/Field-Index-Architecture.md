@@ -10,7 +10,7 @@ Two parts of `minnal_db` share the work. The bitmap engine itself — `bitmap/mo
 `bitmap/container/`, `bitmap/container_map.rs`, `blob_store.rs`, `rowmap.rs`, `bitmap/codec.rs`,
 all under `src/field_index/` — knows nothing about databases. The *lifecycle* around
 it — schema registration, activation, checkpointing, WAL replay — lives in the
-engine (`src/db/database.rs`, `kv_store.rs`, `index_manager.rs`), which owns one
+engine (`src/db/database.rs`, `namespace/kv_store.rs`, `index_manager.rs`), which owns one
 set of indexes per namespace. Paths below are relative to `minnal_db/src/field_index/`
 unless they start with `minnal_db/`.
 
@@ -72,7 +72,7 @@ checkpointing, and recovery that keep it all durable.
 
 ## 1. Defining a field
 
-An index begins with a field definition (`minnal_db/src/db/namespace.rs`):
+An index begins with a field definition (`minnal_db/src/db/namespace/mod.rs`):
 
 ```rust
 pub struct FieldDef {
@@ -137,7 +137,7 @@ whatever an old bitmap still says about the deleted one. The document store's
 the rebuilt indexes number the live documents only.
 
 When it comes time to assign an ID for a key, `KVStore::resolve_row_id_alloc`
-(`kv_store.rs`) consults two sources in order:
+(`namespace/kv_store.rs`) consults two sources in order:
 
 1. A caller-supplied `RowIdFn` wins if present — an escape hatch for keys that
    embed their own ID, paired with a `RowToKeyFn` for the reverse direction. It

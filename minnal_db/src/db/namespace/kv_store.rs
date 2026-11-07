@@ -25,7 +25,7 @@ use crate::support::metrics::Metrics;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::config::SyncConfig;
-use crate::db::namespace_index::{NamespaceIndexSet, RowIdFn, RowToKeyFn};
+use crate::db::namespace::index_set::{NamespaceIndexSet, RowIdFn, RowToKeyFn};
 use std::time::Duration;
 
 /// A resolved key/value pair: both the key and the value bytes read from the value log.
