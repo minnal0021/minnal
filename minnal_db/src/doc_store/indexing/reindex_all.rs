@@ -409,4 +409,79 @@ mod tests {
             after.bytes_on_disk
         );
     }
+
+    /// Writers changing and deleting keys while `reindex-all` runs: afterwards
+    /// every key is listed under exactly its current value. A re-added field's
+    /// WAL replay used to leave a deleted key in the index, and a later write of
+    /// it put the row in two buckets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reindex_all_under_concurrent_writes_leaves_no_stale_entries() {
+        use std::sync::Arc;
+        let db_dir = TempDir::new().unwrap();
+        let store = Arc::new(open_fresh(db_dir.path()).await);
+        let mut schema = make_schema(
+            "rw",
+            vec![IndexSpec {
+                field: "y".to_owned(),
+                index_type: IndexType::Int,
+            }],
+        );
+        schema.key_type = KeyType::Str;
+        store.create(schema).await.unwrap();
+        const KEYS: usize = 1500;
+        for i in 0..KEYS {
+            store
+                .put(
+                    "rw",
+                    DocId::Str(StrKey::new(&format!("k{i:04}")).unwrap()),
+                    serde_json::json!({"y": i % 10}),
+                )
+                .await
+                .unwrap();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for w in 0..6u64 {
+            let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
+            writers.push(tokio::spawn(async move {
+                let mut n = w;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let id = DocId::Str(StrKey::new(&format!("k{:04}", (n >> 33) as usize % KEYS)).unwrap());
+                    if n % 10 == 0 {
+                        let _ = store.delete("rw", id).await;
+                    } else {
+                        store.put("rw", id, serde_json::json!({"y": (n >> 40) % 10})).await.unwrap();
+                    }
+                }
+            }));
+        }
+        for _ in 0..8 {
+            for h in store.reindex_all_attribute_indices("rw").await.unwrap() {
+                h.wait().await.unwrap();
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            w.await.unwrap();
+        }
+        let mut stale = Vec::new();
+        for v in 0..10 {
+            let page = store.query("rw", &format!("y = {v}"), Pagination::new(1, 10_000)).await.unwrap();
+            for (id, doc) in page.results {
+                if doc["y"] != v {
+                    stale.push((id, v, doc["y"].clone()));
+                }
+            }
+        }
+        let mut listed = 0;
+        for v in 0..10 {
+            listed += store.query("rw", &format!("y = {v}"), Pagination::new(1, 10_000)).await.unwrap().total;
+        }
+        let live = store.count_docs("rw").await.unwrap();
+        assert!(
+            stale.is_empty() && listed == live,
+            "stale {stale:?}, {listed} listed for {live} documents"
+        );
+    }
 }

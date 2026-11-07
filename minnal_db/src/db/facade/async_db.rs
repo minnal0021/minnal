@@ -736,6 +736,22 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// [`activate_field_index`](Self::activate_field_index) for a new index that
+    /// a build is about to fill: it starts empty, with no WAL replay, and is safe
+    /// on a store taking writes as long as the build then indexes every key.
+    pub async fn activate_field_index_for_build(
+        &self,
+        namespace_id: u32,
+        field_id: FieldId,
+        value_type: IndexValueType,
+        extractor: ExtractorFn,
+    ) -> Result<()> {
+        let db = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || db.inner.activate_field_index_for_build(namespace_id, field_id, value_type, extractor))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     /// Remove a field index from the in-memory registry.
     ///
     /// After this call predicate queries that reference the field return an

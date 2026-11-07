@@ -142,7 +142,17 @@ impl DocStore {
             spec.field, spec.index_type, field_id, namespace, ns_id
         );
         let extractor = json_extractor(spec.field.clone(), spec.index_type);
-        self.db.activate_field_index(ns_id, field_id, ivt, extractor).await?;
+        // Starts empty unless an interrupted build is being taken over, whose
+        // index holds what it did before the crash (the WAL replay brings that
+        // up to date). The store takes writes meanwhile only in the first case;
+        // see `activate_field_index_for_build`.
+        let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
+        let takes_over_a_build = read_disk_progress(&progress_path).is_some_and(|p| p.status == "in_progress" && p.last_key_hex.is_some());
+        if takes_over_a_build {
+            self.db.activate_field_index(ns_id, field_id, ivt, extractor).await?;
+        } else {
+            self.db.activate_field_index_for_build(ns_id, field_id, ivt, extractor).await?;
+        }
 
         // Record the build as in progress BEFORE the schema lists the index.
         // The build task writes its own first record only after counting every
@@ -151,7 +161,6 @@ impl DocStore {
         // to find: it was never resumed and silently stayed incomplete. A
         // record already there (an interrupted build being taken over) is kept,
         // so its resume point survives.
-        let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
         if read_disk_progress(&progress_path).is_none_or(|p| p.status != "in_progress") {
             let initial = DiskBuildProgress {
                 status: "in_progress".to_owned(),

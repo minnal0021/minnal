@@ -143,6 +143,37 @@ impl Database {
     /// * `value_type`   – runtime type for the index entries
     /// * `extractor`    – closure that extracts a typed value from raw document bytes
     pub fn activate_field_index(&self, namespace_id: u32, field_id: FieldId, value_type: IndexValueType, extractor: ExtractorFn) -> Result<()> {
+        self.activate_field_index_inner(namespace_id, field_id, value_type, extractor, true)
+    }
+
+    /// [`activate_field_index`](Self::activate_field_index) for a new index that
+    /// a build is about to fill: no WAL replay, so it starts empty.
+    ///
+    /// The replay reads the current value of every key in the WAL window, and
+    /// writers do not see the field until it is registered at the end. On a store
+    /// taking writes, a key deleted after the replay read it therefore stays in
+    /// the index: the delete had no index to update, and the build, which only
+    /// visits keys that exist, never comes back to it. When the key is written
+    /// again it is a fresh insert, so the row ends up in two buckets. A build
+    /// indexes every key's current value anyway, so the replay only adds that risk.
+    pub fn activate_field_index_for_build(
+        &self,
+        namespace_id: u32,
+        field_id: FieldId,
+        value_type: IndexValueType,
+        extractor: ExtractorFn,
+    ) -> Result<()> {
+        self.activate_field_index_inner(namespace_id, field_id, value_type, extractor, false)
+    }
+
+    fn activate_field_index_inner(
+        &self,
+        namespace_id: u32,
+        field_id: FieldId,
+        value_type: IndexValueType,
+        extractor: ExtractorFn,
+        replay_wal: bool,
+    ) -> Result<()> {
         // Validate: field_id must be registered and its stored type must match.
         {
             let registry = self.registry.read();
@@ -215,7 +246,7 @@ impl Database {
         // Recovering on the unshared dyn_index (not yet wrapped in Arc<RwLock<>>)
         // guarantees no concurrent put can race with recovery and overwrite a
         // newer value with a stale one from the WAL scan.
-        {
+        if replay_wal {
             let wal_tail = self.wal_metadata.read().tail;
             if wal_tail > 0 {
                 let checkpoint_state = self.index_manager.read_checkpoint_state(namespace_id, field_id, wal_tail);
