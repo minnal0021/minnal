@@ -203,7 +203,7 @@ impl Database {
         }
 
         let cap = Self::GAP_KEY_WORKLIST_CAP;
-        let detected_at_ms = crate::db::namespace::kv_store::current_epoch_millis();
+        let detected_at_ms = crate::db::kv_store::current_epoch_millis();
         for (ns_id, field_id, from, field_segment) in affected {
             // A field checkpointed past every reclaimed segment lost nothing.
             if !forced.iter().any(|&s| s >= field_segment) {

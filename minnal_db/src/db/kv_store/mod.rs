@@ -5,6 +5,8 @@
 //! The WAL is shared across all namespaces and managed by the
 //! Database coordinator.
 
+pub mod index_set;
+
 use crate::db::error::{KVError, Result};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::workers::index_checkpoint::IndexCheckpointTrigger;
@@ -25,7 +27,7 @@ use crate::support::metrics::Metrics;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::config::SyncConfig;
-use crate::db::namespace::index_set::{NamespaceIndexSet, RowIdFn, RowToKeyFn};
+use crate::db::kv_store::index_set::{NamespaceIndexSet, RowIdFn, RowToKeyFn};
 use std::time::Duration;
 
 /// A resolved key/value pair: both the key and the value bytes read from the value log.

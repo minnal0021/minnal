@@ -2899,7 +2899,7 @@ impl LSMTree {
     /// POINTER-RESOLUTION INVARIANT: the returned pointers guarantee LSM-side
     /// completeness only. They are safe to resolve against the value log *solely*
     /// inside the caller's value-log generation bracket
-    /// ([`KVStore::read_generation_stable`](crate::db::namespace::kv_store::KVStore)) or under
+    /// ([`KVStore::read_generation_stable`](crate::db::kv_store::KVStore)) or under
     /// the value-log bucket write lock (GC compaction). This snapshot does NOT
     /// extend value-log GC protection — resolving a returned pointer outside that
     /// bracket reopens the wrong-file window closed in commit 420ac8e.

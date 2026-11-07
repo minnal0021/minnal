@@ -775,8 +775,8 @@ impl AsyncDb {
     pub async fn set_row_id_fn(
         &self,
         namespace_id: u32,
-        row_id_fn: crate::db::namespace::index_set::RowIdFn,
-        row_to_key_fn: Option<crate::db::namespace::index_set::RowToKeyFn>,
+        row_id_fn: crate::db::kv_store::index_set::RowIdFn,
+        row_to_key_fn: Option<crate::db::kv_store::index_set::RowToKeyFn>,
     ) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.set_row_id_fn(namespace_id, row_id_fn, row_to_key_fn))

@@ -3,6 +3,7 @@ pub mod database;
 pub mod error;
 pub mod facade;
 pub mod indexing;
+pub mod kv_store;
 pub(crate) mod layout;
 pub mod namespace;
 pub mod stats;

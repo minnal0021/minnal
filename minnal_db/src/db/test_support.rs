@@ -12,8 +12,8 @@ use std::time::Duration;
 use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
 use crate::db::database::Database;
 use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
+use crate::db::kv_store::index_set::ExtractorFn;
 use crate::db::namespace::FieldId;
-use crate::db::namespace::index_set::ExtractorFn;
 use crate::field_index::{IndexValue, IndexValueType};
 use crate::storage::lsm::tree::LSMConfig;
 

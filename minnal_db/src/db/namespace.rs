@@ -1,6 +1,3 @@
-pub mod index_set;
-pub mod kv_store;
-
 use crc32fast::Hasher;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 /// Namespace Registry

@@ -856,7 +856,7 @@ fn test_database_remove_namespace() {
 
 #[test]
 fn test_activate_type_mismatch_rejected() {
-    use crate::db::namespace::index_set::ExtractorFn;
+    use crate::db::kv_store::index_set::ExtractorFn;
     use crate::field_index::IndexValueType;
     use std::sync::Arc;
 
@@ -878,7 +878,7 @@ fn test_activate_type_mismatch_rejected() {
 
 #[test]
 fn test_activate_unknown_field_id_rejected() {
-    use crate::db::namespace::index_set::ExtractorFn;
+    use crate::db::kv_store::index_set::ExtractorFn;
     use crate::field_index::IndexValueType;
     use std::sync::Arc;
 
@@ -911,7 +911,7 @@ fn test_duplicate_register_field_idempotent() {
 
 #[test]
 fn test_schema_survives_restart_and_index_activates_without_re_register() {
-    use crate::db::namespace::index_set::ExtractorFn;
+    use crate::db::kv_store::index_set::ExtractorFn;
     use crate::field_index::{IndexValue, IndexValueType};
     use std::sync::Arc;
 
@@ -1024,7 +1024,7 @@ fn replay_cost_vs_total() {
             field_id
         };
         let db = Database::open(dir.path(), config).unwrap();
-        let extractor: crate::db::namespace::index_set::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+        let extractor: crate::db::kv_store::index_set::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
             let s = std::str::from_utf8(bytes).ok()?;
             let v: serde_json::Value = serde_json::from_str(s).ok()?;
             Some(crate::field_index::IndexValue::Str(v["status"].as_str()?.to_string()))
@@ -1082,7 +1082,7 @@ fn replay_cost_vs_window() {
         };
 
         let db = Database::open(dir.path(), config).unwrap();
-        let extractor: crate::db::namespace::index_set::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+        let extractor: crate::db::kv_store::index_set::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
             let s = std::str::from_utf8(bytes).ok()?;
             let v: serde_json::Value = serde_json::from_str(s).ok()?;
             Some(crate::field_index::IndexValue::Str(v["status"].as_str()?.to_string()))
@@ -1176,7 +1176,7 @@ fn a_torn_index_slot_records_a_full_rebuild_gap_and_repair_restores_it() {
     std::fs::write(&keys, &bytes).unwrap();
 
     let db = Database::open(dir.path(), create_db_config()).unwrap();
-    let extractor: crate::db::namespace::index_set::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+    let extractor: crate::db::kv_store::index_set::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
         let s = std::str::from_utf8(bytes).ok()?;
         let v: serde_json::Value = serde_json::from_str(s).ok()?;
         Some(crate::field_index::IndexValue::Str(v["status"].as_str()?.to_string()))
@@ -1238,7 +1238,7 @@ fn replaying_a_low_cardinality_field_keeps_its_blob_bounded() {
     std::fs::remove_file(&marker).unwrap();
 
     let db = Database::open(dir.path(), config).unwrap();
-    let extractor: crate::db::namespace::index_set::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
+    let extractor: crate::db::kv_store::index_set::ExtractorFn = std::sync::Arc::new(|bytes: &[u8]| {
         let s = std::str::from_utf8(bytes).ok()?;
         let v: serde_json::Value = serde_json::from_str(s).ok()?;
         Some(crate::field_index::IndexValue::Str(v["status"].as_str()?.to_string()))
@@ -1283,7 +1283,7 @@ fn replaying_a_low_cardinality_field_keeps_its_blob_bounded() {
 ///   6. Query must return all of batch A and batch B.
 #[test]
 fn test_activate_field_index_replays_wal_after_crash() {
-    use crate::db::namespace::index_set::ExtractorFn;
+    use crate::db::kv_store::index_set::ExtractorFn;
     use crate::field_index::{IndexValue, IndexValueType};
     use std::sync::Arc;
 
@@ -1423,7 +1423,7 @@ fn put_and_delete_accept_normal_sized_keys_and_values() {
 /// old and new value after recovery.
 #[test]
 fn test_field_index_replays_updates_after_crash() {
-    use crate::db::namespace::index_set::ExtractorFn;
+    use crate::db::kv_store::index_set::ExtractorFn;
     use crate::field_index::{IndexValue, IndexValueType};
     use std::sync::Arc;
 
@@ -2306,7 +2306,7 @@ fn test_apply_with_retry_gives_up_after_max_attempts() {
 /// full bucket scan.
 #[test]
 fn test_field_index_targeted_update_and_delete() {
-    use crate::db::namespace::index_set::ExtractorFn;
+    use crate::db::kv_store::index_set::ExtractorFn;
     use crate::field_index::{IndexValue, IndexValueType};
     use std::sync::Arc;
 
@@ -2532,7 +2532,7 @@ fn any_level1_data_for_test(db_path: &std::path::Path) -> bool {
     crate::db::layout::namespace_data_dirs(db_path)
         .unwrap()
         .iter()
-        .any(|d| crate::db::namespace::kv_store::KVStore::has_level1_data(d).unwrap())
+        .any(|d| crate::db::kv_store::KVStore::has_level1_data(d).unwrap())
 }
 
 /// The head is derived from the log at open (the oldest segment on disk), not
