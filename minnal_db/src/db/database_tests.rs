@@ -1184,8 +1184,8 @@ fn a_torn_index_slot_records_a_full_rebuild_gap_and_repair_restores_it() {
     db.activate_field_index(ns, field_id, crate::field_index::IndexValueType::Str, extractor)
         .unwrap();
     let gap = db.index_manager.read_gap(ns, field_id).expect("the damage must be recorded");
-    assert_eq!(gap.cause, crate::db::index_manager::GapCause::DamagedIndexFile);
-    assert_eq!(gap.repair, crate::db::index_manager::RepairMode::FullRebuild);
+    assert_eq!(gap.cause, crate::db::indexing::manager::GapCause::DamagedIndexFile);
+    assert_eq!(gap.repair, crate::db::indexing::manager::RepairMode::FullRebuild);
 
     db.repair_field_index(ns, field_id).unwrap();
     assert!(db.index_manager.read_gap(ns, field_id).is_none(), "repair clears the gap");
@@ -3131,7 +3131,7 @@ fn a_flush_retires_entries_without_writing_into_the_log() {
 /// SIGKILL stress harness (1–2 documents per crash).
 #[test]
 fn index_checkpoint_stops_below_an_in_flight_write() {
-    use crate::db::index_manager::CheckpointState;
+    use crate::db::indexing::manager::CheckpointState;
     use crate::db::workers::index_checkpoint::IndexCheckpointTarget;
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();

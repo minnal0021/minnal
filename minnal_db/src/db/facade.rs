@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::db::config::DbConfig;
 use crate::db::database::{Database, OpenStoreLookup};
 use crate::db::error::{KVError, Result};
-use crate::db::index_manager::FieldIndexHealth;
+use crate::db::indexing::manager::FieldIndexHealth;
 use crate::db::namespace::index_set::ExtractorFn;
 use crate::db::namespace::kv_store::{KVStore, KeyValue, ScanPage};
 use crate::db::namespace::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};

@@ -1475,7 +1475,7 @@ at `warn`, but a drop racing the worker would then warn in normal operation.
 
 **Filed:** 2026-11-05
 **Area:** `minnal_db` (`src/db/namespace/mod.rs`, `database.rs`, `wal/main_wal.rs`,
-`vector_index_wal.rs`, `layout.rs`, `index_manager.rs`), `minnal_db_api` (README)
+`vector_index_wal.rs`, `layout.rs`, `indexing/manager.rs`), `minnal_db_api` (README)
 **Severity:** Medium — a damaged registry stops the whole database opening; no data
 is at risk from the design as it stands
 **Source:** Design discussion on how `ns_id` is generated. Not prototyped or measured.

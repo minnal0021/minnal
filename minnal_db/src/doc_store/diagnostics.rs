@@ -217,7 +217,7 @@ impl DocStore {
 
     /// Report the health of every field index in a namespace: where its
     /// persisted state reaches, whether it is active, and any outstanding gap.
-    pub async fn index_health(&self, namespace: &str) -> Result<Vec<crate::db::index_manager::FieldIndexHealth>, DocStoreError> {
+    pub async fn index_health(&self, namespace: &str) -> Result<Vec<crate::db::indexing::manager::FieldIndexHealth>, DocStoreError> {
         let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),

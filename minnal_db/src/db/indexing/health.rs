@@ -40,7 +40,7 @@ impl Database {
     /// other field's extractor. Returns [`FieldRepairOutcome::NotDegraded`] when
     /// there is nothing to repair.
     pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
-        use crate::db::index_manager::RepairMode;
+        use crate::db::indexing::manager::RepairMode;
         use crate::db::namespace::FieldReindexOutcome;
 
         let Some(gap) = self.index_manager.read_gap(namespace_id, field_id) else {
@@ -147,7 +147,7 @@ impl Database {
     /// signal: that tells a caller their *answer* may be short, this tells an
     /// operator *which indices* need repair and why. Dropped fields are omitted —
     /// they have no index to be healthy or otherwise.
-    pub fn index_health(&self, namespace_id: u32) -> Result<Vec<crate::db::index_manager::FieldIndexHealth>> {
+    pub fn index_health(&self, namespace_id: u32) -> Result<Vec<crate::db::indexing::manager::FieldIndexHealth>> {
         let store = self.get_store(namespace_id)?;
         let wal_tail = self.wal_metadata.read().tail;
 
@@ -164,10 +164,10 @@ impl Database {
             .into_iter()
             .map(|f| {
                 let checkpoint_offset = match self.index_manager.read_checkpoint_state(namespace_id, f.field_id, wal_tail) {
-                    crate::db::index_manager::CheckpointState::At(offset) => Some(offset),
+                    crate::db::indexing::manager::CheckpointState::At(offset) => Some(offset),
                     _ => None,
                 };
-                crate::db::index_manager::FieldIndexHealth {
+                crate::db::indexing::manager::FieldIndexHealth {
                     namespace_id,
                     field_id: f.field_id,
                     field_name: f.field_name,
@@ -239,7 +239,7 @@ impl Database {
         let detected_at_ms = crate::db::namespace::kv_store::current_epoch_millis();
         for (ns_id, fields) in namespaces {
             for field_id in fields {
-                if self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail) == crate::db::index_manager::CheckpointState::Absent {
+                if self.index_manager.read_checkpoint_state(ns_id, field_id, wal_tail) == crate::db::indexing::manager::CheckpointState::Absent {
                     continue;
                 }
                 error!(
@@ -247,15 +247,15 @@ impl Database {
                      Those writes have no WAL entries, so their index updates cannot be replayed — the field index is INCOMPLETE \
                      and needs a full rebuild."
                 );
-                let gap = crate::db::index_manager::GapRecord {
+                let gap = crate::db::indexing::manager::GapRecord {
                     namespace_id: ns_id,
                     field_id,
-                    cause: crate::db::index_manager::GapCause::NoWalWrites,
+                    cause: crate::db::indexing::manager::GapCause::NoWalWrites,
                     from: 0,
                     to: 0,
                     missing_segments: Vec::new(),
                     detected_at_ms,
-                    repair: crate::db::index_manager::RepairMode::FullRebuild,
+                    repair: crate::db::indexing::manager::RepairMode::FullRebuild,
                 };
                 if let Err(e) = self.index_manager.record_gap(gap, Self::GAP_KEY_WORKLIST_CAP) {
                     warn!("[NO-WAL] failed to record gap for ns={ns_id} field={field_id}: {e:?}");
@@ -288,9 +288,9 @@ impl Database {
         let detected_at_ms = crate::db::namespace::kv_store::current_epoch_millis();
         for ((ns_id, field_id), rejected) in self.rejected_index_updates.drain() {
             let repair = if rejected.overflowed {
-                crate::db::index_manager::RepairMode::FullRebuild
+                crate::db::indexing::manager::RepairMode::FullRebuild
             } else {
-                crate::db::index_manager::RepairMode::RowScoped {
+                crate::db::indexing::manager::RepairMode::RowScoped {
                     keys: rejected.keys.iter().map(|k| crate::support::hex::bytes_to_hex(k)).collect(),
                 }
             };
@@ -303,10 +303,10 @@ impl Database {
                     ""
                 }
             );
-            let gap = crate::db::index_manager::GapRecord {
+            let gap = crate::db::indexing::manager::GapRecord {
                 namespace_id: ns_id,
                 field_id,
-                cause: crate::db::index_manager::GapCause::RejectedUpdate,
+                cause: crate::db::indexing::manager::GapCause::RejectedUpdate,
                 // A rejected update is not a WAL replay window — the key is known
                 // exactly, so there is no range to record.
                 from: 0,
@@ -584,7 +584,7 @@ mod tests {
     /// rather than only a `warn!`.
     #[test]
     fn a_rejected_index_update_is_recorded_as_a_gap() -> Result<()> {
-        use crate::db::index_manager::{GapCause, RepairMode};
+        use crate::db::indexing::manager::{GapCause, RepairMode};
         use crate::db::namespace::index_set::ExtractorFn;
         use crate::field_index::{IndexValue, IndexValueType};
 
@@ -625,7 +625,7 @@ mod tests {
     /// that silence into a recorded, repairable full rebuild.
     #[test]
     fn unclean_shutdown_with_no_wal_writes_records_a_full_rebuild_gap() -> Result<()> {
-        use crate::db::index_manager::{GapCause, RepairMode};
+        use crate::db::indexing::manager::{GapCause, RepairMode};
 
         let temp_dir = TempDir::new()?;
         let ns = DEFAULT_NAMESPACE_ID;
@@ -696,7 +696,7 @@ mod tests {
     /// before anyone repairs the first must not discard the first worklist.
     #[test]
     fn gap_records_merge_instead_of_overwriting() {
-        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+        use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
         let mk = |from: u64, to: u64, segs: Vec<u64>, keys: &[&str]| GapRecord {
             namespace_id: 0,
@@ -770,7 +770,7 @@ mod tests {
     /// clears the gap, so queries stop reporting degradation.
     #[test]
     fn row_scoped_repair_restores_the_index_and_clears_the_gap() -> Result<()> {
-        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+        use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
         let temp_dir = TempDir::new()?;
         let db = Database::open(temp_dir.path(), create_db_config())?;
@@ -842,7 +842,7 @@ mod tests {
     /// a repair that leaves the index wrong in the opposite direction.
     #[test]
     fn repair_clears_the_row_of_a_key_whose_delete_was_lost() -> Result<()> {
-        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+        use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
         let temp_dir = TempDir::new()?;
         let db = Database::open(temp_dir.path(), create_db_config())?;
@@ -910,7 +910,7 @@ mod tests {
     /// FR-001 step 5: a `FullRebuild` gap re-extracts the whole field.
     #[test]
     fn full_rebuild_repair_reindexes_every_key() -> Result<()> {
-        use crate::db::index_manager::{GapCause, GapRecord, RepairMode};
+        use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
         let temp_dir = TempDir::new()?;
         let db = Database::open(temp_dir.path(), create_db_config())?;

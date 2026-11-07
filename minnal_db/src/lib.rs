@@ -151,7 +151,7 @@ pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS: u64 = db::config::DEFAULT_INDEX_
 ///
 /// Exposed because keys are arbitrary bytes and several surfaces carry them as
 /// hex: scan cursors at the REST boundary, and the field-index gap record's
-/// row-scoped repair worklist ([`db::index_manager::RepairMode`]). A caller
+/// row-scoped repair worklist ([`db::indexing::manager::RepairMode`]). A caller
 /// reading either needs the matching decoder.
 pub use support::hex::{bytes_to_hex, hex_to_bytes};
 
@@ -212,9 +212,9 @@ pub use db::namespace::QueryOutcome;
 
 /// Health of one field index, including any outstanding gap
 /// ([`Db::index_health`]).
-pub use db::index_manager::FieldIndexHealth;
+pub use db::indexing::manager::FieldIndexHealth;
 /// Why a field index is incomplete, and what repair it needs.
-pub use db::index_manager::{GapCause, GapRecord, RepairMode};
+pub use db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
 /// Extractor closure type: maps raw document bytes to an [`IndexValue`].
 pub use db::namespace::index_set::ExtractorFn;

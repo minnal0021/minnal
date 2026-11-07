@@ -120,7 +120,7 @@ Before starting, re-run the search; the list below is what it found on
       `typed_index.rs`, `dyn_index.rs` (crash-atomicity section),
       `blob_store.rs`, `db/namespace/kv_store.rs` and `db/database.rs` (replay and
       backpressure comments), `db/workers/index_checkpoint.rs`,
-      `db/index_manager.rs`, admin route docs in
+      `db/indexing/manager.rs`, admin route docs in
       `minnal_db_api/src/routes/admin_indices.rs` / `admin_storage.rs`,
       `doc_store/diagnostics.rs`
 - [x] 4f. **Feature requests**: `FEATURE-REQUEST.md` entries that describe

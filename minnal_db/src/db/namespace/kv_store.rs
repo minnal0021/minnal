@@ -175,7 +175,7 @@ pub struct KVStore {
     pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<IndexCheckpointTrigger>>>>,
     // Where rejected field-index updates are reported so they become durable gap
     // records instead of a log line (set via `set_index_gap_sink`).
-    pub(crate) index_gap_sink: Arc<RwLock<Option<Arc<dyn crate::db::index_manager::IndexGapSink>>>>,
+    pub(crate) index_gap_sink: Arc<RwLock<Option<Arc<dyn crate::db::indexing::manager::IndexGapSink>>>>,
 
     // Optional TTL for automatic record expiry
     pub(crate) ttl: Option<Duration>,
@@ -570,8 +570,8 @@ impl KVStore {
     }
 
     /// Wire where rejected field-index updates are reported. See
-    /// [`IndexGapSink`](crate::db::index_manager::IndexGapSink).
-    pub(crate) fn set_index_gap_sink(&self, sink: Option<Arc<dyn crate::db::index_manager::IndexGapSink>>) {
+    /// [`IndexGapSink`](crate::db::indexing::manager::IndexGapSink).
+    pub(crate) fn set_index_gap_sink(&self, sink: Option<Arc<dyn crate::db::indexing::manager::IndexGapSink>>) {
         *self.index_gap_sink.write() = sink;
     }
 

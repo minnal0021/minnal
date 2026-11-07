@@ -214,16 +214,16 @@ impl Database {
             // full rebuild — a wedged checkpoint worker could otherwise strand a
             // key set large enough to be its own problem.
             let repair = if keys.is_empty() || keys.len() > cap {
-                crate::db::index_manager::RepairMode::FullRebuild
+                crate::db::indexing::manager::RepairMode::FullRebuild
             } else {
-                crate::db::index_manager::RepairMode::RowScoped {
+                crate::db::indexing::manager::RepairMode::RowScoped {
                     keys: keys.iter().map(|k| crate::support::hex::bytes_to_hex(k)).collect(),
                 }
             };
-            let gap = crate::db::index_manager::GapRecord {
+            let gap = crate::db::indexing::manager::GapRecord {
                 namespace_id: ns_id,
                 field_id,
-                cause: crate::db::index_manager::GapCause::BackstopReclaim,
+                cause: crate::db::indexing::manager::GapCause::BackstopReclaim,
                 from,
                 to: wal_tail,
                 missing_segments: forced.to_vec(),
@@ -585,7 +585,7 @@ mod tests {
     /// Remediation is tracked in `FEATURE-REQUEST.md` (FR-001).
     #[test]
     fn wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable() -> Result<()> {
-        use crate::db::index_manager::{CheckpointState, detect_replay_gap};
+        use crate::db::indexing::manager::{CheckpointState, detect_replay_gap};
 
         let temp_dir = TempDir::new()?;
         let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 4096)?;
@@ -654,7 +654,7 @@ mod tests {
     /// active and checkpointed, which is what arms the watermark.
     #[test]
     fn wal_gc_does_not_reclaim_segments_an_active_field_index_still_needs() -> Result<()> {
-        use crate::db::index_manager::{CheckpointState, detect_replay_gap};
+        use crate::db::indexing::manager::{CheckpointState, detect_replay_gap};
 
         let temp_dir = TempDir::new()?;
         let db = Database::open_with_wal_segment_size(temp_dir.path(), create_db_config(), 4096)?;
@@ -771,7 +771,7 @@ mod tests {
     /// name them.
     #[test]
     fn backstop_records_a_gap_naming_the_affected_keys() -> Result<()> {
-        use crate::db::index_manager::{GapCause, RepairMode};
+        use crate::db::indexing::manager::{GapCause, RepairMode};
 
         let temp_dir = TempDir::new()?;
         let mut config = create_db_config();

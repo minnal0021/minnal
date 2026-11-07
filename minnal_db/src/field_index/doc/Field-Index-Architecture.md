@@ -10,7 +10,7 @@ Two parts of `minnal_db` share the work. The bitmap engine itself — `bitmap/mo
 `bitmap/container/`, `bitmap/container_map.rs`, `blob_store.rs`, `rowmap.rs`, `bitmap/codec.rs`,
 all under `src/field_index/` — knows nothing about databases. The *lifecycle* around
 it — schema registration, activation, checkpointing, WAL replay — lives in the
-engine (`src/db/database.rs`, `namespace/kv_store.rs`, `index_manager.rs`), which owns one
+engine (`src/db/database.rs`, `namespace/kv_store.rs`, `indexing/manager.rs`), which owns one
 set of indexes per namespace. Paths below are relative to `minnal_db/src/field_index/`
 unless they start with `minnal_db/`.
 

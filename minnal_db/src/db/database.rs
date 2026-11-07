@@ -5,7 +5,7 @@
 
 use crate::db::config::DbConfig;
 use crate::db::error::{KVError, Result};
-use crate::db::index_manager::IndexManager;
+use crate::db::indexing::manager::IndexManager;
 use crate::db::key_locks::KeyLocks;
 use crate::db::namespace::index_set::{ExtractorFn, IndexEntry};
 use crate::db::namespace::kv_store::KVStore;
@@ -871,7 +871,7 @@ pub struct Database {
     pub(crate) index_overlay_budget: Arc<crate::field_index::IndexOverlayBudget>,
     /// Rejected field-index updates awaiting the next checkpoint, which turns
     /// them into durable gap records. Shared with every `KVStore`.
-    pub(crate) rejected_index_updates: Arc<crate::db::index_manager::RejectedUpdateBuffer>,
+    pub(crate) rejected_index_updates: Arc<crate::db::indexing::manager::RejectedUpdateBuffer>,
     /// Namespaces whose durable "no-WAL writes outstanding" marker is set.
     /// Debounces the marker write to once per checkpoint interval.
     pub(crate) no_wal_pending: parking_lot::Mutex<std::collections::HashSet<u32>>,
@@ -1019,7 +1019,7 @@ impl Database {
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
             index_overlay_budget,
-            rejected_index_updates: Arc::new(crate::db::index_manager::RejectedUpdateBuffer::default()),
+            rejected_index_updates: Arc::new(crate::db::indexing::manager::RejectedUpdateBuffer::default()),
             no_wal_pending: parking_lot::Mutex::new(std::collections::HashSet::new()),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
@@ -1041,7 +1041,7 @@ impl Database {
                 kv_store.set_seq_counter(db.next_seq.clone());
                 kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
                 kv_store.set_index_gap_sink(Some(
-                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::indexing::manager::IndexGapSink>
                 ));
             }
         }
@@ -1720,7 +1720,7 @@ impl Database {
         // view is the sum of all stores' snapshots plus the global instance.
         kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
         kv_store.set_index_gap_sink(Some(
-            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::indexing::manager::IndexGapSink>
         ));
 
         // Wire up flush observer
@@ -1775,7 +1775,7 @@ impl Database {
         // view is the sum of all stores' snapshots plus the global instance.
         kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
         kv_store.set_index_gap_sink(Some(
-            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+            Arc::clone(&self.rejected_index_updates) as Arc<dyn crate::db::indexing::manager::IndexGapSink>
         ));
 
         // Wire up flush observer
@@ -2121,15 +2121,15 @@ impl Database {
                  rebuilt; recording a full-rebuild gap.",
                 dyn_index.damaged_at_open()
             );
-            let gap = crate::db::index_manager::GapRecord {
+            let gap = crate::db::indexing::manager::GapRecord {
                 namespace_id,
                 field_id,
-                cause: crate::db::index_manager::GapCause::DamagedIndexFile,
+                cause: crate::db::indexing::manager::GapCause::DamagedIndexFile,
                 from: 0,
                 to: 0,
                 missing_segments: Vec::new(),
                 detected_at_ms: crate::db::namespace::kv_store::current_epoch_millis(),
-                repair: crate::db::index_manager::RepairMode::FullRebuild,
+                repair: crate::db::indexing::manager::RepairMode::FullRebuild,
             };
             if let Err(e) = self.index_manager.record_gap(gap, Self::GAP_KEY_WORKLIST_CAP) {
                 warn!("[activate_field_index] ns={namespace_id} field={field_id}: failed to record the damage gap: {e:?}");
@@ -2162,7 +2162,7 @@ impl Database {
                     // Detection only — the replay below is unchanged, and the missing
                     // updates are unrecoverable from here. Recording, surfacing and
                     // repairing this is tracked in `FEATURE-REQUEST.md` (FR-001).
-                    if let Some(gap) = crate::db::index_manager::detect_replay_gap(
+                    if let Some(gap) = crate::db::indexing::manager::detect_replay_gap(
                         checkpoint_state,
                         dyn_index.distinct_count() == 0,
                         wal_tail,
@@ -2331,9 +2331,9 @@ impl Database {
         // Registered with the field, so the two cannot disagree.
         let wal_tail = self.wal_metadata.read().tail;
         let position = match self.index_manager.read_checkpoint_state(namespace_id, field_id, wal_tail) {
-            crate::db::index_manager::CheckpointState::At(p) => Some(p),
-            crate::db::index_manager::CheckpointState::Absent => None,
-            crate::db::index_manager::CheckpointState::Unusable => Some(0),
+            crate::db::indexing::manager::CheckpointState::At(p) => Some(p),
+            crate::db::indexing::manager::CheckpointState::Absent => None,
+            crate::db::indexing::manager::CheckpointState::Unusable => Some(0),
         };
         let mut namespace_index = store.namespace_index.write();
         namespace_index.register(entry);
@@ -3356,7 +3356,7 @@ impl Database {
             lsm_compaction_sender: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(parking_lot::RwLock::new(None)),
             index_overlay_budget,
-            rejected_index_updates: Arc::new(crate::db::index_manager::RejectedUpdateBuffer::default()),
+            rejected_index_updates: Arc::new(crate::db::indexing::manager::RejectedUpdateBuffer::default()),
             no_wal_pending: parking_lot::Mutex::new(std::collections::HashSet::new()),
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
@@ -3376,7 +3376,7 @@ impl Database {
                 kv_store.set_seq_counter(db.next_seq.clone());
                 kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
                 kv_store.set_index_gap_sink(Some(
-                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::index_manager::IndexGapSink>
+                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::db::indexing::manager::IndexGapSink>
                 ));
             }
         }
