@@ -2,6 +2,7 @@
 
 use crate::doc_store::*;
 
+mod lifecycle;
 #[cfg(feature = "semantic-search")]
 pub(crate) mod worker_host;
 
