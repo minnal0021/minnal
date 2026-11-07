@@ -3,7 +3,6 @@ pub mod database;
 pub use crate::error;
 pub mod facade;
 pub mod indexing;
-pub(crate) mod layout;
 mod namespace;
 pub use crate::kv_store::stats;
 pub mod wal;

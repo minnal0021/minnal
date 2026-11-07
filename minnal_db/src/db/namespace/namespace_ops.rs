@@ -35,7 +35,7 @@ impl Database {
 
         let ns_id = self.registry.write().create(name)?;
 
-        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
+        let ns_path = crate::layout::namespace_data_dir(&self.db_path, name);
         let kv_store = KVStore::open_with_ttl(
             ns_id,
             name,
@@ -184,7 +184,7 @@ impl Database {
         if self.registry.read().exists(name) {
             return Ok(());
         }
-        match std::fs::remove_dir_all(crate::db::layout::namespace_data_dir(&self.db_path, name)) {
+        match std::fs::remove_dir_all(crate::layout::namespace_data_dir(&self.db_path, name)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
         }
@@ -200,7 +200,7 @@ impl Database {
     /// This deliberately never touches the shared WAL or its metadata, so WAL
     /// replay for other namespaces is unaffected.
     fn remove_namespace_storage(&self, ns_id: u32, name: &str) {
-        let ns_path = crate::db::layout::namespace_data_dir(&self.db_path, name);
+        let ns_path = crate::layout::namespace_data_dir(&self.db_path, name);
         match std::fs::remove_dir_all(&ns_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

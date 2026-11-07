@@ -59,7 +59,7 @@ impl Database {
 
         let mut stores = HashMap::new();
         for (name, ns_id) in registry.list() {
-            let ns_path = crate::db::layout::namespace_data_dir(db_path, name);
+            let ns_path = crate::layout::namespace_data_dir(db_path, name);
             let kv_store = KVStore::open(
                 ns_id,
                 name,

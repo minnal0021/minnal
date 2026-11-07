@@ -549,7 +549,7 @@ mod tests {
         db.flush_all_namespaces()?;
 
         let wal_dir_bytes = |dir: &std::path::Path| -> u64 {
-            std::fs::read_dir(crate::db::layout::main_wal_dir(dir))
+            std::fs::read_dir(crate::layout::main_wal_dir(dir))
                 .unwrap()
                 .flatten()
                 .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))

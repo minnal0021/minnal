@@ -318,7 +318,7 @@ pub struct IndexManager {
 impl IndexManager {
     /// Open (or create) the index manager rooted at `{db_path}/field-index/`.
     pub fn open(db_path: &Path) -> Result<Arc<Self>> {
-        let index_base_path = crate::db::layout::index_root(db_path);
+        let index_base_path = crate::layout::index_root(db_path);
         std::fs::create_dir_all(&index_base_path)?;
         Ok(Arc::new(Self { index_base_path }))
     }
@@ -344,7 +344,7 @@ impl IndexManager {
     /// Compute the on-disk path for a namespace's whole index subtree:
     /// `{index_base}/{namespace_id}/`.
     pub fn namespace_path(&self, namespace_id: u32) -> PathBuf {
-        crate::db::layout::namespace_index_dir(&self.index_base_path, namespace_id)
+        crate::layout::namespace_index_dir(&self.index_base_path, namespace_id)
     }
 
     /// Compute the on-disk path for a namespace's dense row-ID map.

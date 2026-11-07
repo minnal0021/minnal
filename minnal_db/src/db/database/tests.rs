@@ -1164,7 +1164,7 @@ fn a_torn_index_slot_records_a_full_rebuild_gap_and_repair_restores_it() {
     };
 
     // Tear the first checksummed live slot of the field's bitmap key table.
-    let keys = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns)
+    let keys = crate::layout::namespace_index_dir(&crate::layout::index_root(dir.path()), ns)
         .join(field_id.to_string())
         .join("blobs.keys");
     let mut bytes = std::fs::read(&keys).unwrap();
@@ -1233,7 +1233,7 @@ fn replaying_a_low_cardinality_field_keeps_its_blob_bounded() {
 
     // Force a full replay: drop the checkpoint marker so the whole WAL is in
     // the replay window, exactly as it is after a crash with no checkpoint.
-    let marker = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns)
+    let marker = crate::layout::namespace_index_dir(&crate::layout::index_root(dir.path()), ns)
         .join(field_id.to_string())
         .join("checkpoint");
     std::fs::remove_file(&marker).unwrap();
@@ -1247,7 +1247,7 @@ fn replaying_a_low_cardinality_field_keeps_its_blob_bounded() {
     db.activate_field_index(ns, field_id, crate::field_index::IndexValueType::Str, extractor)
         .unwrap();
 
-    let field_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns).join(field_id.to_string());
+    let field_dir = crate::layout::namespace_index_dir(&crate::layout::index_root(dir.path()), ns).join(field_id.to_string());
     let on_disk: u64 = std::fs::read_dir(&field_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -2139,7 +2139,7 @@ fn test_recovery_applies_same_key_writes_in_sequence_order() {
     use crate::db::wal::{Wal, WalEntry, WalMetadata};
 
     let dir = TempDir::new().unwrap();
-    let wal_dir = crate::db::layout::main_wal_dir(dir.path());
+    let wal_dir = crate::layout::main_wal_dir(dir.path());
     let wal_meta_path = wal_dir.join(crate::db::wal::METADATA_FILE);
     {
         let (wal, report) = Wal::open(&wal_dir, crate::db::wal::DEFAULT_SEGMENT_SIZE, FRESH_WAL).unwrap();
@@ -2176,7 +2176,7 @@ fn test_recovery_reconstructs_wal_tail_past_stale_metadata() {
     use crate::db::wal::{Wal, WalEntry, WalMetadata};
 
     let dir = TempDir::new().unwrap();
-    let wal_dir = crate::db::layout::main_wal_dir(dir.path());
+    let wal_dir = crate::layout::main_wal_dir(dir.path());
     let wal_meta_path = wal_dir.join(crate::db::wal::METADATA_FILE);
 
     {
@@ -2495,7 +2495,7 @@ fn unreadable_wal_metadata_with_l1_data_fails_the_open() {
         "missing metadata is refused the same way"
     );
 
-    std::fs::remove_dir_all(crate::db::layout::main_wal_dir(dir.path())).unwrap();
+    std::fs::remove_dir_all(crate::layout::main_wal_dir(dir.path())).unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
     assert_eq!(db.get(b"kept").unwrap(), Some(b"v".to_vec()));
     assert_eq!(db.get(b"gone").unwrap(), None);
@@ -2530,7 +2530,7 @@ fn unreadable_wal_metadata_without_l1_data_replays_the_log() {
 
 /// Whether any namespace under `db_path` holds L1 data.
 fn any_level1_data_for_test(db_path: &std::path::Path) -> bool {
-    crate::db::layout::namespace_data_dirs(db_path)
+    crate::layout::namespace_data_dirs(db_path)
         .unwrap()
         .iter()
         .any(|d| crate::kv_store::KVStore::has_level1_data(d).unwrap())
@@ -3575,10 +3575,10 @@ fn only_an_unregistered_namespace_loses_its_directory() {
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
     db.create_namespace("live").unwrap();
-    let live = crate::db::layout::namespace_data_dir(dir.path(), "live");
+    let live = crate::layout::namespace_data_dir(dir.path(), "live");
     db.remove_unregistered_namespace_dir("live").unwrap();
     assert!(live.exists());
-    let leftover = crate::db::layout::namespace_data_dir(dir.path(), "leftover");
+    let leftover = crate::layout::namespace_data_dir(dir.path(), "leftover");
     std::fs::create_dir_all(&leftover).unwrap();
     db.remove_unregistered_namespace_dir("leftover").unwrap();
     assert!(!leftover.exists());

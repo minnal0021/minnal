@@ -36,7 +36,7 @@ impl DocStore {
         let Some(ids_allocated) = self.db.rowmap_ids_allocated(ns_id)? else {
             return Ok(None);
         };
-        let dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(&self.db_path), ns_id).join("rowmap");
+        let dir = crate::layout::namespace_index_dir(&crate::layout::index_root(&self.db_path), ns_id).join("rowmap");
         let bytes_on_disk = std::fs::read_dir(&dir)
             .map(|entries| entries.filter_map(|e| e.ok()?.metadata().ok()).map(|m| m.len()).sum())
             .unwrap_or(0);

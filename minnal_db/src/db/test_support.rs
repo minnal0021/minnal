@@ -100,10 +100,10 @@ pub(crate) const FRESH_WAL: crate::db::wal::segmented_log::OpenFrom = crate::db:
 
 /// The main WAL's saved metadata file in the database at `db_path`.
 pub(crate) fn wal_metadata_path(db_path: &std::path::Path) -> std::path::PathBuf {
-    crate::db::layout::main_wal_dir(db_path).join(crate::db::wal::METADATA_FILE)
+    crate::layout::main_wal_dir(db_path).join(crate::db::wal::METADATA_FILE)
 }
 
 /// Main-WAL segment `segment_id`'s file in the database at `db_path`.
 pub(crate) fn wal_segment_path(db_path: &std::path::Path, segment_id: u64) -> std::path::PathBuf {
-    crate::db::wal::segmented_log::segment_path(&crate::db::layout::main_wal_dir(db_path), segment_id)
+    crate::db::wal::segmented_log::segment_path(&crate::layout::main_wal_dir(db_path), segment_id)
 }

@@ -95,6 +95,7 @@ mod support;
 pub mod doc_store;
 pub mod field_index;
 pub mod kv_store;
+pub(crate) mod layout;
 pub mod namespace;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;

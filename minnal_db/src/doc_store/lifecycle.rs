@@ -691,7 +691,7 @@ async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, schemas: &Schema
         db.remove_unregistered_namespace_dir(ns_name.clone()).await?;
     }
 
-    let index_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id);
+    let index_dir = crate::layout::namespace_index_dir(&crate::layout::index_root(db_path), ns_id);
     if index_dir.exists() {
         std::fs::remove_dir_all(&index_dir)?;
     }
@@ -1353,7 +1353,7 @@ mod tests {
     /// `Drop`/`shutdown` checkpoint never ran), forcing `activate_field_index`
     /// to replay the WAL tail on the next open.
     fn rewind_index_checkpoints(db_dir: &Path) {
-        let index_dir = crate::db::layout::index_root(db_dir);
+        let index_dir = crate::layout::index_root(db_dir);
         let Ok(namespaces) = std::fs::read_dir(&index_dir) else { return };
         for ns in namespaces.flatten() {
             let Ok(fields) = std::fs::read_dir(ns.path()) else { continue };

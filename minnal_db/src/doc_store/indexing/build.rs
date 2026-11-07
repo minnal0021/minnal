@@ -682,7 +682,7 @@ mod tests {
         assert!(handle.wait().await.is_err(), "the build ran on after the drop");
         let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
         assert!(!names.iter().any(|n| n == "ns"), "the dropped store's namespace is back");
-        let index_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_dir.path()), ns_id);
+        let index_dir = crate::layout::namespace_index_dir(&crate::layout::index_root(db_dir.path()), ns_id);
         assert!(!index_dir.exists(), "the dropped store's index directory is back");
         store.shutdown().await.unwrap();
     }

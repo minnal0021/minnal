@@ -340,7 +340,7 @@ impl NamespaceRegistry {
 
     /// Return the directory path used for namespace `name`: `{db_path}/ns_{name}`.
     pub fn ns_dir(&self, name: &str) -> PathBuf {
-        crate::db::layout::namespace_data_dir(&self.db_path, name)
+        crate::layout::namespace_data_dir(&self.db_path, name)
     }
 
     /// Create a new namespace and return its ID.
@@ -496,7 +496,7 @@ impl NamespaceRegistry {
 
     /// Read `{db_path}/ns_{name}/config.json`, returning `None` if absent.
     fn load_config(db_path: &Path, name: &str) -> Result<Option<NamespaceConfig>> {
-        let config_path = crate::db::layout::namespace_data_dir(db_path, name).join(CONFIG_FILENAME);
+        let config_path = crate::layout::namespace_data_dir(db_path, name).join(CONFIG_FILENAME);
         if !config_path.exists() {
             return Ok(None);
         }
@@ -541,7 +541,7 @@ impl NamespaceRegistry {
             }),
         };
 
-        let config_dir = crate::db::layout::namespace_data_dir(&self.db_path, name);
+        let config_dir = crate::layout::namespace_data_dir(&self.db_path, name);
         fs::create_dir_all(&config_dir)?;
         let config_path = config_dir.join(CONFIG_FILENAME);
 

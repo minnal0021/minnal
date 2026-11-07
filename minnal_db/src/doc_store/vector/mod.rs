@@ -959,7 +959,7 @@ pub struct VecReindexProgress {
 
 #[cfg(feature = "semantic-search")]
 pub(crate) fn vec_reindex_path(db_path: &Path, ns_id: u32) -> PathBuf {
-    crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id).join("vector_reindex.json")
+    crate::layout::namespace_index_dir(&crate::layout::index_root(db_path), ns_id).join("vector_reindex.json")
 }
 
 #[cfg(feature = "semantic-search")]

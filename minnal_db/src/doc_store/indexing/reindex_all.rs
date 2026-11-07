@@ -37,7 +37,7 @@ struct Intent {
 }
 
 fn intent_path(db_path: &Path, ns_id: u32) -> PathBuf {
-    crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(db_path), ns_id).join(INTENT_FILE)
+    crate::layout::namespace_index_dir(&crate::layout::index_root(db_path), ns_id).join(INTENT_FILE)
 }
 
 fn write_intent(path: &Path, intent: &Intent) -> Result<(), DocStoreError> {

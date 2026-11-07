@@ -11,7 +11,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | `src/lib.rs` | Public re-exports only — all types surfaced here |
 | `src/db/facade/` | `Db`, `AsyncDb` and their `Namespace` handles, one file each — the only entry points callers use |
 | `src/db/database/` | Internal coordinator: owns all subsystems, routes ops. `open`, `writes`, `wal_ops`, `workers`, `stats`, `shutdown`, `flush_observers` |
-| `src/db/layout.rs` | **The one place that knows the on-disk directory layout.** Nothing above it should `join("field-index")` or `format!("ns_{}", ..)` |
+| `src/layout.rs` | **The one place that knows the on-disk directory layout.** Nothing above it should `join("field-index")` or `format!("ns_{}", ..)` |
 | `src/db/indexing/index_fields.rs` | Registering, activating, dropping and measuring field indexes (`Database` methods) |
 | `src/db/wal/recovery.rs` | Replaying both logs at open (`Database` methods) |
 | `src/db/indexing/query.rs` | Predicate evaluation against the field indices (`Database` methods) |

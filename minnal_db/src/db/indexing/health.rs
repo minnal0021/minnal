@@ -571,7 +571,7 @@ mod tests {
 
         // Simulate drop_index: deactivate in-memory then delete on-disk directory.
         db.deactivate_field_index(ns, field_id).unwrap();
-        let index_dir = crate::db::layout::namespace_index_dir(&crate::db::layout::index_root(dir.path()), ns).join(field_id.to_string());
+        let index_dir = crate::layout::namespace_index_dir(&crate::layout::index_root(dir.path()), ns).join(field_id.to_string());
         if index_dir.exists() {
             std::fs::remove_dir_all(&index_dir).unwrap();
         }

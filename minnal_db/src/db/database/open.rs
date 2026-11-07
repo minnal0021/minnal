@@ -23,7 +23,7 @@ use super::*;
 /// above the cut; entries below the cut are in SSTables, which raise it too
 /// (`KVStore::set_seq_counter`).
 pub(super) fn open_main_wal(db_path: &Path, segment_size: u32) -> Result<(Arc<Wal>, WalMetadata, PathBuf, u64)> {
-    let dir = crate::db::layout::main_wal_dir(db_path);
+    let dir = crate::layout::main_wal_dir(db_path);
     let metadata_path = dir.join(crate::db::wal::METADATA_FILE);
     let (saved, unreadable) = match std::fs::read(&metadata_path) {
         Ok(data) => match WalMetadata::from_file_bytes(&data) {
@@ -64,7 +64,7 @@ pub(super) fn open_main_wal(db_path: &Path, segment_size: u32) -> Result<(Arc<Wa
 
 /// Whether any namespace directory under `db_path` holds L1 data.
 fn any_level1_data(db_path: &Path) -> std::io::Result<bool> {
-    for dir in crate::db::layout::namespace_data_dirs(db_path)? {
+    for dir in crate::layout::namespace_data_dirs(db_path)? {
         if KVStore::has_level1_data(&dir)? {
             return Ok(true);
         }
@@ -121,7 +121,7 @@ impl Database {
         // persisted TTL (if any) so `store.ttl` reflects the durable config.
         let mut stores = HashMap::new();
         for (name, ns_id) in registry.list() {
-            let ns_path = crate::db::layout::namespace_data_dir(db_path, name);
+            let ns_path = crate::layout::namespace_data_dir(db_path, name);
             let ttl = registry.ttl_config(ns_id).map(|(ttl, _)| ttl);
             let kv_store = KVStore::open_with_ttl(
                 ns_id,
@@ -233,7 +233,7 @@ impl Database {
         metrics: &Arc<crate::support::metrics::Metrics>,
     ) -> Result<VectorIndexWal> {
         let (wal, report) = VectorIndexWal::open(
-            &crate::db::layout::vector_index_wal_dir(db_path),
+            &crate::layout::vector_index_wal_dir(db_path),
             crate::db::wal::vector_index_wal::DEFAULT_SEGMENT_SIZE,
             Arc::clone(metrics),
         )?;
