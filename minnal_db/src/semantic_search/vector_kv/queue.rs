@@ -379,7 +379,7 @@ enum Completion {
 /// of the WAL under ingestion. The vectors are durable before this runs
 /// ([`make_vector_writes_durable`]), so a removal that does reach disk never
 /// outlives the vectors it vouches for. Design note:
-/// `semantic_search/doc/Fewer-WAL-Fsyncs-Design.md`, Part 1.
+/// `semantic_search/docs/Fewer-WAL-Fsyncs-Design.md`, Part 1.
 async fn complete_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<Completion, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
     crash_point!();

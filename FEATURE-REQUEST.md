@@ -857,7 +857,7 @@ by construction.
 `thresholds.index_overlay_hard_bytes` (64 MiB by default)
 **Source:** field-index write-back work on branch `roaring_bit_map_fixes`
 (steps 1–3a done; this is step 3b–3d of
-`minnal_db/src/field_index/doc/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
+`minnal_db/src/field_index/docs/Field-Index-Write-Back-Plan.md`, deferred on 2026-10-07)
 **✅ Implemented:** 2026-10-09 (`0c04268`) — see *Implementation* below.
 
 ### Summary
@@ -884,7 +884,7 @@ would have to be rebuilt).
 - Crash tests: crash before each write step, with a random subset of dirty pages
   written back; reopen + replay must equal a full rebuild.
 
-The design is in `minnal_db/src/field_index/doc/Field-Index-Write-Back-Evaluation.md`
+The design is in `minnal_db/src/field_index/docs/Field-Index-Write-Back-Evaluation.md`
 (option 4, step 3).
 
 ### Acceptance criteria
@@ -1228,7 +1228,7 @@ patch.
   and FiQA after a rebuild with collection, against one without.
 
 The design and its risk table are in
-`minnal_db/src/semantic_search/doc/Dynamic-RaBitQ-Index-Design.md` →
+`minnal_db/src/semantic_search/docs/Dynamic-RaBitQ-Index-Design.md` →
 *Known limitation: centres are never collected*.
 
 ---

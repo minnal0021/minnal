@@ -8,7 +8,7 @@
 //! instead of flushing three memtables. After a crash, the records not yet
 //! retired are replayed with their original seqs. Partition maintenance logs
 //! its per-document meta writes and key deletes here too. Design:
-//! `semantic_search/doc/Vector-Index-WAL-Design.md`.
+//! `semantic_search/docs/Vector-Index-WAL-Design.md`.
 //!
 //! # What survives a crash is a prefix of the log
 //!

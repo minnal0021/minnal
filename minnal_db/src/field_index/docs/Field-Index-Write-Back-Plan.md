@@ -106,7 +106,7 @@ Before starting, re-run the search; the list below is what it found on
       *Blob store is append-only*, backpressure, crash-safety sections),
       `minnal_db/CLAUDE.md` (index checkpoint / replay batching notes),
       root `CLAUDE.md` (key knobs: `index_blob_*` thresholds, new overlay limits)
-- [x] 4b. **Architecture doc**: `minnal_db/src/field_index/doc/Field-Index-Architecture.md`
+- [x] 4b. **Architecture doc**: `minnal_db/src/field_index/docs/Field-Index-Architecture.md`
 - [x] 4c. **Operator docs**: `minnal_db_api/README.md` — index checkpoint,
       `GET /admin/storage/index-waste`, `GET /admin/indices/{ns}/{field}/blob-stats`,
       `POST /admin/storage/index-checkpoint`, config/metrics tables (new overlay

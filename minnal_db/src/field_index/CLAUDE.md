@@ -19,7 +19,7 @@ Provides per-field bitmap indexes over document key-spaces and a predicate query
 | `bitmap/container_map.rs` | `ContainerMap` — sorted `u128 → Container` heap map behind one bitmap, changed in place, with cached cardinality and heap size. Do not add a backing that keeps a copy per change: an append-only mapped one (removed, it had no callers) cost 514 MiB for an 8 KB bitmap after 65,536 inserts (`memory_is_the_bitmaps_size_not_its_history`) |
 | `blob_store.rs` | `BlobStore` — mmap-backed `u128 → bytes` two-file store; holds each `FieldIndex`'s bitmaps off-heap in the **directory** layout (`BlobLayout::Directory`: slot → directory blob → container blobs; the keymap uses `Flat`). Space accounting, open-time repair and compaction read directories. On-disk `VERSION` 2. Crash-ordered writes (`append_value` → `sync_values` → `set_slot` → `sync_keys`), checksummed slots, repair at open. |
 | `growable_mmap.rs` | `GrowableMmap` — the growable mapped region shared by `BlobStore` and `RowMap` |
-| `doc/` | Architecture and write-back design docs |
+| `docs/` | Architecture and write-back design docs |
 | `overlay_budget.rs` | `IndexOverlayBudget` — one atomic byte counter per `Database`, shared by every field's overlay, with a soft limit (request a checkpoint) and a hard limit (the writer spills its own field) |
 | `rowmap.rs` | `RowMap` — per-namespace dense row-ID map (`key↔id` + counter), mmap sidecar |
 | `bitmap/codec.rs` | On-disk bitmap encoding: one rkyv blob per `Container` (`encode_container` / `decode_container`) and the checksummed per-bitmap **directory** (`MBD1`: sorted container key → offset, len; `encode_dir` / `decode_dir`) |
