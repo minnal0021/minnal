@@ -157,11 +157,18 @@ impl DiskProgress {
         }
     }
 
+    /// Not fsynced: a lost or torn record only costs work, because a record
+    /// that cannot be read restarts the build from the first key
+    /// (`resume_pending_builds`). A failed write is logged, not returned: the
+    /// build itself is unaffected.
     fn write(&self, progress: &DiskBuildProgress) {
         let tmp = self.path.with_extension("tmp");
-        if let Ok(bytes) = serde_json::to_vec(progress) {
-            let _ = std::fs::write(&tmp, &bytes);
-            let _ = std::fs::rename(&tmp, &self.path);
+        let written = serde_json::to_vec(progress)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&tmp, &bytes))
+            .and_then(|()| std::fs::rename(&tmp, &self.path));
+        if let Err(e) = written {
+            log::warn!("index build progress: could not write {}: {e}", self.path.display());
         }
     }
 }
