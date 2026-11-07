@@ -21,10 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, info, warn};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
+use super::{WorkerError, WorkerHost};
 use crate::AsyncDb;
-use crate::doc_store::SemanticSearchContext;
-use crate::doc_store::error::DocStoreError;
-use crate::doc_store::schema::store::SchemaStore;
+use crate::semantic_search::context::{ContextError, SemanticSearchContext};
 use crate::semantic_search::ivf_split;
 
 /// Default maintenance threads per process.
@@ -60,7 +59,7 @@ impl Drop for MaintenanceHandle {
 }
 
 /// Start the task; `ctx.request_maintenance` reaches it from then on.
-pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schemas: Arc<SchemaStore>) -> MaintenanceHandle {
+pub(crate) fn start<H: WorkerHost>(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, host: Arc<H>) -> MaintenanceHandle {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     ctx.set_maintenance_sender(tx);
     let stop = Arc::new(Notify::new());
@@ -86,9 +85,9 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schemas: 
                     if stopping.load(Ordering::Acquire) {
                         break;
                     }
-                    let (db, ctx, schemas, stopping) = (Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schemas), Arc::clone(&stopping));
+                    let (db, ctx, host, stopping) = (Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&host), Arc::clone(&stopping));
                     running.spawn(async move {
-                        maintain(&db, &ctx, &schemas, &namespace, &stopping).await;
+                        maintain(&db, &ctx, &*host, &namespace, &stopping).await;
                         drop(permit);
                     });
                 }
@@ -106,16 +105,16 @@ pub(crate) fn start(db: Arc<AsyncDb>, ctx: Arc<SemanticSearchContext>, schemas: 
 
 /// Split, reassign and merge `namespace`'s postings with its own settings,
 /// until none is left or `stopping` is set.
-async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schemas: &SchemaStore, namespace: &str, stopping: &AtomicBool) {
+async fn maintain<H: WorkerHost>(db: &AsyncDb, ctx: &SemanticSearchContext, host: &H, namespace: &str, stopping: &AtomicBool) {
     // A request sent before the namespace's drop began: nothing to maintain.
     if ctx.is_dropping(namespace) {
         return;
     }
     let result = async {
-        let (settings, ns_id) = schemas.vector_settings(namespace)?;
+        let (settings, ns_id) = host.vector_settings(namespace)?;
         let ns = ctx.for_namespace(db, namespace, ns_id, &settings).await?;
         let report = ivf_split::maintain_partition_until(db, namespace, &ns.partition, &settings.maintenance.ops(), stopping).await?;
-        Ok::<ivf_split::MaintenanceReport, DocStoreError>(report)
+        Ok::<ivf_split::MaintenanceReport, WorkerError>(report)
     }
     .await;
     match result {
@@ -125,7 +124,7 @@ async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schemas: &SchemaSto
             r.splits, r.merges
         ),
         // Dropped (or its semantic search disabled) since the request was sent.
-        Err(e @ (DocStoreError::NotFound { .. } | DocStoreError::SemanticSearchNotEnabled { .. })) => {
+        Err(e @ WorkerError::Context(ContextError::SemanticSearchNotEnabled { .. })) => {
             debug!("partition maintenance: namespace='{namespace}' skipped: {e}")
         }
         Err(e) => warn!("partition maintenance: namespace='{namespace}' failed: {e}"),
@@ -141,14 +140,14 @@ async fn maintain(db: &AsyncDb, ctx: &SemanticSearchContext, schemas: &SchemaSto
 /// partition recovers its journal ([`SemanticSearchContext::for_namespace`]),
 /// so this only does it early; a namespace whose recovery fails here is tried
 /// again by its next user, and nothing uses it before that succeeds.
-pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schemas: &SchemaStore) {
+pub(crate) async fn recover_all<H: WorkerHost>(db: &AsyncDb, ctx: &SemanticSearchContext, host: &H) {
     let names: Vec<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
     for name in &names {
         let Some(namespace) = name.strip_suffix("_ivf_journal") else { continue };
         let result = async {
-            let (settings, ns_id) = schemas.vector_settings(namespace)?;
+            let (settings, ns_id) = host.vector_settings(namespace)?;
             ctx.for_namespace(db, namespace, ns_id, &settings).await?;
-            Ok::<(), DocStoreError>(())
+            Ok::<(), WorkerError>(())
         }
         .await;
         if let Err(e) = result {
@@ -157,7 +156,7 @@ pub(crate) async fn recover_all(db: &AsyncDb, ctx: &SemanticSearchContext, schem
     }
     for name in &names {
         if let Some(namespace) = name.strip_suffix("_ivf_postings")
-            && schemas.vector_settings(namespace).is_ok()
+            && host.vector_settings(namespace).is_ok()
         {
             ctx.request_maintenance(namespace);
         }

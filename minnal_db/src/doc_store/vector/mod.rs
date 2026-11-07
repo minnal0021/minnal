@@ -2,6 +2,9 @@
 
 use crate::doc_store::*;
 
+#[cfg(feature = "semantic-search")]
+pub(crate) mod worker_host;
+
 impl DocStore {
     /// The health of `namespace`'s partition (document or KV store): every
     /// posting's size, state and lineage from memory, and with `codes` also the
@@ -876,29 +879,6 @@ pub(crate) const REINDEX_PAGE: usize = 1_000;
 
 // ── What a document holds now ─────────────────────────────────────────────────
 
-/// What a document (or KV value) holds now, for the vector worker's check of a
-/// queue entry against it ([`vector_kv::check_entry_against_document`]).
-#[cfg(feature = "semantic-search")]
-pub(crate) enum DocumentText {
-    /// The store is gone (dropped, or being dropped): leave the entry to the drop.
-    StoreGone,
-    /// The document is absent, or has no embedding text: it must have no vectors.
-    Nothing,
-    /// The document's embedding text.
-    Text(String),
-}
-
-#[cfg(feature = "semantic-search")]
-impl DocumentText {
-    /// The text the document's vectors must be embedded from, if any.
-    pub(crate) fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text(t) => Some(t),
-            Self::StoreGone | Self::Nothing => None,
-        }
-    }
-}
-
 /// Read what `namespace`'s document `key` holds now: its embedding text, built
 /// as a write builds it (the schema's embedding fields for a document store, the
 /// value itself for a KV store). The caller has seen no write to it in progress
@@ -1538,7 +1518,7 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn a_stale_entry_waits_for_a_write_in_progress() {
-        use crate::doc_store::workers::vec_index::{EntryCheck, check_entry};
+        use crate::semantic_search::workers::vec_index::{EntryCheck, check_entry};
         let db_dir = TempDir::new().unwrap();
         let store = open_kv_semantic(&db_dir).await;
         let parent = store.db.namespace("sem_kv".to_string()).await.unwrap();
@@ -1551,22 +1531,19 @@ mod tests {
         vector_kv::enqueue_embed(&store.db, "sem_kv", b"x", "old").await.unwrap(); // the reindex's snapshot
         let stale = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().unwrap();
         assert_eq!(
-            check_entry(&store.db, &store.schemas, &store.in_flight, &stale).await.unwrap(),
+            check_entry(&store.db, &*store.worker_host(), &stale).await.unwrap(),
             EntryCheck::InProgress
         );
 
         parent.put(b"x".to_vec(), b"new".to_vec()).await.unwrap(); // the write lands
         drop(writing);
         assert_eq!(
-            check_entry(&store.db, &store.schemas, &store.in_flight, &stale).await.unwrap(),
+            check_entry(&store.db, &*store.worker_host(), &stale).await.unwrap(),
             EntryCheck::Rewritten
         );
         let fixed = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().unwrap();
         assert_eq!(fixed.text, "new");
-        assert_eq!(
-            check_entry(&store.db, &store.schemas, &store.in_flight, &fixed).await.unwrap(),
-            EntryCheck::Proceed
-        );
+        assert_eq!(check_entry(&store.db, &*store.worker_host(), &fixed).await.unwrap(), EntryCheck::Proceed);
     }
 
     /// The running worker leaves an entry alone while its document has a write

@@ -17,6 +17,8 @@ pub(crate) mod simd_support;
 // `doc-store`.
 pub mod vector_kv;
 pub mod vector_math;
+#[cfg(feature = "doc-store")]
+pub(crate) mod workers;
 
 pub use self::chunking::chunk_document;
 pub use self::cluster::Cluster;

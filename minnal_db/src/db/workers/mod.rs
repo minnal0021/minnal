@@ -10,8 +10,8 @@
 //! | [`wal_gc`] | Deletes WAL segments nothing needs any more | here |
 //! | [`ttl`] | Removes expired entries from TTL namespaces | here |
 //! | [`index_checkpoint`] | Spills field-index write buffers and records their WAL offset | here |
-//! | `vec_index` | Embeds documents from the vector-index queue | `doc_store::workers` |
-//! | `ivf_maintenance` | Splits, merges and reassigns a namespace's postings | `doc_store::workers` |
+//! | `vec_index` | Embeds documents from the vector-index queue | `semantic_search::workers` |
+//! | `ivf_maintenance` | Splits, merges and reassigns a namespace's postings | `semantic_search::workers` |
 //!
 //! The last two stay in `doc_store`: they need its schemas and in-flight write
 //! tracking, are feature-gated, and are started by `DocStore`. `db` must not

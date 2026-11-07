@@ -81,9 +81,8 @@ use log::{debug, info, warn};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::doc_store::error::DocStoreError;
-use crate::doc_store::schema::store::SchemaStore;
-use crate::doc_store::{DocumentText, InFlightWrites, NamespaceSemantics, SemanticSearchContext, document_text};
+use super::{DocumentText, WorkerError, WorkerHost};
+use crate::semantic_search::context::{NamespaceSemantics, SemanticSearchContext};
 use crate::semantic_search::vector_kv::{self, QueueEntry, QueueEntryKind};
 
 /// Written embed entries completed per flush of the vector namespaces. Larger
@@ -125,17 +124,12 @@ pub(crate) enum EntryCheck {
 
 /// Compare `entry` with what its document holds now (see the module docs),
 /// rewriting it when it does not describe the document. The document is read
-/// only after `in_flight` shows no write to it in progress, so none is half done.
-pub(crate) async fn check_entry(
-    db: &AsyncDb,
-    schemas: &SchemaStore,
-    in_flight: &InFlightWrites,
-    entry: &QueueEntry,
-) -> Result<EntryCheck, DocStoreError> {
-    if in_flight.contains(&entry.namespace, &entry.doc_id_bytes) {
+/// only after the host shows no write to it in progress, so none is half done.
+pub(crate) async fn check_entry<H: WorkerHost>(db: &AsyncDb, host: &H, entry: &QueueEntry) -> Result<EntryCheck, WorkerError> {
+    if host.write_in_progress(&entry.namespace, &entry.doc_id_bytes) {
         return Ok(EntryCheck::InProgress);
     }
-    let current = document_text(db, schemas, &entry.namespace, &entry.doc_id_bytes).await?;
+    let current = host.document_text(&entry.namespace, &entry.doc_id_bytes).await?;
     if matches!(current, DocumentText::StoreGone) {
         return Ok(EntryCheck::StoreGone);
     }
@@ -194,7 +188,7 @@ pub struct VecIndexWorkerHandle {
     notify: Arc<Notify>,
     task: Option<tokio::task::JoinHandle<()>>,
     /// The partition maintenance task, which this worker wakes; stopped with it.
-    maintenance: Option<crate::doc_store::workers::ivf_maintenance::MaintenanceHandle>,
+    maintenance: Option<super::ivf_maintenance::MaintenanceHandle>,
 }
 
 impl VecIndexWorkerHandle {
@@ -222,21 +216,31 @@ impl Drop for VecIndexWorkerHandle {
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
-pub(crate) struct VecIndexWorker {
+pub(crate) struct VecIndexWorker<H> {
     db: Arc<AsyncDb>,
     ctx: Arc<SemanticSearchContext>,
-    /// Every store's schema: each entry is embedded with its namespace's
-    /// model, dimension and chunking, read from its schema.
-    schemas: Arc<SchemaStore>,
-    /// Documents with a write in progress, which the worker skips.
-    in_flight: Arc<InFlightWrites>,
+    /// The stores above: their settings, and their documents and writes.
+    host: Arc<H>,
     notify: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
     config: Arc<VectorIndexConfig>,
 }
 
-impl VecIndexWorker {
+// By hand: a derive would require `H: Clone`, and only the `Arc` is cloned.
+impl<H> Clone for VecIndexWorker<H> {
+    fn clone(&self) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            ctx: Arc::clone(&self.ctx),
+            host: Arc::clone(&self.host),
+            notify: Arc::clone(&self.notify),
+            shutdown: Arc::clone(&self.shutdown),
+            config: Arc::clone(&self.config),
+        }
+    }
+}
+
+impl<H: WorkerHost> VecIndexWorker<H> {
     /// Spawn the worker and return a handle.
     ///
     /// On startup the worker drains any queue entries that survived a crash
@@ -246,18 +250,16 @@ impl VecIndexWorker {
     pub fn start(
         db: Arc<AsyncDb>,
         ctx: Arc<SemanticSearchContext>,
-        schemas: Arc<SchemaStore>,
-        in_flight: Arc<InFlightWrites>,
+        host: Arc<H>,
         notify: Arc<Notify>,
         config: VectorIndexConfig,
     ) -> VecIndexWorkerHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let maintenance = crate::doc_store::workers::ivf_maintenance::start(Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&schemas));
+        let maintenance = super::ivf_maintenance::start(Arc::clone(&db), Arc::clone(&ctx), Arc::clone(&host));
         let worker = VecIndexWorker {
             db,
             ctx,
-            schemas,
-            in_flight,
+            host,
             notify: Arc::clone(&notify),
             shutdown: Arc::clone(&shutdown),
             config: Arc::new(config),
@@ -274,7 +276,7 @@ impl VecIndexWorker {
     async fn run(self) {
         // Splits a crash interrupted are finished first: nothing may write a
         // namespace's vectors while its journal is unfinished.
-        crate::doc_store::workers::ivf_maintenance::recover_all(&self.db, &self.ctx, &self.schemas).await;
+        super::ivf_maintenance::recover_all(&self.db, &self.ctx, &*self.host).await;
         info!("vec index worker started — draining queue (crash recovery)");
         self.drain_queue().await;
         info!("vec index worker ready");
@@ -396,18 +398,18 @@ impl VecIndexWorker {
             let mut resolved_all: HashMap<String, Result<Arc<NamespaceSemantics>, String>> = HashMap::new();
             let mut dropping: Vec<String> = Vec::new();
             for ns in by_namespace.keys() {
-                let resolved = match self.schemas.vector_settings(ns) {
+                let resolved = match self.host.vector_settings(ns) {
                     Ok((settings, ns_id)) => self
                         .ctx
                         .for_namespace(&self.db, ns, ns_id, &settings)
                         .await
                         .map(Arc::new)
-                        .map_err(DocStoreError::from),
+                        .map_err(WorkerError::from),
                     Err(e) => Err(e),
                 }
                 .map_err(|e| e.to_string());
                 if let Err(e) = &resolved {
-                    if self.ctx.is_dropping(ns) || !self.schemas.contains(ns) {
+                    if self.ctx.is_dropping(ns) || !self.host.store_exists(ns) {
                         dropping.push(ns.clone());
                         continue;
                     }
@@ -443,7 +445,7 @@ impl VecIndexWorker {
 
             // Process work_queue with bounded concurrency.
             let concurrency = self.config.concurrency.max(1);
-            let mut set: JoinSet<(QueueEntry, Result<Processed, DocStoreError>)> = JoinSet::new();
+            let mut set: JoinSet<(QueueEntry, Result<Processed, WorkerError>)> = JoinSet::new();
             let mut work_iter = work_queue.into_iter();
             let mut any_failed = false;
             let mut indexed_count = 0usize;
@@ -581,7 +583,7 @@ impl VecIndexWorker {
     /// (see the module docs).
     ///
     /// **Clear:** delete the document's vectors and remove the tombstone.
-    async fn process_one(&self, entry: &QueueEntry, semantics: Option<&Result<Arc<NamespaceSemantics>, String>>) -> Result<Processed, DocStoreError> {
+    async fn process_one(&self, entry: &QueueEntry, semantics: Option<&Result<Arc<NamespaceSemantics>, String>>) -> Result<Processed, WorkerError> {
         // First, and whatever the namespace's settings: the check needs only the
         // queue and the document.
         if let Some(skip) = self.check_against_document(entry).await? {
@@ -591,8 +593,8 @@ impl VecIndexWorker {
             QueueEntryKind::Embed => {
                 let ns = match semantics {
                     Some(Ok(ns)) => ns,
-                    Some(Err(e)) => return Err(DocStoreError::EmbeddingFailed(e.clone())),
-                    None => return Err(DocStoreError::EmbeddingFailed(format!("no settings resolved for '{}'", entry.namespace))),
+                    Some(Err(e)) => return Err(WorkerError::EmbeddingFailed(e.clone())),
+                    None => return Err(WorkerError::EmbeddingFailed(format!("no settings resolved for '{}'", entry.namespace))),
                 };
                 // The partition was resolved at the start of the pass; a drop
                 // since then marks it. No embedding call for a dropped store.
@@ -605,7 +607,7 @@ impl VecIndexWorker {
                 // new one while the text was being embedded).
                 let (dense, chunks) = crate::semantic_search::service::embed_document_floats(&ns.config, &entry.text)
                     .await
-                    .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
+                    .map_err(|e| WorkerError::EmbeddingFailed(e.to_string()))?;
                 let _epoch = ns.partition.read_epoch().await;
                 // Checked again inside the epoch, which the drop waits out
                 // before removing the namespaces: a write after the removal
@@ -615,7 +617,7 @@ impl VecIndexWorker {
                 }
                 let ivf = ns.partition.snapshot();
                 let vector_indexes = crate::semantic_search::service::index_embeddings(&ns.config, &*ivf, &dense, &chunks)
-                    .map_err(|e| DocStoreError::EmbeddingFailed(e.to_string()))?;
+                    .map_err(|e| WorkerError::EmbeddingFailed(e.to_string()))?;
                 let delta = vector_kv::upsert_vectors(&self.db, &entry.namespace, &entry.doc_id_bytes, &entry.text, &vector_indexes).await?;
                 ivf.apply_delta(&delta);
                 if ns.partition.needs_maintenance(&delta) {
@@ -646,8 +648,8 @@ impl VecIndexWorker {
 
     /// [`check_entry`] for the worker: `None` when the entry describes its
     /// document and should be carried out; otherwise what to report instead.
-    async fn check_against_document(&self, entry: &QueueEntry) -> Result<Option<Processed>, DocStoreError> {
-        Ok(match check_entry(&self.db, &self.schemas, &self.in_flight, entry).await? {
+    async fn check_against_document(&self, entry: &QueueEntry) -> Result<Option<Processed>, WorkerError> {
+        Ok(match check_entry(&self.db, &*self.host, entry).await? {
             EntryCheck::Proceed => None,
             EntryCheck::Rewritten => Some(Processed::Rewritten),
             EntryCheck::InProgress => Some(Processed::InProgress),

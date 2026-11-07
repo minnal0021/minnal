@@ -1431,7 +1431,7 @@ agreement first, as any new dependency does.
 ## FR-012 — Make a skipped `upsert_vectors` visible to its caller
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/semantic_search/vector_kv/`, `src/doc_store/workers/vec_index.rs`)
+**Area:** `minnal_db` (`src/semantic_search/vector_kv/`, `src/semantic_search/workers/vec_index.rs`)
 **Severity:** Low — affects direct users of `vector_kv`; the document store creates
 the namespaces itself
 **Source:** Review of store and vector-index lifecycle races.

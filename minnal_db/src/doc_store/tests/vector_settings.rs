@@ -1683,11 +1683,10 @@ mod with_service {
         let ctx = std::sync::Arc::clone(store.semantic_ctx.as_ref().unwrap());
         ctx.begin_drop("g").await;
         let at_drop = seen.lock().len();
-        let worker = crate::doc_store::workers::vec_index::VecIndexWorker::start(
+        let worker = crate::semantic_search::workers::vec_index::VecIndexWorker::start(
             std::sync::Arc::clone(&store.db),
             std::sync::Arc::clone(&ctx),
-            std::sync::Arc::clone(&store.schemas),
-            std::sync::Arc::clone(&store.in_flight),
+            store.worker_host(),
             std::sync::Arc::new(tokio::sync::Notify::new()),
             store.vector_index_config.clone(),
         );

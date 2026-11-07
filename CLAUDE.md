@@ -66,7 +66,7 @@ src/storage/           — LSM tree, value log
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
 src/field_index/       — folded field-indexing module (always compiled)
 src/vector_settings.rs — each store's vector-index settings, in its schema with or without semantic search   #[cfg(doc-store)]
-src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge)   #[cfg(semantic-search)]
+src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge), context.rs and workers/ (with doc-store; they reach the stores above through `WorkerHost`)   #[cfg(semantic-search)]
 src/doc_store/         — folded document-store module   #[cfg(doc-store)]
 tests/                 — integration tests only; unit tests live inline in each module
 ```

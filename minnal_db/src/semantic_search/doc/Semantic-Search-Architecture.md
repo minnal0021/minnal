@@ -419,7 +419,7 @@ Vector indexing is **asynchronous and decoupled from document writes**. A docume
 ### Write path
 
 1. `put` / `kv_put` extracts the embedding field, enqueues a `(namespace, doc_id, text)` entry in the durable `system_pending_vec_index` KV namespace, and then writes the document. The two writes are not atomic, so their order matters: the queue entry always comes first (see [Crash recovery: the queue comes first](#crash-recovery-the-queue-comes-first)). The write returns without contacting the embedding service.
-2. `VecIndexWorker` (`minnal_db/src/doc_store/workers/vec_index.rs`) consumes the queue in the background — see [Background worker](#background-worker).
+2. `VecIndexWorker` (`minnal_db/src/semantic_search/workers/vec_index.rs`) consumes the queue in the background — see [Background worker](#background-worker).
 
 ### Embedding service availability
 
@@ -590,14 +590,14 @@ measured on frozen BEIR embeddings by the frozen eval
 | A store's partition (postings, centres, routing epoch) + choosing the postings a search reads | `minnal_db/src/semantic_search/cluster/layout.rs` |
 | Split, reassignment, merge, rebuild and their journal | `minnal_db/src/semantic_search/ivf_split/` |
 | Recall check and partition history | `minnal_db/src/semantic_search/ivf_split/recall_check.rs`, `minnal_db/src/semantic_search/ivf_split/history.rs` |
-| Background maintenance task and crash recovery | `minnal_db/src/doc_store/workers/ivf_maintenance.rs` |
+| Background maintenance task and crash recovery | `minnal_db/src/semantic_search/workers/ivf_maintenance.rs` |
 | Per-store vector-index settings (defaults, validation) | `minnal_db/src/vector_settings.rs` |
 | Balanced 2-means and k-means | `minnal_db/src/semantic_search/cluster/split.rs`, `cluster/kmeans.rs` |
 | Composite key encoding (posting ‖ doc_id) | `minnal_db/src/semantic_search/index/composite_key.rs` |
 | Scoring, coarse-assignment and end-to-end benchmarks | `minnal_db/benches/semantic_search/bench_distance_estimation.rs` |
 | Vector KV storage (three namespaces) + query cache | `minnal_db/src/semantic_search/vector_kv/` |
 | Latency profiling harness (see §8) | `minnal_db/src/semantic_search/vector_kv/tests/real_kv_profile.rs` (ignored test) |
-| Async vector-index background worker | `minnal_db/src/doc_store/workers/vec_index.rs` |
+| Async vector-index background worker | `minnal_db/src/semantic_search/workers/vec_index.rs` |
 | Document store | `minnal_db/src/doc_store/` |
 
 ---

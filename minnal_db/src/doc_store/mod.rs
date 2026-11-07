@@ -35,9 +35,9 @@ use self::schema::store::SchemaStore;
 #[cfg(feature = "semantic-search")]
 use self::schema::vector_settings::SearchSpec;
 #[cfg(feature = "semantic-search")]
-use self::workers::vec_index::{VecIndexWorker, VecIndexWorkerHandle};
-#[cfg(feature = "semantic-search")]
 use crate::semantic_search::vector_kv;
+#[cfg(feature = "semantic-search")]
+use crate::semantic_search::workers::vec_index::{VecIndexWorker, VecIndexWorkerHandle};
 use crate::support::file_lock::{DirLock, LockError};
 use crate::support::hex::hex_to_bytes;
 
@@ -55,8 +55,6 @@ pub mod schema;
 #[cfg(test)]
 mod tests;
 mod vector;
-#[cfg(feature = "semantic-search")]
-pub(crate) mod workers;
 mod write_gate;
 
 pub use self::indexing::progress::{DiskBuildProgress, IndexBuildHandle, IndexBuildProgress, RowMapStats};
@@ -72,10 +70,10 @@ pub(crate) use self::write_gate::{LifecycleLocks, WriteGate, WriteGuard};
 #[cfg(feature = "semantic-search")]
 pub use crate::semantic_search::context::{NamespaceSemantics, SemanticSearchContext};
 
+#[cfg(feature = "semantic-search")]
+pub(crate) use crate::semantic_search::workers::DocumentText;
 #[allow(unused_imports)]
 use helpers::*;
-#[cfg(feature = "semantic-search")]
-pub(crate) use vector::{DocumentText, document_text};
 
 // ── Error types ────────────────────────────────────────────────────────────
 pub use self::error::{DocStoreError, SchemaError};
@@ -100,9 +98,9 @@ pub use self::indexing::build_manager::IndexBuildManager;
 
 // ── Vector-index worker types (semantic-search only) ───────────────────────
 #[cfg(feature = "semantic-search")]
-pub use self::workers::vec_index::VectorIndexConfig;
-#[cfg(feature = "semantic-search")]
 pub use crate::semantic_search::vector_kv::{QueueEntry, QueueEntryKind};
+#[cfg(feature = "semantic-search")]
+pub use crate::semantic_search::workers::vec_index::VectorIndexConfig;
 
 // ── Engine diagnostic types (re-exported for API consumers) ───────────────
 pub use crate::{GCStats, KVError, LsmManifest, ManifestBucket, ManifestFile, ManifestLevel, Stats, ValueLogMetadata, WalMetadata};
@@ -296,8 +294,7 @@ impl DocStore {
         let handle = VecIndexWorker::start(
             Arc::clone(&self.db),
             Arc::clone(&ctx),
-            Arc::clone(&self.schemas),
-            Arc::clone(&self.in_flight),
+            self.worker_host(),
             Arc::clone(&notify),
             self.vector_index_config.clone(),
         );
@@ -306,6 +303,16 @@ impl DocStore {
         self.notify = Some(notify);
         *self.worker_handle.lock().unwrap() = Some(handle);
         self
+    }
+
+    /// This store's side of the vector workers' [`WorkerHost`](crate::semantic_search::workers::WorkerHost).
+    #[cfg(feature = "semantic-search")]
+    fn worker_host(&self) -> Arc<self::vector::worker_host::DocStoreWorkerHost> {
+        Arc::new(self::vector::worker_host::DocStoreWorkerHost {
+            db: Arc::clone(&self.db),
+            schemas: Arc::clone(&self.schemas),
+            in_flight: Arc::clone(&self.in_flight),
+        })
     }
 
     /// The configured maximum number of embedding attempts per queue entry.

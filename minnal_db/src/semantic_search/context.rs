@@ -35,11 +35,11 @@ pub enum ContextError {
     VecRebuildInProgress { namespace: String },
 
     /// A vector-index setting was rejected.
-    #[error(transparent)]
+    #[error("schema error: {0}")]
     Settings(#[from] VectorSettingsError),
 
     /// The underlying database returned an error.
-    #[error(transparent)]
+    #[error("database error: {0}")]
     Db(#[from] crate::KVError),
 }
 
@@ -124,7 +124,7 @@ impl SemanticSearchContext {
             config,
             supported_models: std::collections::BTreeMap::new(),
             index_defaults: crate::vector_settings::IndexDefaults::default(),
-            maintenance_threads: crate::doc_store::workers::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
+            maintenance_threads: crate::semantic_search::workers::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
             rebuild_threads: crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS,
             rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             maintenance_tx: std::sync::OnceLock::new(),
