@@ -2034,6 +2034,8 @@ curl -X DELETE http://localhost:8080/admin/indices/products/vector/drop-all
 # → 202 Accepted
 ```
 
+Works for both document stores and semantic-search KV stores. A document store can turn semantic search back on by amending its schema; a KV store chooses it when it is created, so turning it back on means re-creating the store.
+
 Returns `409` when a cleanup or campaign is already running. Returns `422` when semantic search is not enabled.
 
 ---

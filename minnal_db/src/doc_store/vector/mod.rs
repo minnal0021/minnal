@@ -1403,6 +1403,76 @@ mod tests {
         dense.get(key.to_vec()).await.unwrap()
     }
 
+    /// Dropping a KV store's vector index turns semantic search off and removes its
+    /// queue entries, vector namespaces and reindex record; its values stay.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn a_kv_store_can_drop_its_vector_index() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
+        let (key, value) = (serde_json::json!("x"), serde_json::json!("some text"));
+        store.kv_put("sem_kv", &key, &value).await.unwrap();
+        vector_kv::create_vector_namespaces(&store.db, "sem_kv").await.unwrap();
+        assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_some());
+        let ns_id = store.load_kv_schema("sem_kv").unwrap().ns_id.unwrap();
+        let record = vec_reindex_path(&store.db_path, ns_id);
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, "{}").unwrap();
+
+        store.disable_semantic_search("sem_kv").unwrap();
+        assert!(!store.load_kv_schema("sem_kv").unwrap().is_semantic_search_enabled());
+        assert!(matches!(
+            store.disable_semantic_search("sem_kv"),
+            Err(DocStoreError::SemanticSearchNotEnabled { .. })
+        ));
+        store.drop_vector_index_data("sem_kv").await.unwrap();
+
+        assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_none());
+        let companions: Vec<_> = store
+            .db
+            .list_namespaces()
+            .into_iter()
+            .filter(|(n, _)| vector_kv::vector_data_base(n).is_some())
+            .collect();
+        assert!(companions.is_empty(), "{companions:?}");
+        assert!(!record.exists());
+        assert_eq!(store.kv_get("sem_kv", &key).await.unwrap(), Some(value.clone()));
+
+        // New writes queue nothing.
+        store.kv_put("sem_kv", &serde_json::json!("y"), &value).await.unwrap();
+        assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"y").await.unwrap().is_none());
+    }
+
+    /// A crash after semantic search went off and before the cleanup ran: the next
+    /// open finishes the drop for a KV store too.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn an_interrupted_kv_vector_drop_is_finished_at_open() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_kv_semantic(&db_dir).await;
+        let (key, value) = (serde_json::json!("x"), serde_json::json!("some text"));
+        store.kv_put("sem_kv", &key, &value).await.unwrap();
+        vector_kv::create_vector_namespaces(&store.db, "sem_kv").await.unwrap();
+        store.disable_semantic_search("sem_kv").unwrap();
+        store.shutdown().await.unwrap();
+        drop(store);
+
+        let store = open_fresh(db_dir.path()).await;
+        assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_none());
+        assert!(!store.db.list_namespaces().iter().any(|(n, _)| vector_kv::vector_data_base(n).is_some()));
+        assert!(!store.load_kv_schema("sem_kv").unwrap().is_semantic_search_enabled());
+        assert_eq!(store.kv_get("sem_kv", &key).await.unwrap(), Some(value));
+    }
+
+    /// A store that does not exist is `NotFound`, for the route's 404.
+    #[cfg(feature = "semantic-search")]
+    #[tokio::test]
+    async fn disabling_semantic_search_on_an_unknown_store_is_not_found() {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_fresh(db_dir.path()).await;
+        assert!(matches!(store.disable_semantic_search("missing"), Err(DocStoreError::NotFound { .. })));
+    }
+
     /// R3 through the real delete path: deleting a key whose older value is being
     /// embedded leaves no vectors once that embed completes.
     #[cfg(feature = "semantic-search")]

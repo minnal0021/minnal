@@ -75,22 +75,34 @@ impl DocStore {
         crate::doc_store::schema::vector_settings::IndexDefaults::default()
     }
 
-    /// Disable semantic search for a namespace by clearing `embedding_fields`
-    /// and setting `semantic_search_enabled = false`.
+    /// Disable semantic search for a document or KV store: `semantic_search_enabled`
+    /// goes to `false`, and a document store's `embedding_fields` are cleared. A
+    /// document store can enable it again by amending its schema; a KV store chooses
+    /// it only when it is created.
     ///
     /// Returns `Err(SemanticSearchNotEnabled)` when the namespace does not have
     /// semantic search configured, so callers can surface a proper 422.
     pub fn disable_semantic_search(&self, namespace: &str) -> Result<(), DocStoreError> {
-        self.schemas.update_doc(namespace, |schema| {
-            if !schema.semantic_search_enabled && schema.embedding_fields.is_empty() {
-                return Err(DocStoreError::SemanticSearchNotEnabled {
-                    namespace: namespace.to_owned(),
-                });
-            }
-            schema.semantic_search_enabled = false;
-            schema.embedding_fields.clear();
-            Ok(())
-        })
+        let not_enabled = || DocStoreError::SemanticSearchNotEnabled {
+            namespace: namespace.to_owned(),
+        };
+        match self.store_type(namespace)? {
+            StoreType::Doc => self.schemas.update_doc(namespace, |schema| {
+                if !schema.semantic_search_enabled && schema.embedding_fields.is_empty() {
+                    return Err(not_enabled());
+                }
+                schema.semantic_search_enabled = false;
+                schema.embedding_fields.clear();
+                Ok(())
+            }),
+            StoreType::Kv => self.schemas.update_kv(namespace, |schema| {
+                if !schema.semantic_search_enabled {
+                    return Err(not_enabled());
+                }
+                schema.semantic_search_enabled = false;
+                Ok(())
+            }),
+        }
     }
 
     /// Finish every vector-index drop a crash interrupted; returns how many.
@@ -263,9 +275,7 @@ impl DocStore {
             ctx.evict(namespace);
         }
 
-        if let Ok(schema) = self.load_schema(namespace)
-            && let Some(ns_id) = schema.ns_id
-        {
+        if let Some(ns_id) = self.schemas.get(namespace).and_then(|s| s.ns_id()) {
             let _ = std::fs::remove_file(vec_reindex_path(&self.db_path, ns_id));
         }
 

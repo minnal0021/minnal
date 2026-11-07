@@ -378,9 +378,18 @@ pub async fn attribute_reindex_doc(
 
 // ── Vector index operations ───────────────────────────────────────────────────
 
+/// Whether a vector reindex of store `ns` (document or KV) is still enqueueing.
+pub(crate) fn vector_reindex_running(state: &AppState, ns: &str) -> bool {
+    let check = match state.store.store_type(ns) {
+        Ok(minnal_db::StoreType::Kv) => state.store.check_kv_index_all_preconditions(ns),
+        _ => state.store.check_index_all_preconditions(ns),
+    };
+    matches!(check, Err(DocStoreError::VecReindexInProgress { .. }))
+}
+
 /// `DELETE /admin/indices/{ns}/vector/drop-all`
 ///
-/// Clears all vector index data for `{ns}`: embedding queue entries and the
+/// Clears all vector index data for `{ns}`, a document or KV store: embedding queue entries and the
 /// `{ns}_sparse_vector`, `{ns}_dense_vector`, and `{ns}_sparse_vector_meta` companion stores.
 /// The schema is updated synchronously (semantic search disabled) before the
 /// background cleanup runs, preventing new embeddings from being enqueued.
@@ -402,8 +411,8 @@ pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<Strin
         state.vec_index_cleanup.lock().remove(&ns);
     };
 
-    // Block if a reindex reindex is running.
-    if let Err(DocStoreError::VecReindexInProgress { .. }) = state.store.check_index_all_preconditions(&ns) {
+    // Block if a reindex is running.
+    if vector_reindex_running(&state, &ns) {
         release();
         return Err((
             StatusCode::CONFLICT,

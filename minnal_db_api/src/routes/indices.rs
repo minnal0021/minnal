@@ -126,8 +126,8 @@ pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<Str
         state.vec_index_cleanup.lock().remove(&ns);
     };
 
-    // Block if a reindex reindex is running.
-    if let Err(DocStoreError::VecReindexInProgress { .. }) = state.store.check_index_all_preconditions(&ns) {
+    // Block if a reindex is running.
+    if crate::routes::admin_indices::vector_reindex_running(&state, &ns) {
         release();
         return Err((
             StatusCode::CONFLICT,
