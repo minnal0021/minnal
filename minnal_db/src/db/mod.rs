@@ -1,6 +1,6 @@
 pub mod config;
 pub mod database;
-pub mod error;
+pub use crate::error;
 pub mod facade;
 pub mod indexing;
 pub mod kv_store;

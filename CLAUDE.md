@@ -61,7 +61,8 @@ When touching feature-gated code, verify each combo compiles: default / `--featu
 
 ```
 src/lib.rs             — public API surface (re-exports; feature-gated)
-src/db/                — stats, error, layout; namespace/ (registry, schema, create and remove), facade/, config/, database/ (the coordinator), kv_store/ (one namespace's LSM tree, value log and live field indexes), wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
+src/db/                — stats, layout; namespace/ (registry, schema, create and remove), facade/, config/, database/ (the coordinator), kv_store/ (one namespace's LSM tree, value log and live field indexes), wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
+src/error.rs           — `KVError`, the engine's error type
 src/storage/           — LSM tree, value log
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
 src/field_index/       — folded field-indexing module (always compiled)

@@ -84,6 +84,7 @@
 compile_error!("minnal_db supports only Linux and macOS (its storage engine uses Unix pread/pwrite)");
 
 pub mod db;
+pub mod error;
 mod storage;
 mod support;
 
@@ -172,7 +173,7 @@ pub use db::config::toml::MinnalTomlConfig;
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// The unified error type returned by all operations.
-pub use db::error::KVError;
+pub use error::KVError;
 
 /// The subsystem errors carried by [`KVError`]'s variants.
 ///
