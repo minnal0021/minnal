@@ -135,7 +135,7 @@ still required; see *Implementation order*.
   that is not true, which is worse than no signal at all.
 - **A rejected index update is a gap.** *(added 2026-08-01)* `update_indices_on_put`
   currently `warn!`s and continues when a field's `insert`/`update`/`set` returns
-  `Err` (`kv_store/mod.rs`), leaving the row silently absent with nothing recorded.
+  `Err` (`kv_store/writes.rs`), leaving the row silently absent with nothing recorded.
   Once the gap-record machinery exists this is the cheapest case in the whole FR
   to capture — it is a one-key row-scoped gap and the key is already in hand.
 
