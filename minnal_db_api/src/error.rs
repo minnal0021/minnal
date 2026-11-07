@@ -42,7 +42,9 @@ impl From<DocStoreError> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self.inner {
-            DocStoreError::NotFound { .. } | DocStoreError::IndexNotFound { .. } => StatusCode::NOT_FOUND,
+            DocStoreError::NotFound { .. } | DocStoreError::IndexNotFound { .. } | DocStoreError::Schema(SchemaError::NotFound { .. }) => {
+                StatusCode::NOT_FOUND
+            }
 
             DocStoreError::AlreadyExists { .. }
             | DocStoreError::IndexAlreadyExists { .. }
@@ -63,6 +65,8 @@ impl IntoResponse for AppError {
             | DocStoreError::Schema(SchemaError::Malformed(_))
             | DocStoreError::Schema(SchemaError::InvalidNamespace)
             | DocStoreError::Schema(SchemaError::StoreNameTooLong { .. })
+            | DocStoreError::Schema(SchemaError::DocNotObject)
+            | DocStoreError::Schema(SchemaError::FieldTypeMismatch { .. })
             | DocStoreError::Schema(SchemaError::ReservedNamespace { .. })
             | DocStoreError::Schema(SchemaError::TooManyIndices { .. })
             | DocStoreError::Schema(SchemaError::EmptyFieldName { .. })
@@ -107,6 +111,10 @@ impl IntoResponse for AppError {
             | DocStoreError::EmbeddingModelUnavailable { .. }
             | DocStoreError::Schema(SchemaError::VectorIndexNotConfigured { .. }) => StatusCode::UNPROCESSABLE_ENTITY,
 
+            // The embedding service is down or failing: the request can work
+            // once it is back, so 503 rather than 500.
+            DocStoreError::EmbeddingFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
+
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
@@ -121,7 +129,11 @@ impl IntoResponse for AppError {
                 error = %self.inner,
                 "internal server error"
             );
-            "internal server error".to_owned()
+            if matches!(self.inner, DocStoreError::EmbeddingFailed(_)) {
+                "the embedding service is unavailable; retry later".to_owned()
+            } else {
+                "internal server error".to_owned()
+            }
         } else if let DocStoreError::Db(minnal_db::KVError::Query(query_error)) = &self.inner {
             // Report the parser's own message without the "database error:"
             // framing `DocStoreError::Db` adds — the fault is in the caller's
@@ -223,5 +235,23 @@ mod tests {
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "internal server error");
+    }
+
+    /// A document that is not a JSON object, or a field of the wrong type, is the
+    /// caller's mistake: 400 with the reason, not 500.
+    #[tokio::test]
+    async fn a_document_the_schema_rejects_is_a_400() {
+        let (status, msg) = render(DocStoreError::Schema(SchemaError::DocNotObject)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("object"), "got: {msg}");
+    }
+
+    /// The embedding service being down is not a server fault the caller can do
+    /// nothing about: 503 says to retry, and the internal detail stays in the log.
+    #[tokio::test]
+    async fn a_failed_embedding_is_a_503_without_internal_detail() {
+        let (status, msg) = render(DocStoreError::EmbeddingFailed("HTTP 503 from http://10.0.0.1:8001/embedding".into())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!msg.contains("10.0.0.1"), "got: {msg}");
     }
 }

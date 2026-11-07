@@ -72,8 +72,11 @@ pub async fn progress_all(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// `GET /admin/indices/{ns}/progress` — index progress for one namespace.
-pub async fn progress_ns(State(state): State<AppState>, Path(ns): Path<String>) -> impl IntoResponse {
-    Json(build_progress_response(&state, Some(&ns)).await)
+pub async fn progress_ns(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, crate::error::AppError> {
+    // Unknown stores are a 404, as on every other per-store route, rather than an
+    // empty report that reads like a store with nothing running.
+    state.store.store_type(&ns).map_err(|e| crate::error::AppError::from(e).with_ns(&ns))?;
+    Ok(Json(build_progress_response(&state, Some(&ns)).await))
 }
 
 async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> IndexProgressResponse {
@@ -1531,6 +1534,9 @@ pub async fn rowmap_stats(
     let err = |status: StatusCode, msg: String| (status, Json(serde_json::json!({ "error": msg })));
     let stats = state.store.rowmap_stats(&ns).await.map_err(|e| match e {
         DocStoreError::NotFound { .. } | DocStoreError::MissingNsId { .. } => err(StatusCode::NOT_FOUND, format!("document store '{ns}' not found")),
+        // A KV store has no field indexes, so no row map: as for the doc-only
+        // row count, this store is the wrong kind.
+        DocStoreError::Schema(minnal_db::SchemaError::WrongStoreType { .. }) => err(StatusCode::CONFLICT, e.to_string()),
         other => err(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
     Ok(Json(match stats {
