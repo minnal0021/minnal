@@ -25,7 +25,6 @@ use crate::db::error::{KVError, Result};
 use crate::db::indexing::manager::FieldIndexHealth;
 use crate::db::kv_store::index_set::ExtractorFn;
 use crate::db::kv_store::{KVStore, KeyValue, ScanPage};
-use crate::db::namespace::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 use crate::db::stats::{GCStats, Stats};
 use crate::db::workers::index_checkpoint::{IndexCheckpointTarget, IndexCheckpointWorker};
 use crate::db::workers::lsm_compaction::{LsmCompactionTarget, LsmCompactionWorker};
@@ -33,6 +32,7 @@ use crate::db::workers::ttl::{TtlTarget, TtlWorker};
 use crate::db::workers::value_log_gc::{GCWorker, ValueLogGcTarget};
 use crate::db::workers::wal_gc::WalGcWorker;
 use crate::field_index::IndexValueType;
+use crate::field_index::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 
 // ── rkyv trait alias ───────────────────────────────────────────────────
 //

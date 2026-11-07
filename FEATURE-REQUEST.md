@@ -1497,7 +1497,7 @@ Goals:
 ### What the registry does today
 
 `{db_path}/namespace_registry` is a binary file: a header with a CRC checksum, then an
-rkyv payload (`RegistryData`, `namespace/registry.rs:347`). Every change rewrites it through
+rkyv payload (`RegistryData`, `namespace/registry.rs:240`). Every change rewrites it through
 `write_atomic_durable`. It has four jobs:
 
 | Job | Where it goes |

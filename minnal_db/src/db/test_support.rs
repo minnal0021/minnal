@@ -13,7 +13,7 @@ use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConf
 use crate::db::database::Database;
 use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
 use crate::db::kv_store::index_set::ExtractorFn;
-use crate::db::namespace::FieldId;
+use crate::field_index::FieldId;
 use crate::field_index::{IndexValue, IndexValueType};
 use crate::storage::lsm::tree::LSMConfig;
 

@@ -199,16 +199,16 @@ pub use crate::field_index::IndexBlobStats;
 pub use crate::field_index::IndexOverlayStats;
 
 /// Unique identifier for a registered field within a namespace.
-pub use db::namespace::FieldId;
+pub use crate::field_index::FieldId;
 /// Metadata for a registered field: id, name, and value type.
-pub use db::namespace::FieldMeta;
+pub use crate::field_index::FieldMeta;
 /// Outcome of a targeted single-field reindex ([`Db::reindex_field`]).
-pub use db::namespace::FieldReindexOutcome;
+pub use crate::field_index::FieldReindexOutcome;
 /// What a field-index repair did ([`Db::repair_field_index`]).
-pub use db::namespace::FieldRepairOutcome;
+pub use crate::field_index::FieldRepairOutcome;
 /// A field-index query result: matching keys plus whether the indices that
 /// produced them are known to be incomplete.
-pub use db::namespace::QueryOutcome;
+pub use crate::field_index::QueryOutcome;
 
 /// Health of one field index, including any outstanding gap
 /// ([`Db::index_health`]).

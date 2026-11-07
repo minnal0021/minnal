@@ -433,7 +433,7 @@ async fn rebuild_index_for_namespace(
             // on a store whose WAL had been reclaimed, 28 of 300; and writing back
             // the bytes read a page earlier overwrote any newer write to that key.
             let outcome = db.reindex_field(ns_id, field_id, key.clone()).await?;
-            if outcome == crate::db::namespace::FieldReindexOutcome::FieldNotActive {
+            if outcome == crate::field_index::FieldReindexOutcome::FieldNotActive {
                 return Err(crate::db::error::KVError::Serialization(format!(
                     "index build for namespace '{ns_name}' field_id={field_id}: the field was deactivated mid-build"
                 ))

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::db::database::Database;
 use crate::db::error::Result;
 use crate::db::kv_store::KVStore;
-use crate::db::namespace::{FieldId, QueryOutcome};
+use crate::field_index::{FieldId, QueryOutcome};
 
 impl Database {
     /// Evaluate a query string against the active field indices of a namespace

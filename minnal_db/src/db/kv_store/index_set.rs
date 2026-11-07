@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::db::namespace::FieldId;
+use crate::field_index::FieldId;
 use crate::field_index::{DynFieldIndex, IndexValue};
 
 // ── Extractor closure ──────────────────────────────────────────────────────

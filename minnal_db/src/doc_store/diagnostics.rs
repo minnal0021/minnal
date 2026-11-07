@@ -234,7 +234,7 @@ impl DocStore {
     ///
     /// Errors with [`DocStoreError::IndexNotFound`] when `field` is not an
     /// indexed field of the namespace.
-    pub async fn repair_index(&self, namespace: &str, field: &str) -> Result<crate::db::namespace::FieldRepairOutcome, DocStoreError> {
+    pub async fn repair_index(&self, namespace: &str, field: &str) -> Result<crate::field_index::FieldRepairOutcome, DocStoreError> {
         let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),

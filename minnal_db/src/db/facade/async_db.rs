@@ -788,7 +788,7 @@ impl AsyncDb {
     ///
     /// On a fresh open the list is populated from `config.json` automatically,
     /// so callers do not need to re-call `register_index_field` after a restart.
-    pub fn list_index_fields(&self, namespace_id: u32) -> Vec<crate::db::namespace::FieldMeta> {
+    pub fn list_index_fields(&self, namespace_id: u32) -> Vec<crate::field_index::FieldMeta> {
         self.inner.inner.list_index_fields(namespace_id)
     }
 

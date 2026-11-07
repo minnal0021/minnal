@@ -183,8 +183,8 @@ impl KVStore {
     /// `KeyNotFound`; the outcome describes what was found, not whether work was
     /// done. (Removing a row that is already absent is a no-op, so this is safe
     /// for a key that simply never existed.)
-    pub fn reindex_field(&self, field_id: crate::db::namespace::FieldId, key: &[u8]) -> Result<crate::db::namespace::FieldReindexOutcome> {
-        use crate::db::namespace::FieldReindexOutcome;
+    pub fn reindex_field(&self, field_id: crate::field_index::FieldId, key: &[u8]) -> Result<crate::field_index::FieldReindexOutcome> {
+        use crate::field_index::FieldReindexOutcome;
 
         let value = self.get(key)?;
 

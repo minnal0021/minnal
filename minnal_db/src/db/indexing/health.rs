@@ -14,8 +14,8 @@ use log::{error, info, warn};
 use crate::db::database::Database;
 // `run_index_checkpoint` is a trait method, so the trait must be in scope here.
 use crate::db::error::{KVError, Result};
-use crate::db::namespace::{FieldId, FieldMeta, FieldRepairOutcome};
 use crate::db::workers::index_checkpoint::IndexCheckpointTarget;
+use crate::field_index::{FieldId, FieldMeta, FieldRepairOutcome};
 
 impl Database {
     /// Repair a field index that has an outstanding gap, then clear the gap.
@@ -41,7 +41,7 @@ impl Database {
     /// there is nothing to repair.
     pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
         use crate::db::indexing::manager::RepairMode;
-        use crate::db::namespace::FieldReindexOutcome;
+        use crate::field_index::FieldReindexOutcome;
 
         let Some(gap) = self.index_manager.read_gap(namespace_id, field_id) else {
             return Ok(FieldRepairOutcome::NotDegraded);
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn test_reindex_field_repairs_and_reports_outcome() {
         use crate::db::kv_store::index_set::ExtractorFn;
-        use crate::db::namespace::FieldReindexOutcome;
+        use crate::field_index::FieldReindexOutcome;
         use crate::field_index::{IndexValue, IndexValueType};
         use std::sync::Arc;
 
