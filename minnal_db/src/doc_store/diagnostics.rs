@@ -1,13 +1,7 @@
-//! Engine diagnostics and per-document reindex hooks surfaced through `DocStore`.
+//! Store-level diagnostics and per-document reindex hooks.
 //!
-//! Most of what follows are one-line passthroughs to the underlying [`Db`]
-//! (`db_stats`, `wal_metadata`, `lsm_manifests`, `compact`, …). They exist so the
-//! API server holds a single handle rather than both a `DocStore` and a `Db`.
-//!
-//! That convenience is also the layering complaint in the 2026-07-25 review: the
-//! API server reaches the engine *through* the document layer instead of
-//! alongside it. Removing them is a breaking API change, so it is tracked
-//! separately — see `FEATURE-REQUEST.md` FR-004 — rather than done here.
+//! Everything here is scoped to one store. The engine's own statistics and
+//! maintenance are on [`DocStore::db`], which the API server calls directly.
 
 use super::*;
 
@@ -47,113 +41,6 @@ impl DocStore {
             dead_ids: ids_allocated.saturating_sub(live_docs),
             bytes_on_disk,
         }))
-    }
-
-    /// Returns engine-wide value-log statistics.
-    pub fn db_stats(&self) -> crate::Stats {
-        self.db.stats()
-    }
-
-    /// Returns a snapshot of engine-wide operational metrics (runtime counters).
-    pub fn ops_metrics(&self) -> crate::MetricsSnapshot {
-        self.db.ops_metrics()
-    }
-
-    /// Field-index write buffers: use, peak, limits and how often each fired.
-    pub fn index_overlay_stats(&self) -> crate::IndexOverlayStats {
-        self.db.index_overlay_stats()
-    }
-
-    /// Operational metrics for a single namespace, by name.
-    ///
-    /// The only failure mode is an unknown namespace, so any underlying error is
-    /// surfaced as [`DocStoreError::NotFound`] (→ 404).
-    pub fn ops_metrics_for(&self, namespace: &str) -> Result<crate::MetricsSnapshot, DocStoreError> {
-        self.db.ops_metrics_for(namespace).map_err(|_| DocStoreError::NotFound {
-            namespace: namespace.to_owned(),
-        })
-    }
-
-    /// Per-namespace operational metrics for every live namespace, keyed by name.
-    pub fn ops_metrics_by_namespace(&self) -> Vec<(String, crate::MetricsSnapshot)> {
-        self.db.ops_metrics_by_namespace()
-    }
-
-    /// Returns a snapshot of the shared WAL metadata.
-    pub fn wal_metadata(&self) -> crate::WalMetadata {
-        self.db.wal_metadata()
-    }
-
-    /// Returns the main WAL's state: bounds, cut, per-namespace progress and
-    /// each segment from the head to the tail.
-    pub fn wal_stats(&self) -> crate::WalStats {
-        self.db.wal_stats()
-    }
-
-    /// Returns the vector index WAL's state.
-    pub fn vector_index_wal_stats(&self) -> Result<crate::VectorIndexWalStats, crate::KVError> {
-        self.db.vector_index_wal_stats()
-    }
-
-    /// Returns a live LSM manifest snapshot for every active namespace.
-    pub fn lsm_manifests(&self) -> Vec<(String, crate::LsmManifest)> {
-        self.db.lsm_manifests()
-    }
-
-    /// Returns the in-memory (non-SSTable) LSM stats for every active namespace.
-    pub fn lsm_runtime_stats(&self) -> Vec<(String, crate::LSMStats)> {
-        self.db.lsm_runtime_stats()
-    }
-
-    /// Returns per-bucket value-log metadata for every active namespace.
-    pub fn value_log_shard_stats(&self) -> Vec<(String, Vec<(u32, crate::ValueLogMetadata)>)> {
-        self.db.value_log_shard_stats()
-    }
-
-    /// Physical (on-disk) vs logical value-log footprint per shard, per namespace.
-    pub fn value_log_physical_stats(&self) -> Vec<(String, Vec<crate::ShardPhysicalStats>)> {
-        self.db.value_log_physical_stats()
-    }
-
-    /// Per-page value-log garbage breakdown for one namespace (by name).
-    pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::SegmentStats>)>, DocStoreError> {
-        self.db.value_log_segment_stats(namespace).map_err(DocStoreError::from)
-    }
-
-    /// Run value-log GC on every namespace and return per-namespace results.
-    pub async fn garbage_collect_all(&self) -> Vec<(String, crate::GCStats)> {
-        self.db.garbage_collect_all().await
-    }
-
-    /// Run WAL garbage collection (reclaims WAL segments wholly below the cut).
-    ///
-    /// Returns `(bytes_reclaimed, pending_bytes)`: the bytes of segment files
-    /// deleted by this pass, and the bytes of WAL recovery would replay
-    /// afterwards (from the cut to the tail). If another pass is already
-    /// running, nothing is reclaimed and the result is `(0, pending_bytes)`.
-    pub async fn garbage_collect_wal(&self) -> Result<(u64, u64), crate::KVError> {
-        self.db.garbage_collect_wal().await
-    }
-
-    /// Trigger LSM compaction across all namespaces.
-    pub async fn compact(&self) -> Result<(), crate::KVError> {
-        self.db.compact().await
-    }
-
-    /// Force an index checkpoint across all namespaces: flush each namespace's
-    /// dense row map and all active field indexes to disk, compacting any
-    /// field-index bitmap store over the configured waste threshold. Returns the
-    /// number of active field indexes checkpointed.
-    ///
-    /// This is the same pass the periodic index-checkpoint worker runs and that
-    /// shutdown runs once on close — exposed for on-demand flush + compaction.
-    pub async fn checkpoint_index(&self) -> Result<usize, crate::KVError> {
-        self.db.checkpoint_index().await
-    }
-
-    /// Returns all indexed fields registered for a namespace.
-    pub fn list_index_fields(&self, namespace_id: u32) -> Vec<crate::FieldMeta> {
-        self.db.list_index_fields(namespace_id)
     }
 
     /// Return the number of distinct indexed values for a field, or `None` if the
@@ -313,23 +200,6 @@ impl DocStore {
             notify.notify_one();
         }
         Ok(VectorReindexOutcome::Enqueued)
-    }
-
-    /// The configured field-index compaction threshold as a fraction (`0.0..1.0`).
-    pub fn index_blob_waste_threshold(&self) -> f64 {
-        self.db.index_blob_waste_threshold()
-    }
-
-    /// Returns the name and numeric ID of every KV namespace currently open in
-    /// the underlying database.
-    pub fn list_kv_namespaces(&self) -> Vec<(String, u32)> {
-        self.db.list_namespaces()
-    }
-
-    /// Return `(ttl_secs, max_deletes_per_run)` for a namespace, or `None` if
-    /// no TTL is registered.
-    pub fn ttl_config_for_ns(&self, ns_id: u32) -> Option<(u64, usize)> {
-        self.db.ttl_config_for_ns(ns_id)
     }
 }
 

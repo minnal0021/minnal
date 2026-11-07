@@ -306,6 +306,13 @@ impl DocStore {
         self
     }
 
+    /// The engine under this store, for what is not scoped to one store: statistics
+    /// (WAL, LSM, value log, operational metrics), maintenance (GC, compaction, index
+    /// checkpoints) and raw namespaces.
+    pub fn db(&self) -> Arc<AsyncDb> {
+        Arc::clone(&self.db)
+    }
+
     /// This store's side of the vector workers' [`WorkerHost`](crate::semantic_search::workers::WorkerHost).
     #[cfg(feature = "semantic-search")]
     fn worker_host(&self) -> Arc<self::vector::worker_host::DocStoreWorkerHost> {

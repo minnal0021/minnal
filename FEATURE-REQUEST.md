@@ -14,7 +14,7 @@ re-check them before starting work.
 | [FR-001](#fr-001--prevent-capture-surface-and-remediate-field-index-replay-gaps) | Prevent, capture, surface and remediate field-index replay gaps | `minnal_db`, `minnal_db_api` | High | ✅ **Done — 2026-08-01** |
 | [FR-002](#fr-002--api-authentication-tls-and-a-safe-bind-default) | API authentication, TLS, and a safe bind default | `minnal_db_api` | **Critical** | Proposed |
 | [FR-003](#fr-003--surface-write-apply-failures-to-the-caller-of-put) | Surface write-apply failures to the caller of `put` | `minnal_db` | Medium | Proposed |
-| [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | Proposed |
+| [FR-004](#fr-004--let-the-api-server-talk-to-the-engine-directly) | Let the API server talk to the engine directly | `minnal_db_api`, `minnal_db` | Low | ✅ **Done — 2026-11-07** |
 | [FR-005](#fr-005--container-granular-field-index-files) | Container-granular field-index files | `minnal_db` (`index`) | Low | ✅ **Done — 2026-10-09** |
 | [FR-006](#fr-006--reindex-all-compacts-the-row-map) | `reindex-all` compacts the row map | `minnal_db`, `minnal_db_api` | Low | ✅ **Done — 2026-10-09** |
 | [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
@@ -782,6 +782,12 @@ documented.
 **Severity:** Low — layering; no defect, no user-visible symptom
 **Source:** engine correctness review 2026-07-25, item 5 (the half the
 decomposition could not reach)
+**✅ Implemented:** 2026-11-07, as a breaking change to `DocStore`'s public methods.
+`DocStore::db()` returns the engine handle, `AppState` holds it, and the 21 passthroughs
+are gone; `doc_store/diagnostics.rs` keeps the operations scoped to one store. The REST
+API is unchanged: every `/admin/storage` route `minnal_ui` calls returned the same status
+and response shape (and the same error bodies) before and after. The repo has no
+changelog to record it in, so the commit message carries the breaking change.
 **Reaffirmed:** 2026-08-01 tech-debt review — the priority is right, but record
 *why*. The cost is not confusion today; it is that the document layer cannot be
 changed or replaced without dragging along a pile of forwarders that have

@@ -1460,7 +1460,7 @@ mod tests {
                 }
                 store.put("events", DocId::Uuid(id), serde_json::json!({"active": active})).await.unwrap();
             }
-            store.checkpoint_index().await.unwrap();
+            store.db.checkpoint_index().await.unwrap();
             let stats = store.field_index_blob_stats("events", "active").unwrap();
             assert!(
                 // Dense: two array containers (2 bytes per row) and two

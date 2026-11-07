@@ -151,7 +151,7 @@ struct Counters {
 
 impl Counters {
     async fn take(ctx: &Ctx) -> Self {
-        let m: MetricsSnapshot = ctx.target.store.ops_metrics();
+        let m: MetricsSnapshot = ctx.target.store.db().ops_metrics();
         let (mut splits, mut merges, mut reassigns, mut postings) = (0, 0, 0, 0);
         if let Ok((_, h, _)) = ctx.target.store.vector_partition_health(&ctx.target.ns, false).await {
             (splits, merges, reassigns, postings) = (h.maintenance.splits, h.maintenance.merges, h.maintenance.reassigns, h.postings as u64);
@@ -468,7 +468,7 @@ fn spawn_monitor(ctx: &Ctx, every: Duration, stop: Arc<AtomicBool>) -> tokio::ta
         let t0 = Instant::now();
         let mut out = Vec::new();
         while !stop.load(Ordering::SeqCst) {
-            let m = store.ops_metrics();
+            let m = store.db().ops_metrics();
             out.push(Sample {
                 t_s: t0.elapsed().as_secs_f64(),
                 queue: queue_depth(&store).await,

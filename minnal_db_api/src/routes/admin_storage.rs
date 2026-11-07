@@ -78,7 +78,7 @@ pub struct StatsResponse {
 /// engine-wide, which made a busy database look empty.)
 pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     let disk_bytes: u64 = state
-        .store
+        .db
         .value_log_physical_stats()
         .into_iter()
         .flat_map(|(_ns, shards)| shards.into_iter().map(|s| s.physical_bytes))
@@ -95,7 +95,7 @@ pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
         namespaces: 0,
     };
 
-    let per_ns = state.store.value_log_shard_stats();
+    let per_ns = state.db.value_log_shard_stats();
     out.namespaces = per_ns.len();
     for (_ns, buckets) in per_ns {
         for (_bucket, m) in buckets {
@@ -325,18 +325,22 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
 /// sum of every namespace's counters plus the global WAL-GC/retired totals.
 /// Includes derived read-path ratios (`read_hit_ratio`, `fast_path_hit_ratio`).
 pub async fn ops_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let m = state.store.ops_metrics();
+    let m = state.db.ops_metrics();
     Json(OpsMetricsResponse {
         uptime_s: state.started_at.elapsed().as_secs(),
         body: ops_metrics_body(&m),
-        index_overlay: Some(state.store.index_overlay_stats()),
+        index_overlay: Some(state.db.index_overlay_stats()),
     })
 }
 
 /// `GET /admin/storage/stores/{ns}/ops-metrics` — operational counters for one
 /// namespace. The WAL-GC counters are engine-global and read `0` here.
 pub async fn ops_metrics_ns(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
-    let m = state.store.ops_metrics_for(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
+    // The only failure is an unknown namespace.
+    let m = state
+        .db
+        .ops_metrics_for(&ns)
+        .map_err(|_| AppError::from(minnal_db::DocStoreError::NotFound { namespace: ns.clone() }).with_ns(&ns))?;
     Ok(Json(OpsMetricsResponse {
         uptime_s: state.started_at.elapsed().as_secs(),
         body: ops_metrics_body(&m),
@@ -348,7 +352,7 @@ pub async fn ops_metrics_ns(State(state): State<AppState>, Path(ns): Path<String
 /// counters for every live namespace (engine-global WAL-GC counters excluded).
 pub async fn ops_metrics_by_namespace(State(state): State<AppState>) -> impl IntoResponse {
     let per_ns: Vec<NamespaceOpsMetrics> = state
-        .store
+        .db
         .ops_metrics_by_namespace()
         .into_iter()
         .map(|(namespace, m)| NamespaceOpsMetrics {
@@ -365,7 +369,7 @@ pub async fn ops_metrics_by_namespace(State(state): State<AppState>) -> impl Int
 /// namespaces ahead of it and holding it, and each segment from the head to the
 /// tail (retired or live, and the bytes a restart would replay).
 pub async fn wal(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.store.wal_stats())
+    Json(state.db.wal_stats())
 }
 
 /// `GET /admin/storage/vector-index-wal` — the vector index WAL's state, read
@@ -374,7 +378,7 @@ pub async fn wal(State(state): State<AppState>) -> impl IntoResponse {
 /// would replay, and the namespaces holding the retired cut back.
 pub async fn vector_index_wal(State(state): State<AppState>) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     state
-        .store
+        .db
         .vector_index_wal_stats()
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))))
@@ -491,9 +495,9 @@ pub fn build_lsm_namespace_info(ns: String, m: LsmManifest) -> LsmNamespaceInfo 
 pub async fn lsm(State(state): State<AppState>) -> impl IntoResponse {
     // In-memory stats (active + sealed memtables) keyed by namespace, to enrich
     // the on-disk manifest view.
-    let runtime: HashMap<String, minnal_db::LSMStats> = state.store.lsm_runtime_stats().into_iter().collect();
+    let runtime: HashMap<String, minnal_db::LSMStats> = state.db.lsm_runtime_stats().into_iter().collect();
     let result: Vec<LsmNamespaceInfo> = state
-        .store
+        .db
         .lsm_manifests()
         .into_iter()
         .map(|(ns, m)| {
@@ -568,7 +572,7 @@ pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
                 // dropped fields (for field_id reuse), which must not show here.
                 let active: std::collections::HashSet<&str> = schema.indices.iter().map(|s| s.field.as_str()).collect();
                 state
-                    .store
+                    .db
                     .list_index_fields(id)
                     .into_iter()
                     .filter(|m| active.contains(m.field_name.as_str()))
@@ -729,14 +733,14 @@ pub async fn value_log(State(state): State<AppState>) -> impl IntoResponse {
     // On-disk footprint per (namespace, bucket) — cheap stat, merged
     // into the logical metadata view so callers see the true on-disk usage.
     let physical: HashMap<String, HashMap<u32, minnal_db::ShardPhysicalStats>> = state
-        .store
+        .db
         .value_log_physical_stats()
         .into_iter()
         .map(|(ns, shards)| (ns, shards.into_iter().map(|s| (s.bucket, s)).collect()))
         .collect();
 
     let result: Vec<ValueLogNamespaceInfo> = state
-        .store
+        .db
         .value_log_shard_stats()
         .into_iter()
         .map(|(ns, buckets)| {
@@ -782,7 +786,7 @@ pub async fn value_log_segments(
     State(state): State<AppState>,
     Path(ns): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    match state.store.value_log_segment_stats(&ns) {
+    match state.db.value_log_segment_stats(&ns).map_err(minnal_db::DocStoreError::from) {
         Ok(per_bucket) => {
             let shards = per_bucket
                 .into_iter()
@@ -812,8 +816,8 @@ pub async fn physical_namespaces(State(state): State<AppState>) -> impl IntoResp
     let kv_names: std::collections::HashSet<String> = state.kv_schemas().keys().cloned().collect();
 
     let mut result: Vec<KvNamespaceInfo> = state
-        .store
-        .list_kv_namespaces()
+        .db
+        .list_namespaces()
         .into_iter()
         .map(|(name, id)| {
             let role = classify_namespace_role(&name, &doc_names, &kv_names);
@@ -863,7 +867,7 @@ pub struct GCResponse {
 
 pub async fn trigger_gc(State(state): State<AppState>) -> impl IntoResponse {
     info!("admin: value-log GC triggered manually");
-    let results = state.store.garbage_collect_all().await;
+    let results = state.db.garbage_collect_all().await;
     let count = results.len();
     let total_reclaimed: u64 = results.iter().map(|(_, s)| s.bytes_reclaimed).sum();
     info!(
@@ -899,7 +903,7 @@ pub struct WalGCResponse {
 
 pub async fn trigger_gc_wal(State(state): State<AppState>) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     info!("admin: WAL GC triggered manually");
-    match state.store.garbage_collect_wal().await {
+    match state.db.garbage_collect_wal().await {
         Ok((bytes_reclaimed, pending_bytes)) => {
             info!(bytes_reclaimed, pending_bytes, "admin: WAL GC complete");
             Ok(Json(WalGCResponse {
@@ -913,7 +917,7 @@ pub async fn trigger_gc_wal(State(state): State<AppState>) -> Result<impl IntoRe
 
 pub async fn trigger_compact(State(state): State<AppState>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     info!("LSM compaction triggered manually");
-    match state.store.compact().await {
+    match state.db.compact().await {
         Ok(()) => {
             info!("LSM compaction complete");
             Ok(StatusCode::NO_CONTENT)
@@ -952,7 +956,7 @@ pub async fn trigger_index_checkpoint(State(state): State<AppState>) -> Result<S
     }
 
     info!("index checkpoint accepted — running in background");
-    let store = std::sync::Arc::clone(&state.store);
+    let db = std::sync::Arc::clone(&state.db);
     let running = std::sync::Arc::clone(&state.index_checkpoint_running);
     tokio::spawn(async move {
         // Clear the running flag however the task exits (including a panic), so a
@@ -965,7 +969,7 @@ pub async fn trigger_index_checkpoint(State(state): State<AppState>) -> Result<S
         }
         let _reset = ResetOnDrop(running);
 
-        match store.checkpoint_index().await {
+        match db.checkpoint_index().await {
             Ok(fields_checkpointed) => info!(fields_checkpointed, "index checkpoint complete"),
             Err(e) => error!(error = %e, "index checkpoint failed"),
         }
@@ -1013,7 +1017,7 @@ pub struct IndexWasteResponse {
 /// field-index bitmap and keymap stores, alongside the compaction threshold.
 /// Use it to decide whether to force a `POST /admin/storage/index-checkpoint`.
 pub async fn index_waste(State(state): State<AppState>) -> impl IntoResponse {
-    let threshold = state.store.index_blob_waste_threshold();
+    let threshold = state.db.index_blob_waste_threshold();
     let schemas = state.doc_schemas();
     let mut namespaces: Vec<NamespaceWasteInfo> = schemas
         .iter()
@@ -1024,7 +1028,7 @@ pub async fn index_waste(State(state): State<AppState>) -> impl IntoResponse {
             // indexes are still active — otherwise a dropped index lingers here.
             let active: std::collections::HashSet<&str> = schema.indices.iter().map(|s| s.field.as_str()).collect();
             let fields = state
-                .store
+                .db
                 .list_index_fields(ns_id)
                 .into_iter()
                 .filter(|m| active.contains(m.field_name.as_str()))
@@ -1085,14 +1089,14 @@ fn companion_purpose(suffix: &str) -> String {
 }
 
 pub fn build_namespace_meta(
-    store: &minnal_db::DocStore,
+    db: &minnal_db::AsyncDb,
     ns: &str,
     doc_names: &std::collections::HashSet<String>,
     kv_names: &std::collections::HashSet<String>,
 ) -> (Option<LsmNamespaceInfo>, Option<ValueLogNamespaceInfo>, Vec<AssociatedKvStore>) {
-    let kv_set: std::collections::HashSet<String> = store.list_kv_namespaces().into_iter().map(|(n, _)| n).collect();
-    let mut lsm_map: HashMap<String, minnal_db::LsmManifest> = store.lsm_manifests().into_iter().collect();
-    let mut vlog_map: HashMap<String, Vec<(u32, ValueLogMetadata)>> = store.value_log_shard_stats().into_iter().collect();
+    let kv_set: std::collections::HashSet<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
+    let mut lsm_map: HashMap<String, minnal_db::LsmManifest> = db.lsm_manifests().into_iter().collect();
+    let mut vlog_map: HashMap<String, Vec<(u32, ValueLogMetadata)>> = db.value_log_shard_stats().into_iter().collect();
 
     let lsm_info = lsm_map.remove(ns).map(|m| build_lsm_namespace_info(ns.to_owned(), m));
     let vlog_info = vlog_map.remove(ns).map(|b| build_vlog_namespace_info(ns.to_owned(), b));
@@ -1162,7 +1166,7 @@ pub async fn store_kv_meta(
                 let kv_names: std::collections::HashSet<String> = state.kv_schemas().keys().cloned().collect();
                 (s.ns_id.unwrap(), s.semantic_search_enabled, doc_names, kv_names)
             };
-            let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
+            let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.db, &ns, &doc_names, &kv_names);
             Ok(Json(serde_json::json!(DocStoreKvMeta {
                 namespace: ns,
                 ns_id,
@@ -1187,7 +1191,7 @@ pub async fn store_kv_meta(
                     kv_names,
                 )
             };
-            let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.store, &ns, &doc_names, &kv_names);
+            let (lsm_info, vlog_info, associated_stores) = build_namespace_meta(&state.db, &ns, &doc_names, &kv_names);
             Ok(Json(serde_json::json!(KvStoreKvMeta {
                 namespace: ns,
                 ns_id,
@@ -1284,7 +1288,7 @@ pub struct SystemStoreMeta {
 
 pub async fn system_stores(State(state): State<AppState>) -> impl IntoResponse {
     let lsm_counts: HashMap<String, u64> = state
-        .store
+        .db
         .lsm_manifests()
         .into_iter()
         .map(|(ns, m)| {
@@ -1300,12 +1304,12 @@ pub async fn system_stores(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
 
     let kv_stores: Vec<SystemKvStoreInfo> = state
-        .store
-        .list_kv_namespaces()
+        .db
+        .list_namespaces()
         .into_iter()
         .filter(|(name, _)| is_system_ns(name))
         .map(|(name, ns_id)| {
-            let ttl_cfg = state.store.ttl_config_for_ns(ns_id);
+            let ttl_cfg = state.db.ttl_config_for_ns(ns_id);
             let ttl_secs = ttl_cfg.map(|(ttl, _)| ttl);
             let ttl_max_deletes_per_run = ttl_cfg.map(|(_, max_del)| max_del as u64);
             let lsm_entry_count = lsm_counts.get(&name).copied().unwrap_or(0);
@@ -1348,7 +1352,7 @@ pub async fn system_store_meta(
         ));
     }
 
-    let kv_map: HashMap<String, u32> = state.store.list_kv_namespaces().into_iter().collect();
+    let kv_map: HashMap<String, u32> = state.db.list_namespaces().into_iter().collect();
 
     let ns_id = match kv_map.get(&ns) {
         Some(&id) => id,
@@ -1363,20 +1367,20 @@ pub async fn system_store_meta(
     };
 
     let lsm_info = state
-        .store
+        .db
         .lsm_manifests()
         .into_iter()
         .find(|(name, _)| name == &ns)
         .map(|(name, m)| build_lsm_namespace_info(name, m));
 
     let vlog_info = state
-        .store
+        .db
         .value_log_shard_stats()
         .into_iter()
         .find(|(name, _)| name == &ns)
         .map(|(name, buckets)| build_vlog_namespace_info(name, buckets));
 
-    let ttl_cfg = state.store.ttl_config_for_ns(ns_id);
+    let ttl_cfg = state.db.ttl_config_for_ns(ns_id);
     let ttl_secs = ttl_cfg.map(|(ttl, _)| ttl);
     let ttl_max_deletes_per_run = ttl_cfg.map(|(_, max_del)| max_del as u64);
     Ok(Json(SystemStoreMeta {

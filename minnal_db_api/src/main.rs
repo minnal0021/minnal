@@ -14,7 +14,7 @@ use std::{
 use config::DocStoreApiConfig;
 use minnal_db::doc_store::StoredSchema;
 use minnal_db::semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
-use minnal_db::{DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
+use minnal_db::{AsyncDb, DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
 use tracing::{error, info};
 
 /// jemalloc, not the system allocator: under concurrent load glibc malloc keeps
@@ -28,6 +28,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub struct AppState {
     /// The underlying document store.
     pub store: Arc<DocStore>,
+    /// The engine under it (the store's own handle), for the admin routes on the
+    /// engine's statistics and maintenance.
+    pub db: Arc<AsyncDb>,
     /// Registry of active background index-build tasks.
     ///
     /// Used to:
@@ -199,6 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state = AppState {
+        db: store.db(),
         store: Arc::new(store),
         index_manager: Arc::clone(&index_manager),
         embedding_service,

@@ -308,7 +308,7 @@ pub async fn field_blob_stats(
 ) -> Result<Json<FieldBlobStatsResponse>, (StatusCode, Json<serde_json::Value>)> {
     match state.store.field_index_blob_stats(&ns, &field) {
         Some(stats) => {
-            let waste_threshold = state.store.index_blob_waste_threshold();
+            let waste_threshold = state.db.index_blob_waste_threshold();
             let over_threshold = stats.bitmap_waste_ratio >= waste_threshold || stats.keymap_waste_ratio >= waste_threshold;
             Ok(Json(FieldBlobStatsResponse {
                 namespace: ns,
