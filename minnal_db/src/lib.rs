@@ -95,6 +95,11 @@ pub mod doc_store;
 pub mod field_index;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;
+// Sits outside both optional layers: a store's schema carries these settings
+// with or without semantic search compiled, and `semantic_search` runs on them
+// without depending on `doc_store`.
+#[cfg(feature = "doc-store")]
+pub mod vector_settings;
 
 // Compiles every Rust example in QUICKSTART.md (`no_run`: they name fixed paths and
 // some need the embedding service). The examples use both optional layers, so

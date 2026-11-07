@@ -92,7 +92,7 @@ impl KvStoreSchema {
     /// The namespace's resolved vector-index settings (the defaults when the
     /// schema has none yet).
     pub fn vector_settings(&self) -> Result<VectorIndexSettings, SchemaError> {
-        vector_settings::resolve_or_default(self.vector_index.as_ref())
+        Ok(vector_settings::resolve_or_default(self.vector_index.as_ref())?)
     }
 
     /// Fill `vector_index` with its defaults when semantic search is on (or the

@@ -33,7 +33,28 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::doc_store::error::SchemaError;
+/// A vector-index setting that was rejected. The document store reports these
+/// as the matching [`SchemaError`](crate::doc_store::error::SchemaError) variants.
+#[derive(Debug, thiserror::Error)]
+pub enum VectorSettingsError {
+    /// A `vector_index` setting is out of range or malformed.
+    #[error("vector_index.{field} {reason}")]
+    Invalid { field: &'static str, reason: String },
+
+    /// A request tried to change a vector-index setting that is fixed for the
+    /// namespace's life (model, dimension, chunking) or read-only (code widths).
+    #[error("vector_index.{field} is {current} for this namespace and cannot be changed (requested {requested})")]
+    Fixed {
+        field: &'static str,
+        current: String,
+        requested: String,
+    },
+
+    /// The namespace has never had semantic search enabled, so it has no
+    /// vector-index settings to update.
+    #[error("namespace '{namespace}' has no vector index settings; enable semantic search first")]
+    NotConfigured { namespace: String },
+}
 
 /// Model used when a namespace does not name one.
 pub const DEFAULT_EMBEDDING_MODEL: &str = "gemma";
@@ -331,7 +352,7 @@ impl MaintenanceSettings {
     }
 
     /// Check every range.
-    pub fn validate(&self) -> Result<(), SchemaError> {
+    pub fn validate(&self) -> Result<(), VectorSettingsError> {
         check_range(
             "maintenance.target_posting_size",
             self.target_posting_size,
@@ -359,7 +380,7 @@ impl MaintenanceSettings {
 
 impl MaintenanceSpec {
     /// Apply these values over `base` (unset fields keep `base`'s) and validate.
-    pub fn apply(&self, base: MaintenanceSettings) -> Result<MaintenanceSettings, SchemaError> {
+    pub fn apply(&self, base: MaintenanceSettings) -> Result<MaintenanceSettings, VectorSettingsError> {
         let m = MaintenanceSettings {
             target_posting_size: self.target_posting_size.unwrap_or(base.target_posting_size),
             reassign_range: self.reassign_range.unwrap_or(base.reassign_range),
@@ -394,7 +415,7 @@ pub struct IndexDefaults {
 
 impl IndexDefaults {
     /// Check both halves.
-    pub fn validate(&self) -> Result<(), SchemaError> {
+    pub fn validate(&self) -> Result<(), VectorSettingsError> {
         self.search.validate()?;
         self.maintenance.validate()
     }
@@ -424,14 +445,14 @@ impl Default for SearchSettings {
     }
 }
 
-fn invalid(field: &'static str, reason: impl Into<String>) -> SchemaError {
-    SchemaError::InvalidVectorSetting {
+fn invalid(field: &'static str, reason: impl Into<String>) -> VectorSettingsError {
+    VectorSettingsError::Invalid {
         field,
         reason: reason.into(),
     }
 }
 
-fn check_range(field: &'static str, value: u32, min: u32, max: u32) -> Result<(), SchemaError> {
+fn check_range(field: &'static str, value: u32, min: u32, max: u32) -> Result<(), VectorSettingsError> {
     if value < min || value > max {
         return Err(invalid(field, format!("must be between {min} and {max}, got {value}")));
     }
@@ -439,7 +460,7 @@ fn check_range(field: &'static str, value: u32, min: u32, max: u32) -> Result<()
 }
 
 /// Lower-case and check a model name.
-fn normalise_model(model: &str) -> Result<String, SchemaError> {
+fn normalise_model(model: &str) -> Result<String, VectorSettingsError> {
     let m = model.trim().to_lowercase();
     if m.is_empty() {
         return Err(invalid("embedding_model", "must not be empty"));
@@ -462,7 +483,7 @@ fn normalise_model(model: &str) -> Result<String, SchemaError> {
     Ok(m)
 }
 
-fn check_dim(dim: u32) -> Result<(), SchemaError> {
+fn check_dim(dim: u32) -> Result<(), VectorSettingsError> {
     check_range("embedding_dim", dim, MIN_EMBEDDING_DIM, MAX_EMBEDDING_DIM)?;
     if !dim.is_multiple_of(2) {
         return Err(invalid("embedding_dim", format!("must be even (the rotation needs it), got {dim}")));
@@ -470,7 +491,7 @@ fn check_dim(dim: u32) -> Result<(), SchemaError> {
     Ok(())
 }
 
-fn check_chunking(window: u32, sliding: u32) -> Result<(), SchemaError> {
+fn check_chunking(window: u32, sliding: u32) -> Result<(), VectorSettingsError> {
     check_range("chunking.window_size", window, 1, MAX_WINDOW_SIZE)?;
     if sliding < 1 || sliding > window {
         return Err(invalid(
@@ -482,7 +503,7 @@ fn check_chunking(window: u32, sliding: u32) -> Result<(), SchemaError> {
 }
 
 /// Parse a `"0x…"` hex seed (1 to 16 hex digits).
-fn parse_seed(s: &str) -> Result<u64, SchemaError> {
+fn parse_seed(s: &str) -> Result<u64, VectorSettingsError> {
     let digits = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).ok_or_else(|| {
         invalid(
             "quantisation.rotation_seed",
@@ -500,7 +521,7 @@ pub fn format_seed(seed: u64) -> String {
     format!("0x{seed:016x}")
 }
 
-fn check_bits(pass1: u8, pass2: u8) -> Result<(), SchemaError> {
+fn check_bits(pass1: u8, pass2: u8) -> Result<(), VectorSettingsError> {
     if !PASS1_WIDTHS.contains(&pass1) {
         return Err(invalid(
             "quantisation.pass1_bits",
@@ -518,7 +539,7 @@ fn check_bits(pass1: u8, pass2: u8) -> Result<(), SchemaError> {
 
 impl SearchSettings {
     /// Check every range, `min_probes ≤ max_probes` and `top_k ≤ first_pass_top_k`.
-    pub fn validate(&self) -> Result<(), SchemaError> {
+    pub fn validate(&self) -> Result<(), VectorSettingsError> {
         // max first: an omitted min_probes is derived from it (see `resolve`).
         check_range("search.max_probes", self.max_probes, 1, MAX_PROBES)?;
         check_range("search.min_probes", self.min_probes, 1, MAX_PROBES)?;
@@ -546,7 +567,7 @@ impl SearchSettings {
 impl SearchSpec {
     /// Apply these values over `base` (unset fields keep `base`'s) and validate
     /// the result. Used for `UpdateVectorSearch` and for per-request overrides.
-    pub fn apply(&self, base: SearchSettings) -> Result<SearchSettings, SchemaError> {
+    pub fn apply(&self, base: SearchSettings) -> Result<SearchSettings, VectorSettingsError> {
         let s = SearchSettings {
             min_probes: self.min_probes.unwrap_or(base.min_probes),
             max_probes: self.max_probes.unwrap_or(base.max_probes),
@@ -565,13 +586,13 @@ impl SearchSpec {
 
 impl VectorIndexSpec {
     /// Fill omitted fields with the built-in defaults and validate.
-    pub fn resolve(&self) -> Result<VectorIndexSettings, SchemaError> {
+    pub fn resolve(&self) -> Result<VectorIndexSettings, VectorSettingsError> {
         self.resolve_with(&IndexDefaults::default())
     }
 
     /// Fill omitted fields with `defaults` (and the built-in model, dimension,
     /// chunking and code widths) and validate.
-    pub fn resolve_with(&self, defaults: &IndexDefaults) -> Result<VectorIndexSettings, SchemaError> {
+    pub fn resolve_with(&self, defaults: &IndexDefaults) -> Result<VectorIndexSettings, VectorSettingsError> {
         let d = &defaults.search;
         let chunking = self.chunking.unwrap_or_default();
         let quantisation = self.quantisation.clone().unwrap_or_default();
@@ -616,10 +637,10 @@ impl VectorIndexSpec {
     /// Combine this request with settings a namespace already has: a fixed or
     /// read-only field may be omitted or repeated but not changed; search
     /// fields may change. Returns the resulting settings.
-    pub fn merge_onto(&self, current: &VectorIndexSettings) -> Result<VectorIndexSettings, SchemaError> {
-        fn fixed<T: PartialEq + std::fmt::Display>(field: &'static str, requested: Option<T>, current: T) -> Result<(), SchemaError> {
+    pub fn merge_onto(&self, current: &VectorIndexSettings) -> Result<VectorIndexSettings, VectorSettingsError> {
+        fn fixed<T: PartialEq + std::fmt::Display>(field: &'static str, requested: Option<T>, current: T) -> Result<(), VectorSettingsError> {
             match requested {
-                Some(r) if r != current => Err(SchemaError::VectorSettingFixed {
+                Some(r) if r != current => Err(VectorSettingsError::Fixed {
                     field,
                     current: current.to_string(),
                     requested: r.to_string(),
@@ -645,7 +666,7 @@ impl VectorIndexSpec {
         if let Some(seed) = &quantisation.rotation_seed {
             let seed = parse_seed(seed)?;
             if seed != current.rotation_seed {
-                return Err(SchemaError::VectorSettingFixed {
+                return Err(VectorSettingsError::Fixed {
                     field: "quantisation.rotation_seed",
                     current: format_seed(current.rotation_seed),
                     requested: format_seed(seed),
@@ -662,7 +683,7 @@ impl VectorIndexSpec {
 
 impl VectorIndexSettings {
     /// Check every field and the cross-field rules.
-    pub fn validate(&self) -> Result<(), SchemaError> {
+    pub fn validate(&self) -> Result<(), VectorSettingsError> {
         normalise_model(&self.embedding_model)?;
         check_dim(self.embedding_dim)?;
         check_chunking(self.window_size, self.sliding_size)?;
@@ -714,7 +735,7 @@ impl VectorIndexSettings {
 
 /// The settings a schema's `vector_index` resolves to, or the defaults when it
 /// has none.
-pub(crate) fn resolve_or_default(spec: Option<&VectorIndexSpec>) -> Result<VectorIndexSettings, SchemaError> {
+pub(crate) fn resolve_or_default(spec: Option<&VectorIndexSpec>) -> Result<VectorIndexSettings, VectorSettingsError> {
     spec.cloned().unwrap_or_default().resolve()
 }
 
@@ -725,7 +746,7 @@ pub(crate) fn settle(
     existing: Option<&VectorIndexSpec>,
     requested: Option<&VectorIndexSpec>,
     defaults: &IndexDefaults,
-) -> Result<VectorIndexSpec, SchemaError> {
+) -> Result<VectorIndexSpec, VectorSettingsError> {
     let requested = requested.cloned().unwrap_or_default();
     let settings = match existing {
         Some(e) => requested.merge_onto(&e.resolve()?)?,
@@ -742,9 +763,9 @@ pub(crate) fn update_search(
     namespace: &str,
     search: &SearchSpec,
     maintenance: Option<&MaintenanceSpec>,
-) -> Result<VectorIndexSpec, SchemaError> {
+) -> Result<VectorIndexSpec, VectorSettingsError> {
     let current = existing
-        .ok_or_else(|| SchemaError::VectorIndexNotConfigured {
+        .ok_or_else(|| VectorSettingsError::NotConfigured {
             namespace: namespace.to_owned(),
         })?
         .resolve()?;
@@ -771,9 +792,9 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    fn err_field(r: Result<VectorIndexSettings, SchemaError>) -> &'static str {
+    fn err_field(r: Result<VectorIndexSettings, VectorSettingsError>) -> &'static str {
         match r.unwrap_err() {
-            SchemaError::InvalidVectorSetting { field, .. } | SchemaError::VectorSettingFixed { field, .. } => field,
+            VectorSettingsError::Invalid { field, .. } | VectorSettingsError::Fixed { field, .. } => field,
             other => panic!("unexpected error {other:?}"),
         }
     }
@@ -1098,7 +1119,7 @@ mod tests {
                 },
                 None
             ),
-            Err(SchemaError::VectorIndexNotConfigured { .. })
+            Err(VectorSettingsError::NotConfigured { .. })
         ));
         assert!(update_search(Some(&current), "ns", &SearchSpec::default(), None).is_err());
         assert!(

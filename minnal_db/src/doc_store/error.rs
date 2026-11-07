@@ -124,6 +124,23 @@ pub enum SchemaError {
 
 // ── Doc-store-level errors ─────────────────────────────────────────────────
 
+impl From<crate::vector_settings::VectorSettingsError> for SchemaError {
+    fn from(e: crate::vector_settings::VectorSettingsError) -> Self {
+        use crate::vector_settings::VectorSettingsError as E;
+        match e {
+            E::Invalid { field, reason } => Self::InvalidVectorSetting { field, reason },
+            E::Fixed { field, current, requested } => Self::VectorSettingFixed { field, current, requested },
+            E::NotConfigured { namespace } => Self::VectorIndexNotConfigured { namespace },
+        }
+    }
+}
+
+impl From<crate::vector_settings::VectorSettingsError> for DocStoreError {
+    fn from(e: crate::vector_settings::VectorSettingsError) -> Self {
+        Self::Schema(e.into())
+    }
+}
+
 /// Errors produced by [`DocStore`] operations.
 ///
 /// [`DocStore`]: crate::doc_store::DocStore
