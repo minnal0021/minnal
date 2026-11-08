@@ -221,8 +221,8 @@ pub enum DocStoreError {
     #[error("store '{namespace}' cannot move from {from:?} to {to:?}")]
     InvalidTransition {
         namespace: String,
-        from: crate::doc_store::schema::StoreState,
-        to: crate::doc_store::schema::StoreState,
+        from: crate::namespace_lifecycle::NamespaceState,
+        to: crate::namespace_lifecycle::NamespaceState,
     },
 
     /// A store's creation or drop failed every run the governor gave it; the
@@ -333,5 +333,22 @@ pub enum DocStoreError {
 impl From<serde_json::Error> for DocStoreError {
     fn from(e: serde_json::Error) -> Self {
         DocStoreError::InvalidId(e.to_string())
+    }
+}
+
+impl From<crate::namespace_lifecycle::LifecycleError> for DocStoreError {
+    /// Each lifecycle error becomes the flat variant of the same meaning, so a
+    /// caller matches one error type.
+    fn from(e: crate::namespace_lifecycle::LifecycleError) -> Self {
+        use crate::namespace_lifecycle::LifecycleError as L;
+        match e {
+            L::Creating { namespace } => Self::StoreCreating { namespace },
+            L::Deleting { namespace } => Self::StoreDeleting { namespace },
+            L::InvalidTransition { namespace, from, to } => Self::InvalidTransition { namespace, from, to },
+            L::TaskFailed { namespace, attempts, error } => Self::LifecycleTaskFailed { namespace, attempts, error },
+            L::GovernorUnavailable => Self::GovernorUnavailable,
+            L::Db(e) => Self::Db(e),
+            L::Record(e) => Self::Io(std::io::Error::other(format!("maintenance record: {e}"))),
+        }
     }
 }

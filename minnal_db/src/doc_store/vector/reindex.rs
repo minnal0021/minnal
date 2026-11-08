@@ -1,9 +1,9 @@
 //! Re-queueing a store's documents for embedding (`index_all`, `kv_index_all`),
 //! its progress record, and the claim that keeps one reindex per store.
 
-#[cfg(feature = "semantic-search")]
-use crate::doc_store::indexing::progress::BuildStatus;
 use crate::doc_store::*;
+#[cfg(feature = "semantic-search")]
+use crate::namespace_lifecycle::BuildStatus;
 
 impl DocStore {
     /// Validate that `namespace` exists and has semantic search enabled.

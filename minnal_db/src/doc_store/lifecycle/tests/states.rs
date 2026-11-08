@@ -23,7 +23,7 @@ async fn a_store_being_created_refuses_requests_and_the_next_open_finishes_it() 
         let schema = make_schema("docs", vec![index()]);
         store
             .schemas
-            .insert(StoredSchema::Doc(std::sync::Arc::new(schema)), StoreState::Creating)
+            .insert(StoredSchema::Doc(std::sync::Arc::new(schema)), NamespaceState::Creating)
             .unwrap();
 
         let creating = |r: Result<_, DocStoreError>| matches!(r, Err(DocStoreError::StoreCreating { .. }));
@@ -43,7 +43,7 @@ async fn a_store_being_created_refuses_requests_and_the_next_open_finishes_it() 
         store.shutdown().await.unwrap();
     }
     let store = open_fresh(db_dir.path()).await;
-    assert_eq!(store.schemas.state("docs"), Some(StoreState::Created));
+    assert_eq!(store.schemas.state("docs"), Some(NamespaceState::Created));
     assert_eq!(store.list().unwrap()[0]["state"], "created");
     store.put("docs", DocId::U64(1), serde_json::json!({"active": true})).await.unwrap();
     assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
@@ -59,7 +59,10 @@ async fn a_creation_run_twice_keeps_what_the_first_run_made() {
     store.create(make_schema("docs", vec![index()])).await.unwrap();
     store.put("docs", DocId::U64(1), serde_json::json!({"active": true})).await.unwrap();
     let id = store.schemas.get("docs").unwrap().ns_id();
-    store.schemas.transition("docs", &[StoreState::Created], StoreState::Creating).unwrap();
+    store
+        .schemas
+        .transition("docs", &[NamespaceState::Created], NamespaceState::Creating)
+        .unwrap();
     store.provision("docs").await.unwrap();
     assert_eq!(store.schemas.get("docs").unwrap().ns_id(), id, "the same namespace");
     assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
@@ -76,7 +79,10 @@ async fn a_store_being_deleted_refuses_requests_and_the_next_open_finishes_it() 
         store.create(make_schema("docs", vec![index()])).await.unwrap();
         store.put("docs", DocId::U64(1), serde_json::json!({"active": true})).await.unwrap();
         // A drop a crash cut short right after it began.
-        store.schemas.transition("docs", &[StoreState::Created], StoreState::Deleting).unwrap();
+        store
+            .schemas
+            .transition("docs", &[NamespaceState::Created], NamespaceState::Deleting)
+            .unwrap();
 
         let deleting = |r: Result<_, DocStoreError>| matches!(r, Err(DocStoreError::StoreDeleting { .. }));
         assert!(deleting(store.get("docs", DocId::U64(1)).await.map(|_| ())));

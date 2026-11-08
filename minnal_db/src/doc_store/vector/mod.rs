@@ -1,8 +1,8 @@
 //! Vector-index queue administration and bulk (re)indexing.
 
-use crate::doc_store::indexing::progress::BuildStatus;
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::*;
+use crate::namespace_lifecycle::BuildStatus;
 
 mod lifecycle;
 #[cfg(feature = "semantic-search")]
@@ -23,7 +23,7 @@ pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace
     let Some(schema) = schemas.get(namespace) else {
         return Ok(DocumentText::StoreGone);
     };
-    if schemas.state(namespace) == Some(StoreState::Deleting) {
+    if schemas.state(namespace) == Some(NamespaceState::Deleting) {
         return Ok(DocumentText::StoreGone);
     }
     // Never get-or-create: this runs outside any partition's epoch, so a drop can

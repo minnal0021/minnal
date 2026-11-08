@@ -13,7 +13,8 @@ use tokio::task::JoinHandle;
 
 use crate::doc_store::IndexBuildHandle;
 use crate::doc_store::error::DocStoreError;
-use crate::doc_store::indexing::progress::{BuildStatus, IndexBuildSnapshot, IndexId, now_ms};
+use crate::doc_store::indexing::progress::{IndexBuildSnapshot, IndexId, now_ms};
+use crate::namespace_lifecycle::BuildStatus;
 
 // ── BuildHandle ───────────────────────────────────────────────────────────────
 

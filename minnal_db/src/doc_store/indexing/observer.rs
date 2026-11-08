@@ -14,8 +14,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::doc_store::indexing::progress::{BuildStatus, FieldBuildRecord};
-use crate::doc_store::maintenance::{MaintenanceStore, TaskKey};
+use crate::namespace_lifecycle::{BuildStatus, FieldBuildRecord};
+use crate::namespace_lifecycle::{MaintenanceStore, TaskKey};
 use crate::support::hex::bytes_to_hex;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────

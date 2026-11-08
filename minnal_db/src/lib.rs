@@ -97,6 +97,8 @@ pub mod field_index;
 pub mod kv_store;
 pub(crate) mod layout;
 pub mod namespace;
+#[cfg(feature = "doc-store")]
+pub mod namespace_lifecycle;
 #[cfg(feature = "semantic-search")]
 pub mod semantic_search;
 // Sits outside both optional layers: a store's schema carries these settings
@@ -300,7 +302,7 @@ pub use storage::value_log::SegmentStats;
 pub use doc_store::{
     AttributeDef, AttributeType, CursorPage, DocId, DocStore, DocStoreError, DocStoreSchema, FieldBuildRecord, IndexBuildHandle, IndexBuildManager,
     IndexBuildProgress, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, LifecycleConfig, MAX_INDICES,
-    MAX_STR_KEY_LEN, Page, Pagination, SchemaAmendment, SchemaError, StoreState, StoreType, StrKey, prefix_upper_bound,
+    MAX_STR_KEY_LEN, NamespaceState, Page, Pagination, SchemaAmendment, SchemaError, StoreType, StrKey, prefix_upper_bound,
 };
 
 // Document-store types that only exist alongside `semantic-search`.

@@ -1544,7 +1544,7 @@ mod with_service {
         drop(drop_store); // what axum does when the client disconnects
         drop(running);
         assert!(!ctx.is_dropping("g"));
-        assert_eq!(store.schemas.state("g"), Some(StoreState::Deleting));
+        assert_eq!(store.schemas.state("g"), Some(NamespaceState::Deleting));
         assert!(matches!(
             store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await,
             Err(DocStoreError::StoreDeleting { .. })

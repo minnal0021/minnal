@@ -338,7 +338,7 @@ impl DocStore {
                 .maintenance
                 .get::<crate::doc_store::FieldBuildRecord>(crate::doc_store::TaskKey::field_build(ns_id, fid))
             {
-                Ok(record) => record.is_some_and(|r| r.status != crate::doc_store::indexing::progress::BuildStatus::Complete),
+                Ok(record) => record.is_some_and(|r| r.status != crate::namespace_lifecycle::BuildStatus::Complete),
                 Err(_) => true,
             };
             if building && !degraded.contains(&fid) {

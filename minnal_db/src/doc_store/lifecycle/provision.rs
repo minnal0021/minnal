@@ -17,7 +17,7 @@ impl DocStore {
         #[cfg(test)]
         self.inject_lifecycle_fault(namespace)?;
         let _lifecycle = self.lifecycle.lock(namespace).await;
-        if self.schemas.state(namespace) != Some(StoreState::Creating) {
+        if self.schemas.state(namespace) != Some(NamespaceState::Creating) {
             return Ok(());
         }
         let ns_id = self.provision_namespace(namespace).await?;
@@ -32,7 +32,7 @@ impl DocStore {
         if let Some(settings) = semantic {
             self.seed_vector_index(namespace, &settings, &mut None).await?;
         }
-        self.schemas.transition(namespace, &[StoreState::Creating], StoreState::Created)?;
+        self.schemas.transition(namespace, &[NamespaceState::Creating], NamespaceState::Created)?;
         info!("store '{namespace}' created (ns_id={ns_id})");
         Ok(())
     }

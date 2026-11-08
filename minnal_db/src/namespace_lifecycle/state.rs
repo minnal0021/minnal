@@ -1,4 +1,4 @@
-//! `StoreState`: where a store is in its lifecycle.
+//! `NamespaceState`: where a namespace is in its lifecycle.
 //!
 //! ```text
 //! Creating ──► Created ──► Deleting ──► (gone)
@@ -10,18 +10,19 @@
 //! except the admin views, while its data is removed; its record goes last,
 //! which is the moment the store is gone.
 //!
-//! The state is lifecycle metadata, not part of the schema a user writes: it is
-//! kept as a `"state"` key in the store's record in `system_schema`, beside the
-//! schema's own fields, and only `SchemaStore` reads or writes it.
+//! The state is lifecycle metadata, not part of the schema a user writes. The
+//! layer that owns the namespace keeps it: the doc store keeps it as a
+//! `"state"` key in the store's record in `system_schema`, beside the schema's
+//! own fields.
 
 use serde::{Deserialize, Serialize};
 
-use crate::doc_store::error::DocStoreError;
+use crate::namespace_lifecycle::LifecycleError;
 
-/// Where a store is in its lifecycle. See the module docs.
+/// Where a namespace is in its lifecycle. See the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StoreState {
+pub enum NamespaceState {
     /// Its record is written; its namespaces and indexes are being set up.
     /// Refuses every request but the admin views; cannot be dropped yet.
     Creating,
@@ -31,19 +32,19 @@ pub enum StoreState {
     Deleting,
 }
 
-impl StoreState {
+impl NamespaceState {
     /// The JSON key the state is kept under in a store's record.
     pub(crate) const KEY: &'static str = "state";
 
     /// `Ok` if a store in this state takes reads and writes, else the error a
     /// request gets.
-    pub(crate) fn admit(self, namespace: &str) -> Result<(), DocStoreError> {
+    pub(crate) fn admit(self, namespace: &str) -> Result<(), LifecycleError> {
         match self {
             Self::Created => Ok(()),
-            Self::Creating => Err(DocStoreError::StoreCreating {
+            Self::Creating => Err(LifecycleError::Creating {
                 namespace: namespace.to_owned(),
             }),
-            Self::Deleting => Err(DocStoreError::StoreDeleting {
+            Self::Deleting => Err(LifecycleError::Deleting {
                 namespace: namespace.to_owned(),
             }),
         }
@@ -65,14 +66,14 @@ mod tests {
 
     #[test]
     fn only_a_created_store_takes_requests() {
-        assert!(StoreState::Created.admit("s").is_ok());
-        assert!(matches!(StoreState::Creating.admit("s"), Err(DocStoreError::StoreCreating { .. })));
-        assert!(matches!(StoreState::Deleting.admit("s"), Err(DocStoreError::StoreDeleting { .. })));
+        assert!(NamespaceState::Created.admit("s").is_ok());
+        assert!(matches!(NamespaceState::Creating.admit("s"), Err(LifecycleError::Creating { .. })));
+        assert!(matches!(NamespaceState::Deleting.admit("s"), Err(LifecycleError::Deleting { .. })));
     }
 
     #[test]
     fn the_json_names_match_as_str() {
-        for s in [StoreState::Creating, StoreState::Created, StoreState::Deleting] {
+        for s in [NamespaceState::Creating, NamespaceState::Created, NamespaceState::Deleting] {
             assert_eq!(serde_json::to_value(s).unwrap(), serde_json::json!(s.as_str()));
         }
     }

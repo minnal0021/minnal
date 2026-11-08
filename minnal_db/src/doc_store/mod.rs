@@ -27,13 +27,13 @@ use log::warn;
 use log::{debug, info};
 
 use self::indexing::observer::{ChainedObserver, InMemoryProgress, IndexProgressObserver, RecordProgress};
-use self::indexing::progress::BuildStatus;
 #[cfg(feature = "semantic-search")]
 use self::indexing::progress::now_ms;
 use self::pagination::clamp_cursor;
 use self::schema::store::SchemaStore;
 #[cfg(feature = "semantic-search")]
 use self::schema::vector_settings::SearchSpec;
+use crate::namespace_lifecycle::BuildStatus;
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::vector_kv;
 #[cfg(feature = "semantic-search")]
@@ -49,7 +49,6 @@ pub mod indexing;
 pub mod key;
 mod kv;
 mod lifecycle;
-mod maintenance;
 pub mod pagination;
 mod query;
 pub mod schema;
@@ -59,16 +58,15 @@ mod vector;
 mod write_gate;
 
 pub use self::diagnostics::RowMapStats;
-pub use self::indexing::progress::{FieldBuildRecord, IndexBuildHandle, IndexBuildProgress};
-pub use self::lifecycle::LifecycleConfig;
-pub use self::maintenance::MAINTENANCE_NAMESPACE;
-pub(crate) use self::maintenance::{MaintenanceStore, TaskKey};
+pub use self::indexing::progress::{IndexBuildHandle, IndexBuildProgress};
 #[cfg(feature = "semantic-search")]
 pub use self::vector::VectorReindexOutcome;
 pub use self::vector::{ReindexStats, VecReindexProgress};
 #[cfg(feature = "semantic-search")]
 pub(crate) use self::write_gate::{InFlightWrite, InFlightWrites};
 pub(crate) use self::write_gate::{LifecycleLocks, WriteGate, WriteGuard};
+pub use crate::namespace_lifecycle::{FieldBuildRecord, LifecycleConfig, MAINTENANCE_NAMESPACE, NamespaceState};
+pub(crate) use crate::namespace_lifecycle::{MaintenanceStore, TaskKey};
 #[cfg(feature = "semantic-search")]
 pub use crate::semantic_search::context::{NamespaceSemantics, SemanticSearchContext};
 
@@ -86,7 +84,7 @@ pub use self::key::{DocId, MAX_STR_KEY_LEN, StrKey};
 // ── Schema types ───────────────────────────────────────────────────────────
 pub use self::schema::{
     AttributeDef, AttributeType, DocStoreSchema, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES,
-    SchemaAmendment, StoreState, StoreType,
+    SchemaAmendment, StoreType,
 };
 
 // ── Pagination types ───────────────────────────────────────────────────────
@@ -162,7 +160,7 @@ pub struct DocStore {
     in_flight: Arc<InFlightWrites>,
     /// The lifecycle governor, once [`start_lifecycle`](Self::start_lifecycle)
     /// has started it.
-    governor: std::sync::OnceLock<self::lifecycle::Governor>,
+    governor: std::sync::OnceLock<crate::namespace_lifecycle::Governor>,
     /// Test hook: failures to inject into a store's lifecycle tasks, per store
     /// (`(failures left, panic instead of an error)`).
     #[cfg(test)]
@@ -236,9 +234,9 @@ impl DocStore {
         // keeps refusing requests meanwhile.
         for (namespace, state) in store.schemas.states() {
             let finished = match state {
-                StoreState::Creating => store.provision(&namespace).await,
-                StoreState::Deleting => store.teardown(&namespace).await,
-                StoreState::Created => continue,
+                NamespaceState::Creating => store.provision(&namespace).await,
+                NamespaceState::Deleting => store.teardown(&namespace).await,
+                NamespaceState::Created => continue,
             };
             if let Err(e) = finished {
                 log::error!("store '{namespace}' is left {}: finishing it at open failed: {e}", state.as_str());
@@ -248,7 +246,7 @@ impl DocStore {
         let schemas = store.load_all_schemas()?;
         info!("loaded {} schema(s)", schemas.len());
         for schema in schemas {
-            if store.schemas.state(&schema.namespace) != Some(StoreState::Created) {
+            if store.schemas.state(&schema.namespace) != Some(NamespaceState::Created) {
                 continue;
             }
             if let Some(ns_id) = schema.ns_id {
@@ -260,7 +258,7 @@ impl DocStore {
         let kv_schemas = store.load_all_kv_schemas()?;
         info!("loaded {} KV schema(s)", kv_schemas.len());
         for schema in kv_schemas {
-            if schema.ns_id.is_some() && store.schemas.state(&schema.namespace) == Some(StoreState::Created) {
+            if schema.ns_id.is_some() && store.schemas.state(&schema.namespace) == Some(NamespaceState::Created) {
                 debug!("opening KV namespace '{}'", schema.namespace);
                 store.db.namespace(schema.namespace.clone()).await?;
             }

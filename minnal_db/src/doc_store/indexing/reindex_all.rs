@@ -159,9 +159,9 @@ impl DocStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::indexing::progress::BuildStatus;
     use crate::doc_store::schema::IndexType;
     use crate::doc_store::tests::test_support::*;
+    use crate::namespace_lifecycle::BuildStatus;
 
     const DOCS: u128 = 300;
 

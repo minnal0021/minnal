@@ -64,7 +64,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<serde_json::
 /// `202 Accepted` with the store's name and its new lifecycle state: the
 /// lifecycle governor finishes the create or drop in the background, and
 /// `GET /stores/{ns}` (or `GET /stores`) shows when it is done.
-fn accepted(namespace: &str, state: minnal_db::StoreState) -> (StatusCode, Json<serde_json::Value>) {
+fn accepted(namespace: &str, state: minnal_db::NamespaceState) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "namespace": namespace, "state": state.as_str() })),
@@ -86,7 +86,7 @@ pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) 
     let ns = schema.namespace.clone();
     info!(namespace = %ns, semantic_search = schema.semantic_search_enabled, "creating store");
     state.store.begin_create(schema).await?;
-    Ok(accepted(&ns, minnal_db::StoreState::Creating))
+    Ok(accepted(&ns, minnal_db::NamespaceState::Creating))
 }
 
 /// `DELETE /stores/{ns}`: answers `202` once the store is `deleting` (it then
@@ -101,7 +101,7 @@ pub async fn drop_store(State(state): State<AppState>, Path(ns): Path<String>) -
         StoreType::Kv => state.store.begin_remove_kv(&ns).await,
     }
     .map_err(|e| AppError::from(e).with_ns(&ns))?;
-    Ok(accepted(&ns, minnal_db::StoreState::Deleting))
+    Ok(accepted(&ns, minnal_db::NamespaceState::Deleting))
 }
 
 pub async fn get_schema(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
@@ -335,5 +335,5 @@ pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) ->
     let ns = schema.namespace.clone();
     info!(namespace = %ns, value_type = ?schema.value_type, "creating KV store");
     state.store.begin_create_kv(schema).await?;
-    Ok(accepted(&ns, minnal_db::StoreState::Creating))
+    Ok(accepted(&ns, minnal_db::NamespaceState::Creating))
 }

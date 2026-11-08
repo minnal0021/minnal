@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::AsyncDb;
 use crate::doc_store::error::{DocStoreError, SchemaError};
-use crate::doc_store::schema::StoreState;
 use crate::doc_store::schema::store::SchemaStore;
 use crate::doc_store::write_gate::InFlightWrites;
+use crate::namespace_lifecycle::NamespaceState;
 use crate::semantic_search::workers::{DocumentText, WorkerError, WorkerHost};
 use crate::vector_index::vector_settings::VectorIndexSettings;
 
@@ -21,7 +21,7 @@ impl WorkerHost for DocStoreWorkerHost {
     /// A store being dropped is gone to the workers: its entries are discarded
     /// and its work dropped, while its data is removed.
     fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, crate::namespace::NamespaceId), WorkerError> {
-        if self.schemas.state(namespace) == Some(StoreState::Deleting) {
+        if self.schemas.state(namespace) == Some(NamespaceState::Deleting) {
             return Err(WorkerError::StoreGone(format!("store '{namespace}' is being deleted")));
         }
         self.schemas.vector_settings(namespace).map_err(|e| match e {
@@ -33,7 +33,7 @@ impl WorkerHost for DocStoreWorkerHost {
     /// Whether the store exists and is not being dropped. A store being
     /// created has no entries yet (it takes no writes until it is created).
     fn store_exists(&self, namespace: &str) -> bool {
-        self.schemas.state(namespace).is_some_and(|s| s != StoreState::Deleting)
+        self.schemas.state(namespace).is_some_and(|s| s != NamespaceState::Deleting)
     }
 
     fn write_in_progress(&self, namespace: &str, key: &[u8]) -> bool {

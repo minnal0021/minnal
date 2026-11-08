@@ -17,7 +17,8 @@ use axum::{
 };
 use minnal_db::{
     DocStoreError, IndexSpec,
-    doc_store::indexing::progress::{BuildStatus, IndexBuildSnapshot, IndexId},
+    doc_store::indexing::progress::{IndexBuildSnapshot, IndexId},
+    namespace_lifecycle::BuildStatus,
 };
 use tracing::{error, info};
 

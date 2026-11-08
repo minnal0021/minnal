@@ -1,7 +1,7 @@
 //! Creating and listing document and KV stores.
 
 use super::super::*;
-use super::Task;
+use crate::namespace_lifecycle::Task;
 
 impl DocStore {
     // ── Admin: create / list / drop ───────────────────────────────────────
@@ -11,10 +11,10 @@ impl DocStore {
     ///
     /// Checks what the caller should hear about first (the schema, the
     /// embedding model, a namespace of that name holding keys), then writes the
-    /// store's record in [`StoreState::Creating`]: from then on the store is
+    /// store's record in [`NamespaceState::Creating`]: from then on the store is
     /// listed, and refuses requests until it is created. Its namespace, field
     /// indexes and, with semantic search, its vector index are then set up, and
-    /// it moves to [`StoreState::Created`].
+    /// it moves to [`NamespaceState::Created`].
     ///
     /// Returns [`DocStoreError::AlreadyExists`] if a store with that namespace
     /// exists, [`DocStoreError::StoreDeleting`] while one of that name is being
@@ -26,7 +26,7 @@ impl DocStore {
     }
 
     /// [`create`](Self::create), returning once the store's record is written
-    /// in [`StoreState::Creating`]: the lifecycle governor sets it up in the
+    /// in [`NamespaceState::Creating`]: the lifecycle governor sets it up in the
     /// background, and the store is ready once its state is `Created`. Fails
     /// with [`DocStoreError::GovernorUnavailable`] when the governor is not
     /// running, before anything is written.
@@ -66,7 +66,7 @@ impl DocStore {
             }
             // An imported schema may carry the id of another database's namespace.
             schema.ns_id = None;
-            self.schemas.insert(StoredSchema::Doc(Arc::new(schema)), StoreState::Creating)?;
+            self.schemas.insert(StoredSchema::Doc(Arc::new(schema)), NamespaceState::Creating)?;
         }
         Ok(ns_name)
     }
@@ -87,7 +87,7 @@ impl DocStore {
     /// `value` with `namespace`'s lifecycle state added under `"state"`.
     fn with_state(&self, namespace: &str, mut value: serde_json::Value) -> Result<serde_json::Value, DocStoreError> {
         if let (serde_json::Value::Object(map), Some(state)) = (&mut value, self.schemas.state(namespace)) {
-            map.insert(StoreState::KEY.to_owned(), serde_json::to_value(state)?);
+            map.insert(NamespaceState::KEY.to_owned(), serde_json::to_value(state)?);
         }
         Ok(value)
     }
@@ -140,7 +140,7 @@ impl DocStore {
                 self.refuse_a_namespace_holding_keys(&ns_name).await?;
             }
             schema.ns_id = None;
-            self.schemas.insert(StoredSchema::Kv(Arc::new(schema)), StoreState::Creating)?;
+            self.schemas.insert(StoredSchema::Kv(Arc::new(schema)), NamespaceState::Creating)?;
         }
         Ok(ns_name)
     }

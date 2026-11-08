@@ -2,13 +2,13 @@
 //! namespaces, its index files and its maintenance records, then its record.
 
 use super::super::*;
-use super::Task;
 use crate::namespace::NamespaceId;
+use crate::namespace_lifecycle::Task;
 
 impl DocStore {
     /// Destroy a document store completely, and return once it is gone.
     ///
-    /// Moves the store to [`StoreState::Deleting`] first, durably: from then on
+    /// Moves the store to [`NamespaceState::Deleting`] first, durably: from then on
     /// it refuses every request but the admin views. Then its writes in progress
     /// are waited out, its namespaces, index files and maintenance records are
     /// removed, and its record last. A store already being dropped (a drop a
@@ -26,7 +26,7 @@ impl DocStore {
     }
 
     /// [`remove`](Self::remove), returning once the store is
-    /// [`StoreState::Deleting`]: the lifecycle governor removes it in the
+    /// [`NamespaceState::Deleting`]: the lifecycle governor removes it in the
     /// background, and it is gone once it is no longer listed. Fails with
     /// [`DocStoreError::GovernorUnavailable`] when the governor is not running,
     /// before anything changes.
@@ -62,7 +62,7 @@ impl DocStore {
     /// `Deleting` stays so (the drop is finished); one `Creating` is refused.
     fn begin_drop_store(&self, namespace: &str) -> Result<(), DocStoreError> {
         self.schemas
-            .transition(namespace, &[StoreState::Created, StoreState::Deleting], StoreState::Deleting)?;
+            .transition(namespace, &[NamespaceState::Created, NamespaceState::Deleting], NamespaceState::Deleting)?;
         Ok(())
     }
 
@@ -75,7 +75,7 @@ impl DocStore {
         let Some(schema) = self.schemas.get(namespace) else {
             return Ok(());
         };
-        if self.schemas.state(namespace) != Some(StoreState::Deleting) {
+        if self.schemas.state(namespace) != Some(NamespaceState::Deleting) {
             return Ok(());
         }
         let ns_id = schema.ns_id().ok_or_else(|| DocStoreError::MissingNsId {

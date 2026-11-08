@@ -1,7 +1,8 @@
 //! `MaintenanceStore`: maintenance records, persisted in
 //! [`MAINTENANCE_NAMESPACE`] and served from memory.
 //!
-//! The same write-through rule as the schema store (`schema/store.rs`): each
+//! The same write-through rule as the doc store's schema store
+//! (`doc_store/schema/store.rs`): each
 //! write takes `writer`, persists the record (a WAL-backed put or delete,
 //! durable on return), then updates the cached copy. So the cache always holds
 //! what is on disk, in write order, and a read costs no I/O, which matters
@@ -16,8 +17,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::key::TaskKey;
-use crate::doc_store::error::DocStoreError;
 use crate::namespace::NamespaceId;
+use crate::namespace_lifecycle::LifecycleError;
 use crate::{AsyncDb, AsyncNamespace};
 
 /// The system namespace that holds every maintenance record.
@@ -36,7 +37,7 @@ impl MaintenanceStore {
     /// Open the namespace (creating it in a new database) and load every record.
     /// A key that does not decode is logged and left alone: nothing written
     /// here produces one.
-    pub(crate) async fn open(db: &AsyncDb) -> Result<Self, DocStoreError> {
+    pub(crate) async fn open(db: &AsyncDb) -> Result<Self, LifecycleError> {
         let ns = db.namespace(MAINTENANCE_NAMESPACE.to_owned()).await?;
         let mut map = BTreeMap::new();
         for (key, value) in ns.scan_prefix(Vec::new()).await? {
@@ -59,29 +60,29 @@ impl MaintenanceStore {
     /// A record that does not parse as `T` is an error, not an absence: records
     /// are never torn, so it means a record of another shape, and treating it as
     /// missing could restart or skip a task.
-    pub(crate) fn get<T: DeserializeOwned>(&self, key: TaskKey) -> Result<Option<T>, DocStoreError> {
+    pub(crate) fn get<T: DeserializeOwned>(&self, key: TaskKey) -> Result<Option<T>, LifecycleError> {
         let Some(bytes) = self.map.read().get(&key).cloned() else {
             return Ok(None);
         };
         serde_json::from_slice(&bytes)
             .map(Some)
-            .map_err(|e| DocStoreError::Io(std::io::Error::other(format!("maintenance record {key:?} does not parse: {e}"))))
+            .map_err(|e| LifecycleError::Record(format!("{key:?} does not parse: {e}")))
     }
 
     /// Save `record` at `key`, durably.
-    pub(crate) fn put<T: Serialize>(&self, key: TaskKey, record: &T) -> Result<(), DocStoreError> {
+    pub(crate) fn put<T: Serialize>(&self, key: TaskKey, record: &T) -> Result<(), LifecycleError> {
         let _w = self.writer.lock();
         self.persist(key, record)
     }
 
     /// Remove the record at `key`, durably. Removing an absent record is a no-op.
-    pub(crate) fn delete(&self, key: TaskKey) -> Result<(), DocStoreError> {
+    pub(crate) fn delete(&self, key: TaskKey) -> Result<(), LifecycleError> {
         let _w = self.writer.lock();
         self.remove(key)
     }
 
     /// Remove every record of `store`, durably: the last step of dropping it.
-    pub(crate) fn delete_store(&self, store: NamespaceId) -> Result<(), DocStoreError> {
+    pub(crate) fn delete_store(&self, store: NamespaceId) -> Result<(), LifecycleError> {
         let _w = self.writer.lock();
         for key in self.keys_of(store) {
             self.remove(key)?;
@@ -95,15 +96,15 @@ impl MaintenanceStore {
     }
 
     /// Persist and cache. Caller holds `writer`.
-    fn persist<T: Serialize>(&self, key: TaskKey, record: &T) -> Result<(), DocStoreError> {
-        let json = serde_json::to_vec(record).map_err(|e| DocStoreError::Io(std::io::Error::other(e)))?;
+    fn persist<T: Serialize>(&self, key: TaskKey, record: &T) -> Result<(), LifecycleError> {
+        let json = serde_json::to_vec(record).map_err(|e| LifecycleError::Record(e.to_string()))?;
         crate::support::run_blocking_pass(|| self.ns.put_blocking(&key.to_bytes(), &json))?;
         self.map.write().insert(key, Arc::from(json));
         Ok(())
     }
 
     /// Delete and uncache. Caller holds `writer`.
-    fn remove(&self, key: TaskKey) -> Result<(), DocStoreError> {
+    fn remove(&self, key: TaskKey) -> Result<(), LifecycleError> {
         if !self.map.read().contains_key(&key) {
             return Ok(());
         }

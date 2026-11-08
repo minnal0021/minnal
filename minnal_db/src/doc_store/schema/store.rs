@@ -3,7 +3,7 @@
 //! Every schema the doc store reads comes from `SchemaStore`, and nothing else
 //! touches `system_schema`. The key is the store's name and the value its schema
 //! as JSON (the same JSON export and import use), plus the store's lifecycle
-//! state under a `"state"` key ([`StoreState`]).
+//! state under a `"state"` key ([`NamespaceState`]).
 //!
 //! **Writes are write-through and serialised.** Each write takes `writer`,
 //! persists the schema (a WAL-backed put or delete, durable on return), then
@@ -22,7 +22,8 @@ use parking_lot::{Mutex, RwLock};
 use crate::doc_store::error::{DocStoreError, SchemaError};
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::schema::vector_settings::VectorIndexSettings;
-use crate::doc_store::schema::{DocStoreSchema, KvStoreSchema, StoreState, StoreType, peek_store_type};
+use crate::doc_store::schema::{DocStoreSchema, KvStoreSchema, StoreType, peek_store_type};
+use crate::namespace_lifecycle::NamespaceState;
 use crate::{AsyncDb, AsyncNamespace};
 
 /// The system namespace that holds every store's schema.
@@ -87,22 +88,22 @@ impl StoredSchema {
     }
 
     /// The stored record: the schema's JSON with the store's state beside it.
-    fn to_record(&self, state: StoreState) -> Result<Vec<u8>, SchemaError> {
+    fn to_record(&self, state: NamespaceState) -> Result<Vec<u8>, SchemaError> {
         let mut value = self.to_value()?;
         if let serde_json::Value::Object(map) = &mut value {
-            map.insert(StoreState::KEY.to_owned(), serde_json::to_value(state)?);
+            map.insert(NamespaceState::KEY.to_owned(), serde_json::to_value(state)?);
         }
         Ok(serde_json::to_vec_pretty(&value)?)
     }
 
     /// Parse a stored record; `store_type` says which kind it is. A record
     /// without a state is a created store.
-    fn from_record(bytes: &[u8]) -> Result<(Self, StoreState), SchemaError> {
+    fn from_record(bytes: &[u8]) -> Result<(Self, NamespaceState), SchemaError> {
         let json = String::from_utf8_lossy(bytes);
         let mut value: serde_json::Value = serde_json::from_str(&json)?;
-        let state = match value.as_object_mut().and_then(|m| m.remove(StoreState::KEY)) {
+        let state = match value.as_object_mut().and_then(|m| m.remove(NamespaceState::KEY)) {
             Some(s) => serde_json::from_value(s)?,
-            None => StoreState::Created,
+            None => NamespaceState::Created,
         };
         let schema = match peek_store_type(&json) {
             Some(StoreType::Kv) => Self::Kv(Arc::new(serde_json::from_value(value)?)),
@@ -118,13 +119,13 @@ impl StoredSchema {
 #[derive(Debug)]
 struct Entry {
     schema: StoredSchema,
-    state: StoreState,
+    state: NamespaceState,
     #[cfg(feature = "semantic-search")]
     vector: Option<VectorIndexSettings>,
 }
 
 impl Entry {
-    fn new(schema: StoredSchema, state: StoreState) -> Arc<Self> {
+    fn new(schema: StoredSchema, state: NamespaceState) -> Arc<Self> {
         Arc::new(Self {
             #[cfg(feature = "semantic-search")]
             vector: schema.vector_settings().ok(),
@@ -210,19 +211,22 @@ impl SchemaStore {
     }
 
     /// A store's lifecycle state; `None` if there is no such store.
-    pub(crate) fn state(&self, namespace: &str) -> Option<StoreState> {
+    pub(crate) fn state(&self, namespace: &str) -> Option<NamespaceState> {
         self.entry(namespace).map(|e| e.state)
     }
 
     /// `Ok` if the store exists and takes requests (it is created); otherwise
     /// `NotFound`, `StoreCreating` or `StoreDeleting`.
     pub(crate) fn admit(&self, namespace: &str) -> Result<(), DocStoreError> {
-        self.state(namespace).ok_or_else(|| Self::not_found(namespace))?.admit(namespace)
+        self.state(namespace)
+            .ok_or_else(|| Self::not_found(namespace))?
+            .admit(namespace)
+            .map_err(Into::into)
     }
 
     /// Every store's name and state, sorted by name.
-    pub(crate) fn states(&self) -> Vec<(String, StoreState)> {
-        let mut all: Vec<(String, StoreState)> = self.map.read().iter().map(|(n, e)| (n.clone(), e.state)).collect();
+    pub(crate) fn states(&self) -> Vec<(String, NamespaceState)> {
+        let mut all: Vec<(String, NamespaceState)> = self.map.read().iter().map(|(n, e)| (n.clone(), e.state)).collect();
         all.sort_by(|a, b| a.0.cmp(&b.0));
         all
     }
@@ -296,7 +300,7 @@ impl SchemaStore {
 
     /// Persist `schema` under its name in `state` and cache it. Caller holds
     /// `writer`.
-    fn persist(&self, schema: StoredSchema, state: StoreState) -> Result<(), DocStoreError> {
+    fn persist(&self, schema: StoredSchema, state: NamespaceState) -> Result<(), DocStoreError> {
         let name = schema.namespace().to_owned();
         let json = schema.to_record(state)?;
         crate::support::run_blocking_pass(|| self.ns.put_blocking(name.as_bytes(), &json))?;
@@ -306,12 +310,12 @@ impl SchemaStore {
 
     /// Save a new store's schema in `state`. `AlreadyExists` if the name is
     /// taken, whatever state its store is in.
-    pub(crate) fn insert(&self, schema: StoredSchema, state: StoreState) -> Result<(), DocStoreError> {
+    pub(crate) fn insert(&self, schema: StoredSchema, state: NamespaceState) -> Result<(), DocStoreError> {
         let _w = self.writer.lock();
         if let Some(current) = self.state(schema.namespace()) {
             let namespace = schema.namespace().to_owned();
             return Err(match current {
-                StoreState::Deleting => DocStoreError::StoreDeleting { namespace },
+                NamespaceState::Deleting => DocStoreError::StoreDeleting { namespace },
                 _ => DocStoreError::AlreadyExists { namespace },
             });
         }
@@ -323,7 +327,7 @@ impl SchemaStore {
     /// the second finds it `Deleting`). A store in another state gets the error
     /// a request to it would (`StoreCreating`, `StoreDeleting`); `NotFound` if
     /// there is none. Returns the state it was in.
-    pub(crate) fn transition(&self, namespace: &str, from: &[StoreState], to: StoreState) -> Result<StoreState, DocStoreError> {
+    pub(crate) fn transition(&self, namespace: &str, from: &[NamespaceState], to: NamespaceState) -> Result<NamespaceState, DocStoreError> {
         let _w = self.writer.lock();
         let entry = self.entry(namespace).ok_or_else(|| Self::not_found(namespace))?;
         if !from.contains(&entry.state) {
@@ -343,7 +347,7 @@ impl SchemaStore {
     pub(crate) fn update_doc<R>(&self, namespace: &str, f: impl FnOnce(&mut DocStoreSchema) -> Result<R, DocStoreError>) -> Result<R, DocStoreError> {
         let _w = self.writer.lock();
         let current = self.doc(namespace)?;
-        let state = self.state(namespace).unwrap_or(StoreState::Created);
+        let state = self.state(namespace).unwrap_or(NamespaceState::Created);
         let mut schema = DocStoreSchema::clone(&current);
         let out = f(&mut schema)?;
         self.persist(StoredSchema::Doc(Arc::new(schema)), state)?;
@@ -354,7 +358,7 @@ impl SchemaStore {
     pub(crate) fn update_kv<R>(&self, namespace: &str, f: impl FnOnce(&mut KvStoreSchema) -> Result<R, DocStoreError>) -> Result<R, DocStoreError> {
         let _w = self.writer.lock();
         let current = self.kv(namespace)?;
-        let state = self.state(namespace).unwrap_or(StoreState::Created);
+        let state = self.state(namespace).unwrap_or(NamespaceState::Created);
         let mut schema = KvStoreSchema::clone(&current);
         let out = f(&mut schema)?;
         self.persist(StoredSchema::Kv(Arc::new(schema)), state)?;
@@ -416,9 +420,9 @@ mod tests {
         {
             let db = open_db(dir.path()).await;
             let schemas = SchemaStore::open(&db).await.unwrap();
-            schemas.insert(doc("docs"), StoreState::Created).unwrap();
-            schemas.insert(kv("tokens"), StoreState::Created).unwrap();
-            schemas.insert(doc("gone"), StoreState::Created).unwrap();
+            schemas.insert(doc("docs"), NamespaceState::Created).unwrap();
+            schemas.insert(kv("tokens"), NamespaceState::Created).unwrap();
+            schemas.insert(doc("gone"), NamespaceState::Created).unwrap();
             schemas
                 .update_doc("docs", |s| {
                     s.embedding_fields.push("text".into());
@@ -446,9 +450,9 @@ mod tests {
         {
             let db = open_db(dir.path()).await;
             let schemas = SchemaStore::open(&db).await.unwrap();
-            schemas.insert(doc("new"), StoreState::Creating).unwrap();
-            schemas.insert(doc("old"), StoreState::Created).unwrap();
-            schemas.transition("old", &[StoreState::Created], StoreState::Deleting).unwrap();
+            schemas.insert(doc("new"), NamespaceState::Creating).unwrap();
+            schemas.insert(doc("old"), NamespaceState::Created).unwrap();
+            schemas.transition("old", &[NamespaceState::Created], NamespaceState::Deleting).unwrap();
             schemas
                 .update_doc("old", |s| {
                     s.embedding_fields.push("text".into());
@@ -460,12 +464,12 @@ mod tests {
         }
         let db = open_db(dir.path()).await;
         let schemas = SchemaStore::open(&db).await.unwrap();
-        assert_eq!(schemas.state("new"), Some(StoreState::Creating));
-        assert_eq!(schemas.state("old"), Some(StoreState::Deleting));
+        assert_eq!(schemas.state("new"), Some(NamespaceState::Creating));
+        assert_eq!(schemas.state("old"), Some(NamespaceState::Deleting));
         assert_eq!(schemas.state("none"), None);
         assert_eq!(
             schemas.states(),
-            vec![("new".to_owned(), StoreState::Creating), ("old".to_owned(), StoreState::Deleting)]
+            vec![("new".to_owned(), NamespaceState::Creating), ("old".to_owned(), NamespaceState::Deleting)]
         );
         db.shutdown().await.unwrap();
     }
@@ -478,24 +482,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(dir.path()).await;
         let schemas = SchemaStore::open(&db).await.unwrap();
-        schemas.insert(doc("s"), StoreState::Creating).unwrap();
+        schemas.insert(doc("s"), NamespaceState::Creating).unwrap();
         assert!(matches!(
-            schemas.transition("s", &[StoreState::Created], StoreState::Deleting),
+            schemas.transition("s", &[NamespaceState::Created], NamespaceState::Deleting),
             Err(DocStoreError::StoreCreating { .. })
         ));
         assert!(matches!(schemas.admit("s"), Err(DocStoreError::StoreCreating { .. })));
         assert_eq!(
-            schemas.transition("s", &[StoreState::Creating], StoreState::Created).unwrap(),
-            StoreState::Creating
+            schemas.transition("s", &[NamespaceState::Creating], NamespaceState::Created).unwrap(),
+            NamespaceState::Creating
         );
         schemas.admit("s").unwrap();
-        schemas.transition("s", &[StoreState::Created], StoreState::Deleting).unwrap();
+        schemas.transition("s", &[NamespaceState::Created], NamespaceState::Deleting).unwrap();
         assert!(matches!(
-            schemas.transition("s", &[StoreState::Created], StoreState::Deleting),
+            schemas.transition("s", &[NamespaceState::Created], NamespaceState::Deleting),
             Err(DocStoreError::StoreDeleting { .. })
         ));
         assert!(matches!(
-            schemas.insert(doc("s"), StoreState::Creating),
+            schemas.insert(doc("s"), NamespaceState::Creating),
             Err(DocStoreError::StoreDeleting { .. })
         ));
         assert!(matches!(schemas.admit("missing"), Err(DocStoreError::NotFound { .. })));
@@ -507,10 +511,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(dir.path()).await;
         let schemas = SchemaStore::open(&db).await.unwrap();
-        schemas.insert(doc("docs"), StoreState::Created).unwrap();
-        schemas.insert(kv("tokens"), StoreState::Created).unwrap();
+        schemas.insert(doc("docs"), NamespaceState::Created).unwrap();
+        schemas.insert(kv("tokens"), NamespaceState::Created).unwrap();
         assert!(matches!(
-            schemas.insert(kv("docs"), StoreState::Created),
+            schemas.insert(kv("docs"), NamespaceState::Created),
             Err(DocStoreError::AlreadyExists { .. })
         ));
         assert!(matches!(

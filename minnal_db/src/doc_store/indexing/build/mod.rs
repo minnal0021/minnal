@@ -360,7 +360,7 @@ impl DocStore {
         let Some(meta) = fields.iter().find(|f| f.field_name == field) else {
             return Ok(None);
         };
-        self.maintenance.get(TaskKey::field_build(ns_id, meta.field_id))
+        Ok(self.maintenance.get(TaskKey::field_build(ns_id, meta.field_id))?)
     }
 }
 
