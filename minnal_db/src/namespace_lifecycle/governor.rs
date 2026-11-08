@@ -35,7 +35,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::namespace_lifecycle::{JobKey, Jobs, LifecycleError, LifecycleHost, NamespaceState};
+use crate::namespace_lifecycle::{AuditEvent, JobKey, Jobs, LifecycleError, LifecycleHost, NamespaceState};
 
 /// How the governor restarts what fails.
 #[derive(Debug, Clone)]
@@ -190,6 +190,7 @@ async fn supervise<H: LifecycleHost>(
                     log::error!(
                         "CRITICAL: the namespace lifecycle governor failed {restarts} times ({e}); no namespace can be created, dropped or have an index job until the process restarts"
                     );
+                    jobs.audit().record("", AuditEvent::GovernorStopped, None, None, Some(&e.to_string()));
                     rx.lock().await.close();
                     return;
                 }
@@ -273,6 +274,7 @@ async fn govern<H: LifecycleHost>(
                     && !task.is_job()
                 {
                     parked.lock().insert(namespace.clone(), failure.clone());
+                    jobs.audit().record(&namespace, AuditEvent::TaskParked, Some(&task.to_string()), None, Some(&failure.error));
                 }
                 for waiter in running.0.remove(&(namespace, task)).unwrap_or_default() {
                     let _ = waiter.send(outcome.clone());

@@ -68,6 +68,7 @@ impl DocStore {
             schema.ns_id = None;
             self.schemas.insert(StoredSchema::Doc(Arc::new(schema)), NamespaceState::Creating)?;
         }
+        self.audit(&ns_name, AuditEvent::Creating);
         Ok(ns_name)
     }
 
@@ -142,6 +143,7 @@ impl DocStore {
             schema.ns_id = None;
             self.schemas.insert(StoredSchema::Kv(Arc::new(schema)), NamespaceState::Creating)?;
         }
+        self.audit(&ns_name, AuditEvent::Creating);
         Ok(ns_name)
     }
 

@@ -285,6 +285,9 @@ pub struct LifecycleSection {
     /// Wait before each run again, in milliseconds.
     #[serde(default = "default_lifecycle_restart_backoff_ms")]
     pub restart_backoff_ms: u64,
+    /// Days a lifecycle audit record is kept (`GET /admin/lifecycle/audit`).
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u64,
 }
 
 impl Default for LifecycleSection {
@@ -292,11 +295,17 @@ impl Default for LifecycleSection {
         Self {
             max_restarts: default_lifecycle_max_restarts(),
             restart_backoff_ms: default_lifecycle_restart_backoff_ms(),
+            audit_retention_days: default_audit_retention_days(),
         }
     }
 }
 
 impl LifecycleSection {
+    /// How long a lifecycle audit record is kept.
+    pub fn audit_retention(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.audit_retention_days.max(1) * 86_400)
+    }
+
     /// The governor's configuration.
     pub fn config(&self) -> minnal_db::LifecycleConfig {
         minnal_db::LifecycleConfig {
@@ -308,6 +317,10 @@ impl LifecycleSection {
 
 fn default_lifecycle_max_restarts() -> u32 {
     minnal_db::LifecycleConfig::default().max_restarts
+}
+
+fn default_audit_retention_days() -> u64 {
+    minnal_db::namespace_lifecycle::DEFAULT_AUDIT_RETENTION.as_secs() / 86_400
 }
 
 fn default_lifecycle_restart_backoff_ms() -> u64 {

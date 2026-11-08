@@ -47,7 +47,14 @@ impl FakeHost {
             states: Mutex::default(),
             scripts: Mutex::default(),
             runs: Mutex::default(),
-            jobs: Arc::new(Jobs::new(records)),
+            jobs: Arc::new(Jobs::new(
+                records,
+                Arc::new(
+                    crate::namespace_lifecycle::AuditLog::open(&db, crate::namespace_lifecycle::DEFAULT_AUDIT_RETENTION)
+                        .await
+                        .unwrap(),
+                ),
+            )),
             _db: db,
             _dir: dir,
         })

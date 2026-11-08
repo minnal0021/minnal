@@ -61,8 +61,12 @@ impl DocStore {
     /// Move `namespace` from `Created` to `Deleting`, durably. One already
     /// `Deleting` stays so (the drop is finished); one `Creating` is refused.
     fn begin_drop_store(&self, namespace: &str) -> Result<(), DocStoreError> {
-        self.schemas
+        let was = self
+            .schemas
             .transition(namespace, &[NamespaceState::Created, NamespaceState::Deleting], NamespaceState::Deleting)?;
+        if was != NamespaceState::Deleting {
+            self.audit(namespace, AuditEvent::Deleting);
+        }
         Ok(())
     }
 
@@ -89,29 +93,28 @@ impl DocStore {
             .await
         })
         .await?;
+        self.audit(namespace, AuditEvent::Deleted);
         info!("store '{namespace}' is gone (ns_id={ns_id})");
         Ok(())
     }
 
-    /// Run `drop`, which removes store `namespace`, with no write to it in
-    /// progress and none let in until it is done ([`WriteGate`]): a write after
-    /// the removal would recreate the namespace or queue an embedding for it.
+    /// Run `drop`, which removes store `namespace` (already `Deleting`, so no
+    /// write is let in), once the writes in progress have finished
+    /// ([`WriteGate`]): a write after the removal would recreate the
+    /// namespace or queue an embedding for it.
     async fn without_writes<T>(
         &self,
         namespace: &str,
         drop: impl std::future::Future<Output = Result<T, DocStoreError>>,
     ) -> Result<T, DocStoreError> {
-        // A guard, because this future can be dropped at any await (the client of
-        // a route disconnecting): left closed, the store refuses writes for good.
-        struct Reopen<'a>(&'a WriteGate, &'a str);
-        impl Drop for Reopen<'_> {
-            fn drop(&mut self) {
-                self.0.reopen(self.1);
-            }
-        }
-        let _reopen = Reopen(&self.writes, namespace);
-        self.writes.close(namespace).await;
+        self.writes.drain(namespace).await;
         drop.await
+    }
+
+    /// Start a write to `namespace`: refused unless its state takes requests
+    /// (see [`WriteGate`]).
+    pub(in crate::doc_store) fn enter_write(&self, namespace: &str) -> Result<WriteGuard, DocStoreError> {
+        self.writes.enter(namespace, || self.schemas.admit(namespace))
     }
 }
 

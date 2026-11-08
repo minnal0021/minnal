@@ -163,7 +163,7 @@ impl DocStore {
     /// is not semantic-search-enabled.
     #[cfg(feature = "semantic-search")]
     pub async fn reindex_doc_vector(&self, namespace: &str, id: DocId) -> Result<VectorReindexOutcome, DocStoreError> {
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let schema = self.load_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
             return Err(DocStoreError::SemanticSearchNotEnabled {
@@ -196,7 +196,7 @@ impl DocStore {
     /// is not semantic-search-enabled.
     #[cfg(feature = "semantic-search")]
     pub async fn kv_reindex_doc_vector(&self, namespace: &str, raw_key: &str) -> Result<VectorReindexOutcome, DocStoreError> {
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let schema = self.load_kv_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
             return Err(DocStoreError::SemanticSearchNotEnabled {

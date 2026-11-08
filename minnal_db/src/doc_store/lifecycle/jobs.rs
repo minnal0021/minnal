@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use super::super::*;
-use crate::namespace_lifecycle::{JobKind, JobRecord, Task};
+use crate::namespace_lifecycle::{AuditEvent, AuditRecord, JobKind, JobRecord, Task};
 
 impl DocStore {
     /// Whether a job started now can run: inline without the governor, or
@@ -102,6 +102,49 @@ impl DocStore {
             }
         }
         Ok(())
+    }
+
+    /// Record a create or drop `event` of `namespace` in the audit log.
+    pub(in crate::doc_store) fn audit(&self, namespace: &str, event: AuditEvent) {
+        self.jobs.audit().record(namespace, event, None, None, None);
+    }
+
+    /// The lifecycle audit log, newest first: every create, drop and index job
+    /// event, and every task the governor gave up on, of `namespace` only
+    /// when given (a store dropped since too). At most `limit` records from
+    /// `cursor` (a page's next cursor) on; returns the next page's cursor,
+    /// `None` at the end.
+    pub async fn lifecycle_audit(
+        &self,
+        namespace: Option<&str>,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<(Vec<AuditRecord>, Option<Vec<u8>>), DocStoreError> {
+        Ok(self.jobs.audit().read(namespace, cursor, limit).await?)
+    }
+
+    /// Keep lifecycle audit records for `retention` from now on (default 30
+    /// days). Records already written expire by the retention they were
+    /// written with.
+    pub async fn set_audit_retention(&self, retention: Duration) -> Result<(), DocStoreError> {
+        Ok(crate::namespace_lifecycle::AuditLog::set_retention(&self.db, retention).await?)
+    }
+
+    /// `namespace`'s lifecycle state, `None` for no store.
+    pub fn store_state(&self, namespace: &str) -> Option<NamespaceState> {
+        self.schemas.state(namespace)
+    }
+
+    /// Every store's live jobs, by store then name.
+    pub fn live_jobs(&self) -> Vec<(String, String, JobRecord)> {
+        let mut out = Vec::new();
+        for (namespace, _) in self.schemas.states() {
+            if let Ok(jobs) = self.jobs(&namespace) {
+                out.extend(jobs.into_iter().filter(|(_, r)| r.is_live()).map(|(n, r)| (namespace.clone(), n, r)));
+            }
+        }
+        out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        out
     }
 
     // ── Admin views ────────────────────────────────────────────────────────

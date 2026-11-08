@@ -1,5 +1,5 @@
 //! What keeps a store's writes and lifecycle apart: per-store lifecycle locks, the
-//! gate a drop closes to wait out writes in progress, and the set of documents
+//! gate a drop drains to wait out writes in progress, and the set of documents
 //! being written that the vector worker skips.
 
 use std::sync::Arc;
@@ -35,79 +35,67 @@ impl LifecycleLocks {
 }
 
 /// Fences a store's writes off from its drop. Every write to a store (a
-/// document or KV write, a reindex) holds a [`WriteGuard`] for its whole
-/// duration; a drop [`close`](Self::close)s the gate, which refuses new writes
-/// and waits for the ones in progress, before it removes anything. A write
-/// that went on would resolve the store's namespace after its removal and
-/// recreate it, or leave an embed-queue entry the drop already cleared.
+/// document or KV write, a diagnostic reindex) holds a [`WriteGuard`] for its
+/// whole duration, entered only while the store's state takes requests. A drop
+/// first moves the store to `Deleting`, then [`drain`](Self::drain)s the gate:
+/// it waits for the writes already in, before it removes anything. A write
+/// that went on would resolve the store's namespace after its removal, or
+/// leave an embed-queue entry the drop already cleared.
+///
+/// The state check and the count are one step under the gate's lock, and the
+/// drop reads the count under it after its state change is in place: a write
+/// either saw the old state and is counted, or sees `Deleting` and is refused.
 #[derive(Default)]
 pub(crate) struct WriteGate {
-    state: parking_lot::Mutex<WriteGateState>,
+    writers: parking_lot::Mutex<std::collections::HashMap<String, usize>>,
     left: tokio::sync::Notify,
 }
 
-#[derive(Default)]
-struct WriteGateState {
-    closed: std::collections::HashSet<String>,
-    writers: std::collections::HashMap<String, usize>,
-}
-
-/// A write in progress on one store; see [`WriteGate`]. Owns its gate, so a
-/// background task (an index build) can hold it.
+/// A write in progress on one store; see [`WriteGate`].
 pub(crate) struct WriteGuard {
     gate: Arc<WriteGate>,
     namespace: String,
 }
 
 impl WriteGate {
-    /// Start a write to `namespace`; fails with [`DocStoreError::NotFound`]
-    /// while it is being dropped.
-    pub(crate) fn enter(self: &Arc<Self>, namespace: &str) -> Result<WriteGuard, DocStoreError> {
-        let mut state = self.state.lock();
-        if state.closed.contains(namespace) {
-            return Err(DocStoreError::NotFound {
-                namespace: namespace.to_owned(),
-            });
-        }
-        *state.writers.entry(namespace.to_owned()).or_default() += 1;
+    /// Start a write to `namespace` if `admit` (its state check) passes;
+    /// `admit` runs under the gate's lock.
+    pub(crate) fn enter(self: &Arc<Self>, namespace: &str, admit: impl FnOnce() -> Result<(), DocStoreError>) -> Result<WriteGuard, DocStoreError> {
+        let mut writers = self.writers.lock();
+        admit()?;
+        *writers.entry(namespace.to_owned()).or_default() += 1;
         Ok(WriteGuard {
             gate: Arc::clone(self),
             namespace: namespace.to_owned(),
         })
     }
 
-    /// Refuse new writes to `namespace` and wait for those in progress.
-    pub(crate) async fn close(&self, namespace: &str) {
-        self.state.lock().closed.insert(namespace.to_owned());
+    /// Wait until no write to `namespace` is in progress. The caller has
+    /// moved the store to a state that admits none, so none starts after.
+    pub(crate) async fn drain(&self, namespace: &str) {
         loop {
             let left = self.left.notified();
             tokio::pin!(left);
             // Registered before the check, so a write leaving between the two is seen.
             left.as_mut().enable();
-            if !self.state.lock().writers.contains_key(namespace) {
+            if !self.writers.lock().contains_key(namespace) {
                 return;
             }
             left.await;
         }
     }
-
-    /// Accept writes to `namespace` again: the drop is over (its schema is
-    /// gone, so they now fail on that, or it failed and the store remains).
-    pub(crate) fn reopen(&self, namespace: &str) {
-        self.state.lock().closed.remove(namespace);
-    }
 }
 
 impl Drop for WriteGuard {
     fn drop(&mut self) {
-        let mut state = self.gate.state.lock();
-        if let Some(n) = state.writers.get_mut(&self.namespace) {
+        let mut writers = self.gate.writers.lock();
+        if let Some(n) = writers.get_mut(&self.namespace) {
             *n -= 1;
             if *n == 0 {
-                state.writers.remove(&self.namespace);
+                writers.remove(&self.namespace);
             }
         }
-        drop(state);
+        drop(writers);
         self.gate.left.notify_waiters();
     }
 }

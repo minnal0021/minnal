@@ -290,7 +290,8 @@ impl DocStore {
         let _lifecycle = self.lifecycle.lock(namespace).await;
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
-            // A guard, as in `without_writes`: left in place, the namespace's
+            // A guard, so a drop cut short at an await (its future dropped)
+            // does not leave it in place: left in place, the namespace's
             // partition is refused for good. Declared after `_lifecycle`, so the
             // drop has ended before another lifecycle operation starts.
             struct EndDrop<'a>(&'a SemanticSearchContext, &'a str);

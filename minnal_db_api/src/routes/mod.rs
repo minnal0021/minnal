@@ -3,6 +3,7 @@ pub mod admin_storage;
 pub mod admin_stores;
 pub mod docs;
 pub mod indices;
+pub mod jobs;
 pub mod kv;
 pub mod semantic_search;
 pub mod stores;
@@ -125,6 +126,11 @@ pub fn router() -> Router<AppState> {
             "/admin/indices/{ns}/vector/queue/{doc_id}/retry",
             post(admin_indices::vector_queue_retry_entry),
         )
+        // ── Index jobs and the lifecycle audit log ────────────────────────────
+        .route("/admin/jobs", get(jobs::live_jobs))
+        .route("/admin/stores/{ns}/jobs", get(jobs::store_jobs))
+        .route("/admin/stores/{ns}/jobs/{job}", delete(jobs::cancel_job))
+        .route("/admin/lifecycle/audit", get(jobs::lifecycle_audit))
         // ── Admin / store schema & data management ────────────────────────────
         .route("/admin/stores/{ns}/schema/export", get(admin_stores::export_schema))
         .route("/admin/stores/import", post(admin_stores::import_schema))

@@ -181,6 +181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Every store's create, drop and index job runs under the lifecycle
     // governor from here on; it also finishes those a crash left part-way.
+    if let Err(e) = state.store.set_audit_retention(cfg.lifecycle.audit_retention()).await {
+        error!("could not set the lifecycle audit retention: {e}");
+    }
     state.store.start_lifecycle(cfg.lifecycle.config());
 
     let shutdown_store = Arc::clone(&state.store);

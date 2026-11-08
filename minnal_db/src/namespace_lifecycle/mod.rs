@@ -24,8 +24,10 @@
 //! - `jobs`: index jobs: their keys, records and conflicts, and [`Jobs`].
 //! - `host`: [`LifecycleHost`], what the governor needs from the owner.
 //! - `records`: the system namespace `system_namespace_maintenance`.
+//! - `audit`: the lifecycle audit log, `system_lifecycle_audit`.
 //! - `error`: [`LifecycleError`].
 
+mod audit;
 mod error;
 mod governor;
 mod host;
@@ -35,6 +37,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use audit::{AUDIT_NAMESPACE, AuditEvent, AuditLog, AuditRecord, DEFAULT_AUDIT_RETENTION, MAX_AUDIT_LIMIT};
 pub use error::LifecycleError;
 pub(crate) use governor::Governor;
 pub use governor::{LifecycleConfig, Task};

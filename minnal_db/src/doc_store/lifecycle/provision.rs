@@ -33,6 +33,7 @@ impl DocStore {
             self.seed_vector_index(namespace, &settings, &mut None).await?;
         }
         self.schemas.transition(namespace, &[NamespaceState::Creating], NamespaceState::Created)?;
+        self.audit(namespace, AuditEvent::Created);
         info!("store '{namespace}' created (ns_id={ns_id})");
         Ok(())
     }

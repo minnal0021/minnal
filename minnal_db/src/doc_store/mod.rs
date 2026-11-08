@@ -59,8 +59,8 @@ pub use self::vector::VectorReindexOutcome;
 pub use self::vector::{ReindexStats, VecReindexProgress};
 #[cfg(feature = "semantic-search")]
 pub(crate) use self::write_gate::{InFlightWrite, InFlightWrites};
-pub(crate) use self::write_gate::{LifecycleLocks, WriteGate};
-pub use crate::namespace_lifecycle::{BuildStatus, JobRecord, LifecycleConfig, MAINTENANCE_NAMESPACE, NamespaceState};
+pub(crate) use self::write_gate::{LifecycleLocks, WriteGate, WriteGuard};
+pub use crate::namespace_lifecycle::{AuditEvent, AuditRecord, BuildStatus, JobRecord, LifecycleConfig, MAINTENANCE_NAMESPACE, NamespaceState};
 pub(crate) use crate::namespace_lifecycle::{JobKey, MaintenanceStore};
 #[cfg(feature = "semantic-search")]
 pub use crate::semantic_search::context::{NamespaceSemantics, SemanticSearchContext};
@@ -190,11 +190,12 @@ impl DocStore {
         // After WAL recovery (done by the open above), before anything reads a schema.
         let schemas = Arc::new(SchemaStore::open(&db).await?);
         let maintenance = Arc::new(MaintenanceStore::open(&db).await?);
+        let audit = Arc::new(crate::namespace_lifecycle::AuditLog::open(&db, crate::namespace_lifecycle::DEFAULT_AUDIT_RETENTION).await?);
         let store = Self {
             db,
             db_path,
             schemas,
-            jobs: Arc::new(crate::namespace_lifecycle::Jobs::new(Arc::clone(&maintenance))),
+            jobs: Arc::new(crate::namespace_lifecycle::Jobs::new(Arc::clone(&maintenance), audit)),
             maintenance,
             #[cfg(feature = "semantic-search")]
             semantic_ctx: None,

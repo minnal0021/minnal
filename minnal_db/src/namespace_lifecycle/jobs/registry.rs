@@ -24,22 +24,31 @@ use super::conflicts::conflicts;
 use super::key::JobKey;
 use super::record::JobRecord;
 use crate::namespace::NamespaceId;
-use crate::namespace_lifecycle::{BuildStatus, LifecycleError, LifecycleHost, MaintenanceStore, NamespaceState};
+use crate::namespace_lifecycle::{AuditEvent, AuditLog, BuildStatus, LifecycleError, LifecycleHost, MaintenanceStore, NamespaceState};
 
 /// The index jobs of every namespace. See the module docs.
 pub struct Jobs {
     records: Arc<MaintenanceStore>,
+    /// Where every start, cancel and end is recorded.
+    audit: Arc<AuditLog>,
     /// Held by every start and finish, across the record and the state write.
     lock: Mutex<()>,
 }
 
 impl Jobs {
-    /// The jobs whose records `records` holds.
-    pub(crate) fn new(records: Arc<MaintenanceStore>) -> Self {
+    /// The jobs whose records `records` holds, their events recorded in
+    /// `audit`.
+    pub(crate) fn new(records: Arc<MaintenanceStore>, audit: Arc<AuditLog>) -> Self {
         Self {
             records,
+            audit,
             lock: Mutex::new(()),
         }
+    }
+
+    /// The lifecycle audit log the jobs record their events in.
+    pub fn audit(&self) -> &AuditLog {
+        &self.audit
     }
 
     /// Start job `key` on `namespace`: refused unless the namespace is ready
@@ -69,6 +78,7 @@ impl Jobs {
             }
             .into());
         }
+        let subject_name = subject.clone();
         self.records.put(key, &JobRecord::started(subject, progress))?;
         let ready = [NamespaceState::Created, NamespaceState::IndexMaintenance];
         if let Err(e) = host.transition(namespace, &ready, NamespaceState::IndexMaintenance) {
@@ -77,6 +87,8 @@ impl Jobs {
             self.records.delete(key)?;
             return Err(e);
         }
+        self.audit
+            .record(namespace, AuditEvent::JobStarted, Some(key.kind.name()), subject_name.as_deref(), None);
         Ok(())
     }
 
@@ -98,6 +110,18 @@ impl Jobs {
             record.error = outcome.err();
             record.updated_at_ms = crate::support::now_ms();
             self.records.put(key, &record)?;
+            let event = match record.status {
+                BuildStatus::Cancelled => AuditEvent::JobCancelled,
+                BuildStatus::Failed => AuditEvent::JobFailed,
+                _ => AuditEvent::JobCompleted,
+            };
+            self.audit.record(
+                namespace,
+                event,
+                Some(key.kind.name()),
+                record.subject.as_deref(),
+                record.error.as_deref(),
+            );
         }
         self.leave_if_idle(host, namespace, key.namespace)
     }
@@ -122,7 +146,15 @@ impl Jobs {
         }
         record.status = BuildStatus::Cancelling;
         record.updated_at_ms = crate::support::now_ms();
-        self.records.put(key, &record)
+        self.records.put(key, &record)?;
+        self.audit.record(
+            namespace,
+            AuditEvent::JobCancelRequested,
+            Some(key.kind.name()),
+            record.subject.as_deref(),
+            None,
+        );
+        Ok(())
     }
 
     /// Take back a cancel of job `key` that came too late: its body got past
