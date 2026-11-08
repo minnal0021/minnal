@@ -1,5 +1,6 @@
 //! The doc store as the lifecycle governor's host: its stores' states come
-//! from their records, and their tasks are `provision` and `teardown`. Also
+//! from their records, and their tasks are `provision`, `teardown` and the
+//! index jobs' bodies (`jobs.rs`). Also
 //! the `DocStore` methods that start the governor and hand it tasks.
 
 use std::sync::Arc;
@@ -31,8 +32,7 @@ impl LifecycleHost for DocStore {
         match task {
             Task::Provision => self.provision(namespace).await,
             Task::Teardown => self.teardown(namespace).await,
-            // No job is started by this store yet, so none is left to resume.
-            Task::Job(key) => Err(DocStoreError::Io(std::io::Error::other(format!("no body for index job {}", key.kind)))),
+            Task::Job(key) => self.job_body(namespace, key).await,
         }
     }
 }

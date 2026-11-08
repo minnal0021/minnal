@@ -252,9 +252,9 @@ async fn the_cache_matches_storage_after_every_schema_change() {
         field: "level".to_owned(),
         index_type: IndexType::Int,
     };
-    store.add_index("docs", spec).await.unwrap().wait().await.unwrap();
+    store.add_index("docs", spec).await.unwrap();
     check(&store, "add_index").await;
-    store.drop_index("docs", "level").unwrap();
+    store.drop_index("docs", "level").await.unwrap();
     check(&store, "drop_index").await;
     store.remove_attribute("docs", "status").unwrap();
     check(&store, "remove_attribute").await;

@@ -10,9 +10,7 @@
 //! [`NamespaceId`](crate::NamespaceId), then the job. `store` owns the
 //! namespace: nothing else reads or writes it.
 
-mod progress;
 mod store;
 
-pub use progress::{BuildStatus, FieldBuildRecord};
 pub use store::MAINTENANCE_NAMESPACE;
 pub(crate) use store::MaintenanceStore;

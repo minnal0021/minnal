@@ -43,11 +43,19 @@ impl Jobs {
     }
 
     /// Start job `key` on `namespace`: refused unless the namespace is ready
-    /// and no live job of it conflicts; then its record is written (running)
-    /// and the namespace moved to `IndexMaintenance`. The caller then hands
-    /// the job to the governor. `subject` names what the job works on, for the
-    /// admin views.
-    pub fn start<H: LifecycleHost>(&self, host: &H, namespace: &str, key: JobKey, subject: Option<String>) -> Result<(), H::Error> {
+    /// and no live job of it conflicts; then its record is written (running,
+    /// holding `progress`, what the body starts from) and the namespace moved
+    /// to `IndexMaintenance`. The caller then hands the job to the governor.
+    /// `subject` names what the job works on, for the admin views. A record
+    /// of an ended job under the same key is replaced.
+    pub fn start<H: LifecycleHost>(
+        &self,
+        host: &H,
+        namespace: &str,
+        key: JobKey,
+        subject: Option<String>,
+        progress: serde_json::Value,
+    ) -> Result<(), H::Error> {
         let _g = self.lock.lock();
         let state = host.state(namespace).ok_or_else(|| LifecycleError::NotFound {
             namespace: namespace.to_owned(),
@@ -61,10 +69,11 @@ impl Jobs {
             }
             .into());
         }
-        self.records.put(key, &JobRecord::started(subject))?;
+        self.records.put(key, &JobRecord::started(subject, progress))?;
         let ready = [NamespaceState::Created, NamespaceState::IndexMaintenance];
         if let Err(e) = host.transition(namespace, &ready, NamespaceState::IndexMaintenance) {
-            // A drop moved first: the job never started.
+            // A drop moved first: the job never started. (Any ended record
+            // under the key went with it, which only shortens the history.)
             self.records.delete(key)?;
             return Err(e);
         }
@@ -138,6 +147,17 @@ impl Jobs {
         record.progress = progress;
         record.updated_at_ms = crate::support::now_ms();
         self.records.put(key, &record)
+    }
+
+    /// Delete job `key`'s record if the job has ended: its history goes, for a
+    /// record that would describe something no longer there (the build of an
+    /// index since dropped). A live record is kept.
+    pub fn forget(&self, key: JobKey) -> Result<(), LifecycleError> {
+        let _g = self.lock.lock();
+        if self.records.get::<JobRecord>(key)?.is_some_and(|r| !r.is_live()) {
+            self.records.delete(key)?;
+        }
+        Ok(())
     }
 
     /// Every job of `namespace` with a record, live or ended, in key order.

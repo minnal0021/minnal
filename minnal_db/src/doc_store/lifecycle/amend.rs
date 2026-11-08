@@ -117,29 +117,4 @@ impl DocStore {
             Ok(will_disable_ss)
         })
     }
-
-    /// Drop every field index for a namespace and return their specs.
-    ///
-    /// Each field is demoted to a plain attribute (its data stays in stored
-    /// documents) and its on-disk index files are deleted. With no field index
-    /// left, the namespace's row map is reset, freeing every row ID. The caller
-    /// can pass the returned specs back to [`add_index`] to rebuild them; to
-    /// drop and rebuild in one crash-safe step, use
-    /// [`reindex_all_attribute_indices`](DocStore::reindex_all_attribute_indices).
-    ///
-    /// [`add_index`]: DocStore::add_index
-    pub fn drop_all_attribute_indices(&self, namespace: &str) -> Result<Vec<IndexSpec>, DocStoreError> {
-        let schema = self.load_schema(namespace)?;
-        let specs = schema.indices.clone();
-        for spec in &specs {
-            self.drop_index(namespace, &spec.field)?;
-        }
-        // No field index is left to reference a row ID: free them all (FR-006).
-        if !specs.is_empty()
-            && let Some(ns_id) = schema.ns_id
-        {
-            self.db.reset_rowmap(ns_id)?;
-        }
-        Ok(specs)
-    }
 }

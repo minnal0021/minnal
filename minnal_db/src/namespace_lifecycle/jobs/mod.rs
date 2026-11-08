@@ -12,6 +12,7 @@
 //!
 //! - `key`: [`JobKey`] and [`JobKind`].
 //! - `record`: [`JobRecord`].
+//! - `status`: [`BuildStatus`].
 //! - `conflicts`: which jobs cannot run together.
 //! - `registry`: [`Jobs`], which starts, finishes and cancels them.
 
@@ -19,8 +20,10 @@ mod conflicts;
 mod key;
 mod record;
 mod registry;
+mod status;
 
 pub use conflicts::conflicts;
 pub use key::{JobKey, JobKind};
 pub use record::JobRecord;
 pub use registry::Jobs;
+pub use status::BuildStatus;

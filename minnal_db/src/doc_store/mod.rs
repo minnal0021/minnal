@@ -12,7 +12,7 @@
 //!   .put("users", id, doc)              ← write a document
 //!   .get("users", id)            ← read by primary key
 //!   .query("users", "status = \"active\"") ← index query
-//!   .add_index("users", spec)           ← add an index (background build)
+//!   .add_index("users", spec)           ← add an index (a build job)
 //!   .drop_index("users", "status")      ← remove an index
 //!   .amend("users", amendment)          ← add/remove non-index attributes
 //!   .remove("users")                ← destroy everything
@@ -26,20 +26,17 @@ use crate::{AsyncDb, AsyncNamespace, DbConfig, FieldId};
 use log::warn;
 use log::{debug, info};
 
-use self::indexing::observer::{ChainedObserver, InMemoryProgress, IndexProgressObserver, RecordProgress};
 #[cfg(feature = "semantic-search")]
 use self::indexing::progress::now_ms;
 use self::pagination::clamp_cursor;
 use self::schema::store::SchemaStore;
 #[cfg(feature = "semantic-search")]
 use self::schema::vector_settings::SearchSpec;
-use crate::namespace_lifecycle::BuildStatus;
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::vector_kv;
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::workers::vec_index::{VecIndexWorker, VecIndexWorkerHandle};
 use crate::support::file_lock::{DirLock, LockError};
-use crate::support::hex::hex_to_bytes;
 
 mod diagnostics;
 mod documents;
@@ -58,14 +55,14 @@ mod vector;
 mod write_gate;
 
 pub use self::diagnostics::RowMapStats;
-pub use self::indexing::progress::{IndexBuildHandle, IndexBuildProgress};
+pub use self::indexing::progress::FieldBuildProgress;
 #[cfg(feature = "semantic-search")]
 pub use self::vector::VectorReindexOutcome;
 pub use self::vector::{ReindexStats, VecReindexProgress};
 #[cfg(feature = "semantic-search")]
 pub(crate) use self::write_gate::{InFlightWrite, InFlightWrites};
-pub(crate) use self::write_gate::{LifecycleLocks, WriteGate, WriteGuard};
-pub use crate::namespace_lifecycle::{FieldBuildRecord, LifecycleConfig, MAINTENANCE_NAMESPACE, NamespaceState};
+pub(crate) use self::write_gate::{LifecycleLocks, WriteGate};
+pub use crate::namespace_lifecycle::{BuildStatus, JobRecord, LifecycleConfig, MAINTENANCE_NAMESPACE, NamespaceState};
 pub(crate) use crate::namespace_lifecycle::{JobKey, MaintenanceStore};
 #[cfg(feature = "semantic-search")]
 pub use crate::semantic_search::context::{NamespaceSemantics, SemanticSearchContext};
@@ -93,9 +90,6 @@ pub use crate::support::prefix_upper_bound;
 
 // ── Stored schemas ─────────────────────────────────────────────────────────
 pub use self::schema::store::{SCHEMA_NAMESPACE, StoredSchema};
-
-// ── Index manager ──────────────────────────────────────────────────────────
-pub use self::indexing::build_manager::IndexBuildManager;
 
 // ── Vector-index worker types (semantic-search only) ───────────────────────
 #[cfg(feature = "semantic-search")]
@@ -154,8 +148,6 @@ pub struct DocStore {
     writes: Arc<WriteGate>,
     /// Keeps a store's create, amendments and drop apart ([`LifecycleLocks`]).
     lifecycle: LifecycleLocks,
-    /// Field-index builds running in this process ([`RunningBuilds`]).
-    builds: Arc<self::indexing::RunningBuilds>,
     /// Documents of semantic-search stores with a write in progress, which the
     /// vector worker skips (see [`InFlightWrites`]).
     #[cfg(feature = "semantic-search")]
@@ -223,7 +215,6 @@ impl DocStore {
             vector_index_config: VectorIndexConfig::default(),
             writes: Arc::default(),
             lifecycle: LifecycleLocks::default(),
-            builds: Arc::default(),
             #[cfg(feature = "semantic-search")]
             in_flight: Arc::default(),
             governor: std::sync::OnceLock::new(),

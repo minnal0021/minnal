@@ -75,7 +75,7 @@ impl FakeHost {
     /// Start job `kind` on `name` through the registry.
     pub fn start(&self, name: &str, kind: JobKind) -> Result<JobKey, LifecycleError> {
         let key = JobKey::new(self.namespace_id(name).unwrap(), kind);
-        self.jobs.start(self, name, key, None)?;
+        self.jobs.start(self, name, key, None, serde_json::Value::Null)?;
         Ok(key)
     }
 

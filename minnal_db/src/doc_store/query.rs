@@ -322,26 +322,33 @@ impl DocStore {
     }
 
     /// The fields a query's results may be incomplete for, by name: those with
-    /// an outstanding gap record (from the engine), and those whose index build
-    /// is still running or failed — a building index holds only the documents
-    /// it has reached so far. Only fields the predicate touched are considered.
+    /// an outstanding gap record (from the engine), and those whose index is
+    /// still being built or failed to build (a `field_build` job not complete,
+    /// or a `reindex-all` that has not reached the field) — a building index
+    /// holds only the documents it has reached so far. Only fields the
+    /// predicate touched are considered.
     ///
     /// An id with no matching registered field falls back to its numeric form
     /// rather than being dropped — losing a degradation signal because a name
     /// could not be resolved would be exactly the wrong failure mode.
     fn degraded_field_names(&self, ns_id: NamespaceId, outcome: &crate::QueryOutcome) -> Vec<String> {
+        use crate::namespace_lifecycle::BuildStatus;
         let mut degraded = outcome.degraded_fields.clone();
+        let fields = self.db.list_index_fields(ns_id);
+        // A record that cannot be read counts as degraded: losing the signal
+        // is the wrong way to fail.
+        let reindexing = self.fields_reindexing(ns_id);
         for &fid in &outcome.touched_fields {
-            // A record that does not parse counts as degraded: losing the
-            // signal is the wrong way to fail.
-            let building = match self
-                .maintenance
-                .get::<crate::doc_store::FieldBuildRecord>(crate::doc_store::JobKey::field_build(ns_id, fid))
-            {
-                Ok(record) => record.is_some_and(|r| r.status != crate::namespace_lifecycle::BuildStatus::Complete),
+            let name = fields.iter().find(|f| f.field_id == fid).map(|f| f.field_name.as_str());
+            let building = match self.jobs.get(crate::doc_store::JobKey::field_build(ns_id, fid)) {
+                Ok(record) => record.is_some_and(|r| !matches!(r.status, BuildStatus::Complete | BuildStatus::Cancelled)),
                 Err(_) => true,
             };
-            if building && !degraded.contains(&fid) {
+            let rebuilding = match &reindexing {
+                Ok(unbuilt) => name.is_some_and(|n| unbuilt.iter().any(|u| u == n)),
+                Err(_) => true,
+            };
+            if (building || rebuilding) && !degraded.contains(&fid) {
                 degraded.push(fid);
             }
         }
@@ -349,7 +356,6 @@ impl DocStore {
             return Vec::new();
         }
         degraded.sort_unstable();
-        let fields = self.db.list_index_fields(ns_id);
         degraded
             .iter()
             .map(|&fid| {

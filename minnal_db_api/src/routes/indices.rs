@@ -2,9 +2,9 @@
 //!
 //! ```text
 //! GET    /stores/{ns}/indices            → list all indices for namespace
-//! POST   /stores/{ns}/indices            → add index (background build, returns 202)
+//! POST   /stores/{ns}/indices            → add index (a field_build job, returns 202)
 //! DELETE /stores/{ns}/indices/vector     → drop vector index (background cleanup, returns 202)
-//! DELETE /stores/{ns}/indices/{field}    → drop field index (background cleanup, returns 202)
+//! DELETE /stores/{ns}/indices/{field}    → drop field index (a field_drop job, returns 202)
 //! ```
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use axum::{
     response::IntoResponse,
 };
 use minnal_db::{
-    DocStoreError, IndexSpec,
+    DocStoreError, IndexSpec, NamespaceState,
     doc_store::indexing::progress::{IndexBuildSnapshot, IndexId},
     namespace_lifecycle::BuildStatus,
 };
@@ -26,7 +26,7 @@ use crate::{AppState, error::AppError};
 
 /// `GET /stores/{ns}/indices` — list all indices for a namespace.
 pub async fn list_indices(State(state): State<AppState>, Path(ns): Path<String>) -> impl IntoResponse {
-    let mut snaps: Vec<IndexBuildSnapshot> = state.index_manager.list().into_iter().filter(|s| s.id.namespace() == ns).collect();
+    let mut snaps: Vec<IndexBuildSnapshot> = state.store.field_index_builds(Some(&ns));
 
     if let Some(c) = state.store.vec_reindex_progress(&ns).await {
         use minnal_db::doc_store::indexing::progress::now_ms;
@@ -50,57 +50,37 @@ pub async fn list_indices(State(state): State<AppState>, Path(ns): Path<String>)
     Json(snaps)
 }
 
-pub async fn add_index(State(state): State<AppState>, Path(ns): Path<String>, Json(spec): Json<IndexSpec>) -> Result<impl IntoResponse, AppError> {
-    info!(namespace = %ns, field = %spec.field, index_type = ?spec.index_type, "adding index");
-    let handle = state.store.add_index(&ns, spec).await?;
-    info!(namespace = %ns, field = %handle.field, "index activated, background build started");
-    state.index_manager.insert_field_build(handle);
-    Ok(StatusCode::ACCEPTED)
+/// `202 Accepted` for an index job just started: `{namespace, job, state}`,
+/// the job's name (for `GET /admin/stores/{ns}/jobs`) and the store's state.
+pub(crate) fn job_accepted(namespace: &str, job: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "namespace": namespace,
+            "job": job,
+            "state": NamespaceState::IndexMaintenance.as_str(),
+        })),
+    )
 }
 
-/// `DELETE /stores/{ns}/indices/{field}` — drop a field index.
-///
-/// The bitmap files are deleted in a background task.  Returns `202 Accepted`.
-/// Returns `404` when the store does not exist or `field` is not indexed, and
-/// `409` when an attribute index operation is already active for this namespace.
+/// `POST /stores/{ns}/indices` — add an index. The index is activated at once
+/// and built by a `field_build` job in the background: `202 Accepted`, with the
+/// job's name. `409` while another job on the field (or a reindex-all) runs.
+pub async fn add_index(State(state): State<AppState>, Path(ns): Path<String>, Json(spec): Json<IndexSpec>) -> Result<impl IntoResponse, AppError> {
+    info!(namespace = %ns, field = %spec.field, index_type = ?spec.index_type, "adding index");
+    let job = state.store.begin_add_index(&ns, spec).await?;
+    info!(namespace = %ns, job = %job, "index activated, build started");
+    Ok(job_accepted(&ns, &job))
+}
+
+/// `DELETE /stores/{ns}/indices/{field}` — drop a field index, as a
+/// `field_drop` job in the background: `202 Accepted`, with the job's name.
+/// `404` when the store does not exist or `field` is not indexed, and `409`
+/// while another job on the field (its build, say: cancel it first) runs.
 pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(String, String)>) -> Result<impl IntoResponse, AppError> {
-    {
-        let ops = state.attr_index_ops.lock();
-        if ops.contains(&ns) {
-            return Err(DocStoreError::AttrIndexOpInProgress { namespace: ns }.into());
-        }
-    }
-
-    // Verify the store and the index exist (fail fast before spawning). The
-    // background `drop_index` checks again, but by then the caller already has
-    // its 202, so a missing index would only surface as a logged error.
-    let schema = state.store.get_schema(&ns).map_err(AppError::from)?;
-    if !schema.indices.iter().any(|s| s.field == field) {
-        return Err(DocStoreError::IndexNotFound { namespace: ns, field }.into());
-    }
-
-    info!(namespace = %ns, field = %field, "dropping index — background cleanup");
-    state.attr_index_ops.lock().insert(ns.clone());
-
-    let store = Arc::clone(&state.store);
-    let ops_ref = Arc::clone(&state.attr_index_ops);
-    let ns_c = ns.clone();
-    let field_c = field.clone();
-
-    tokio::spawn(async move {
-        // `drop_index` persists the schema (demoting the index to a plain
-        // attribute; the store's schema cache follows) and deactivates the
-        // in-memory index.
-        match store.drop_index(&ns_c, &field_c) {
-            Ok(()) => {
-                info!(namespace = %ns_c, field = %field_c, "index drop complete");
-            }
-            Err(e) => error!(namespace = %ns_c, field = %field_c, error = %e, "index drop failed"),
-        }
-        ops_ref.lock().remove(&ns_c);
-    });
-
-    Ok(StatusCode::ACCEPTED)
+    info!(namespace = %ns, field = %field, "dropping index");
+    let job = state.store.begin_drop_index(&ns, &field)?;
+    Ok(job_accepted(&ns, &job))
 }
 
 /// `DELETE /stores/{ns}/indices/vector` — disable semantic search and drop all vector data.

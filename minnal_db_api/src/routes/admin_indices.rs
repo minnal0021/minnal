@@ -39,7 +39,7 @@ use minnal_db::{DocStoreError, Page, Pagination, QueueEntry, QueueEntryKind, Vec
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::{AppState, id::parse_doc_id};
+use crate::{AppState, error::AppError, id::parse_doc_id};
 
 // ── Progress — unified view ───────────────────────────────────────────────────
 
@@ -82,12 +82,7 @@ pub async fn progress_ns(State(state): State<AppState>, Path(ns): Path<String>) 
 async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> IndexProgressResponse {
     let max_retries = state.store.vector_index_max_retries();
 
-    let attribute_builds: Vec<IndexBuildSnapshot> = state
-        .index_manager
-        .list()
-        .into_iter()
-        .filter(|s| ns_filter.is_none_or(|ns| s.id.namespace() == ns))
-        .collect();
+    let attribute_builds: Vec<IndexBuildSnapshot> = state.store.field_index_builds(ns_filter);
 
     // Build vector reindex snapshots for SS-enabled namespaces.
     let ss_namespaces: Vec<String> = {
@@ -150,138 +145,49 @@ async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> I
 ///
 /// Drops every field index for `{ns}`, frees its row IDs (the row map is reset,
 /// so the rebuilt indexes number only the live documents), and rebuilds every
-/// index from scratch. Crash-safe: a run interrupted by a crash is finished at
-/// the next start. Returns `202 Accepted`; progress is visible via
-/// `GET /admin/indices/{ns}/progress`.
-/// Returns `409 Conflict` when any attribute or vector index operation is already active
-/// for this namespace.
-pub async fn attribute_reindex_all(
-    State(state): State<AppState>,
-    Path(ns): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    {
-        let ops = state.attr_index_ops.lock();
-        if ops.contains(&ns) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("an attribute index operation is already in progress for '{ns}'")
-                })),
-            ));
+/// index, as one `reindex_all` job. Crash-safe: a run interrupted by a crash
+/// is finished at the next start. Returns `202 Accepted` with the job's name;
+/// progress is visible via `GET /admin/indices/{ns}/progress`. `409` while
+/// any other index job of the store runs, `422` for a store with no field
+/// index.
+pub async fn attribute_reindex_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
+    match state.store.begin_reindex_all(&ns).map_err(|e| AppError::from(e).with_ns(&ns))? {
+        Some(job) => {
+            info!(namespace = %ns, "attribute reindex-all accepted — running in background");
+            Ok(crate::routes::indices::job_accepted(&ns, &job).into_response())
         }
+        None => Ok(no_attribute_indices(&ns, "reindex")),
     }
-
-    // Dropping an index whose build is running would delete its files under it.
-    if let Some(field) = state.store.field_index_build_running(&ns) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("the index build of field '{field}' in '{ns}' is still running; retry when it finishes")
-            })),
-        ));
-    }
-
-    let schema = state.store.get_schema(&ns).map_err(|e| {
-        let status = if matches!(e, DocStoreError::NotFound { .. }) {
-            StatusCode::NOT_FOUND
-        } else {
-            error!(namespace = %ns, error = %e, "attribute reindex-all: failed to load schema");
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (status, Json(serde_json::json!({ "error": e.to_string() })))
-    })?;
-
-    if schema.indices.is_empty() {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": format!("namespace '{ns}' has no attribute indices to reindex")
-            })),
-        ));
-    }
-
-    state.attr_index_ops.lock().insert(ns.clone());
-    info!(namespace = %ns, "attribute reindex-all accepted — running in background");
-
-    let store = Arc::clone(&state.store);
-    let index_manager = Arc::clone(&state.index_manager);
-    let ops_ref = Arc::clone(&state.attr_index_ops);
-
-    tokio::spawn(async move {
-        let result: Result<(), DocStoreError> = async {
-            // Crash-safe: an interrupted run is finished at the next start.
-            for handle in store.reindex_all_attribute_indices(&ns).await? {
-                index_manager.insert_field_build(handle);
-            }
-            Ok(())
-        }
-        .await;
-        match result {
-            Ok(()) => info!(namespace = %ns, "attribute reindex-all complete"),
-            Err(e) => error!(namespace = %ns, error = %e, "attribute reindex-all failed"),
-        }
-        ops_ref.lock().remove(&ns);
-    });
-
-    Ok(StatusCode::ACCEPTED)
 }
 
 /// `DELETE /admin/indices/{ns}/attribute/drop-all`
 ///
-/// Drops every field index for `{ns}` (no rebuild).
-/// Returns `202 Accepted`.
-/// Returns `409` when an operation is already active.
-pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+/// Drops every field index for `{ns}` (no rebuild), as one `reindex_all` job
+/// that stops after the drops. Returns `202 Accepted` with the job's name;
+/// `409` while any other index job of the store runs.
+pub async fn attribute_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
+    match state
+        .store
+        .begin_drop_all_attribute_indices(&ns)
+        .map_err(|e| AppError::from(e).with_ns(&ns))?
     {
-        let ops = state.attr_index_ops.lock();
-        if ops.contains(&ns) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("an attribute index operation is already in progress for '{ns}'")
-                })),
-            ));
+        Some(job) => {
+            info!(namespace = %ns, "attribute drop-all accepted — running in background");
+            Ok(crate::routes::indices::job_accepted(&ns, &job).into_response())
         }
+        None => Ok(no_attribute_indices(&ns, "drop")),
     }
+}
 
-    let schema = state.store.get_schema(&ns).map_err(|e| {
-        let status = if matches!(e, DocStoreError::NotFound { .. }) {
-            StatusCode::NOT_FOUND
-        } else {
-            error!(namespace = %ns, error = %e, "attribute drop-all: failed to load schema");
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (status, Json(serde_json::json!({ "error": e.to_string() })))
-    })?;
-
-    if schema.indices.is_empty() {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": format!("namespace '{ns}' has no attribute indices to drop")
-            })),
-        ));
-    }
-
-    state.attr_index_ops.lock().insert(ns.clone());
-    info!(namespace = %ns, "attribute drop-all accepted — running in background");
-
-    let store = Arc::clone(&state.store);
-    let ops_ref = Arc::clone(&state.attr_index_ops);
-
-    tokio::spawn(async move {
-        // drop_all_attribute_indices persists the schema (demoting every index
-        // to a plain attribute); the store's schema cache follows.
-        match store.drop_all_attribute_indices(&ns) {
-            Ok(dropped) => {
-                info!(namespace = %ns, count = dropped.len(), "attribute drop-all complete");
-            }
-            Err(e) => error!(namespace = %ns, error = %e, "attribute drop-all failed"),
-        }
-        ops_ref.lock().remove(&ns);
-    });
-
-    Ok(StatusCode::ACCEPTED)
+/// `422` for a store with no field index to reindex or drop.
+fn no_attribute_indices(ns: &str, what: &str) -> axum::response::Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "error": format!("namespace '{ns}' has no attribute indices to {what}")
+        })),
+    )
+        .into_response()
 }
 
 // ── GET /admin/indices/{ns}/{field}/blob-stats ────────────────────────────────

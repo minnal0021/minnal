@@ -59,14 +59,6 @@ pub(crate) struct WriteGuard {
     namespace: String,
 }
 
-impl WriteGuard {
-    /// Whether the store is being dropped: a long write stops when it is, so
-    /// the drop waiting for it is not held up.
-    pub(crate) fn store_dropping(&self) -> bool {
-        self.gate.is_closed(&self.namespace)
-    }
-}
-
 impl WriteGate {
     /// Start a write to `namespace`; fails with [`DocStoreError::NotFound`]
     /// while it is being dropped.
@@ -85,6 +77,7 @@ impl WriteGate {
     }
 
     /// Whether `namespace` is being dropped.
+    #[cfg(feature = "semantic-search")]
     pub(crate) fn is_closed(&self, namespace: &str) -> bool {
         self.state.lock().closed.contains(namespace)
     }

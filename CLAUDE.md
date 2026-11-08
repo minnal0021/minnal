@@ -72,7 +72,7 @@ src/db/                — the engine: facade/ (`Db`, `AsyncDb` and their namesp
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
 src/vector_index/      — each store's vector-index settings (`vector_settings`), in its schema with or without semantic search   #[cfg(doc-store)]
 src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge), partition_admin.rs, context.rs and workers/ (with doc-store; they reach the stores above through `WorkerHost`)   #[cfg(semantic-search)]
-src/doc_store/         — JSON document stores and typed KV stores: schema/, indexing/ (field-index builds, reindex-all, which builds are running), vector/ (each store's vector index: admin and lifecycle), lifecycle, queries   #[cfg(doc-store)]
+src/doc_store/         — JSON document stores and typed KV stores: schema/, indexing/ (the field_build, field_drop and reindex_all job bodies and their progress), lifecycle/ (incl. jobs.rs: starting, running, listing and cancelling index jobs), vector/ (each store's vector index: admin and lifecycle), queries   #[cfg(doc-store)]
 tests/                 — integration tests only; unit tests live beside their module (inline, or in its own tests.rs or tests/)
 ```
 

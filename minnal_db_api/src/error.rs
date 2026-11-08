@@ -51,14 +51,12 @@ impl IntoResponse for AppError {
 
             DocStoreError::AlreadyExists { .. }
             | DocStoreError::IndexAlreadyExists { .. }
-            | DocStoreError::IndexBuildInProgress { .. }
             | DocStoreError::AttributeIsIndexed { .. }
             | DocStoreError::VecReindexInProgress { .. }
             | DocStoreError::VectorCleanupInProgress { .. }
             | DocStoreError::NamespaceNotEmpty { .. }
             | DocStoreError::VecRebuildInProgress { .. }
             | DocStoreError::VecIndexCleanupInProgress { .. }
-            | DocStoreError::AttrIndexOpInProgress { .. }
             | DocStoreError::Schema(SchemaError::SemanticSearchAlreadyEnabled { .. })
             | DocStoreError::Schema(SchemaError::VectorSettingFixed { .. })
             | DocStoreError::Schema(SchemaError::WrongStoreType { .. })

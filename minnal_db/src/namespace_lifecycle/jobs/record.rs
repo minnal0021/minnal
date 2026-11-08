@@ -33,8 +33,9 @@ pub struct JobRecord {
 }
 
 impl JobRecord {
-    /// A job starting now.
-    pub fn started(subject: Option<String>) -> Self {
+    /// A job starting now, its body's progress `progress` (what the body
+    /// needs to begin, such as the index spec of a build).
+    pub fn started(subject: Option<String>, progress: serde_json::Value) -> Self {
         let now = crate::support::now_ms();
         Self {
             status: BuildStatus::Running,
@@ -42,7 +43,7 @@ impl JobRecord {
             started_at_ms: now,
             updated_at_ms: now,
             error: None,
-            progress: serde_json::Value::Null,
+            progress,
         }
     }
 

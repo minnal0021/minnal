@@ -71,10 +71,13 @@ impl JobKind {
         }
     }
 
-    /// Whether a cancel may stop the job part-way. A vector cleanup may not: a
-    /// half-removed vector index serves neither searches nor a new enable.
+    /// Whether a cancel may stop the job part-way and undo it. Not a field
+    /// drop (it is short, and its undo would be a full build), a
+    /// `reindex-all` (its first step drops the old indexes, which cannot come
+    /// back), or a vector cleanup (a half-removed vector index serves neither
+    /// searches nor a new enable).
     pub fn cancellable(self) -> bool {
-        !matches!(self, Self::VectorCleanup)
+        !matches!(self, Self::FieldDrop(_) | Self::ReindexAll | Self::VectorCleanup)
     }
 }
 
@@ -97,6 +100,11 @@ impl JobKey {
     /// The key of `namespace`'s build of field `field`.
     pub fn field_build(namespace: NamespaceId, field: FieldId) -> Self {
         Self::new(namespace, JobKind::FieldBuild(field))
+    }
+
+    /// The key of `namespace`'s drop of field `field`'s index.
+    pub fn field_drop(namespace: NamespaceId, field: FieldId) -> Self {
+        Self::new(namespace, JobKind::FieldDrop(field))
     }
 
     /// The key of `namespace`'s `reindex-all`.

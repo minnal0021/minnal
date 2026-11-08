@@ -261,10 +261,6 @@ pub enum DocStoreError {
     #[error("field '{field}' in namespace '{namespace}' is already indexed")]
     IndexAlreadyExists { namespace: String, field: String },
 
-    /// A background index build for this field is already running.
-    #[error("an index build for field '{field}' in namespace '{namespace}' is already in progress")]
-    IndexBuildInProgress { namespace: String, field: String },
-
     /// Attempt to drop or amend an attribute that is currently indexed.
     /// Drop the index first, then retry the operation.
     #[error("attribute '{field}' in namespace '{namespace}' is used by an index — drop the index first")]
@@ -340,10 +336,6 @@ pub enum DocStoreError {
     #[cfg(feature = "semantic-search")]
     #[error("invalid probe trace for namespace '{namespace}': {reason}")]
     InvalidProbeTrace { namespace: String, reason: String },
-
-    /// An exclusive attribute-index operation is already running for this namespace.
-    #[error("an attribute index operation is already in progress for namespace '{namespace}'")]
-    AttrIndexOpInProgress { namespace: String },
 }
 
 /// Shared conversion: serde_json errors become `DocStoreError::InvalidJson`.

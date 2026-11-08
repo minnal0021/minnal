@@ -14,7 +14,7 @@ use std::{
 use config::DocStoreApiConfig;
 use minnal_db::doc_store::StoredSchema;
 use minnal_db::semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
-use minnal_db::{AsyncDb, DocStore, DocStoreSchema, IndexBuildManager, KvStoreSchema, SemanticSearchContext};
+use minnal_db::{AsyncDb, DocStore, DocStoreSchema, KvStoreSchema, SemanticSearchContext};
 use tracing::{error, info};
 
 /// jemalloc, not the system allocator: under concurrent load glibc malloc keeps
@@ -31,12 +31,6 @@ pub struct AppState {
     /// The engine under it (the store's own handle), for the admin routes on the
     /// engine's statistics and maintenance.
     pub db: Arc<AsyncDb>,
-    /// Registry of active background index-build tasks.
-    ///
-    /// Used to:
-    ///   - await every in-progress build on graceful shutdown.
-    ///   - serve live progress snapshots via the progress endpoints.
-    pub index_manager: Arc<IndexBuildManager>,
     /// Embedding-service settings for semantic search (URL, timeouts, cache
     /// TTL), used to probe a namespace's model when it enables semantic search.
     ///
@@ -47,9 +41,6 @@ pub struct AppState {
     ///
     /// Used by the `GET /admin/storage/health` endpoint to report uptime.
     pub started_at: Instant,
-    /// Tracks namespaces with an active exclusive attribute-index operation
-    /// (drop-all, reindex-all, or single-field cleanup).
-    pub attr_index_ops: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Tracks namespaces whose vector index is currently being dropped (background cleanup).
     pub vec_index_cleanup: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Set while a (background) index checkpoint (field-index flush + compaction)
@@ -130,21 +121,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         minnal_db::doc_store::SCHEMA_NAMESPACE
     );
 
-    let index_manager = Arc::new(IndexBuildManager::new());
-
-    // Resume any index builds interrupted by a previous shutdown.
-    match store.resume_pending_builds().await {
-        Ok(handles) => {
-            if !handles.is_empty() {
-                info!("resuming {} interrupted index build(s)", handles.len());
-                for h in handles {
-                    index_manager.insert_field_build(h);
-                }
-            }
-        }
-        Err(e) => error!("failed to resume pending index builds: {e}"),
-    }
-
     let semantic_cfg = cfg.semantic_search.resolve();
     let embedding_service = Some(semantic_cfg.service_config());
 
@@ -204,16 +180,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         db: store.db(),
         store: Arc::new(store),
-        index_manager: Arc::clone(&index_manager),
         embedding_service,
         started_at: Instant::now(),
-        attr_index_ops: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         vec_index_cleanup: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         index_checkpoint_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    // Every store's create and drop runs under the lifecycle governor from here
-    // on; it also finishes those a crash left part-way.
+    // Every store's create, drop and index job runs under the lifecycle
+    // governor from here on; it also finishes those a crash left part-way.
     state.store.start_lifecycle(cfg.lifecycle.config());
 
     let shutdown_store = Arc::clone(&state.store);
@@ -223,9 +197,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
 
-    // Drain and await all in-progress index builds before exiting.
-    index_manager.drain_all().await;
-
+    // Index jobs still running stop with the process; the governor resumes
+    // them at the next start, from their records.
     // Stop all background workers (vec-index, GC, WAL GC, LSM compaction,
     // index checkpoint, TTL) and flush all in-memory state to disk.
     if let Err(e) = shutdown_store.shutdown().await {

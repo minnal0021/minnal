@@ -1,11 +1,7 @@
-//! Building and tracking indexes: field-index lifecycle, reindex-all, and the
-//! progress and handles shared by field-index and vector-index builds.
+//! Field indexes: adding and dropping one (`build`, each an index job),
+//! `reindex_all` (drop and rebuild them all, one job), and the progress
+//! types the build jobs save and the progress views report.
 
 mod build;
-pub mod build_manager;
-pub mod observer;
 pub mod progress;
 mod reindex_all;
-mod running;
-
-pub(crate) use running::RunningBuilds;

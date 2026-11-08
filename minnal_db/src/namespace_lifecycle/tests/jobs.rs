@@ -61,15 +61,18 @@ async fn a_job_is_refused_unless_its_namespace_is_ready() {
     let creating = host.add("c", NamespaceState::Creating);
     let deleting = host.add("d", NamespaceState::Deleting);
     assert!(matches!(
-        host.jobs.start(&*host, "c", JobKey::new(creating, BUILD_7), None),
+        host.jobs
+            .start(&*host, "c", JobKey::new(creating, BUILD_7), None, serde_json::Value::Null),
         Err(LifecycleError::Creating { .. })
     ));
     assert!(matches!(
-        host.jobs.start(&*host, "d", JobKey::new(deleting, BUILD_7), None),
+        host.jobs
+            .start(&*host, "d", JobKey::new(deleting, BUILD_7), None, serde_json::Value::Null),
         Err(LifecycleError::Deleting { .. })
     ));
     assert!(matches!(
-        host.jobs.start(&*host, "nobody", JobKey::new(creating, BUILD_7), None),
+        host.jobs
+            .start(&*host, "nobody", JobKey::new(creating, BUILD_7), None, serde_json::Value::Null),
         Err(LifecycleError::NotFound { .. })
     ));
     assert!(host.jobs.list(creating).unwrap().is_empty() && host.jobs.list(deleting).unwrap().is_empty());

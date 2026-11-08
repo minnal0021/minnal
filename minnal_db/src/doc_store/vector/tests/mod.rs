@@ -5,6 +5,7 @@
 #[cfg(feature = "semantic-search")]
 use super::*;
 use crate::doc_store::tests::test_support::*;
+#[cfg(not(feature = "semantic-search"))]
 use crate::doc_store::*;
 
 #[cfg(feature = "semantic-search")]

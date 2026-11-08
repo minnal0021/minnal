@@ -176,9 +176,6 @@ async fn test_add_index_removes_field_from_attributes() {
             },
         )
         .await
-        .unwrap()
-        .wait()
-        .await
         .unwrap();
 
     let stored = store.get_schema("agency_ns").unwrap();

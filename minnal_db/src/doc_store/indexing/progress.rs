@@ -1,13 +1,8 @@
 //! Progress and status types for field-index builds and vector-index reindexes, so
-//! the REST API can return one shape whichever kind of index it reports.
-
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+//! the REST API can return one shape whichever kind of index it reports, and
+//! the progress a field-index build saves in its job's record.
 
 use serde::{Deserialize, Serialize};
-
-use crate::doc_store::error::DocStoreError;
-use crate::doc_store::indexing::observer::InMemoryProgress;
 
 use crate::doc_store::schema::IndexKind;
 use crate::namespace_lifecycle::BuildStatus;
@@ -92,51 +87,83 @@ impl IndexBuildSnapshot {
 
 pub use crate::support::now_ms;
 
-/// A snapshot of the progress of a background index build.
-#[derive(Debug, Clone)]
-pub struct IndexBuildProgress {
-    /// Total number of documents to be indexed (0 until the scan begins).
+/// How far a field-index build got: the progress a `field_build` job keeps in
+/// its record (and a `reindex-all`, for the field it is building).
+///
+/// Saved when the job starts, every 1,000 documents, and when the scan ends.
+/// A restart resumes the build after `resume_after_hex`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldBuildProgress {
+    /// The index being built.
+    pub spec: crate::doc_store::IndexSpec,
+    /// Total document count (0 until the first scan has counted them).
     pub total: u64,
-    /// Number of documents processed so far.
+    /// Documents indexed so far.
     pub indexed: u64,
-    /// `true` once the build has finished (successfully or with an error).
-    pub done: bool,
-    /// Non-`None` if the build failed.
-    pub error: Option<String>,
+    /// Hex-encoded key a restart resumes after. Never ahead of what the field
+    /// index has made durable: the build names a key only once an index
+    /// checkpoint covers it. `None`: start from the first key.
+    pub resume_after_hex: Option<String>,
 }
 
-/// Handle returned by [`DocStore::add_index`](crate::doc_store::DocStore::add_index) or
-/// [`DocStore::resume_pending_builds`](crate::doc_store::DocStore::resume_pending_builds).
-///
-/// Use [`progress`] to poll status or [`wait`] to block until complete.
-///
-/// [`progress`]: IndexBuildHandle::progress
-/// [`wait`]: IndexBuildHandle::wait
-pub struct IndexBuildHandle {
-    /// The namespace this build belongs to.
-    pub namespace: String,
-    /// The field being indexed.
-    pub field: String,
-    /// Live progress counters shared with the observer inside the build task.
-    pub mem: Arc<InMemoryProgress>,
-    /// `pub(super)` rather than private: the build is spawned from a sibling
-    /// module, which before the split was the same file.
-    pub(super) task: tokio::task::JoinHandle<Result<(), DocStoreError>>,
-}
-
-impl IndexBuildHandle {
-    /// Return a snapshot of the current build progress.
-    pub fn progress(&self) -> IndexBuildProgress {
-        IndexBuildProgress {
-            total: self.mem.total.load(Ordering::Relaxed),
-            indexed: self.mem.indexed.load(Ordering::Relaxed),
-            done: self.mem.done.load(Ordering::Relaxed),
-            error: self.mem.error.lock().unwrap().clone(),
+impl FieldBuildProgress {
+    /// A build of `spec` that has done nothing yet.
+    pub fn new(spec: crate::doc_store::IndexSpec) -> Self {
+        Self {
+            spec,
+            total: 0,
+            indexed: 0,
+            resume_after_hex: None,
         }
     }
+}
 
-    /// Await the build task and return its result.
-    pub async fn wait(self) -> Result<(), DocStoreError> {
-        self.task.await.map_err(|e| DocStoreError::BuildFailed(e.to_string()))?
+impl crate::doc_store::DocStore {
+    /// The field-index builds of every document store (or only `namespace`)
+    /// as progress snapshots, read from their jobs' records: every
+    /// `field_build` job with a record, live or ended, and the fields a live
+    /// `reindex-all` is building or has still to build.
+    pub fn field_index_builds(&self, namespace: Option<&str>) -> Vec<IndexBuildSnapshot> {
+        let mut snapshots = Vec::new();
+        let mut schemas = self.schemas.docs();
+        schemas.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+        for schema in schemas.iter().filter(|s| namespace.is_none_or(|n| s.namespace == n)) {
+            let Some(ns_id) = schema.ns_id else { continue };
+            let snapshot = |field: &str, status: BuildStatus, p: Option<&FieldBuildProgress>, record: &crate::namespace_lifecycle::JobRecord| {
+                let id = IndexId::Field {
+                    namespace: schema.namespace.clone(),
+                    field: field.to_owned(),
+                };
+                IndexBuildSnapshot {
+                    kind: id.kind(),
+                    id,
+                    status,
+                    total: p.map_or(0, |p| p.total),
+                    indexed: p.map_or(0, |p| p.indexed),
+                    failed: 0,
+                    started_at_ms: record.started_at_ms,
+                    updated_at_ms: record.updated_at_ms,
+                    completed_at_ms: status.is_terminal().then_some(record.updated_at_ms),
+                    last_error: record.error.clone(),
+                    extra: None,
+                }
+            };
+            for (key, record) in self.jobs.list(ns_id).unwrap_or_default() {
+                if let crate::namespace_lifecycle::JobKind::FieldBuild(_) = key.kind
+                    && let Some(p) = record.progress::<FieldBuildProgress>()
+                {
+                    snapshots.push(snapshot(&p.spec.field, record.status, Some(&p), &record));
+                }
+            }
+            if let Some((record, current, waiting)) = self.reindex_all_builds(ns_id) {
+                if let Some(p) = &current {
+                    snapshots.push(snapshot(&p.spec.field, record.status, Some(p), &record));
+                }
+                for field in &waiting {
+                    snapshots.push(snapshot(field, BuildStatus::Pending, None, &record));
+                }
+            }
+        }
+        snapshots
     }
 }
