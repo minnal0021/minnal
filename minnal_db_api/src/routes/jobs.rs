@@ -16,7 +16,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use minnal_db::{JobRecord, bytes_to_hex, hex_to_bytes};
+use minnal_db::JobRecord;
 use serde::Deserialize;
 use tracing::info;
 
@@ -91,16 +91,13 @@ pub struct AuditParams {
 /// audit_retention_days`. `{results, next_cursor}`; `next_cursor` is `null`
 /// at the end.
 pub async fn lifecycle_audit(State(state): State<AppState>, Query(params): Query<AuditParams>) -> Result<impl IntoResponse, AppError> {
-    let cursor = match params.cursor.as_deref() {
-        Some(hex) => Some(hex_to_bytes(hex).ok_or_else(|| AppError::from(minnal_db::DocStoreError::InvalidId(format!("invalid cursor '{hex}'"))))?),
-        None => None,
-    };
+    let cursor = params.cursor.as_deref().map(crate::routes::decode_cursor).transpose()?;
     let (results, next) = state
         .store
         .lifecycle_audit(params.namespace.as_deref(), cursor, params.limit.unwrap_or(100))
         .await?;
     Ok(Json(serde_json::json!({
         "results": results,
-        "next_cursor": next.map(|c| bytes_to_hex(&c)),
+        "next_cursor": next.as_deref().map(crate::routes::encode_cursor),
     })))
 }

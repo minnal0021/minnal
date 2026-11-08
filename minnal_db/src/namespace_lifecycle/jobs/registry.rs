@@ -73,8 +73,8 @@ impl Jobs {
         if let Some((running, _)) = self.live(key.namespace)?.into_iter().find(|(k, _)| conflicts(k.kind, key.kind)) {
             return Err(LifecycleError::JobConflict {
                 namespace: namespace.to_owned(),
-                job: key.kind.to_string(),
-                running: running.kind.to_string(),
+                job: host.job_name(namespace, key.kind),
+                running: host.job_name(namespace, running.kind),
             }
             .into());
         }

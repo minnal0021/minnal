@@ -28,6 +28,13 @@ impl LifecycleHost for DocStore {
         self.schemas.transition(namespace, from, to)
     }
 
+    fn job_name(&self, namespace: &str, kind: crate::namespace_lifecycle::JobKind) -> String {
+        match self.schemas.get(namespace).and_then(|s| s.ns_id()) {
+            Some(id) => super::jobs::job_name(&self.db.list_index_fields(id), kind),
+            None => kind.to_string(),
+        }
+    }
+
     async fn run(&self, namespace: &str, task: Task) -> Result<(), DocStoreError> {
         match task {
             Task::Provision => self.provision(namespace).await,

@@ -243,6 +243,11 @@ async fn govern<H: LifecycleHost>(
     // Everything a crash, or a parked task, left part-way.
     if let Some(h) = host.upgrade() {
         for (namespace, task) in leftover_tasks(&*h, &jobs) {
+            let name = match task {
+                Task::Job(key) => key.kind.name().to_owned(),
+                other => other.to_string(),
+            };
+            jobs.audit().record(&namespace, AuditEvent::Resumed, Some(&name), None, None);
             spawn(&mut running, &mut coordinators, namespace, task, Vec::new());
         }
     }

@@ -1,5 +1,6 @@
 //! The lifecycle audit log: one record per lifecycle event of any namespace
-//! (created, dropped, an index job started or ended, a task given up on), in
+//! (created, dropped, an index job started or ended, work a restart picked up
+//! again, a task given up on), in
 //! the TTL namespace `system_lifecycle_audit`.
 //!
 //! It is what an operator reads to answer "what happened to this store, and
@@ -59,6 +60,8 @@ pub enum AuditEvent {
     JobFailed,
     /// A job stopped on a cancel, its work undone.
     JobCancelled,
+    /// A creation, drop or job a restart found part-way was picked up again.
+    Resumed,
     /// A creation or drop failed every run the governor allows; the namespace
     /// is left in its state until the process restarts.
     TaskParked,

@@ -168,8 +168,20 @@ impl DocStore {
     /// recorded cancelled. Refused with [`DocStoreError::JobNotCancellable`]
     /// for a job that cannot be stopped part-way.
     pub fn cancel_job(&self, namespace: &str, job: &str) -> Result<(), DocStoreError> {
+        use crate::namespace_lifecycle::LifecycleError;
         let key = self.job_key(namespace, job)?;
-        Ok(self.jobs.cancel(namespace, key)?)
+        // The registry names the job by its field's id; say it as asked.
+        self.jobs.cancel(namespace, key).map_err(|e| match e {
+            LifecycleError::JobNotFound { namespace, .. } => DocStoreError::JobNotFound {
+                namespace,
+                job: job.to_owned(),
+            },
+            LifecycleError::JobNotCancellable { namespace, .. } => DocStoreError::JobNotCancellable {
+                namespace,
+                job: job.to_owned(),
+            },
+            other => other.into(),
+        })
     }
 
     /// Wait up to `timeout` for `namespace`'s job `job` to end, and return
@@ -234,7 +246,7 @@ impl DocStore {
 
 /// A job's name: its kind, and for a field job the field's name (its id if
 /// it has none).
-fn job_name(fields: &[crate::field_index::FieldMeta], kind: JobKind) -> String {
+pub(super) fn job_name(fields: &[crate::field_index::FieldMeta], kind: JobKind) -> String {
     match kind.field() {
         Some(id) => match fields.iter().find(|f| f.field_id == id) {
             Some(meta) => format!("{}:{}", kind.name(), meta.field_name),

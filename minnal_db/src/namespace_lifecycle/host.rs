@@ -5,7 +5,7 @@
 use std::future::Future;
 
 use crate::namespace::NamespaceId;
-use crate::namespace_lifecycle::{LifecycleError, NamespaceState, Task};
+use crate::namespace_lifecycle::{JobKind, LifecycleError, NamespaceState, Task};
 
 /// The owner of a set of namespaces, as the lifecycle layer sees it. The
 /// governor decides when a task runs and how often it is run again, and the
@@ -31,6 +31,12 @@ pub trait LifecycleHost: Send + Sync + 'static {
     /// gives. Moving to the state it is in, when listed in `from`, is a no-op
     /// that succeeds.
     fn transition(&self, namespace: &str, from: &[NamespaceState], to: NamespaceState) -> Result<NamespaceState, Self::Error>;
+
+    /// How `namespace`'s job `kind` is named to people (in errors): by default
+    /// its kind with the field's id; a host that knows field names uses them.
+    fn job_name(&self, _namespace: &str, kind: JobKind) -> String {
+        kind.to_string()
+    }
 
     /// Run `namespace`'s `task` once. It must be idempotent: a run cut short
     /// (an error, a panic, a crash) is finished by running it again.

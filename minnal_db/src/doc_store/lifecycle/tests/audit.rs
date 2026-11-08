@@ -37,12 +37,18 @@ async fn a_stores_life_is_in_the_audit_log_after_it_is_gone() {
         ]
     );
     let started = &all[3];
-    assert_eq!((started.job.as_deref(), started.subject.as_deref()), (Some("field_build"), Some("status")));
+    assert_eq!(
+        (started.job.as_deref(), started.subject.as_deref()),
+        (Some("field_build"), Some("status"))
+    );
     assert!(all.windows(2).all(|w| w[0].at_ms >= w[1].at_ms), "newest first");
 
     // One store, two at a time.
     let (page, next) = store.lifecycle_audit(Some("a"), None, 2).await.unwrap();
-    assert_eq!(page.iter().map(|r| r.event).collect::<Vec<_>>(), vec![AuditEvent::Deleted, AuditEvent::Deleting]);
+    assert_eq!(
+        page.iter().map(|r| r.event).collect::<Vec<_>>(),
+        vec![AuditEvent::Deleted, AuditEvent::Deleting]
+    );
     let (rest, _) = store.lifecycle_audit(Some("a"), next, 100).await.unwrap();
     assert_eq!(rest.len(), 4);
     assert!(rest.iter().all(|r| r.namespace == "a"));

@@ -91,6 +91,22 @@ async fn what_a_crash_left_is_picked_up_at_start() {
     })
     .await;
     assert_eq!(status(&host, key), Some(BuildStatus::Complete));
+    // Each pick-up is in the audit log.
+    let (audit, _) = host.jobs.audit().read(None, None, 100).await.unwrap();
+    let mut resumed: Vec<(String, Option<String>)> = audit
+        .into_iter()
+        .filter(|r| r.event == crate::namespace_lifecycle::AuditEvent::Resumed)
+        .map(|r| (r.namespace, r.job))
+        .collect();
+    resumed.sort();
+    assert_eq!(
+        resumed,
+        vec![
+            ("busy".to_owned(), Some("vector_reindex".to_owned())),
+            ("gone".to_owned(), Some("drop".to_owned())),
+            ("new".to_owned(), Some("creation".to_owned())),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

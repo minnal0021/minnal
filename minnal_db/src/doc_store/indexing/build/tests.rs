@@ -261,7 +261,7 @@ async fn a_drop_waits_for_the_fields_build_and_a_re_add_starts_afresh() {
     store.start_field_build("ns", status_spec()).await.unwrap();
     assert!(matches!(
         store.drop_index("ns", "status").await,
-        Err(DocStoreError::JobConflict { running, .. }) if running.starts_with("field_build")
+        Err(DocStoreError::JobConflict { job, running, .. }) if job == "field_drop:status" && running == "field_build:status"
     ));
     store.run_pending_jobs().await.unwrap();
     store.drop_index("ns", "status").await.unwrap();
