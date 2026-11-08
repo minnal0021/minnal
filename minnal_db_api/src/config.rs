@@ -106,6 +106,8 @@ pub struct DocStoreApiConfig {
     pub semantic_search: SemanticSearchSection,
     #[serde(default)]
     pub vector_index: VectorIndexSection,
+    #[serde(default)]
+    pub lifecycle: LifecycleSection,
 }
 
 impl DocStoreApiConfig {
@@ -270,6 +272,46 @@ impl Default for LoggingSection {
 
 fn default_log_level() -> String {
     "info".into()
+}
+
+/// How the store lifecycle governor restarts a store's create or drop that
+/// fails (`[lifecycle]`).
+#[derive(Debug, Deserialize)]
+pub struct LifecycleSection {
+    /// Runs again of a failed create or drop before the store is parked (left
+    /// as it is, with a CRITICAL log, until the server restarts).
+    #[serde(default = "default_lifecycle_max_restarts")]
+    pub max_restarts: u32,
+    /// Wait before each run again, in milliseconds.
+    #[serde(default = "default_lifecycle_restart_backoff_ms")]
+    pub restart_backoff_ms: u64,
+}
+
+impl Default for LifecycleSection {
+    fn default() -> Self {
+        Self {
+            max_restarts: default_lifecycle_max_restarts(),
+            restart_backoff_ms: default_lifecycle_restart_backoff_ms(),
+        }
+    }
+}
+
+impl LifecycleSection {
+    /// The governor's configuration.
+    pub fn config(&self) -> minnal_db::LifecycleConfig {
+        minnal_db::LifecycleConfig {
+            max_restarts: self.max_restarts,
+            restart_backoff: std::time::Duration::from_millis(self.restart_backoff_ms),
+        }
+    }
+}
+
+fn default_lifecycle_max_restarts() -> u32 {
+    minnal_db::LifecycleConfig::default().max_restarts
+}
+
+fn default_lifecycle_restart_backoff_ms() -> u64 {
+    minnal_db::LifecycleConfig::default().restart_backoff.as_millis() as u64
 }
 
 // ── DB engine sections (mirrors MinnalTomlConfig) ─────────────────────────────

@@ -14,6 +14,8 @@ impl DocStore {
     /// move it to `Created`. Does nothing for a store in any other state, or
     /// none: it was created already, or is gone.
     pub(in crate::doc_store) async fn provision(&self, namespace: &str) -> Result<(), DocStoreError> {
+        #[cfg(test)]
+        self.inject_lifecycle_fault(namespace)?;
         let _lifecycle = self.lifecycle.lock(namespace).await;
         if self.schemas.state(namespace) != Some(StoreState::Creating) {
             return Ok(());
@@ -79,6 +81,26 @@ impl DocStore {
             self.db.remove_namespace(name.to_owned()).await?;
         }
         Ok(())
+    }
+
+    /// Test hook: fail (or panic in) this run of `namespace`'s lifecycle task if
+    /// a failure is set for it ([`DocStore::lifecycle_faults`]).
+    #[cfg(test)]
+    pub(in crate::doc_store) fn inject_lifecycle_fault(&self, namespace: &str) -> Result<(), DocStoreError> {
+        let mut faults = self.lifecycle_faults.lock();
+        let Some((left, panic)) = faults.get_mut(namespace) else { return Ok(()) };
+        if *left == 0 {
+            return Ok(());
+        }
+        *left -= 1;
+        let panic = *panic;
+        drop(faults);
+        if panic {
+            panic!("injected lifecycle panic for '{namespace}'");
+        }
+        Err(DocStoreError::Io(std::io::Error::other(format!(
+            "injected lifecycle failure for '{namespace}'"
+        ))))
     }
 
     /// [`DocStoreError::NamespaceNotEmpty`] if a namespace called `name` holds

@@ -2,6 +2,7 @@
 //! namespaces, its index files and its maintenance records, then its record.
 
 use super::super::*;
+use super::Task;
 use crate::namespace::NamespaceId;
 
 impl DocStore {
@@ -19,8 +20,21 @@ impl DocStore {
         info!("dropping namespace '{}'", namespace);
         self.schemas.doc(namespace)?;
         self.begin_drop_store(namespace)?;
-        self.teardown(namespace).await?;
+        self.run_lifecycle_task(namespace, Task::Teardown).await?;
         info!("namespace '{}' dropped", namespace);
+        Ok(())
+    }
+
+    /// [`remove`](Self::remove), returning once the store is
+    /// [`StoreState::Deleting`]: the lifecycle governor removes it in the
+    /// background, and it is gone once it is no longer listed. Fails with
+    /// [`DocStoreError::GovernorUnavailable`] when the governor is not running,
+    /// before anything changes.
+    pub async fn begin_remove(&self, namespace: &str) -> Result<(), DocStoreError> {
+        let governor = self.running_governor()?;
+        self.schemas.doc(namespace)?;
+        self.begin_drop_store(namespace)?;
+        governor.submit(namespace, Task::Teardown)?;
         Ok(())
     }
 
@@ -29,8 +43,18 @@ impl DocStore {
         info!("dropping KV namespace '{}'", namespace);
         self.schemas.kv(namespace)?;
         self.begin_drop_store(namespace)?;
-        self.teardown(namespace).await?;
+        self.run_lifecycle_task(namespace, Task::Teardown).await?;
         info!("KV namespace '{}' dropped", namespace);
+        Ok(())
+    }
+
+    /// [`remove_kv`](Self::remove_kv), returning once the store is `Deleting`;
+    /// see [`begin_remove`](Self::begin_remove).
+    pub async fn begin_remove_kv(&self, namespace: &str) -> Result<(), DocStoreError> {
+        let governor = self.running_governor()?;
+        self.schemas.kv(namespace)?;
+        self.begin_drop_store(namespace)?;
+        governor.submit(namespace, Task::Teardown)?;
         Ok(())
     }
 
@@ -46,6 +70,8 @@ impl DocStore {
     /// record last. Idempotent: a teardown cut short is finished by running it
     /// again. Does nothing for a store that is not `Deleting` (or is gone).
     pub(in crate::doc_store) async fn teardown(&self, namespace: &str) -> Result<(), DocStoreError> {
+        #[cfg(test)]
+        self.inject_lifecycle_fault(namespace)?;
         let Some(schema) = self.schemas.get(namespace) else {
             return Ok(());
         };
@@ -62,7 +88,9 @@ impl DocStore {
             )
             .await
         })
-        .await
+        .await?;
+        info!("store '{namespace}' is gone (ns_id={ns_id})");
+        Ok(())
     }
 
     /// Run `drop`, which removes store `namespace`, with no write to it in

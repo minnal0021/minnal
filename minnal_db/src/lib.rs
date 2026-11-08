@@ -299,8 +299,8 @@ pub use storage::value_log::SegmentStats;
 #[cfg(feature = "doc-store")]
 pub use doc_store::{
     AttributeDef, AttributeType, CursorPage, DocId, DocStore, DocStoreError, DocStoreSchema, FieldBuildRecord, IndexBuildHandle, IndexBuildManager,
-    IndexBuildProgress, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES, MAX_STR_KEY_LEN, Page,
-    Pagination, SchemaAmendment, SchemaError, StoreState, StoreType, StrKey, prefix_upper_bound,
+    IndexBuildProgress, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, LifecycleConfig, MAX_INDICES,
+    MAX_STR_KEY_LEN, Page, Pagination, SchemaAmendment, SchemaError, StoreState, StoreType, StrKey, prefix_upper_bound,
 };
 
 // Document-store types that only exist alongside `semantic-search`.

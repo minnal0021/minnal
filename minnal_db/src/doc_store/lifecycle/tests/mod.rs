@@ -3,6 +3,7 @@
 mod amend;
 mod create_drop;
 mod export_import;
+mod governor;
 mod kv;
 mod restart;
 mod states;

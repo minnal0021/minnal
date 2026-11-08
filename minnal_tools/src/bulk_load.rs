@@ -263,6 +263,7 @@ async fn run_doc(positional: Vec<&String>, schema_path: Option<PathBuf>, skip_wa
     if let Some(schema_path) = &schema_path {
         import_schema(&client, base_url, schema_path, namespace, StoreKind::Doc, "/admin/stores/import").await?;
     }
+    wait_until_created(&client, base_url, namespace).await?;
 
     let key_type = resolve_doc_key_type(&client, base_url, namespace).await?;
     println!("namespace '{namespace}' found  key_type={key_type:?}");
@@ -286,6 +287,7 @@ async fn run_kv(positional: Vec<&String>, schema_path: Option<PathBuf>, skip_wal
     if let Some(schema_path) = &schema_path {
         import_schema(&client, base_url, schema_path, namespace, StoreKind::Kv, "/admin/stores/import").await?;
     }
+    wait_until_created(&client, base_url, namespace).await?;
 
     let key_type = resolve_kv_key_type(&client, base_url, namespace).await?;
     println!("KV namespace '{namespace}' found  key_type={key_type:?}");
@@ -347,7 +349,7 @@ async fn import_schema(
         .map_err(|e| format!("cannot reach '{base_url}{endpoint}': {e}"))?;
 
     match resp.status() {
-        s if s.is_success() => println!("schema imported — {} '{namespace}' created", kind.label()),
+        s if s.is_success() => println!("schema imported — {} '{namespace}' is being created", kind.label()),
         StatusCode::CONFLICT => println!("{} '{namespace}' already exists — reusing it", kind.label()),
         s => {
             let body = resp.text().await.unwrap_or_default();
@@ -375,6 +377,41 @@ async fn resolve_doc_key_type(client: &Client, base_url: &str, namespace: &str) 
         }
         None => Err(namespace_not_found("namespace", namespace, &stores)),
     }
+}
+
+/// Wait until `namespace` is `created`: a store takes no writes while it is
+/// being created (`POST /stores` and the import answer before it is ready).
+/// Fails at once if the store is being deleted, and after ten minutes.
+async fn wait_until_created(client: &Client, base_url: &str, namespace: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let mut said = false;
+    loop {
+        let stores = fetch_stores(client, base_url).await?;
+        let Some(entry) = stores.iter().find(|s| s.get("namespace").and_then(Value::as_str) == Some(namespace)) else {
+            return Err(namespace_not_found("namespace", namespace, &stores));
+        };
+        match entry.get("state").and_then(Value::as_str) {
+            Some("created") | None => return Ok(()),
+            Some("deleting") => return Err(format!("store '{namespace}' is being deleted").into()),
+            Some(other) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("store '{namespace}' is still '{other}' after ten minutes").into());
+                }
+                if !said {
+                    println!("waiting for '{namespace}' to be created…");
+                    said = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// Whether a failed write means the store is no longer there to load into:
+/// being deleted (409) or gone (404). The load stops rather than skipping
+/// every line that is left.
+fn store_gone(status: StatusCode, body: &str) -> bool {
+    (status == StatusCode::CONFLICT && body.contains("is being deleted")) || (status == StatusCode::NOT_FOUND && body.contains("not found"))
 }
 
 /// `GET /stores` → the full (doc + KV) store list, parsed untyped so a mix of
@@ -426,6 +463,8 @@ async fn load_doc_jsonl(
     let mut loaded: u64 = 0;
     let mut skipped: u64 = 0;
     let mut error_lines: Vec<String> = Vec::new();
+    // Set when the store is deleted under the load, which then stops.
+    let mut gone: Option<String> = None;
 
     let started = Instant::now();
 
@@ -474,6 +513,13 @@ async fn load_doc_jsonl(
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
+                if store_gone(status, &body) {
+                    let msg = format!("line {line_no}: the store is gone ({status}: {body}); the load stops here");
+                    eprintln!("  {msg}");
+                    error_lines.push(msg.clone());
+                    gone = Some(msg);
+                    break;
+                }
                 let msg = format!("line {line_no}: PUT failed ({status}: {body})");
                 eprintln!("  {msg} — skipped");
                 error_lines.push(format!("{msg}\n  {trimmed}"));
@@ -488,7 +534,11 @@ async fn load_doc_jsonl(
         }
     }
 
-    finish(jsonl_path, loaded, skipped, &error_lines, started, "documents")
+    let finished = finish(jsonl_path, loaded, skipped, &error_lines, started, "documents");
+    match gone {
+        Some(msg) => finished.and(Err(msg.into())),
+        None => finished,
+    }
 }
 
 /// Extract the document ID from `doc[id_field]` and format it as a URL path
@@ -615,6 +665,8 @@ async fn load_kv_jsonl(
     let mut loaded: u64 = 0;
     let mut skipped: u64 = 0;
     let mut error_lines: Vec<String> = Vec::new();
+    // Set when the store is deleted under the load, which then stops.
+    let mut gone: Option<String> = None;
 
     let started = Instant::now();
 
@@ -674,6 +726,13 @@ async fn load_kv_jsonl(
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
+                if store_gone(status, &body) {
+                    let msg = format!("line {line_no}: the store is gone ({status}: {body}); the load stops here");
+                    eprintln!("  {msg}");
+                    error_lines.push(msg.clone());
+                    gone = Some(msg);
+                    break;
+                }
                 let msg = format!("line {line_no}: PUT failed ({status}: {body})");
                 eprintln!("  {msg} — skipped");
                 error_lines.push(format!("{msg}\n  {trimmed}"));
@@ -688,7 +747,11 @@ async fn load_kv_jsonl(
         }
     }
 
-    finish(jsonl_path, loaded, skipped, &error_lines, started, "entries")
+    let finished = finish(jsonl_path, loaded, skipped, &error_lines, started, "entries");
+    match gone {
+        Some(msg) => finished.and(Err(msg.into())),
+        None => finished,
+    }
 }
 
 /// Extract the entry key from `row[key_field]` and format it as a URL path

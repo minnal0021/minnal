@@ -33,6 +33,22 @@ log_dir = "./data/log"
 level = "info"
 
 # ---------------------------------------------------------------------------
+# [lifecycle] — store create and drop
+# ---------------------------------------------------------------------------
+# A store's create or drop runs in the background under the lifecycle
+# governor (POST /stores and DELETE /stores/{ns} answer 202). A create or drop
+# that fails is run again, up to max_restarts times; after that the store is
+# left as it is (still "creating" or "deleting"), a CRITICAL error is logged,
+# and it stays so until the server restarts.
+[lifecycle]
+
+# Runs again of a failed create or drop before the store is left as it is.
+max_restarts = 3
+
+# Wait before each run again, in milliseconds.
+restart_backoff_ms = 1000
+
+# ---------------------------------------------------------------------------
 # [api] — HTTP server settings
 # ---------------------------------------------------------------------------
 [api]

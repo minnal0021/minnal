@@ -212,6 +212,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         index_checkpoint_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
+    // Every store's create and drop runs under the lifecycle governor from here
+    // on; it also finishes those a crash left part-way.
+    state.store.start_lifecycle(cfg.lifecycle.config());
+
     let shutdown_store = Arc::clone(&state.store);
     let app = routes::router().with_state(state);
     let listener = tokio::net::TcpListener::bind(cfg.listen_addr()).await?;

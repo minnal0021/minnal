@@ -60,6 +60,7 @@ mod write_gate;
 
 pub use self::diagnostics::RowMapStats;
 pub use self::indexing::progress::{FieldBuildRecord, IndexBuildHandle, IndexBuildProgress};
+pub use self::lifecycle::LifecycleConfig;
 pub use self::maintenance::MAINTENANCE_NAMESPACE;
 pub(crate) use self::maintenance::{MaintenanceStore, TaskKey};
 #[cfg(feature = "semantic-search")]
@@ -159,6 +160,13 @@ pub struct DocStore {
     /// vector worker skips (see [`InFlightWrites`]).
     #[cfg(feature = "semantic-search")]
     in_flight: Arc<InFlightWrites>,
+    /// The lifecycle governor, once [`start_lifecycle`](Self::start_lifecycle)
+    /// has started it.
+    governor: std::sync::OnceLock<self::lifecycle::Governor>,
+    /// Test hook: failures to inject into a store's lifecycle tasks, per store
+    /// (`(failures left, panic instead of an error)`).
+    #[cfg(test)]
+    lifecycle_faults: parking_lot::Mutex<std::collections::HashMap<String, (u32, bool)>>,
 }
 
 impl DocStore {
@@ -217,6 +225,9 @@ impl DocStore {
             builds: Arc::default(),
             #[cfg(feature = "semantic-search")]
             in_flight: Arc::default(),
+            governor: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            lifecycle_faults: parking_lot::Mutex::default(),
         };
 
         // Finish what a crash interrupted, before anything opens a store's
@@ -382,6 +393,10 @@ impl DocStore {
     /// avoid losing buffered writes or leaving the tokio runtime hanging on
     /// background tasks.
     pub async fn shutdown(&self) -> Result<(), DocStoreError> {
+        // First: a lifecycle task cut short is finished at the next open.
+        if let Some(governor) = self.governor.get() {
+            governor.stop();
+        }
         #[cfg(feature = "semantic-search")]
         self.shutdown_vec_index_worker().await;
         self.db.shutdown().await.map_err(DocStoreError::Db)

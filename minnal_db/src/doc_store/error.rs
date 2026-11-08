@@ -225,6 +225,11 @@ pub enum DocStoreError {
         to: crate::doc_store::schema::StoreState,
     },
 
+    /// A store's creation or drop failed every run the governor gave it; the
+    /// store is left in its state until the process restarts.
+    #[error("store '{namespace}': its lifecycle task failed {attempts} time(s), last: {error}")]
+    LifecycleTaskFailed { namespace: String, attempts: u32, error: String },
+
     /// The lifecycle governor, which creates and drops stores, is not running
     /// (it stopped after too many restarts). Stores that exist keep working;
     /// none can be created or dropped until the process is restarted.

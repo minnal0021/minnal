@@ -1,6 +1,7 @@
 //! Creating and listing document and KV stores.
 
 use super::super::*;
+use super::Task;
 
 impl DocStore {
     // ── Admin: create / list / drop ───────────────────────────────────────
@@ -17,9 +18,28 @@ impl DocStore {
     ///
     /// Returns [`DocStoreError::AlreadyExists`] if a store with that namespace
     /// exists, [`DocStoreError::StoreDeleting`] while one of that name is being
-    /// dropped. A setup that fails part-way leaves the store `Creating`; it is
-    /// finished at the next open.
-    pub async fn create(&self, mut schema: DocStoreSchema) -> Result<(), DocStoreError> {
+    /// dropped. A setup that fails part-way leaves the store `Creating`; the
+    /// lifecycle governor runs it again (or, without one, the next open does).
+    pub async fn create(&self, schema: DocStoreSchema) -> Result<(), DocStoreError> {
+        let namespace = self.write_creating_doc(schema).await?;
+        self.run_lifecycle_task(&namespace, Task::Provision).await
+    }
+
+    /// [`create`](Self::create), returning once the store's record is written
+    /// in [`StoreState::Creating`]: the lifecycle governor sets it up in the
+    /// background, and the store is ready once its state is `Created`. Fails
+    /// with [`DocStoreError::GovernorUnavailable`] when the governor is not
+    /// running, before anything is written.
+    pub async fn begin_create(&self, schema: DocStoreSchema) -> Result<(), DocStoreError> {
+        let governor = self.running_governor()?;
+        let namespace = self.write_creating_doc(schema).await?;
+        governor.submit(&namespace, Task::Provision)?;
+        Ok(())
+    }
+
+    /// The checks and the `Creating` record of a document store's creation;
+    /// returns its name.
+    async fn write_creating_doc(&self, mut schema: DocStoreSchema) -> Result<String, DocStoreError> {
         schema.validate()?;
         schema.settle_vector_index(&self.index_defaults())?;
         if schema.semantic_search_enabled {
@@ -48,7 +68,7 @@ impl DocStore {
             schema.ns_id = None;
             self.schemas.insert(StoredSchema::Doc(Arc::new(schema)), StoreState::Creating)?;
         }
-        self.provision(&ns_name).await
+        Ok(ns_name)
     }
 
     /// List all known document stores.
@@ -81,7 +101,23 @@ impl DocStore {
     /// stores raw bytes keyed by the declared `key_type`.
     ///
     /// [`create`]: DocStore::create
-    pub async fn create_kv(&self, mut schema: KvStoreSchema) -> Result<(), DocStoreError> {
+    pub async fn create_kv(&self, schema: KvStoreSchema) -> Result<(), DocStoreError> {
+        let namespace = self.write_creating_kv(schema).await?;
+        self.run_lifecycle_task(&namespace, Task::Provision).await
+    }
+
+    /// [`create_kv`](Self::create_kv), returning once the record is written;
+    /// see [`begin_create`](Self::begin_create).
+    pub async fn begin_create_kv(&self, schema: KvStoreSchema) -> Result<(), DocStoreError> {
+        let governor = self.running_governor()?;
+        let namespace = self.write_creating_kv(schema).await?;
+        governor.submit(&namespace, Task::Provision)?;
+        Ok(())
+    }
+
+    /// The checks and the `Creating` record of a KV store's creation; returns
+    /// its name.
+    async fn write_creating_kv(&self, mut schema: KvStoreSchema) -> Result<String, DocStoreError> {
         schema.validate()?;
         schema.settle_vector_index(&self.index_defaults())?;
         if schema.is_semantic_search_enabled() {
@@ -106,7 +142,7 @@ impl DocStore {
             schema.ns_id = None;
             self.schemas.insert(StoredSchema::Kv(Arc::new(schema)), StoreState::Creating)?;
         }
-        self.provision(&ns_name).await
+        Ok(ns_name)
     }
 
     /// List all known KV stores, each with its lifecycle state; see [`list`](Self::list).

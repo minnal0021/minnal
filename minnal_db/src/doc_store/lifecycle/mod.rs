@@ -4,6 +4,10 @@
 mod amend;
 mod create;
 mod drop;
+mod governor;
 mod provision;
 #[cfg(test)]
 mod tests;
+
+pub use governor::LifecycleConfig;
+pub(in crate::doc_store) use governor::{Governor, Task};

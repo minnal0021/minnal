@@ -61,8 +61,19 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<serde_json::
     }
 }
 
+/// `202 Accepted` with the store's name and its new lifecycle state: the
+/// lifecycle governor finishes the create or drop in the background, and
+/// `GET /stores/{ns}` (or `GET /stores`) shows when it is done.
+fn accepted(namespace: &str, state: minnal_db::StoreState) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "namespace": namespace, "state": state.as_str() })),
+    )
+}
+
 /// Core doc-store creation, shared by `POST /stores` and schema import.
-pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) -> Result<StatusCode, AppError> {
+/// Answers once the store is recorded as `creating`; see [`accepted`].
+pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     // Reject semantic-search-enabled stores when the server runs without
     // semantic search: writes would never be embedded.
     if schema.semantic_search_enabled {
@@ -74,28 +85,23 @@ pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) 
     }
     let ns = schema.namespace.clone();
     info!(namespace = %ns, semantic_search = schema.semantic_search_enabled, "creating store");
-    state.store.create(schema).await?;
-    info!(namespace = %ns, "store created");
-    Ok(StatusCode::CREATED)
+    state.store.begin_create(schema).await?;
+    Ok(accepted(&ns, minnal_db::StoreState::Creating))
 }
 
+/// `DELETE /stores/{ns}`: answers `202` once the store is `deleting` (it then
+/// refuses every request but the admin views); the lifecycle governor removes
+/// it, and it is gone once `GET /stores/{ns}` answers 404. A store already being
+/// deleted answers 202 again; one still being created cannot be dropped (409).
 pub async fn drop_store(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, "dropping store");
     let store_type = state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
-    // In its own task: axum drops a handler when its client disconnects, and a drop
-    // stopped midway leaves the store half removed until it is retried.
-    let store = Arc::clone(&state.store);
-    let name = ns.clone();
-    tokio::spawn(async move {
-        match store_type {
-            StoreType::Doc => store.remove(&name).await,
-            StoreType::Kv => store.remove_kv(&name).await,
-        }
-    })
-    .await
-    .map_err(|e| AppError::from(DocStoreError::Io(std::io::Error::other(e))))??;
-    info!(namespace = %ns, "store dropped");
-    Ok(StatusCode::NO_CONTENT)
+    match store_type {
+        StoreType::Doc => state.store.begin_remove(&ns).await,
+        StoreType::Kv => state.store.begin_remove_kv(&ns).await,
+    }
+    .map_err(|e| AppError::from(e).with_ns(&ns))?;
+    Ok(accepted(&ns, minnal_db::StoreState::Deleting))
 }
 
 pub async fn get_schema(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
@@ -318,7 +324,8 @@ async fn probe_model(state: &AppState, settings: &VectorIndexSettings) -> Result
 // ── KV store creation (shared core) ─────────────────────────────────────────────
 
 /// Core KV-store creation, shared by `POST /stores` and schema import.
-pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) -> Result<StatusCode, AppError> {
+/// Answers once the store is recorded as `creating`; see [`accepted`].
+pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     if schema.semantic_search_enabled {
         require_semantic_search(state)?;
         if let Ok(settings) = schema.vector_settings() {
@@ -327,7 +334,6 @@ pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) ->
     }
     let ns = schema.namespace.clone();
     info!(namespace = %ns, value_type = ?schema.value_type, "creating KV store");
-    state.store.create_kv(schema).await?;
-    info!(namespace = %ns, "KV store created");
-    Ok(StatusCode::CREATED)
+    state.store.begin_create_kv(schema).await?;
+    Ok(accepted(&ns, minnal_db::StoreState::Creating))
 }
