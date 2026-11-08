@@ -1,5 +1,6 @@
 use crate::namespace::NamespaceId;
 pub mod kv;
+pub mod state;
 pub mod store;
 pub use crate::vector_index::vector_settings;
 
@@ -15,6 +16,7 @@ use crate::doc_store::error::SchemaError;
 /// path used across the API layer; the split is about where the code lives, not
 /// about renaming anything.
 pub use crate::doc_store::schema::kv::{KvKeyType, KvStoreSchema, KvValueType};
+pub use crate::doc_store::schema::state::StoreState;
 
 /// Maximum number of indices allowed per document store.
 pub const MAX_INDICES: usize = 5;

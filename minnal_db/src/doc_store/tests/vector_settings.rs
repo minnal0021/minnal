@@ -1522,10 +1522,11 @@ mod with_service {
         store.shutdown().await.unwrap();
     }
 
-    /// A store drop cancelled while it waits for maintenance must not leave the
-    /// namespace refused: its partition would never be handed out again.
+    /// A store drop cancelled while it waits for maintenance leaves the store
+    /// `Deleting` (refusing requests) and clears the context's drop mark, and a
+    /// retry finishes the drop, partition and all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_cancelled_drop_leaves_the_partition_usable() {
+    async fn a_cancelled_drop_is_finished_by_a_retry() {
         let (url, _seen) = spawn_service();
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));
@@ -1543,11 +1544,21 @@ mod with_service {
         drop(drop_store); // what axum does when the client disconnects
         drop(running);
         assert!(!ctx.is_dropping("g"));
-        partition(&store, "g").await;
-        store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
-        wait_for_empty_queue(&store).await;
-        assert_eq!(store.count_indexed_docs("g").await, 1);
+        assert_eq!(store.schemas.state("g"), Some(StoreState::Deleting));
+        assert!(matches!(
+            store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await,
+            Err(DocStoreError::StoreDeleting { .. })
+        ));
         store.remove("g").await.unwrap();
+        assert!(!store.schemas.contains("g"));
+        let left: Vec<String> = store
+            .db
+            .list_namespaces()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.starts_with("g_") || n == "g")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         store.shutdown().await.unwrap();
     }
 

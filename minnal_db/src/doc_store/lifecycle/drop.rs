@@ -1,40 +1,58 @@
-//! Dropping a store: wait out its writes, remove its namespaces, its index
-//! files and its records, then its schema; and finish at open a drop a crash
-//! interrupted.
+//! Dropping a store: move it to `Deleting`, wait out its writes, remove its
+//! namespaces, its index files and its maintenance records, then its record.
 
 use super::super::*;
 use crate::namespace::NamespaceId;
 
 impl DocStore {
-    /// Destroy a document store completely.
+    /// Destroy a document store completely, and return once it is gone.
     ///
-    /// Removes the minnal_db namespace (in-memory), deletes all on-disk
-    /// storage (`ns_{name}/`, `field-index/{ns_id}/`), and removes the schema file.
+    /// Moves the store to [`StoreState::Deleting`] first, durably: from then on
+    /// it refuses every request but the admin views. Then its writes in progress
+    /// are waited out, its namespaces, index files and maintenance records are
+    /// removed, and its record last. A store already being dropped (a drop a
+    /// crash interrupted, or another caller's) is finished; a store still being
+    /// created cannot be dropped ([`DocStoreError::StoreCreating`]).
     ///
     /// This is irreversible.
     pub async fn remove(&self, namespace: &str) -> Result<(), DocStoreError> {
         info!("dropping namespace '{}'", namespace);
-        let schema = self.load_schema(namespace)?;
-        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
-            namespace: namespace.to_owned(),
-        })?;
-        self.without_writes(namespace, async {
-            self.without_partition_maintenance(
-                namespace,
-                cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, &self.maintenance, namespace, ns_id),
-            )
-            .await
-        })
-        .await?;
+        self.schemas.doc(namespace)?;
+        self.begin_drop_store(namespace)?;
+        self.teardown(namespace).await?;
         info!("namespace '{}' dropped", namespace);
         Ok(())
     }
 
-    /// Destroy a KV store completely (irreversible).
+    /// Destroy a KV store completely (irreversible); see [`remove`](Self::remove).
     pub async fn remove_kv(&self, namespace: &str) -> Result<(), DocStoreError> {
         info!("dropping KV namespace '{}'", namespace);
-        let schema = self.load_kv_schema(namespace)?;
-        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+        self.schemas.kv(namespace)?;
+        self.begin_drop_store(namespace)?;
+        self.teardown(namespace).await?;
+        info!("KV namespace '{}' dropped", namespace);
+        Ok(())
+    }
+
+    /// Move `namespace` from `Created` to `Deleting`, durably. One already
+    /// `Deleting` stays so (the drop is finished); one `Creating` is refused.
+    fn begin_drop_store(&self, namespace: &str) -> Result<(), DocStoreError> {
+        self.schemas
+            .transition(namespace, &[StoreState::Created, StoreState::Deleting], StoreState::Deleting)?;
+        Ok(())
+    }
+
+    /// Remove everything of `namespace`, whose record is `Deleting`, and the
+    /// record last. Idempotent: a teardown cut short is finished by running it
+    /// again. Does nothing for a store that is not `Deleting` (or is gone).
+    pub(in crate::doc_store) async fn teardown(&self, namespace: &str) -> Result<(), DocStoreError> {
+        let Some(schema) = self.schemas.get(namespace) else {
+            return Ok(());
+        };
+        if self.schemas.state(namespace) != Some(StoreState::Deleting) {
+            return Ok(());
+        }
+        let ns_id = schema.ns_id().ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
         self.without_writes(namespace, async {
@@ -44,9 +62,7 @@ impl DocStore {
             )
             .await
         })
-        .await?;
-        info!("KV namespace '{}' dropped", namespace);
-        Ok(())
+        .await
     }
 
     /// Run `drop`, which removes store `namespace`, with no write to it in
@@ -72,35 +88,6 @@ impl DocStore {
 }
 
 // ── Namespace cleanup helper ──────────────────────────────────────────────────
-
-/// Finish every store drop a crash interrupted: a schema whose namespace is
-/// not registered. A store's namespace is created before its schema and
-/// removed before it, so nothing else leaves one. Called by `open` before it
-/// touches any store: opening would recreate a KV store's namespace (under an
-/// id its schema does not name) and fail on a document store's field indexes.
-pub(in crate::doc_store) async fn finish_interrupted_drops(
-    db: &AsyncDb,
-    db_path: &Path,
-    schemas: &SchemaStore,
-    maintenance: &MaintenanceStore,
-) -> Result<(), DocStoreError> {
-    let registered: std::collections::HashSet<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
-    let stores: Vec<(String, Option<NamespaceId>)> = schemas
-        .docs()
-        .into_iter()
-        .map(|s| (s.namespace.clone(), s.ns_id))
-        .chain(schemas.kvs().into_iter().map(|s| (s.namespace.clone(), s.ns_id)))
-        .collect();
-    for (namespace, ns_id) in stores {
-        let Some(ns_id) = ns_id else { continue };
-        if registered.contains(&namespace) {
-            continue;
-        }
-        log::warn!("finishing the drop of store '{namespace}' (ns_id={ns_id}) that a crash interrupted");
-        cleanup_store_namespaces(db, db_path, schemas, maintenance, &namespace, ns_id).await?;
-    }
-    Ok(())
-}
 
 /// Remove a namespace (and its vector-index companions) from the engine registry
 /// and delete all on-disk directories and the schema file.

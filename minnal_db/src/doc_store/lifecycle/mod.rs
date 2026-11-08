@@ -4,7 +4,6 @@
 mod amend;
 mod create;
 mod drop;
+mod provision;
 #[cfg(test)]
 mod tests;
-
-pub(super) use drop::finish_interrupted_drops;

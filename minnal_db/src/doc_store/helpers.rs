@@ -57,7 +57,8 @@ pub(super) fn build_embedding_text(doc: &serde_json::Value, fields: &[String]) -
 /// their row IDs are the key values. `U128`, `Uuid` and `Str` keys register
 /// nothing and take dense row IDs from the namespace's `RowMap` — see below.
 ///
-/// Called once on open and once after creating a new store.
+/// Called at open for every created store, and by a store's creation; a field
+/// already active is left as it is, so a creation run again is safe.
 pub(super) async fn activate_indices(db: &AsyncDb, ns_id: NamespaceId, schema: &DocStoreSchema) -> Result<(), DocStoreError> {
     // Register the row-ID functions FIRST — before activating any field index.
     //
@@ -107,6 +108,11 @@ pub(super) async fn activate_indices(db: &AsyncDb, ns_id: NamespaceId, schema: &
         let ivt = to_ivt(spec.index_type);
         // register_index_field is idempotent — returns existing field_id on restart
         let field_id = db.register_index_field(ns_id, &spec.field, ivt)?;
+        // Already active: a create run again in this process (a supervised
+        // restart). Activating again would map the field's files a second time.
+        if db.field_index_distinct_count(ns_id, field_id).is_some() {
+            continue;
+        }
         let extractor = json_extractor(spec.field.clone(), spec.index_type);
         db.activate_field_index(ns_id, field_id, ivt, extractor).await?;
     }

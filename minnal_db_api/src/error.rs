@@ -58,7 +58,12 @@ impl IntoResponse for AppError {
             | DocStoreError::AttrIndexOpInProgress { .. }
             | DocStoreError::Schema(SchemaError::SemanticSearchAlreadyEnabled { .. })
             | DocStoreError::Schema(SchemaError::VectorSettingFixed { .. })
-            | DocStoreError::Schema(SchemaError::WrongStoreType { .. }) => StatusCode::CONFLICT,
+            | DocStoreError::Schema(SchemaError::WrongStoreType { .. })
+            // The store is being created or deleted: the request conflicts with
+            // its lifecycle state, and the message says which.
+            | DocStoreError::StoreCreating { .. }
+            | DocStoreError::StoreDeleting { .. }
+            | DocStoreError::InvalidTransition { .. } => StatusCode::CONFLICT,
 
             DocStoreError::InvalidId(_)
             | DocStoreError::Schema(SchemaError::Serialize(_))
@@ -115,6 +120,10 @@ impl IntoResponse for AppError {
             // once it is back, so 503 rather than 500.
             DocStoreError::EmbeddingFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
 
+            // No store can be created or dropped until the process restarts;
+            // stores that exist keep working.
+            DocStoreError::GovernorUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
@@ -131,6 +140,8 @@ impl IntoResponse for AppError {
             );
             if matches!(self.inner, DocStoreError::EmbeddingFailed(_)) {
                 "the embedding service is unavailable; retry later".to_owned()
+            } else if matches!(self.inner, DocStoreError::GovernorUnavailable) {
+                self.inner.to_string()
             } else {
                 "internal server error".to_owned()
             }

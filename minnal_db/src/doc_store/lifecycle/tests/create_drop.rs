@@ -83,7 +83,7 @@ async fn a_store_saved_under_a_companion_name_survives_a_restart_and_a_drop() {
     store.create(make_schema("foo", vec![])).await.unwrap();
     let mut schema = make_schema(NAME, vec![]);
     schema.ns_id = Some(store.db.namespace(NAME.to_owned()).await.unwrap().id());
-    store.schemas.insert(StoredSchema::Doc(Arc::new(schema))).unwrap();
+    store.schemas.insert(StoredSchema::Doc(Arc::new(schema)), StoreState::Created).unwrap();
     store.put(NAME, DocId::U64(1), serde_json::json!({})).await.unwrap();
     store.shutdown().await.unwrap();
     drop(store);
@@ -95,10 +95,11 @@ async fn a_store_saved_under_a_companion_name_survives_a_restart_and_a_drop() {
     store.shutdown().await.unwrap();
 }
 
-/// A drop's future can be dropped at any await, when the client of its route
-/// disconnects. The store must not be left refusing writes.
+/// A drop's future can be dropped at any await (the client of its route
+/// disconnecting). Once it has moved the store to `Deleting`, the store stays
+/// so, refusing requests, and the next drop finishes it.
 #[tokio::test]
-async fn a_cancelled_drop_leaves_the_store_writable() {
+async fn a_cancelled_drop_leaves_the_store_deleting_and_a_retry_finishes_it() {
     let db_dir = TempDir::new().unwrap();
     let store = open_fresh(db_dir.path()).await;
     store.create(make_schema("ns", vec![])).await.unwrap();
@@ -106,8 +107,13 @@ async fn a_cancelled_drop_leaves_the_store_writable() {
     let cancelled = tokio::time::timeout(std::time::Duration::from_millis(50), store.remove("ns")).await;
     assert!(cancelled.is_err(), "the drop waits for the lifecycle lock");
     drop(held);
-    store.put("ns", DocId::U64(1), serde_json::json!({})).await.unwrap();
+    assert_eq!(store.schemas.state("ns"), Some(StoreState::Deleting));
+    assert!(matches!(
+        store.put("ns", DocId::U64(1), serde_json::json!({})).await,
+        Err(DocStoreError::StoreDeleting { .. })
+    ));
     store.remove("ns").await.unwrap();
+    assert!(!store.schemas.contains("ns"));
     store.shutdown().await.unwrap();
 }
 
@@ -301,9 +307,13 @@ async fn an_interrupted_drop_is_finished_by_a_retry_or_the_next_open() {
             store.put("docs", DocId::U64(1), serde_json::json!({"active": true})).await.unwrap();
             store.create_kv(make_kv_schema("kv", KvKeyType::Str, KvValueType::Str)).await.unwrap();
             store.kv_put("kv", &serde_json::json!("k"), &serde_json::json!("v")).await.unwrap();
-            // Interrupted: the namespaces are gone, the schemas are not.
-            store.db.remove_namespace("docs".to_owned()).await.unwrap();
-            store.db.remove_namespace("kv".to_owned()).await.unwrap();
+            // Interrupted part-way: the stores are `Deleting` and their
+            // namespaces gone, their records not.
+            for name in ["docs", "kv"] {
+                store.schemas.transition(name, &[StoreState::Created], StoreState::Deleting).unwrap();
+                store.db.remove_namespace(name.to_owned()).await.unwrap();
+            }
+            assert!(matches!(store.get("docs", DocId::U64(1)).await, Err(DocStoreError::StoreDeleting { .. })));
             if retry {
                 store.remove("docs").await.unwrap();
                 store.remove_kv("kv").await.unwrap();

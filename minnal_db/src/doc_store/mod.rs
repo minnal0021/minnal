@@ -85,7 +85,7 @@ pub use self::key::{DocId, MAX_STR_KEY_LEN, StrKey};
 // ── Schema types ───────────────────────────────────────────────────────────
 pub use self::schema::{
     AttributeDef, AttributeType, DocStoreSchema, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES,
-    SchemaAmendment, StoreType,
+    SchemaAmendment, StoreState, StoreType,
 };
 
 // ── Pagination types ───────────────────────────────────────────────────────
@@ -219,11 +219,27 @@ impl DocStore {
             in_flight: Arc::default(),
         };
 
-        lifecycle::finish_interrupted_drops(&store.db, &store.db_path, &store.schemas, &store.maintenance).await?;
+        // Finish what a crash interrupted, before anything opens a store's
+        // namespace: a creation (its record `Creating`) and a drop (`Deleting`).
+        // A step that fails is logged and left for the next open; the store
+        // keeps refusing requests meanwhile.
+        for (namespace, state) in store.schemas.states() {
+            let finished = match state {
+                StoreState::Creating => store.provision(&namespace).await,
+                StoreState::Deleting => store.teardown(&namespace).await,
+                StoreState::Created => continue,
+            };
+            if let Err(e) = finished {
+                log::error!("store '{namespace}' is left {}: finishing it at open failed: {e}", state.as_str());
+            }
+        }
 
         let schemas = store.load_all_schemas()?;
         info!("loaded {} schema(s)", schemas.len());
         for schema in schemas {
+            if store.schemas.state(&schema.namespace) != Some(StoreState::Created) {
+                continue;
+            }
             if let Some(ns_id) = schema.ns_id {
                 debug!("activating indices for namespace '{}' (ns_id={})", schema.namespace, ns_id);
                 activate_indices(&store.db, ns_id, &schema).await?;
@@ -233,7 +249,7 @@ impl DocStore {
         let kv_schemas = store.load_all_kv_schemas()?;
         info!("loaded {} KV schema(s)", kv_schemas.len());
         for schema in kv_schemas {
-            if schema.ns_id.is_some() {
+            if schema.ns_id.is_some() && store.schemas.state(&schema.namespace) == Some(StoreState::Created) {
                 debug!("opening KV namespace '{}'", schema.namespace);
                 store.db.namespace(schema.namespace.clone()).await?;
             }
@@ -398,7 +414,11 @@ impl DocStore {
     /// The engine namespace holding store `namespace`'s data. Never creates it:
     /// a call racing the store's drop fails with [`DocStoreError::NotFound`]
     /// rather than bring the namespace back.
+    /// The namespace of `namespace`, a store taking requests: `NotFound`,
+    /// `StoreCreating` or `StoreDeleting` otherwise. Every read and write of a
+    /// store's data comes through here or [`load_schema`](Self::load_schema).
     async fn store_ns(&self, namespace: &str) -> Result<AsyncNamespace, DocStoreError> {
+        self.schemas.admit(namespace)?;
         self.db
             .existing_namespace(namespace.to_owned())
             .await?
@@ -407,11 +427,31 @@ impl DocStore {
             })
     }
 
+    /// A document store's schema, for a request to its data: only a created
+    /// store answers (`StoreCreating` / `StoreDeleting` otherwise). The admin
+    /// views use [`view_schema`](Self::view_schema).
     fn load_schema(&self, namespace: &str) -> Result<Arc<DocStoreSchema>, DocStoreError> {
+        let schema = self.schemas.doc(namespace)?;
+        self.schemas.admit(namespace)?;
+        Ok(schema)
+    }
+
+    /// A KV store's schema, for a request to its data; see [`load_schema`](Self::load_schema).
+    fn load_kv_schema(&self, namespace: &str) -> Result<Arc<KvStoreSchema>, DocStoreError> {
+        let schema = self.schemas.kv(namespace)?;
+        self.schemas.admit(namespace)?;
+        Ok(schema)
+    }
+
+    /// A document store's schema in whatever state the store is: for the
+    /// admin views (export, diagnostics, progress), which work on a store being
+    /// created or deleted too.
+    fn view_schema(&self, namespace: &str) -> Result<Arc<DocStoreSchema>, DocStoreError> {
         self.schemas.doc(namespace)
     }
 
-    fn load_kv_schema(&self, namespace: &str) -> Result<Arc<KvStoreSchema>, DocStoreError> {
+    /// A KV store's schema in whatever state; see [`view_schema`](Self::view_schema).
+    fn view_kv_schema(&self, namespace: &str) -> Result<Arc<KvStoreSchema>, DocStoreError> {
         self.schemas.kv(namespace)
     }
 

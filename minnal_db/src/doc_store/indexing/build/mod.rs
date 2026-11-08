@@ -354,7 +354,7 @@ impl DocStore {
     /// The fallback for the progress API when no build of the field is running
     /// in this process (e.g. after it completed, or before a restart resumes it).
     pub fn index_build_record(&self, namespace: &str, field: &str) -> Result<Option<FieldBuildRecord>, DocStoreError> {
-        let schema = self.load_schema(namespace)?;
+        let schema = self.view_schema(namespace)?;
         let Some(ns_id) = schema.ns_id else { return Ok(None) };
         let fields = self.db.list_index_fields(ns_id);
         let Some(meta) = fields.iter().find(|f| f.field_name == field) else {

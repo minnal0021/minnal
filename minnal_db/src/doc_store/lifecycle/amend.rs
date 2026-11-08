@@ -70,7 +70,7 @@ impl DocStore {
     ///
     /// [`list`]: DocStore::list
     pub fn get_schema(&self, namespace: &str) -> Result<DocStoreSchema, DocStoreError> {
-        let schema = self.load_schema(namespace)?;
+        let schema = self.view_schema(namespace)?;
         Ok(DocStoreSchema::clone(&schema))
     }
 
@@ -78,7 +78,7 @@ impl DocStore {
     ///
     /// [`list_kv`]: DocStore::list_kv
     pub fn get_kv_schema(&self, namespace: &str) -> Result<KvStoreSchema, DocStoreError> {
-        let schema = self.load_kv_schema(namespace)?;
+        let schema = self.view_kv_schema(namespace)?;
         Ok(KvStoreSchema::clone(&schema))
     }
 

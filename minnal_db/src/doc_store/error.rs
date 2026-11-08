@@ -208,6 +208,29 @@ pub enum DocStoreError {
     #[error("doc store '{namespace}' not found")]
     NotFound { namespace: String },
 
+    /// The store is still being set up; it takes requests once it is created.
+    #[error("store '{namespace}' is being created")]
+    StoreCreating { namespace: String },
+
+    /// The store is being dropped.
+    #[error("namespace '{namespace}' is being deleted")]
+    StoreDeleting { namespace: String },
+
+    /// A lifecycle move the store's state does not allow (a drop of a store
+    /// that is not created, say).
+    #[error("store '{namespace}' cannot move from {from:?} to {to:?}")]
+    InvalidTransition {
+        namespace: String,
+        from: crate::doc_store::schema::StoreState,
+        to: crate::doc_store::schema::StoreState,
+    },
+
+    /// The lifecycle governor, which creates and drops stores, is not running
+    /// (it stopped after too many restarts). Stores that exist keep working;
+    /// none can be created or dropped until the process is restarted.
+    #[error("store lifecycle is unavailable: the lifecycle governor is not running")]
+    GovernorUnavailable,
+
     /// The specified index field does not exist in the schema.
     #[error("index field '{field}' not found in namespace '{namespace}'")]
     IndexNotFound { namespace: String, field: String },

@@ -300,7 +300,7 @@ pub use storage::value_log::SegmentStats;
 pub use doc_store::{
     AttributeDef, AttributeType, CursorPage, DocId, DocStore, DocStoreError, DocStoreSchema, FieldBuildRecord, IndexBuildHandle, IndexBuildManager,
     IndexBuildProgress, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES, MAX_STR_KEY_LEN, Page,
-    Pagination, SchemaAmendment, SchemaError, StoreType, StrKey, prefix_upper_bound,
+    Pagination, SchemaAmendment, SchemaError, StoreState, StoreType, StrKey, prefix_upper_bound,
 };
 
 // Document-store types that only exist alongside `semantic-search`.

@@ -39,9 +39,9 @@ impl DocStore {
     /// short).
     #[cfg(feature = "semantic-search")]
     pub async fn vec_reindex_progress(&self, namespace: &str) -> Option<VecReindexProgress> {
-        let ns_id = match self.load_schema(namespace) {
+        let ns_id = match self.view_schema(namespace) {
             Ok(schema) => schema.ns_id?,
-            Err(_) => self.load_kv_schema(namespace).ok()?.ns_id?,
+            Err(_) => self.view_kv_schema(namespace).ok()?.ns_id?,
         };
         let key = TaskKey::vector_reindex(ns_id);
         let mut record: VecReindexProgress = self.maintenance.get(key).ok()??;

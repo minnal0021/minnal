@@ -23,6 +23,9 @@ pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace
     let Some(schema) = schemas.get(namespace) else {
         return Ok(DocumentText::StoreGone);
     };
+    if schemas.state(namespace) == Some(StoreState::Deleting) {
+        return Ok(DocumentText::StoreGone);
+    }
     // Never get-or-create: this runs outside any partition's epoch, so a drop can
     // land at any moment, and resolving the name after it would recreate the store.
     let Some(store_ns) = db.existing_namespace(namespace.to_owned()).await? else {
