@@ -18,7 +18,7 @@ use crate::vector_index::vector_settings::VectorIndexSettings;
 pub(crate) trait WorkerHost: Send + Sync + 'static {
     /// `namespace`'s vector-index settings and id: each entry is embedded with
     /// its namespace's model, dimension and chunking.
-    fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, u32), WorkerError>;
+    fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, crate::namespace::NamespaceId), WorkerError>;
 
     /// Whether a store called `namespace` exists.
     fn store_exists(&self, namespace: &str) -> bool;

@@ -14,6 +14,7 @@
 //! produces gaps by design -- which is why the harvest in `record_backstop_gaps`
 //! has to run *before* a segment is unlinked.
 
+use crate::namespace::NamespaceId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -53,7 +54,7 @@ impl Database {
         // the tail shown (both only grow).
         let durable_tail = self.wal.durable_tail();
         let m = self.wal_metadata.read().clone();
-        let name = |ns: u32| self.registry.read().get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned);
+        let name = |ns: NamespaceId| self.registry.read().get_name(ns).map_or_else(|| format!("#{ns}"), str::to_owned);
         let cut_segment = self.wal.segment_of(m.cut);
         let segments = self
             .wal
@@ -129,7 +130,7 @@ impl Database {
     /// and is suppressed here exactly as `detect_replay_gap` suppresses it —
     /// otherwise every `add_index` on an established database would pin the
     /// entire WAL.
-    fn field_replay_offsets(&self) -> Vec<(u32, FieldId, u64)> {
+    fn field_replay_offsets(&self) -> Vec<(NamespaceId, FieldId, u64)> {
         let consumers = self.wal_flush_observer.field_consumers();
         if consumers.is_empty() {
             return Vec::new();
@@ -180,7 +181,7 @@ impl Database {
     /// very outage the backstop exists to prevent.
     fn record_backstop_gaps(&self, forced: &[u64], wal_tail: u64) {
         // Which active fields needed each reclaimed segment, by checkpoint offset.
-        let affected: Vec<(u32, FieldId, u64, u64)> = self
+        let affected: Vec<(NamespaceId, FieldId, u64, u64)> = self
             .field_replay_offsets()
             .into_iter()
             .map(|(ns_id, field_id, offset)| (ns_id, field_id, offset, self.wal.segment_of(offset)))
@@ -190,7 +191,7 @@ impl Database {
         }
 
         // Harvest once per segment; the same keys usually serve several fields.
-        let mut keys_by_ns: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+        let mut keys_by_ns: HashMap<NamespaceId, Vec<Vec<u8>>> = HashMap::new();
         for &segment_id in forced {
             match self.wal.scan_segment_keys(segment_id) {
                 Ok(pairs) => {
@@ -934,7 +935,7 @@ mod tests {
     // rather than read from its marker on each GC tick.
 
     /// The field's consumer position, if it is one.
-    fn consumer(db: &Database, ns: u32, field: FieldId) -> Option<Option<u64>> {
+    fn consumer(db: &Database, ns: NamespaceId, field: FieldId) -> Option<Option<u64>> {
         db.wal_flush_observer
             .field_consumers()
             .into_iter()

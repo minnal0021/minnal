@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 pub mod kv;
 pub mod store;
 pub use crate::vector_index::vector_settings;
@@ -223,7 +224,7 @@ pub struct DocStoreSchema {
     pub store_type: StoreType,
     /// The minnal_db internal namespace ID — set after creation.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ns_id: Option<u32>,
+    pub ns_id: Option<NamespaceId>,
     /// The type used as the document key.
     pub key_type: KeyType,
     /// Non-indexed attribute declarations (documentation / future validation).

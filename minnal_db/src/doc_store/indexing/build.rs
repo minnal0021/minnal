@@ -2,6 +2,7 @@
 //! populates a newly added index.
 
 use crate::doc_store::*;
+use crate::namespace::NamespaceId;
 
 impl DocStore {
     // ── Admin: index management ────────────────────────────────────────────
@@ -413,7 +414,7 @@ fn successor_key(key: &[u8]) -> Vec<u8> {
 async fn rebuild_index_for_namespace(
     db: Arc<AsyncDb>,
     ns_name: String,
-    ns_id: u32,
+    ns_id: NamespaceId,
     key_type: KeyType,
     field_id: FieldId,
     resume_after: Option<Vec<u8>>,

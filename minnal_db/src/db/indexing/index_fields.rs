@@ -6,6 +6,7 @@ use crate::field_index::{DynFieldIndex, IndexValueType};
 use crate::field_index::{FieldId, FieldMeta, FieldReindexOutcome};
 use crate::kv_store::KVStore;
 use crate::kv_store::index_set::{ExtractorFn, IndexEntry};
+use crate::namespace::NamespaceId;
 
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
@@ -21,7 +22,7 @@ impl Database {
     /// The `value_type` is stored in the schema and validated when
     /// `activate_field_index` is called, so type mismatches are caught at
     /// activation time rather than at query time.
-    pub fn register_index_field(&self, namespace_id: u32, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
+    pub fn register_index_field(&self, namespace_id: NamespaceId, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
         let field_id = self.registry.write().register_schema_field(namespace_id, field_name, value_type)?;
         self.index_manager.ensure_field_path(namespace_id, field_id)?;
         Ok(field_id)
@@ -43,7 +44,7 @@ impl Database {
     /// [`activate_field_index`]: Self::activate_field_index
     pub fn set_row_id_fn(
         &self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         row_id_fn: crate::kv_store::index_set::RowIdFn,
         row_to_key_fn: Option<crate::kv_store::index_set::RowToKeyFn>,
     ) -> Result<()> {
@@ -51,7 +52,7 @@ impl Database {
     }
 
     /// Return all indexed fields registered for a namespace, sorted by `FieldId`.
-    pub fn list_index_fields(&self, namespace_id: u32) -> Vec<FieldMeta> {
+    pub fn list_index_fields(&self, namespace_id: NamespaceId) -> Vec<FieldMeta> {
         self.registry.read().schema(namespace_id).map(|s| s.list_fields()).unwrap_or_default()
     }
 
@@ -59,7 +60,7 @@ impl Database {
     ///
     /// Returns `None` when the field is not active (not yet registered via
     /// `activate_field_index`).
-    pub fn field_index_distinct_count(&self, namespace_id: u32, field_id: FieldId) -> Option<usize> {
+    pub fn field_index_distinct_count(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<usize> {
         let store = self.get_store(namespace_id).ok()?;
         let ns_index = store.namespace_index.read();
         ns_index.get(field_id).map(|e| e.index.read().distinct_count())
@@ -72,7 +73,7 @@ impl Database {
     /// [`index_blob_waste_threshold`](Self::index_blob_waste_threshold).
     ///
     /// Returns `None` when the field is not active.
-    pub fn field_index_waste(&self, namespace_id: u32, field_id: FieldId) -> Option<(f64, f64)> {
+    pub fn field_index_waste(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<(f64, f64)> {
         let store = self.get_store(namespace_id).ok()?;
         let ns_index = store.namespace_index.read();
         ns_index.get(field_id).map(|e| {
@@ -88,7 +89,7 @@ impl Database {
     /// e.g. to alert before disk fills between compactions.
     ///
     /// Returns `None` when the field is not active.
-    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<crate::field_index::IndexBlobStats> {
+    pub fn field_index_blob_stats(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<crate::field_index::IndexBlobStats> {
         let store = self.get_store(namespace_id).ok()?;
         let ns_index = store.namespace_index.read();
         ns_index.get(field_id).map(|e| e.index.read().blob_stats())
@@ -102,7 +103,7 @@ impl Database {
     ///
     /// Returns `FieldReindexOutcome::FieldNotActive` when the namespace is not
     /// open or `field_id` has no live index there.
-    pub fn reindex_field(&self, namespace_id: u32, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+    pub fn reindex_field(&self, namespace_id: NamespaceId, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
         let Ok(store) = self.get_store(namespace_id) else {
             return Ok(FieldReindexOutcome::FieldNotActive);
         };
@@ -117,7 +118,7 @@ impl Database {
     /// without the stripe the two interleave: reindex reads v1, the put applies v2
     /// and moves the row v1→v2, then reindex sets it back to v1 — the index now
     /// disagrees with the store until something rewrites the key.
-    pub(crate) fn reindex_key(&self, store: &KVStore, namespace_id: u32, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+    pub(crate) fn reindex_key(&self, store: &KVStore, namespace_id: NamespaceId, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
         let _stripe = self.key_locks.guard(namespace_id, key);
         store.reindex_field(field_id, key)
     }
@@ -157,7 +158,13 @@ impl Database {
     /// * `field_id`     – the [`FieldId`] returned by `register_index_field`
     /// * `value_type`   – runtime type for the index entries
     /// * `extractor`    – closure that extracts a typed value from raw document bytes
-    pub fn activate_field_index(&self, namespace_id: u32, field_id: FieldId, value_type: IndexValueType, extractor: ExtractorFn) -> Result<()> {
+    pub fn activate_field_index(
+        &self,
+        namespace_id: NamespaceId,
+        field_id: FieldId,
+        value_type: IndexValueType,
+        extractor: ExtractorFn,
+    ) -> Result<()> {
         self.activate_field_index_inner(namespace_id, field_id, value_type, extractor, true)
     }
 
@@ -173,7 +180,7 @@ impl Database {
     /// indexes every key's current value anyway, so the replay only adds that risk.
     pub fn activate_field_index_for_build(
         &self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         field_id: FieldId,
         value_type: IndexValueType,
         extractor: ExtractorFn,
@@ -183,7 +190,7 @@ impl Database {
 
     fn activate_field_index_inner(
         &self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         field_id: FieldId,
         value_type: IndexValueType,
         extractor: ExtractorFn,
@@ -468,7 +475,7 @@ impl Database {
     /// that references it returns [`KVError::Query`] carrying
     /// [`crate::field_index::query::QueryError::InactiveField`].  The on-disk checkpoint
     /// files are left untouched; callers are responsible for removing them.
-    pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn deactivate_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         let store = self.get_store(namespace_id)?;
         let mut namespace_index = store.namespace_index.write();
         namespace_index.deregister(field_id);
@@ -501,7 +508,7 @@ impl Database {
     ///
     /// Idempotent: dropping an already-dropped or unregistered field still
     /// deregisters and reclaims any leftover directory.
-    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn drop_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         // (1) Persist the drop before anything becomes unreachable.
         self.registry.write().mark_schema_field_dropped(namespace_id, field_id)?;
 
@@ -534,7 +541,7 @@ impl Database {
     /// Holds `index_activate_lock` for the whole reset, so no field can be
     /// activated (and allocate an ID) in the middle of it. The reset itself is
     /// crash-safe (`RowMap::reset`).
-    pub fn reset_rowmap(&self, namespace_id: u32) -> Result<bool> {
+    pub fn reset_rowmap(&self, namespace_id: NamespaceId) -> Result<bool> {
         let store = self.get_store(namespace_id)?;
         if store.row_id_fn.read().is_some() {
             return Ok(false);
@@ -561,7 +568,7 @@ impl Database {
     /// Row IDs a namespace's dense row map has allocated (every key ever
     /// indexed, live or not), or `None` when it uses a key-derived `RowIdFn`
     /// or has no row map loaded (no field index was ever activated).
-    pub fn rowmap_ids_allocated(&self, namespace_id: u32) -> Result<Option<u64>> {
+    pub fn rowmap_ids_allocated(&self, namespace_id: NamespaceId) -> Result<Option<u64>> {
         Ok(self.get_store(namespace_id)?.rowmap_ids_allocated())
     }
 
@@ -578,7 +585,7 @@ impl Database {
     /// cannot affect correctness, and refusing to open the database over it would
     /// be a far worse outcome.
     pub(in crate::db) fn complete_interrupted_field_drops(&self) {
-        let dropped: Vec<(u32, FieldId)> = {
+        let dropped: Vec<(NamespaceId, FieldId)> = {
             let registry = self.registry.read();
             registry
                 .list()

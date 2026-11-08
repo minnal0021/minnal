@@ -1,6 +1,7 @@
 //! [`Namespace`]: a scoped handle to one namespace of a [`Db`](super::Db).
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 // ── Namespace (scoped handle) ──────────────────────────────────────────
 
@@ -9,14 +10,14 @@ use super::*;
 /// Provides the same CRUD and iteration methods as `Db`, but all
 /// operations are pinned to the namespace this handle was created for.
 pub struct Namespace<'db> {
-    pub(super) ns_id: u32,
+    pub(super) ns_id: NamespaceId,
     pub(super) store: Arc<KVStore>,
     pub(super) db: &'db Database,
 }
 
 impl<'db> Namespace<'db> {
     /// The namespace ID.
-    pub fn id(&self) -> u32 {
+    pub fn id(&self) -> NamespaceId {
         self.ns_id
     }
 

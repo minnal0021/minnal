@@ -246,6 +246,8 @@ pub use kv_store::index_set::RowToKeyFn;
 
 /// Namespace ID for the implicit default namespace.
 pub use namespace::DEFAULT_NAMESPACE_ID;
+/// A namespace's identity: a random UUID, never reused.
+pub use namespace::{BadNamespaceId, NamespaceId};
 
 /// Name and ID for the system-wide namespace (always present, never removable).
 pub use namespace::{SYSTEM_NAMESPACE, SYSTEM_NAMESPACE_ID};

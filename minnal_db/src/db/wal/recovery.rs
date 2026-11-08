@@ -3,6 +3,7 @@
 use crate::db::database::{Database, display_key};
 use crate::db::error::Result;
 use crate::db::wal::{WalEntry, WalOperationType};
+use crate::namespace::NamespaceId;
 
 use log::{debug, error, info, warn};
 use std::sync::atomic::Ordering;
@@ -134,9 +135,9 @@ impl Database {
         //     reserved for writes that genuinely failed to apply. Namespace IDs
         //     are monotonic and never reused, so a missing store is unambiguous.
         use std::collections::HashSet;
-        let known_namespaces: HashSet<u32> = self.stores.read().keys().copied().collect();
+        let known_namespaces: HashSet<NamespaceId> = self.stores.read().keys().copied().collect();
         let mut skipped_unknown_ns_count = 0u64;
-        let mut warned_namespaces: HashSet<u32> = HashSet::new();
+        let mut warned_namespaces: HashSet<NamespaceId> = HashSet::new();
         let mut eligible: Vec<WalEntry> = Vec::new();
         let mut skipped_flushed_count = 0u64;
         for (pointer, entry) in all_entries {

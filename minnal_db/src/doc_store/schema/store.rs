@@ -12,6 +12,7 @@
 //! concurrent update. Readers clone an `Arc` under the read lock and never wait
 //! for an fsync. `writer` is never held across an `.await`.
 
+use crate::namespace::NamespaceId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -53,7 +54,7 @@ impl StoredSchema {
     }
 
     /// The store's namespace id, once it has one.
-    pub fn ns_id(&self) -> Option<u32> {
+    pub fn ns_id(&self) -> Option<NamespaceId> {
         match self {
             Self::Doc(s) => s.ns_id,
             Self::Kv(s) => s.ns_id,
@@ -225,7 +226,7 @@ impl SchemaStore {
     /// A store's resolved vector-index settings and namespace id, whichever kind
     /// of store it is.
     #[cfg(feature = "semantic-search")]
-    pub(crate) fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, u32), DocStoreError> {
+    pub(crate) fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, NamespaceId), DocStoreError> {
         let entry = self.entry(namespace).ok_or_else(|| {
             DocStoreError::Schema(SchemaError::NotFound {
                 namespace: namespace.to_owned(),
@@ -315,7 +316,7 @@ mod tests {
         StoredSchema::Doc(Arc::new(DocStoreSchema {
             store_type: StoreType::Doc,
             namespace: name.to_owned(),
-            ns_id: Some(7),
+            ns_id: Some(NamespaceId::from_u128(7)),
             key_type: KeyType::U64,
             indices: vec![],
             attributes: vec![],
@@ -329,7 +330,7 @@ mod tests {
         StoredSchema::Kv(Arc::new(KvStoreSchema {
             store_type: StoreType::Kv,
             namespace: name.to_owned(),
-            ns_id: Some(8),
+            ns_id: Some(NamespaceId::from_u128(8)),
             key_type: KvKeyType::Str,
             value_type: KvValueType::Str,
             semantic_search_enabled: false,

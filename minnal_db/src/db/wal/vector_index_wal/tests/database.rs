@@ -1,12 +1,13 @@
 //! The log wired into `Database`: logging, flushing, replay after a crash.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 use crate::db::database::Database;
 use crate::db::test_support::create_db_config;
 
 /// Logs and applies one write to `ns`, as step 4's worker will.
-fn log_and_apply(db: &Database, ns: u32, key: &[u8], value: &[u8]) {
+fn log_and_apply(db: &Database, ns: NamespaceId, key: &[u8], value: &[u8]) {
     let seq = db.next_seq.fetch_add(1, Ordering::SeqCst);
     let logged = db.vector_index_wal.append(ns, key, value, seq).unwrap();
     // Applied with the logged seq, and synced before the caller goes on,
@@ -93,7 +94,7 @@ fn a_restart_keeps_records_nobody_flushed() {
         log_and_apply(&db, v, b"k1", b"x");
         log_and_apply(&db, v, b"k2", b"y");
         // A namespace that no longer exists after the restart.
-        db.vector_index_wal.append(999, b"gone", b"z", 1).unwrap();
+        db.vector_index_wal.append(NamespaceId::from_u128(999), b"gone", b"z", 1).unwrap();
         db.vector_index_wal.sync().unwrap();
         db.mark_crashed();
         (v, first)

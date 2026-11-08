@@ -2,6 +2,7 @@
 
 use super::open::open_main_wal;
 use super::*;
+use crate::namespace::NamespaceId;
 
 impl Database {
     /// Test-only: mark the database closed without flushing anything, so its
@@ -149,7 +150,7 @@ impl Database {
 
     /// Test hook: the key-stripe lock `key` takes in `namespace_id`.
     #[cfg(test)]
-    pub(crate) fn stripe_of(&self, namespace_id: u32, key: &[u8]) -> usize {
+    pub(crate) fn stripe_of(&self, namespace_id: NamespaceId, key: &[u8]) -> usize {
         self.key_locks.stripe_of(namespace_id, key)
     }
 

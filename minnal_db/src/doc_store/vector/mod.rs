@@ -17,7 +17,7 @@ impl DocStore {
         (
             &Arc<SemanticSearchContext>,
             crate::doc_store::schema::vector_settings::VectorIndexSettings,
-            u32,
+            crate::namespace::NamespaceId,
         ),
         DocStoreError,
     > {
@@ -472,7 +472,7 @@ impl DocStore {
     async fn reindex_vectors(
         &self,
         namespace: &str,
-        ns_id: u32,
+        ns_id: crate::namespace::NamespaceId,
         label: &str,
         text_of: impl Fn(&[u8]) -> Option<String>,
     ) -> Result<ReindexStats, DocStoreError> {
@@ -747,7 +747,7 @@ pub struct VecReindexProgress {
 }
 
 #[cfg(feature = "semantic-search")]
-pub(crate) fn vec_reindex_path(db_path: &Path, ns_id: u32) -> PathBuf {
+pub(crate) fn vec_reindex_path(db_path: &Path, ns_id: crate::namespace::NamespaceId) -> PathBuf {
     crate::layout::namespace_index_dir(&crate::layout::index_root(db_path), ns_id).join("vector_reindex.json")
 }
 

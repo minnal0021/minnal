@@ -271,7 +271,7 @@ frame:   [size: 4B] [crc32(body): 4B] [body: rkyv-serialized WalEntry]
 
 WalEntry {
   operation:    Upsert | Delete
-  namespace_id: u32
+  namespace_id: NamespaceId — 16 bytes, see below
   sequence:     u64   — global monotonic counter
   op_name:      String — caller-supplied label, used in fail-log output
   key:          Vec<u8>
@@ -466,7 +466,7 @@ A namespace is a fully isolated keyspace inside a single database instance — t
 
 **Each namespace is self-contained.** It has its own LSM tree (skip list, L0 files, L1 SSTables), its own sharded value log (`num_buckets` shards), and its own on-disk directory at `<db_path>/ns_<name>/`. Keys in one namespace are invisible to another. (Maintenance — GC, LSM compaction, and TTL expiry — is run by single global workers that fan out over the namespaces, not one worker per namespace; see [Background Workers](#background-workers).)
 
-**Two things are shared across all namespaces:** the single global WAL (each entry tagged with its `namespace_id`), and the namespace registry — a persistent file that maps names to numeric IDs. The registry makes two guarantees worth relying on: the default namespace is always ID `0`, and IDs are assigned monotonically and **never reused**, even after a namespace is deleted. The registry also stores each TTL-enabled namespace's TTL configuration (`ttl` + `max_deletes_per_run`), so TTL expiry is restored automatically on restart rather than having to be re-declared.
+**Two things are shared across all namespaces:** the single global WAL (each entry tagged with its `namespace_id`), and the namespace registry — a persistent file that maps names to ids. A namespace id (`NamespaceId`) is a random 128-bit UUID drawn when the namespace is created, so an id is **never reused**: a name dropped and created again gets a new id, and the old namespace's WAL records and field-index files can never be taken for the new one's. The `default` and `system` namespaces have fixed ids (`NamespaceId::DEFAULT`, `NamespaceId::SYSTEM`). The registry also stores each TTL-enabled namespace's TTL configuration (`ttl` + `max_deletes_per_run`), so TTL expiry is restored automatically on restart rather than having to be re-declared.
 
 **Dropping a namespace** (`remove_namespace`) reclaims its storage and is carefully ordered so that it is crash-safe:
 
@@ -502,7 +502,7 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 
 ```
 <db_path>/
-├── namespace_registry          # Namespace name → ID map, plus TTL settings (rkyv)
+├── namespace_registry          # Namespace name → id (UUID) map, plus TTL settings (rkyv)
 │
 ├── wal/                        # The main WAL
 │   ├── 0000000000.log          # Segments, 64 MB each, created at full size; reclaimed

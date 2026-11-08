@@ -5,6 +5,7 @@
 //! The WAL is shared across all namespaces and managed by the
 //! Database coordinator.
 
+use crate::namespace::NamespaceId;
 mod gc;
 pub mod index_set;
 mod maintenance;
@@ -129,7 +130,7 @@ pub enum LsmCompactionCommand {
 pub struct KVStore {
     /// Namespace identifier (0 = "default")
     #[allow(dead_code)]
-    pub(crate) namespace_id: u32,
+    pub(crate) namespace_id: NamespaceId,
     pub(crate) name: String,
 
     // LSM tree for keys
@@ -241,7 +242,7 @@ impl KVStore {
     /// creation: a segment's size is not encoded in any pointer, so existing segments
     /// keep theirs and new ones use whatever is configured now.
     pub fn open(
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         name: &str,
         base_path: &Path,
         lsm_config: LSMConfig,
@@ -259,7 +260,7 @@ impl KVStore {
     /// is nothing to roll forward or back, which is why the GC journal, its commit
     /// marker and the `.log.new`/`.log.old` dance are all gone.
     pub fn open_with_ttl(
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         name: &str,
         base_path: &Path,
         lsm_config: LSMConfig,

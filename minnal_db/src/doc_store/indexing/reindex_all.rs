@@ -13,6 +13,7 @@
 //! live documents only (FR-006).
 
 use crate::doc_store::*;
+use crate::namespace::NamespaceId;
 
 /// Name of the intent file in the namespace's index directory.
 const INTENT_FILE: &str = "reindex_all.json";
@@ -36,7 +37,7 @@ struct Intent {
     phase: Phase,
 }
 
-fn intent_path(db_path: &Path, ns_id: u32) -> PathBuf {
+fn intent_path(db_path: &Path, ns_id: NamespaceId) -> PathBuf {
     crate::layout::namespace_index_dir(&crate::layout::index_root(db_path), ns_id).join(INTENT_FILE)
 }
 
@@ -130,7 +131,7 @@ impl DocStore {
     async fn drive_reindex_all(
         &self,
         namespace: &str,
-        ns_id: u32,
+        ns_id: NamespaceId,
         mut intent: Intent,
         stop_after: Option<usize>,
     ) -> Result<Vec<IndexBuildHandle>, DocStoreError> {

@@ -2,6 +2,7 @@
 //! schema amendment. A store's vector index has its own: `vector/lifecycle.rs`.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 impl DocStore {
     // ── Admin: create / list / drop ───────────────────────────────────────
@@ -361,7 +362,7 @@ impl DocStore {
 /// id its schema does not name) and fail on a document store's field indexes.
 pub(super) async fn finish_interrupted_drops(db: &AsyncDb, db_path: &Path, schemas: &SchemaStore) -> Result<(), DocStoreError> {
     let registered: std::collections::HashSet<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
-    let stores: Vec<(String, Option<u32>)> = schemas
+    let stores: Vec<(String, Option<NamespaceId>)> = schemas
         .docs()
         .into_iter()
         .map(|s| (s.namespace.clone(), s.ns_id))
@@ -383,7 +384,13 @@ pub(super) async fn finish_interrupted_drops(db: &AsyncDb, db_path: &Path, schem
 ///
 /// Shared by [`DocStore::drop`] and [`DocStore::drop_kv`] to
 /// eliminate the near-identical cleanup sequences in each method.
-async fn cleanup_store_namespaces(db: &AsyncDb, db_path: &Path, schemas: &SchemaStore, namespace: &str, ns_id: u32) -> Result<(), DocStoreError> {
+async fn cleanup_store_namespaces(
+    db: &AsyncDb,
+    db_path: &Path,
+    schemas: &SchemaStore,
+    namespace: &str,
+    ns_id: NamespaceId,
+) -> Result<(), DocStoreError> {
     // Clear this namespace's pending embed-queue entries FIRST.
     //
     // The queue outlives the store otherwise, and a store recreated under the
@@ -580,7 +587,7 @@ mod tests {
         let list = store.list().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["namespace"], "users");
-        assert!(list[0]["ns_id"].as_u64().is_some());
+        assert!(list[0]["ns_id"].as_str().is_some_and(|s| s.parse::<NamespaceId>().is_ok()));
     }
 
     #[tokio::test]
@@ -1240,7 +1247,7 @@ mod tests {
         let list = store.list_kv().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["namespace"], "cache");
-        assert!(list[0]["ns_id"].as_u64().is_some());
+        assert!(list[0]["ns_id"].as_str().is_some_and(|s| s.parse::<NamespaceId>().is_ok()));
         assert_eq!(list[0]["key_type"], "str");
         assert_eq!(list[0]["value_type"], "str");
     }
@@ -1381,14 +1388,14 @@ mod tests {
 
         // Schema carries a stale ns_id from a previous database instance.
         let mut schema = make_schema("ns_id_test", vec![]);
-        schema.ns_id = Some(99999);
+        schema.ns_id = Some(NamespaceId::from_u128(99999));
 
         store.create(schema).await.unwrap();
 
         let stored = store.get_schema("ns_id_test").unwrap();
         // The stored ns_id must be the one assigned by this store, not the
         // stale value that came in with the import body.
-        assert_ne!(stored.ns_id, Some(99999));
+        assert_ne!(stored.ns_id, Some(NamespaceId::from_u128(99999)));
         assert!(stored.ns_id.is_some(), "ns_id must be assigned after create");
     }
 

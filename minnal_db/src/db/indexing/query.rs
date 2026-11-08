@@ -9,6 +9,7 @@
 //! while still being queryable, and serving results that look complete over one
 //! is the failure FR-001 exists to remove.
 
+use crate::namespace::NamespaceId;
 use std::sync::Arc;
 
 use crate::db::database::Database;
@@ -34,7 +35,7 @@ impl Database {
     /// Only fields activated via `activate_field_index` are queryable.
     /// Unindexed fields in the predicate produce a [`KVError::Query`](crate::KVError::Query)
     /// carrying a [`crate::field_index::query::QueryError::InactiveField`].
-    pub fn query_keys(&self, namespace_id: u32, query_str: &str) -> Result<QueryOutcome> {
+    pub fn query_keys(&self, namespace_id: NamespaceId, query_str: &str) -> Result<QueryOutcome> {
         let store = self.get_store(namespace_id)?;
         let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;
         let degraded_fields = self.degraded_among(namespace_id, &touched);
@@ -84,7 +85,7 @@ impl Database {
     /// disagreeing about which fields a query touched.
     fn evaluate_predicate(
         &self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         store: &Arc<KVStore>,
         query_str: &str,
     ) -> Result<(crate::field_index::bitmap::RoaringBitmap, Vec<FieldId>)> {
@@ -127,7 +128,7 @@ impl Database {
     /// One marker read per touched field — a predicate references a handful of
     /// fields, not the whole schema, so this is bounded by the query rather than
     /// by the namespace.
-    fn degraded_among(&self, namespace_id: u32, touched: &[FieldId]) -> Vec<FieldId> {
+    fn degraded_among(&self, namespace_id: NamespaceId, touched: &[FieldId]) -> Vec<FieldId> {
         touched
             .iter()
             .copied()
@@ -144,7 +145,7 @@ impl Database {
     /// - Fallback (no inverse): O(n_keys) scan but no full match list allocated.
     ///
     /// [`query_keys`]: Self::query_keys
-    pub fn query_keys_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
+    pub fn query_keys_paginated(&self, namespace_id: NamespaceId, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
         let store = self.get_store(namespace_id)?;
         let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;
         let degraded_fields = self.degraded_among(namespace_id, &touched);

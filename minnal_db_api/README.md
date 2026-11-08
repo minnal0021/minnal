@@ -359,7 +359,7 @@ curl http://localhost:8080/stores
 [
   {
     "namespace": "users",
-    "ns_id": 3,
+    "ns_id": "7f3e9c2a-5b1d-4e8f-9a6c-2d4b8e1f0a37",
     "store_type": "doc",
     "key_type": "uuid",
     "attributes": [],
@@ -371,7 +371,7 @@ curl http://localhost:8080/stores
   },
   {
     "namespace": "session-cache",
-    "ns_id": 5,
+    "ns_id": "c41a6d08-93e2-4b7f-8d15-6e0f2a9b3c54",
     "store_type": "kv",
     "key_type": "str",
     "value_type": "str",
@@ -503,7 +503,7 @@ curl http://localhost:8080/stores/users/schema
 ```json
 {
   "namespace": "users",
-  "ns_id": 3,
+  "ns_id": "7f3e9c2a-5b1d-4e8f-9a6c-2d4b8e1f0a37",
   "store_type": "doc",
   "key_type": "uuid",
   "indices": [
@@ -1616,7 +1616,7 @@ curl http://localhost:8080/admin/storage/index-waste
   "namespaces": [
     {
       "namespace": "users",
-      "ns_id": 3,
+      "ns_id": "7f3e9c2a-5b1d-4e8f-9a6c-2d4b8e1f0a37",
       "fields": [
         {
           "field_id": 0,
@@ -2522,7 +2522,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
 
 ```
 {db_path}/
-  namespace_registry          ← namespace name → id map, plus TTL settings
+  namespace_registry          ← namespace name → id map (each id a random UUID), plus TTL settings
   wal/                        ← the main write-ahead log: {segment_id}.log segments (64 MiB), metadata
   vector_index_wal/           ← the vector index WAL: {segment_id}.log segments, retired_cut
   fail_logs/                  ← written only if WAL recovery could not apply an entry
@@ -2540,7 +2540,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   ns_system_qemb_cache/              ← cached query embeddings
   ns_system_schema/                  ← every store's schema, keyed by store name
   field-index/
-    {ns_id}/                  ← doc stores only; KV stores have no field indices
+    {ns_id}/                  ← the namespace's id (a UUID); doc stores only, KV stores have no field indices
       {field_id}/
         blobs.keys, blobs.vals ← one RoaringBitmap per field value (append-only blob store)
         keymap                ← field value → bitmap slot

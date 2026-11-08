@@ -1,6 +1,7 @@
 //! The synchronous entry point, [`Db`].
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 // ── Db (sync facade) ──────────────────────────────────────────────────
 
@@ -331,13 +332,13 @@ impl Db {
     }
 
     /// List all namespaces as `(name, id)` pairs.
-    pub fn list_namespaces(&self) -> Vec<(String, u32)> {
+    pub fn list_namespaces(&self) -> Vec<(String, NamespaceId)> {
         self.inner.list_namespaces()
     }
 
     /// Return `(ttl_secs, max_deletes_per_run)` for a namespace, or `None` if
     /// no TTL is registered for it.
-    pub fn ttl_config_for_ns(&self, ns_id: u32) -> Option<(u64, usize)> {
+    pub fn ttl_config_for_ns(&self, ns_id: NamespaceId) -> Option<(u64, usize)> {
         self.inner
             .registry
             .read()
@@ -348,7 +349,7 @@ impl Db {
     /// Remove a namespace and reclaim its on-disk storage (data directory and
     /// index files). The shared WAL is left untouched, so crash recovery for the
     /// remaining namespaces is unaffected.
-    pub fn remove_namespace(&self, name: &str) -> Result<u32> {
+    pub fn remove_namespace(&self, name: &str) -> Result<NamespaceId> {
         self.inner.remove_namespace(name)
     }
 
@@ -580,7 +581,7 @@ impl Db {
     // ── Index ─────────────────────────────────────────────────────────
 
     /// Register an indexed field for a namespace and return its [`FieldId`].
-    pub fn register_index_field(&self, namespace_id: u32, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
+    pub fn register_index_field(&self, namespace_id: NamespaceId, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
         self.inner.register_index_field(namespace_id, field_name, value_type)
     }
 
@@ -593,7 +594,7 @@ impl Db {
     /// for full documentation.
     pub fn set_row_id_fn(
         &self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         row_id_fn: crate::kv_store::index_set::RowIdFn,
         row_to_key_fn: Option<crate::kv_store::index_set::RowToKeyFn>,
     ) -> Result<()> {
@@ -601,7 +602,13 @@ impl Db {
     }
 
     /// Activate a registered field index.
-    pub fn activate_field_index(&self, namespace_id: u32, field_id: FieldId, value_type: IndexValueType, extractor: ExtractorFn) -> Result<()> {
+    pub fn activate_field_index(
+        &self,
+        namespace_id: NamespaceId,
+        field_id: FieldId,
+        value_type: IndexValueType,
+        extractor: ExtractorFn,
+    ) -> Result<()> {
         self.inner.activate_field_index(namespace_id, field_id, value_type, extractor)
     }
 
@@ -609,7 +616,7 @@ impl Db {
     ///
     /// After this call predicate queries that reference the field return an
     /// `InactiveField` error.  The on-disk checkpoint files are not touched.
-    pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn deactivate_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         self.inner.deactivate_field_index(namespace_id, field_id)
     }
 
@@ -621,7 +628,7 @@ impl Db {
     /// deregister that leaves every file in place. The field keeps its
     /// [`FieldId`] for reuse, but must be re-registered before it can be
     /// activated again.
-    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn drop_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         self.inner.drop_field_index(namespace_id, field_id)
     }
 
@@ -631,14 +638,14 @@ impl Db {
     /// ([`drop_field_index`](Self::drop_field_index)) — otherwise this returns
     /// an error and changes nothing. Returns `false` for a namespace whose row
     /// IDs come from a key-derived `RowIdFn` (nothing to reset).
-    pub fn reset_rowmap(&self, namespace_id: u32) -> Result<bool> {
+    pub fn reset_rowmap(&self, namespace_id: NamespaceId) -> Result<bool> {
         self.inner.reset_rowmap(namespace_id)
     }
 
     /// Row IDs a namespace's dense row map has allocated — every key ever
     /// indexed, live or deleted — or `None` when the namespace uses a
     /// key-derived `RowIdFn` or no field index was ever activated.
-    pub fn rowmap_ids_allocated(&self, namespace_id: u32) -> Result<Option<u64>> {
+    pub fn rowmap_ids_allocated(&self, namespace_id: NamespaceId) -> Result<Option<u64>> {
         self.inner.rowmap_ids_allocated(namespace_id)
     }
 
@@ -646,19 +653,19 @@ impl Db {
     ///
     /// On a fresh open the list is populated from `config.json` automatically,
     /// so callers do not need to re-call `register_index_field` after a restart.
-    pub fn list_index_fields(&self, namespace_id: u32) -> Vec<crate::field_index::FieldMeta> {
+    pub fn list_index_fields(&self, namespace_id: NamespaceId) -> Vec<crate::field_index::FieldMeta> {
         self.inner.list_index_fields(namespace_id)
     }
 
     /// Return the number of distinct indexed values for a field, or `None` if
     /// the field is not currently active.
-    pub fn field_index_distinct_count(&self, namespace_id: u32, field_id: FieldId) -> Option<usize> {
+    pub fn field_index_distinct_count(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<usize> {
         self.inner.field_index_distinct_count(namespace_id, field_id)
     }
 
     /// Reclaimable dead-space ratios `(bitmap_waste, keymap_waste)` for a field,
     /// or `None` if the field is not currently active.
-    pub fn field_index_waste(&self, namespace_id: u32, field_id: FieldId) -> Option<(f64, f64)> {
+    pub fn field_index_waste(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<(f64, f64)> {
         self.inner.field_index_waste(namespace_id, field_id)
     }
 
@@ -666,14 +673,14 @@ impl Db {
     /// sizes (logical vs. live bytes) and waste ratios — or `None` if the field
     /// is not currently active. Use it to monitor the append-only write
     /// amplification that low-cardinality fields suffer.
-    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<crate::field_index::IndexBlobStats> {
+    pub fn field_index_blob_stats(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<crate::field_index::IndexBlobStats> {
         self.inner.field_index_blob_stats(namespace_id, field_id)
     }
 
     /// Reindex a single field for a single key, re-deriving its value from the
     /// key's current stored bytes using the same logic as the put path. Touches
     /// only the named field. See [`crate::FieldReindexOutcome`].
-    pub fn reindex_field(&self, namespace_id: u32, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+    pub fn reindex_field(&self, namespace_id: NamespaceId, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
         self.inner.reindex_field(namespace_id, field_id, key)
     }
 
@@ -684,7 +691,7 @@ impl Db {
 
     /// Report the health of every registered field index in a namespace,
     /// including any outstanding gap and what it would take to repair.
-    pub fn index_health(&self, namespace_id: u32) -> Result<Vec<FieldIndexHealth>> {
+    pub fn index_health(&self, namespace_id: NamespaceId) -> Result<Vec<FieldIndexHealth>> {
         self.inner.index_health(namespace_id)
     }
 
@@ -693,7 +700,7 @@ impl Db {
     /// Row-scoped when the gap named the affected keys, a full rebuild
     /// otherwise. Does not re-put documents. See
     /// [`FieldRepairOutcome`].
-    pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
+    pub fn repair_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<FieldRepairOutcome> {
         self.inner.repair_field_index(namespace_id, field_id)
     }
 
@@ -706,7 +713,7 @@ impl Db {
     /// failure FR-001 exists to remove. Check
     /// [`is_degraded`](QueryOutcome::is_degraded) — or `degraded_fields` for
     /// which ones — before treating the result as exhaustive.
-    pub fn query_index(&self, namespace_id: u32, query_str: &str) -> Result<QueryOutcome> {
+    pub fn query_index(&self, namespace_id: NamespaceId, query_str: &str) -> Result<QueryOutcome> {
         self.inner.query_keys(namespace_id, query_str)
     }
 
@@ -718,7 +725,7 @@ impl Db {
     /// registered `RowToKeyFn` only `offset + limit` keys need to be resolved.
     ///
     /// [`query_index`]: Db::query_index
-    pub fn query_index_paginated(&self, namespace_id: u32, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
+    pub fn query_index_paginated(&self, namespace_id: NamespaceId, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
         self.inner.query_keys_paginated(namespace_id, query_str, offset, limit)
     }
 }

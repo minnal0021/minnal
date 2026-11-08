@@ -6,6 +6,7 @@
 //!
 //! The whole module is `#[cfg(test)]`, so none of it reaches a release build.
 
+use crate::namespace::NamespaceId;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,7 +54,7 @@ pub(crate) fn crash_test_config() -> DbConfig {
 
 /// Build a namespace with one activated `status` field index and a couple of
 /// documents. Returns the field id.
-pub(crate) fn activate_status_index(db: &Database, ns: u32) -> FieldId {
+pub(crate) fn activate_status_index(db: &Database, ns: NamespaceId) -> FieldId {
     let field_id = db.register_index_field(ns, "status", IndexValueType::Str).unwrap();
     let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
         let s = std::str::from_utf8(bytes).ok()?;
@@ -65,7 +66,7 @@ pub(crate) fn activate_status_index(db: &Database, ns: u32) -> FieldId {
 }
 
 /// Activate an index over the named JSON string field. Returns the field id.
-pub(crate) fn activate_named_index(db: &Database, ns: u32, field: &'static str) -> FieldId {
+pub(crate) fn activate_named_index(db: &Database, ns: NamespaceId, field: &'static str) -> FieldId {
     let field_id = db.register_index_field(ns, field, IndexValueType::Str).unwrap();
     let extractor: ExtractorFn = Arc::new(move |bytes: &[u8]| {
         let s = std::str::from_utf8(bytes).ok()?;
@@ -77,7 +78,7 @@ pub(crate) fn activate_named_index(db: &Database, ns: u32, field: &'static str) 
 }
 
 /// Record a minimal gap so a field reads as degraded.
-pub(crate) fn record_test_gap(db: &Database, ns: u32, field_id: FieldId) {
+pub(crate) fn record_test_gap(db: &Database, ns: NamespaceId, field_id: FieldId) {
     db.index_manager
         .record_gap(
             GapRecord {

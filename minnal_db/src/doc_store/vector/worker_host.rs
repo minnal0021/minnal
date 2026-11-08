@@ -17,7 +17,7 @@ pub(crate) struct DocStoreWorkerHost {
 }
 
 impl WorkerHost for DocStoreWorkerHost {
-    fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, u32), WorkerError> {
+    fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, crate::namespace::NamespaceId), WorkerError> {
         self.schemas.vector_settings(namespace).map_err(|e| match e {
             DocStoreError::Schema(SchemaError::NotFound { .. }) => WorkerError::StoreGone(e.to_string()),
             e => WorkerError::Host(e.to_string()),

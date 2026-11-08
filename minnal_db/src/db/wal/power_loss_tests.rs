@@ -11,6 +11,7 @@
 //! runs recovery, and checked: every acknowledged write is there, and every
 //! unacknowledged one is either whole or absent.
 
+use crate::namespace::NamespaceId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -361,7 +362,7 @@ impl Rng {
 /// What a key should read after a power loss: its last acknowledged value,
 /// or — if a write to it was in flight — possibly that write's value.
 /// A key in a namespace, and a value (`None`: deleted).
-type NsKey = (u32, Vec<u8>);
+type NsKey = (NamespaceId, Vec<u8>);
 type Value = Option<Vec<u8>>;
 
 #[derive(Default)]
@@ -391,7 +392,7 @@ fn power_loss_stress(seed: u64, images: usize) {
     // lock: a writer stopped inside a commit holds its key's stripe, and a
     // second writer waiting on that stripe could never reach a stopping point.
     let mut taken = std::collections::HashSet::new();
-    let keys: Vec<Vec<(u32, Vec<u8>)>> = (0..WRITERS)
+    let keys: Vec<Vec<(NamespaceId, Vec<u8>)>> = (0..WRITERS)
         .map(|w| {
             let mut mine = Vec::new();
             let mut i = 0u64;
@@ -504,7 +505,7 @@ fn power_loss_stress(seed: u64, images: usize) {
 }
 
 fn check_image(image: &Database, expected: &Expected, seed: u64, round: usize) {
-    let in_flight: HashMap<&(u32, Vec<u8>), &Option<Vec<u8>>> = expected.in_flight.values().map(|(k, v)| (k, v)).collect();
+    let in_flight: HashMap<&(NamespaceId, Vec<u8>), &Option<Vec<u8>>> = expected.in_flight.values().map(|(k, v)| (k, v)).collect();
     for ((ns, key), want) in &expected.acked {
         // Namespace ids are kept in the copied registry.
         let got = image.get_ns(*ns, key).unwrap();

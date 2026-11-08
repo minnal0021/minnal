@@ -1485,6 +1485,14 @@ at `warn`, but a drop racing the worker would then warn in normal operation.
 **Severity:** Medium — a damaged registry stops the whole database opening; no data
 is at risk from the design as it stands
 **Source:** Design discussion on how `ns_id` is generated. Not prototyped or measured.
+**Status:** Partly done (branch `namespace-uuid`, 2026-11-08). Ids are `NamespaceId`
+(random UUID, read from `/dev/urandom`, no new dependency) everywhere, and `next_id` is
+gone. Decided to **keep** the `namespace_registry` file (it now stores UUIDs), so the
+"no central file" half below stays open. Part of the store-lifecycle refactor.
+WAL cost measured (`bench_wal`, criterion, `TMPDIR=/var/tmp`, main `98cddcf` vs the branch):
+appends with and without fsync at 128 B / 4 KiB / 64 KiB and `db_put_with_wal` show no
+change (p > 0.05); `WalEntry` serialisation is 0.4–2.7% slower (+0.2 ns to +20 ns per
+entry); scans are within noise (< 1%).
 
 ### Summary
 

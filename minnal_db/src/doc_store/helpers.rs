@@ -1,5 +1,6 @@
 //! Shared helpers used across the `DocStore` impl modules.
 
+use crate::namespace::NamespaceId;
 use std::sync::Arc;
 
 use crate::doc_store::error::DocStoreError;
@@ -57,7 +58,7 @@ pub(super) fn build_embedding_text(doc: &serde_json::Value, fields: &[String]) -
 /// nothing and take dense row IDs from the namespace's `RowMap` — see below.
 ///
 /// Called once on open and once after creating a new store.
-pub(super) async fn activate_indices(db: &AsyncDb, ns_id: u32, schema: &DocStoreSchema) -> Result<(), DocStoreError> {
+pub(super) async fn activate_indices(db: &AsyncDb, ns_id: NamespaceId, schema: &DocStoreSchema) -> Result<(), DocStoreError> {
     // Register the row-ID functions FIRST — before activating any field index.
     //
     // `activate_field_index` replays the WAL tail and resolves each affected

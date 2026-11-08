@@ -2,6 +2,7 @@
 //! configuration, each namespace's loaded partition, and what a drop or a rebuild
 //! coordinates through.
 
+use crate::namespace::NamespaceId;
 use std::sync::Arc;
 
 use crate::semantic_search::PartitionHandle;
@@ -99,7 +100,7 @@ pub struct SemanticSearchContext {
     /// Each namespace's partition, loaded once from its stores. Keyed by name and
     /// `ns_id`, so a namespace dropped and recreated under the same name never
     /// reuses the old one.
-    ivfs: parking_lot::RwLock<std::collections::HashMap<(String, u32), Arc<PartitionHandle>>>,
+    ivfs: parking_lot::RwLock<std::collections::HashMap<(String, NamespaceId), Arc<PartitionHandle>>>,
     /// Namespaces whose vector index is being dropped: no partition of theirs
     /// is loaded or handed out until the drop ends ([`begin_drop`](Self::begin_drop)).
     dropping: parking_lot::Mutex<std::collections::HashSet<String>>,
@@ -346,7 +347,7 @@ impl SemanticSearchContext {
         &self,
         db: &crate::AsyncDb,
         namespace: &str,
-        ns_id: u32,
+        ns_id: NamespaceId,
         settings: &VectorIndexSettings,
     ) -> Result<NamespaceSemantics, ContextError> {
         let key = (namespace.to_owned(), ns_id);

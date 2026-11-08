@@ -1,6 +1,7 @@
 //! The async entry point, [`AsyncDb`], and its background workers.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 // ── AsyncDb ────────────────────────────────────────────────────────────
 
@@ -334,7 +335,7 @@ impl AsyncDb {
     pub async fn namespace(&self, name: String) -> Result<AsyncNamespace> {
         let db = self.inner.clone();
         let name_clone = name.clone();
-        let (ns_id, store) = tokio::task::spawn_blocking(move || -> Result<(u32, Arc<KVStore>)> {
+        let (ns_id, store) = tokio::task::spawn_blocking(move || -> Result<(NamespaceId, Arc<KVStore>)> {
             let ns_id = match db.inner.get_namespace_id(&name_clone) {
                 Some(id) => id,
                 None => db.inner.create_namespace(&name_clone)?,
@@ -386,7 +387,7 @@ impl AsyncDb {
     pub async fn namespace_with_ttl(&self, name: String, ttl: Duration, max_deletes_per_run: usize) -> Result<AsyncNamespace> {
         let db = self.inner.clone();
         let name_clone = name.clone();
-        let (ns_id, store) = tokio::task::spawn_blocking(move || -> Result<(u32, Arc<KVStore>)> {
+        let (ns_id, store) = tokio::task::spawn_blocking(move || -> Result<(NamespaceId, Arc<KVStore>)> {
             let ns_id = match db.inner.get_namespace_id(&name_clone) {
                 Some(id) => id,
                 None => db.inner.create_namespace_with_ttl(&name_clone, Some(ttl))?,
@@ -422,13 +423,13 @@ impl AsyncDb {
         })
     }
 
-    pub fn list_namespaces(&self) -> Vec<(String, u32)> {
+    pub fn list_namespaces(&self) -> Vec<(String, NamespaceId)> {
         self.inner.list_namespaces()
     }
 
     /// Return the `(ttl_secs, max_deletes_per_run)` config for a namespace, or
     /// `None` if no TTL is registered for it.
-    pub fn ttl_config_for_ns(&self, ns_id: u32) -> Option<(u64, usize)> {
+    pub fn ttl_config_for_ns(&self, ns_id: NamespaceId) -> Option<(u64, usize)> {
         self.inner
             .inner
             .registry
@@ -437,7 +438,7 @@ impl AsyncDb {
             .map(|(ttl, max_del)| (ttl.as_secs(), max_del))
     }
 
-    pub async fn remove_namespace(&self, name: String) -> Result<u32> {
+    pub async fn remove_namespace(&self, name: String) -> Result<NamespaceId> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.remove_namespace(&name))
             .await
@@ -699,7 +700,7 @@ impl AsyncDb {
     // ── Index ──────────────────────────────────────────────────────────
 
     /// Register an indexed field for a namespace and return its `FieldId`.
-    pub fn register_index_field(&self, namespace_id: u32, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
+    pub fn register_index_field(&self, namespace_id: NamespaceId, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
         self.inner.inner.register_index_field(namespace_id, field_name, value_type)
     }
 
@@ -708,7 +709,13 @@ impl AsyncDb {
     ///
     /// After this call every `put` / `delete` on the namespace automatically
     /// keeps the index current.
-    pub async fn activate_field_index(&self, namespace_id: u32, field_id: FieldId, value_type: IndexValueType, extractor: ExtractorFn) -> Result<()> {
+    pub async fn activate_field_index(
+        &self,
+        namespace_id: NamespaceId,
+        field_id: FieldId,
+        value_type: IndexValueType,
+        extractor: ExtractorFn,
+    ) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.activate_field_index(namespace_id, field_id, value_type, extractor))
             .await
@@ -720,7 +727,7 @@ impl AsyncDb {
     /// on a store taking writes as long as the build then indexes every key.
     pub async fn activate_field_index_for_build(
         &self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         field_id: FieldId,
         value_type: IndexValueType,
         extractor: ExtractorFn,
@@ -735,7 +742,7 @@ impl AsyncDb {
     ///
     /// After this call predicate queries that reference the field return an
     /// `InactiveField` error.  The on-disk checkpoint files are not touched.
-    pub fn deactivate_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn deactivate_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         self.inner.inner.deactivate_field_index(namespace_id, field_id)
     }
 
@@ -745,18 +752,18 @@ impl AsyncDb {
     /// See [`Db::drop_field_index`] for the semantics and the ordering
     /// guarantee. Synchronous — the work is a schema write plus a directory
     /// removal, not a scan.
-    pub fn drop_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn drop_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         self.inner.inner.drop_field_index(namespace_id, field_id)
     }
 
     /// See [`Db::reset_rowmap`]. Synchronous — a marker removal, a directory
     /// fsync and three small file truncations.
-    pub fn reset_rowmap(&self, namespace_id: u32) -> Result<bool> {
+    pub fn reset_rowmap(&self, namespace_id: NamespaceId) -> Result<bool> {
         self.inner.inner.reset_rowmap(namespace_id)
     }
 
     /// See [`Db::rowmap_ids_allocated`].
-    pub fn rowmap_ids_allocated(&self, namespace_id: u32) -> Result<Option<u64>> {
+    pub fn rowmap_ids_allocated(&self, namespace_id: NamespaceId) -> Result<Option<u64>> {
         self.inner.inner.rowmap_ids_allocated(namespace_id)
     }
 
@@ -769,7 +776,7 @@ impl AsyncDb {
     /// for full documentation.
     pub async fn set_row_id_fn(
         &self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         row_id_fn: crate::kv_store::index_set::RowIdFn,
         row_to_key_fn: Option<crate::kv_store::index_set::RowToKeyFn>,
     ) -> Result<()> {
@@ -783,19 +790,19 @@ impl AsyncDb {
     ///
     /// On a fresh open the list is populated from `config.json` automatically,
     /// so callers do not need to re-call `register_index_field` after a restart.
-    pub fn list_index_fields(&self, namespace_id: u32) -> Vec<crate::field_index::FieldMeta> {
+    pub fn list_index_fields(&self, namespace_id: NamespaceId) -> Vec<crate::field_index::FieldMeta> {
         self.inner.inner.list_index_fields(namespace_id)
     }
 
     /// Return the number of distinct indexed values for a field, or `None` if
     /// the field is not currently active.
-    pub fn field_index_distinct_count(&self, namespace_id: u32, field_id: FieldId) -> Option<usize> {
+    pub fn field_index_distinct_count(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<usize> {
         self.inner.inner.field_index_distinct_count(namespace_id, field_id)
     }
 
     /// Reclaimable dead-space ratios `(bitmap_waste, keymap_waste)` for a field,
     /// or `None` if the field is not currently active.
-    pub fn field_index_waste(&self, namespace_id: u32, field_id: FieldId) -> Option<(f64, f64)> {
+    pub fn field_index_waste(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<(f64, f64)> {
         self.inner.inner.field_index_waste(namespace_id, field_id)
     }
 
@@ -803,7 +810,7 @@ impl AsyncDb {
     /// sizes (logical vs. live bytes) and waste ratios — or `None` if the field
     /// is not currently active. Use it to monitor the append-only write
     /// amplification that low-cardinality fields suffer.
-    pub fn field_index_blob_stats(&self, namespace_id: u32, field_id: FieldId) -> Option<crate::field_index::IndexBlobStats> {
+    pub fn field_index_blob_stats(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<crate::field_index::IndexBlobStats> {
         self.inner.inner.field_index_blob_stats(namespace_id, field_id)
     }
 
@@ -811,7 +818,7 @@ impl AsyncDb {
     /// key's current stored bytes using the same logic as the put path. Touches
     /// only the named field. See [`crate::FieldReindexOutcome`].
     /// Report the health of every registered field index in a namespace.
-    pub async fn index_health(&self, namespace_id: u32) -> Result<Vec<FieldIndexHealth>> {
+    pub async fn index_health(&self, namespace_id: NamespaceId) -> Result<Vec<FieldIndexHealth>> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.index_health(namespace_id))
             .await
@@ -822,14 +829,14 @@ impl AsyncDb {
     ///
     /// Offloaded to a blocking task: a full rebuild scans the namespace, so this
     /// must not run on the async runtime's worker threads.
-    pub async fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
+    pub async fn repair_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<FieldRepairOutcome> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.repair_field_index(namespace_id, field_id))
             .await
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    pub async fn reindex_field(&self, namespace_id: u32, field_id: FieldId, key: Vec<u8>) -> Result<FieldReindexOutcome> {
+    pub async fn reindex_field(&self, namespace_id: NamespaceId, field_id: FieldId, key: Vec<u8>) -> Result<FieldReindexOutcome> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.reindex_field(namespace_id, field_id, &key))
             .await
@@ -843,7 +850,7 @@ impl AsyncDb {
 
     /// Evaluate a query string against the active field indices of a namespace
     /// and return the raw keys of all matching documents.
-    pub async fn query_index(&self, namespace_id: u32, query: impl Into<String> + Send + 'static) -> Result<QueryOutcome> {
+    pub async fn query_index(&self, namespace_id: NamespaceId, query: impl Into<String> + Send + 'static) -> Result<QueryOutcome> {
         let db = Arc::clone(&self.inner);
         let q = query.into();
         tokio::task::spawn_blocking(move || db.inner.query_keys(namespace_id, &q))
@@ -857,7 +864,7 @@ impl AsyncDb {
     /// [`query_index`]: AsyncDb::query_index
     pub async fn query_index_paginated(
         &self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         query: impl Into<String> + Send + 'static,
         offset: usize,
         limit: usize,

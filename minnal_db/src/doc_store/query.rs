@@ -2,6 +2,7 @@
 //! queries, and semantic search.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 impl DocStore {
     // ── Query ─────────────────────────────────────────────────────────────
@@ -13,7 +14,7 @@ impl DocStore {
     pub(super) async fn namespace_semantics(
         &self,
         namespace: &str,
-        ns_id: Option<u32>,
+        ns_id: Option<crate::namespace::NamespaceId>,
         settings: &crate::doc_store::schema::vector_settings::VectorIndexSettings,
         overrides: &SearchSpec,
     ) -> Result<NamespaceSemantics, DocStoreError> {
@@ -285,7 +286,7 @@ impl DocStore {
         namespace: &str,
         predicate: &str,
         pagination: Pagination,
-        ns_id: u32,
+        ns_id: NamespaceId,
         key_type: KeyType,
     ) -> Result<Page<(DocId, serde_json::Value)>, DocStoreError> {
         // Use the paginated variant so only the page window of keys is resolved
@@ -328,7 +329,7 @@ impl DocStore {
     /// An id with no matching registered field falls back to its numeric form
     /// rather than being dropped — losing a degradation signal because a name
     /// could not be resolved would be exactly the wrong failure mode.
-    fn degraded_field_names(&self, ns_id: u32, outcome: &crate::QueryOutcome) -> Vec<String> {
+    fn degraded_field_names(&self, ns_id: NamespaceId, outcome: &crate::QueryOutcome) -> Vec<String> {
         let mut degraded = outcome.degraded_fields.clone();
         for &fid in &outcome.touched_fields {
             let building = read_disk_progress(&build_progress_path(&self.db_path, ns_id, fid))

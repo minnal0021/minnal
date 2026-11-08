@@ -62,7 +62,7 @@ async fn key_type_for(state: &AppState, ns: &str) -> Result<minnal_db::KeyType, 
 
 /// Resolve `(ns_id, key_type)` for `ns` from the schema cache, or the
 /// appropriate error.
-async fn ns_schema_for(state: &AppState, ns: &str) -> Result<(u32, minnal_db::KeyType), AppError> {
+async fn ns_schema_for(state: &AppState, ns: &str) -> Result<(minnal_db::NamespaceId, minnal_db::KeyType), AppError> {
     let schema = doc_schema(state, ns)?;
     let ns_id = schema
         .ns_id

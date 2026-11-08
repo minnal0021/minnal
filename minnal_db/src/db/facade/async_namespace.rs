@@ -1,19 +1,20 @@
 //! [`AsyncNamespace`]: a scoped handle to one namespace of an [`AsyncDb`](super::AsyncDb).
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 // ── AsyncNamespace ─────────────────────────────────────────────────────
 
 /// Async scoped handle to a single namespace.
 #[derive(Clone)]
 pub struct AsyncNamespace {
-    pub(super) ns_id: u32,
+    pub(super) ns_id: NamespaceId,
     pub(super) store: Arc<KVStore>,
     pub(super) db: Arc<Db>,
 }
 
 impl AsyncNamespace {
-    pub fn id(&self) -> u32 {
+    pub fn id(&self) -> NamespaceId {
         self.ns_id
     }
 

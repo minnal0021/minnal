@@ -3,6 +3,7 @@
 //! on what the context holds. The store above decides whether a namespace may be
 //! asked about and resolves its settings.
 
+use crate::namespace::NamespaceId;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ impl SemanticSearchContext {
         &self,
         db: &AsyncDb,
         namespace: &str,
-        ns_id: u32,
+        ns_id: NamespaceId,
         settings: &VectorIndexSettings,
         codes: bool,
     ) -> Result<(PartitionHealth, Vec<PostingHealth>), ContextError> {
@@ -53,7 +54,7 @@ impl SemanticSearchContext {
         &self,
         db: &AsyncDb,
         namespace: &str,
-        ns_id: u32,
+        ns_id: NamespaceId,
         settings: &VectorIndexSettings,
         codes: bool,
     ) -> Result<Vec<CentreHealth>, ContextError> {
@@ -232,7 +233,7 @@ impl SemanticSearchContext {
         self: &Arc<Self>,
         db: &Arc<AsyncDb>,
         namespace: &str,
-        ns_id: u32,
+        ns_id: NamespaceId,
         settings: VectorIndexSettings,
         postings: Option<usize>,
     ) -> Result<(), ContextError> {
