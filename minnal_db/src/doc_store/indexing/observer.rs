@@ -7,16 +7,15 @@
 //! # Built-in implementations
 //!
 //! - [`InMemoryProgress`] — atomics-backed snapshot for live API queries.
-//! - [`DiskProgress`] — throttled atomic-JSON tmp-then-rename for crash
-//!   recovery.
+//! - [`RecordProgress`] — the build's record in the maintenance namespace,
+//!   saved every `every_n` documents and at each status change, for a restart.
 //! - [`ChainedObserver`] — fan-out to multiple observers.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::doc_store::DiskBuildProgress;
-use crate::doc_store::indexing::progress::BuildStatus;
+use crate::doc_store::indexing::progress::{BuildStatus, FieldBuildRecord};
+use crate::doc_store::maintenance::{MaintenanceStore, TaskKey};
 use crate::support::hex::bytes_to_hex;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -112,181 +111,188 @@ impl IndexProgressObserver for InMemoryProgress {
     }
 }
 
-// ── DiskProgress ─────────────────────────────────────────────────────────────
+// ── RecordProgress ───────────────────────────────────────────────────────────
 
-/// Throttled disk-backed observer that atomically writes `build_progress.json`
-/// (tmp-then-rename for crash-safety).  This is the **single source of truth**
-/// for on-disk build progress — it fully replaces the ad-hoc `write_disk_progress`
-/// calls that used to be scattered through `rebuild_index_for_namespace`.
+/// Saves a field-index build's [`FieldBuildRecord`] in the maintenance
+/// namespace: every `every_n` documents, and at each status change.
 ///
-/// `on_progress` keeps the latest `(total, indexed, last_key)` current on every
-/// call (cheap atomics) and flushes to disk every `every_n` documents.
-/// `on_status` writes a record built from that remembered snapshot, so a
-/// terminal `complete`/`failed` record preserves the real progress instead of
-/// zeroing it.
-pub struct DiskProgress {
-    pub path: PathBuf,
-    /// Flush interval in documents.  Flush on every `indexed % every_n == 0`.
-    pub every_n: u64,
-    /// Latest observed counters, so status/terminal writes carry the most recent
-    /// progress rather than starting from zero.
+/// `on_progress` keeps the latest `(total, indexed, resume point)` (cheap
+/// atomics) and saves every `every_n` documents. `on_status` saves a record
+/// built from that remembered snapshot, so a terminal record keeps the real
+/// progress instead of zeroing it.
+///
+/// A save is a WAL-backed write, durable when it returns. One that fails is
+/// logged and the build goes on: the record it would have replaced still names
+/// an earlier resume point, which only costs work on a restart.
+pub struct RecordProgress {
+    store: Arc<MaintenanceStore>,
+    key: TaskKey,
+    /// Save interval in documents: on every `indexed % every_n == 0`.
+    every_n: u64,
     total: AtomicU64,
     indexed: AtomicU64,
-    last_key_hex: std::sync::Mutex<Option<String>>,
+    resume_after_hex: std::sync::Mutex<Option<String>>,
 }
 
-impl DiskProgress {
-    pub fn new(path: impl AsRef<Path>, every_n: u64) -> Self {
+impl RecordProgress {
+    /// Saves to `key` in `store`, starting from `start` (the record a resumed
+    /// build continues, or a new one).
+    pub(crate) fn new(store: Arc<MaintenanceStore>, key: TaskKey, every_n: u64, start: &FieldBuildRecord) -> Self {
         Self {
-            path: path.as_ref().to_path_buf(),
+            store,
+            key,
             every_n,
-            total: AtomicU64::new(0),
-            indexed: AtomicU64::new(0),
-            last_key_hex: std::sync::Mutex::new(None),
+            total: AtomicU64::new(start.total),
+            indexed: AtomicU64::new(start.indexed),
+            resume_after_hex: std::sync::Mutex::new(start.resume_after_hex.clone()),
         }
     }
 
-    /// Build a record from the latest remembered counters.
-    fn snapshot(&self, status: &str, error: Option<&str>) -> DiskBuildProgress {
-        DiskBuildProgress {
-            status: status.to_owned(),
+    fn snapshot(&self, status: BuildStatus, error: Option<&str>) -> FieldBuildRecord {
+        FieldBuildRecord {
+            status,
             total: self.total.load(Ordering::Relaxed),
             indexed: self.indexed.load(Ordering::Relaxed),
-            last_key_hex: self.last_key_hex.lock().unwrap().clone(),
+            resume_after_hex: self.resume_after_hex.lock().unwrap().clone(),
             error: error.map(str::to_owned),
         }
     }
 
-    /// Not fsynced: a lost or torn record only costs work, because a record
-    /// that cannot be read restarts the build from the first key
-    /// (`resume_pending_builds`). A failed write is logged, not returned: the
-    /// build itself is unaffected.
-    fn write(&self, progress: &DiskBuildProgress) {
-        let tmp = self.path.with_extension("tmp");
-        let written = serde_json::to_vec(progress)
-            .map_err(std::io::Error::other)
-            .and_then(|bytes| std::fs::write(&tmp, &bytes))
-            .and_then(|()| std::fs::rename(&tmp, &self.path));
-        if let Err(e) = written {
-            log::warn!("index build progress: could not write {}: {e}", self.path.display());
+    fn save(&self, record: &FieldBuildRecord) {
+        if let Err(e) = self.store.put(self.key, record) {
+            log::warn!("index build progress: could not save {:?}: {e}", self.key);
         }
     }
 }
 
-impl IndexProgressObserver for DiskProgress {
+impl IndexProgressObserver for RecordProgress {
     fn on_progress(&self, indexed: u64, total: u64, _failed: bool, last_key: Option<&[u8]>) {
         self.total.store(total, Ordering::Relaxed);
         self.indexed.store(indexed, Ordering::Relaxed);
         if let Some(k) = last_key {
-            *self.last_key_hex.lock().unwrap() = Some(bytes_to_hex(k));
+            *self.resume_after_hex.lock().unwrap() = Some(bytes_to_hex(k));
         }
         if indexed.is_multiple_of(self.every_n) {
-            self.write(&self.snapshot("in_progress", None));
+            self.save(&self.snapshot(BuildStatus::Running, None));
         }
     }
 
     fn on_status(&self, status: BuildStatus, error: Option<&str>) {
-        let status_str = match status {
-            BuildStatus::Running => "in_progress",
-            BuildStatus::Complete => "complete",
-            BuildStatus::Failed => "failed",
-            BuildStatus::Pending => "pending",
-        };
-        self.write(&self.snapshot(status_str, error));
+        self.save(&self.snapshot(status, error));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc_store::DiskBuildProgress;
+    use crate::AsyncDb;
+    use crate::namespace::NamespaceId;
     use std::sync::atomic::Ordering;
 
-    fn read_back(path: &Path) -> DiskBuildProgress {
-        let bytes = std::fs::read(path).unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        _db: AsyncDb,
+        store: Arc<MaintenanceStore>,
+        key: TaskKey,
     }
 
-    /// A terminal record must preserve the latest `(total, indexed, last_key)`
-    /// fed via `on_progress` rather than zeroing them — the bug this guards.
-    #[test]
-    fn disk_progress_terminal_preserves_latest_snapshot() {
+    async fn fixture() -> Fixture {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("build_progress.json");
-        let disk = DiskProgress::new(&path, 1_000);
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), crate::support::test_db_config())
+            .await
+            .unwrap();
+        let store = Arc::new(MaintenanceStore::open(&db).await.unwrap());
+        let key = TaskKey::field_build(NamespaceId::random().unwrap(), 3);
+        Fixture {
+            _dir: dir,
+            _db: db,
+            store,
+            key,
+        }
+    }
 
-        // A non-multiple of `every_n`, so no flush happens here — the terminal
-        // write must still carry these values.
-        disk.on_progress(523, 1_000, false, Some(b"row-523"));
-        disk.on_status(BuildStatus::Complete, None);
+    impl Fixture {
+        fn observer(&self, every_n: u64) -> RecordProgress {
+            RecordProgress::new(Arc::clone(&self.store), self.key, every_n, &FieldBuildRecord::started())
+        }
 
-        let rec = read_back(&path);
-        assert_eq!(rec.status, "complete");
-        assert_eq!(rec.total, 1_000);
-        assert_eq!(rec.indexed, 523);
-        assert_eq!(rec.last_key_hex, Some(bytes_to_hex(b"row-523")));
+        fn record(&self) -> Option<FieldBuildRecord> {
+            self.store.get(self.key).unwrap()
+        }
+    }
+
+    /// A terminal record must preserve the latest `(total, indexed, resume
+    /// point)` fed via `on_progress` rather than zeroing them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_record_keeps_the_latest_progress() {
+        let f = fixture().await;
+        let obs = f.observer(1_000);
+        // Not a multiple of `every_n`, so nothing is saved here: the terminal
+        // record must still carry these values.
+        obs.on_progress(523, 1_000, false, Some(b"row-523"));
+        obs.on_status(BuildStatus::Complete, None);
+        let rec = f.record().unwrap();
+        assert_eq!(rec.status, BuildStatus::Complete);
+        assert_eq!((rec.total, rec.indexed), (1_000, 523));
+        assert_eq!(rec.resume_after_hex, Some(bytes_to_hex(b"row-523")));
         assert_eq!(rec.error, None);
     }
 
-    /// On failure the snapshot is preserved *and* the error message recorded.
-    #[test]
-    fn disk_progress_failed_preserves_snapshot_and_error() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("build_progress.json");
-        let disk = DiskProgress::new(&path, 1_000);
-
-        disk.on_progress(42, 100, false, Some(b"row-42"));
-        disk.on_status(BuildStatus::Failed, Some("boom"));
-
-        let rec = read_back(&path);
-        assert_eq!(rec.status, "failed");
-        assert_eq!(rec.total, 100);
-        assert_eq!(rec.indexed, 42);
-        assert_eq!(rec.last_key_hex, Some(bytes_to_hex(b"row-42")));
+    /// On failure the progress is preserved *and* the error recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_record_keeps_the_progress_and_the_error() {
+        let f = fixture().await;
+        let obs = f.observer(1_000);
+        obs.on_progress(42, 100, false, Some(b"row-42"));
+        obs.on_status(BuildStatus::Failed, Some("boom"));
+        let rec = f.record().unwrap();
+        assert_eq!(rec.status, BuildStatus::Failed);
+        assert_eq!((rec.total, rec.indexed), (100, 42));
         assert_eq!(rec.error.as_deref(), Some("boom"));
     }
 
-    /// `on_progress` flushes on the `every_n` boundary with current counters.
-    #[test]
-    fn disk_progress_flushes_on_interval() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("build_progress.json");
-        let disk = DiskProgress::new(&path, 10);
+    /// `on_progress` saves on the `every_n` boundary with the current counters.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn progress_is_saved_every_n_documents() {
+        let f = fixture().await;
+        let obs = f.observer(10);
+        obs.on_progress(7, 50, false, Some(b"a"));
+        assert_eq!(f.record(), None, "not a multiple of every_n: nothing saved");
+        obs.on_progress(10, 50, false, Some(b"b"));
+        let rec = f.record().unwrap();
+        assert!(rec.is_running());
+        assert_eq!((rec.total, rec.indexed), (50, 10));
+        assert_eq!(rec.resume_after_hex, Some(bytes_to_hex(b"b")));
+    }
 
-        disk.on_progress(7, 50, false, Some(b"a")); // not a multiple → no flush
-        assert!(!path.exists());
-
-        disk.on_progress(10, 50, false, Some(b"b")); // multiple → flush
-        let rec = read_back(&path);
-        assert_eq!(rec.status, "in_progress");
-        assert_eq!(rec.indexed, 10);
-        assert_eq!(rec.total, 50);
-        assert_eq!(rec.last_key_hex, Some(bytes_to_hex(b"b")));
+    /// A progress call with no new resume point keeps the last one: the build
+    /// names a key only once an index checkpoint covers it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_save_without_a_new_resume_point_keeps_the_last_one() {
+        let f = fixture().await;
+        let obs = f.observer(10);
+        obs.on_progress(10, 50, false, Some(b"covered"));
+        obs.on_progress(20, 50, false, None);
+        assert_eq!(f.record().unwrap().resume_after_hex, Some(bytes_to_hex(b"covered")));
     }
 
     /// `ChainedObserver` must fan a terminal status out to *every* member, so a
-    /// failure reaches the disk observer and not just the in-memory one.
-    #[test]
-    fn chained_observer_fans_status_to_all_members() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("build_progress.json");
+    /// failure reaches the record and not just the in-memory snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chained_observer_fans_status_to_all_members() {
+        let f = fixture().await;
         let mem = Arc::new(InMemoryProgress::new());
-        let disk = Arc::new(DiskProgress::new(&path, 1_000));
+        let rec = Arc::new(f.observer(1_000));
         let chain = ChainedObserver(vec![
             Arc::clone(&mem) as Arc<dyn IndexProgressObserver>,
-            Arc::clone(&disk) as Arc<dyn IndexProgressObserver>,
+            rec as Arc<dyn IndexProgressObserver>,
         ]);
-
         chain.on_progress(5, 10, false, Some(b"k"));
         chain.on_status(BuildStatus::Failed, Some("nope"));
-
-        // In-memory link saw the failure.
         assert!(mem.done.load(Ordering::Relaxed));
         assert_eq!(mem.error.lock().unwrap().as_deref(), Some("nope"));
-
-        // Disk link persisted it with the snapshot intact.
-        let rec = read_back(&path);
-        assert_eq!(rec.status, "failed");
+        let rec = f.record().unwrap();
+        assert_eq!(rec.status, BuildStatus::Failed);
         assert_eq!(rec.indexed, 5);
         assert_eq!(rec.error.as_deref(), Some("nope"));
     }

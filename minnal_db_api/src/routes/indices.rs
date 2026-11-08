@@ -29,11 +29,7 @@ pub async fn list_indices(State(state): State<AppState>, Path(ns): Path<String>)
 
     if let Some(c) = state.store.vec_reindex_progress(&ns).await {
         use minnal_db::doc_store::indexing::progress::now_ms;
-        let status = match c.status.as_str() {
-            "complete" => BuildStatus::Complete,
-            "failed" => BuildStatus::Failed,
-            _ => BuildStatus::Running,
-        };
+        let status = c.status;
         let id = IndexId::Vector { namespace: ns.clone() };
         snaps.push(IndexBuildSnapshot {
             kind: id.kind(),

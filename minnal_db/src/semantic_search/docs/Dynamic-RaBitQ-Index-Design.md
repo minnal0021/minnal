@@ -415,7 +415,7 @@ tombstone, and the reindex progress record.
 | Delete / clear (`clear_vectors` → `process_clear`) | `Clear` tombstone, written first | All writes WAL-backed; confirm a crash at each step leaves the tombstone or no vectors |
 | Vanished-document cleanup in `finish_embed` | Next worker pass? | A crash after the vector write and before its `delete_vector`: is anything left that re-checks the document? |
 | Startup reconciliation (`enqueue_embed_if_absent`) | Itself, at the next start | Its cheap completeness check passes stale vectors (M0-1's case); confirm that after M0-1 nothing reaches that state |
-| `reindex-all` | `vector_reindex.json` progress record | Resume after a crash mid-enqueue; old and new codes mixed while it runs |
+| `reindex-all` | Vector reindex record (maintenance namespace) | Resume after a crash mid-enqueue; old and new codes mixed while it runs |
 | Drop vector index / drop store | Registry-first ordering | No sidecar data or queue entries left behind after a crash at each step |
 | Query-cache clear | WAL-backed deletes | Already reasoned in `semantic_search/CLAUDE.md`; one test to pin it |
 

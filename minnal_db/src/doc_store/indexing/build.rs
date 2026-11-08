@@ -62,8 +62,14 @@ impl DocStore {
         // field's `dropped` flag, deregisters the in-memory bitmap, and deletes
         // `field-index/{ns_id}/{field_id}/`. A crash part-way leaves the drop recorded,
         // so the next open finishes it.
+        //
+        // The build record goes first. Left behind (a crash after the engine's
+        // drop), a running record would make a later re-add of the field resume
+        // the old build instead of starting a new one; a missing record only
+        // means there is no build to resume.
         let fields = self.db.list_index_fields(ns_id);
         if let Some(meta) = fields.iter().find(|f| f.field_name == field) {
+            self.maintenance.delete(TaskKey::field_build(ns_id, meta.field_id))?;
             self.db.drop_field_index(ns_id, meta.field_id)?;
         }
 
@@ -87,7 +93,7 @@ impl DocStore {
 
     /// [`add_index`](Self::add_index). `resuming` skips the "a build is already
     /// in progress" guard: a re-add that finishes an interrupted run (an
-    /// interrupted `reindex-all`) finds its own `in_progress` record from before
+    /// interrupted `reindex-all`) finds its own running record from before
     /// the crash, and must take it over rather than refuse.
     pub(super) async fn add_index_inner(&self, namespace: &str, spec: IndexSpec, resuming: bool) -> Result<IndexBuildHandle, DocStoreError> {
         // Held by the build task until it ends: registering the field creates
@@ -130,14 +136,14 @@ impl DocStore {
         }
 
         // Guard against a second caller racing in while a background build is
-        // still running (e.g. after a drop_index + immediate re-add).
-        // We detect this via the on-disk progress file rather than in-process
-        // state so the check also works when called directly (not via the API).
+        // still running (e.g. after a drop_index + immediate re-add). Read from
+        // the build's record rather than in-process state, so the check also
+        // works when called directly (not via the API).
         if !resuming {
             let ivt = to_ivt(spec.index_type);
             if let Ok(fid) = self.db.register_index_field(ns_id, &spec.field, ivt) {
-                let progress_path = build_progress_path(&self.db_path, ns_id, fid);
-                if read_disk_progress(&progress_path).map(|p| p.status == "in_progress").unwrap_or(false) {
+                let running = self.maintenance.get::<FieldBuildRecord>(TaskKey::field_build(ns_id, fid))?;
+                if running.is_some_and(|r| r.is_running()) {
                     return Err(DocStoreError::IndexBuildInProgress {
                         namespace: namespace.to_owned(),
                         field: spec.field.clone(),
@@ -157,32 +163,30 @@ impl DocStore {
         // index holds what it did before the crash (the WAL replay brings that
         // up to date). The store takes writes meanwhile only in the first case;
         // see `activate_field_index_for_build`.
-        let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
-        let takes_over_a_build = read_disk_progress(&progress_path).is_some_and(|p| p.status == "in_progress" && p.last_key_hex.is_some());
+        let record_key = TaskKey::field_build(ns_id, field_id);
+        let interrupted = self.maintenance.get::<FieldBuildRecord>(record_key)?.filter(FieldBuildRecord::is_running);
+        let takes_over_a_build = interrupted.as_ref().is_some_and(|r| r.resume_after_hex.is_some());
         if takes_over_a_build {
             self.db.activate_field_index(ns_id, field_id, ivt, extractor).await?;
         } else {
             self.db.activate_field_index_for_build(ns_id, field_id, ivt, extractor).await?;
         }
 
-        // Record the build as in progress BEFORE the schema lists the index.
-        // The build task writes its own first record only after counting every
+        // Record the build as running BEFORE the schema lists the index. The
+        // build task saves its own first record only after counting every
         // document, so without this a crash in between left an index the
         // schema lists, half built, with no record for `resume_pending_builds`
         // to find: it was never resumed and silently stayed incomplete. A
-        // record already there (an interrupted build being taken over) is kept,
-        // so its resume point survives.
-        if read_disk_progress(&progress_path).is_none_or(|p| p.status != "in_progress") {
-            let initial = DiskBuildProgress {
-                status: "in_progress".to_owned(),
-                total: 0,
-                indexed: 0,
-                last_key_hex: None,
-                error: None,
-            };
-            let bytes = serde_json::to_vec(&initial).map_err(|e| DocStoreError::Io(std::io::Error::other(e)))?;
-            crate::support::write_atomic_durable(&progress_path, &bytes)?;
-        }
+        // record already running (an interrupted build being taken over) is
+        // kept, so its resume point survives.
+        let start = match interrupted {
+            Some(record) => record,
+            None => {
+                let record = FieldBuildRecord::started();
+                self.maintenance.put(record_key, &record)?;
+                record
+            }
+        };
 
         // Persist updated schema — if the field was previously declared as a
         // non-indexed attribute, move it to indices (remove from attributes).
@@ -208,21 +212,18 @@ impl DocStore {
 
         // ── Background rebuild ────────────────────────────────────────────
         // Check for a previously interrupted build and resume from where it left off.
-        let resume_after: Option<Vec<u8>> = read_disk_progress(&progress_path)
-            .filter(|p| p.status == "in_progress")
-            .and_then(|p| p.last_key_hex)
-            .and_then(|h| hex_to_bytes(&h));
+        let resume_after: Option<Vec<u8>> = start.resume_after_hex.as_deref().and_then(hex_to_bytes);
         if resume_after.is_some() {
             info!("resuming interrupted index build for namespace '{}' field '{}'", namespace, spec.field);
         } else {
             info!("starting background index build for namespace '{}' field '{}'", namespace, spec.field);
         }
 
-        let mem = Arc::new(InMemoryProgress::new());
-        let disk = Arc::new(DiskProgress::new(&progress_path, 1_000));
+        let mem = Arc::new(InMemoryProgress::with_initial(start.total, start.indexed));
+        let record = Arc::new(RecordProgress::new(Arc::clone(&self.maintenance), record_key, 1_000, &start));
         let observer: Arc<dyn IndexProgressObserver> = Arc::new(ChainedObserver(vec![
             Arc::clone(&mem) as Arc<dyn IndexProgressObserver>,
-            Arc::clone(&disk) as Arc<dyn IndexProgressObserver>,
+            record as Arc<dyn IndexProgressObserver>,
         ]));
 
         let observer_clone = Arc::clone(&observer);
@@ -235,8 +236,8 @@ impl DocStore {
         let task = tokio::spawn(async move {
             let result = rebuild_index_for_namespace(db_clone, ns_name, ns_id, key_type, field_id, resume_after, observer_clone, &write).await;
             if let Err(ref e) = result {
-                // Notify the whole chain (in-memory *and* disk), so the failure
-                // is persisted, not just visible to live pollers.
+                // Notify the whole chain (in-memory *and* the record), so the
+                // failure is saved, not just visible to live pollers.
                 fail_observer.on_status(BuildStatus::Failed, Some(&e.to_string()));
             }
             drop(write);
@@ -254,10 +255,9 @@ impl DocStore {
 
     /// Resume any index builds that were interrupted by a previous shutdown.
     ///
-    /// Scans all persisted schemas.  For each index whose
-    /// `build_progress.json` has `status == "in_progress"`, a new background
-    /// task is spawned that continues from the last checkpointed key rather
-    /// than rescanning every document.
+    /// Scans all persisted schemas.  For each index whose build record is
+    /// still running, a new background task is spawned that continues from the
+    /// record's resume point rather than rescanning every document.
     ///
     /// Call this once at startup, right after [`open`] / [`open_with_config`],
     /// and store the returned handles the same way you would handles returned
@@ -289,46 +289,25 @@ impl DocStore {
                 };
                 let ivt = to_ivt(spec.index_type);
                 let field_id = self.db.register_index_field(ns_id, &spec.field, ivt)?;
-                let progress_path = build_progress_path(&self.db_path, ns_id, field_id);
+                let record_key = TaskKey::field_build(ns_id, field_id);
 
-                // A missing record means no build of this field was ever started
-                // here. One that exists but cannot be read is what a power loss
-                // can leave behind (its writes are not fsynced): the build may have
-                // been anywhere, so it starts again from the first key. Skipping
-                // it would leave the index half built, with nothing to finish it.
-                let disk = match read_disk_progress(&progress_path) {
-                    Some(disk) => disk,
-                    None if !progress_path.exists() => continue,
-                    None => {
-                        log::warn!(
-                            "index build of namespace='{}' field='{}': its progress record is unreadable (a power loss can leave it so); rebuilding the field from the start",
-                            schema.namespace,
-                            spec.field
-                        );
-                        DiskBuildProgress {
-                            status: "in_progress".to_owned(),
-                            total: 0,
-                            indexed: 0,
-                            last_key_hex: None,
-                            error: None,
-                        }
-                    }
-                };
-                if disk.status != "in_progress" {
+                // No record, or a finished one: no build of this field is left
+                // to finish. A record is a WAL-backed write, so it is never torn.
+                let Some(start) = self.maintenance.get::<FieldBuildRecord>(record_key)?.filter(FieldBuildRecord::is_running) else {
                     continue;
-                }
+                };
 
                 info!(
                     "resuming interrupted index build: namespace='{}' field='{}' progress={}/{}",
-                    schema.namespace, spec.field, disk.indexed, disk.total
+                    schema.namespace, spec.field, start.indexed, start.total
                 );
-                let resume_after = disk.last_key_hex.as_deref().and_then(hex_to_bytes);
+                let resume_after = start.resume_after_hex.as_deref().and_then(hex_to_bytes);
 
-                let mem = Arc::new(InMemoryProgress::with_initial(disk.total, disk.indexed));
-                let disk_obs = Arc::new(DiskProgress::new(&progress_path, 1_000));
+                let mem = Arc::new(InMemoryProgress::with_initial(start.total, start.indexed));
+                let record = Arc::new(RecordProgress::new(Arc::clone(&self.maintenance), record_key, 1_000, &start));
                 let observer: Arc<dyn IndexProgressObserver> = Arc::new(ChainedObserver(vec![
                     Arc::clone(&mem) as Arc<dyn IndexProgressObserver>,
-                    Arc::clone(&disk_obs) as Arc<dyn IndexProgressObserver>,
+                    record as Arc<dyn IndexProgressObserver>,
                 ]));
 
                 let observer_clone = Arc::clone(&observer);
@@ -342,8 +321,8 @@ impl DocStore {
                     let result =
                         rebuild_index_for_namespace(db_clone, ns_name, ns_id, key_type, field_id, resume_after, observer_clone, &write).await;
                     if let Err(ref e) = result {
-                        // Notify the whole chain (in-memory *and* disk), so the
-                        // failure is persisted, not just visible to live pollers.
+                        // Notify the whole chain (in-memory *and* the record), so
+                        // the failure is saved, not just visible to live pollers.
                         fail_observer.on_status(BuildStatus::Failed, Some(&e.to_string()));
                     }
                     drop(write);
@@ -369,18 +348,19 @@ impl DocStore {
         self.builds.any(namespace)
     }
 
-    /// Return the persisted build progress for a specific index, or `None` if
-    /// no `build_progress.json` exists for that field.
+    /// The saved record of a field's index build, or `None` if no build of it
+    /// was started.
     ///
-    /// This is the fallback used by the progress API when no active in-memory
-    /// handle exists (e.g. after the build completed and was drained on shutdown).
-    pub fn index_build_disk_progress(&self, namespace: &str, field: &str) -> Option<DiskBuildProgress> {
-        let schema = self.load_schema(namespace).ok()?;
-        let ns_id = schema.ns_id?;
+    /// The fallback for the progress API when no build of the field is running
+    /// in this process (e.g. after it completed, or before a restart resumes it).
+    pub fn index_build_record(&self, namespace: &str, field: &str) -> Result<Option<FieldBuildRecord>, DocStoreError> {
+        let schema = self.load_schema(namespace)?;
+        let Some(ns_id) = schema.ns_id else { return Ok(None) };
         let fields = self.db.list_index_fields(ns_id);
-        let meta = fields.iter().find(|f| f.field_name == field)?;
-        let path = build_progress_path(&self.db_path, ns_id, meta.field_id);
-        read_disk_progress(&path)
+        let Some(meta) = fields.iter().find(|f| f.field_name == field) else {
+            return Ok(None);
+        };
+        self.maintenance.get(TaskKey::field_build(ns_id, meta.field_id))
     }
 }
 
@@ -390,7 +370,7 @@ impl DocStore {
 /// is called for each, populating the freshly activated index with historical
 /// data.
 ///
-/// Progress is reported via `observer` (e.g. atomics + disk JSON) every 1 000
+/// Progress is reported via `observer` (atomics and the build's record) every 1 000
 /// documents and on terminal status changes.  When `resume_after` is `Some(key)`,
 /// all documents with keys ≤ that key are skipped (they were already processed
 /// before the previous shutdown).
@@ -456,9 +436,9 @@ async fn rebuild_index_for_namespace(
     info!("index build started: namespace='{}' field_id={} total={} docs", ns_name, field_id, total);
 
     // Seed the observer with the counts from the scan, then announce Running.
-    // The observer (its `DiskProgress` link) is the single source of truth for
-    // persistence: seeding before `on_status(Running)` makes the initial
-    // in_progress record carry the real total/resume point.
+    // The observer (its `RecordProgress` link) is the single source of truth
+    // for the saved record: seeding before `on_status(Running)` makes the
+    // running record carry the real total and resume point.
     observer.on_progress(already_done, total, false, resume_after.as_deref());
     observer.on_status(BuildStatus::Running, None);
 
@@ -506,7 +486,7 @@ async fn rebuild_index_for_namespace(
             while unsaved.front().is_some_and(|(started, _)| db.index_checkpoint_covers(*started)) {
                 resume_point = unsaved.pop_front().map(|(_, key)| key);
             }
-            // The observer persists to disk on its own cadence (every `every_n`).
+            // The observer saves the record on its own cadence (every `every_n`).
             observer.on_progress(indexed, total, false, resume_point.as_deref());
 
             // Log progress and yield every 1 000 documents.

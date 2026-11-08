@@ -1,14 +1,11 @@
 //! Progress and status types for field-index builds and vector-index reindexes, so
 //! the REST API can return one shape whichever kind of index it reports.
 
-use crate::namespace::NamespaceId;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-use crate::FieldId;
 use crate::doc_store::error::DocStoreError;
 use crate::doc_store::indexing::observer::InMemoryProgress;
 
@@ -18,8 +15,8 @@ use crate::doc_store::schema::IndexKind;
 
 /// Lifecycle status of an index build or vector-index reindex.
 ///
-/// Stored as a snake_case string in JSON and in the on-disk progress files so
-/// that old files remain readable after a version upgrade that adds new variants.
+/// Stored as a snake_case string in JSON, in API responses and in the
+/// maintenance records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildStatus {
@@ -71,8 +68,7 @@ impl IndexId {
 
 // ── IndexBuildSnapshot ────────────────────────────────────────────────────────
 
-/// Uniform progress snapshot for any index type, returned by the REST API and
-/// stored on disk to survive restarts.
+/// Uniform progress snapshot for any index type, returned by the REST API.
 ///
 /// `extra` carries type-specific data (e.g. `last_key_hex` for field builds,
 /// `actionable`/`exhausted` counts for vector reindexs) without forcing the
@@ -121,41 +117,45 @@ impl IndexBuildSnapshot {
 
 pub use crate::support::now_ms;
 
-/// Persistent state for a background index build, written to
-/// `{db_path}/field-index/{ns_id}/{field_id}/build_progress.json`.
+/// One field-index build's progress, kept in the maintenance namespace
+/// (`doc_store::maintenance`, key `TaskKey::field_build`).
 ///
-/// Survives server restarts — on startup the store uses this to resume
-/// interrupted builds instead of restarting from scratch.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DiskBuildProgress {
-    /// `"in_progress"`, `"complete"`, or `"failed"`.
-    pub status: String,
+/// Written when the build is set up (before the schema lists the index), every
+/// 1,000 documents while it runs, and when it ends. A restart resumes a
+/// `Running` build from `resume_after`. Each write is WAL-backed and durable on
+/// return, so a record is either there whole or not there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FieldBuildRecord {
+    /// `Running` until the build ends, then `Complete` or `Failed`.
+    pub status: BuildStatus,
     /// Total document count (0 until the initial scan finishes).
     pub total: u64,
     /// Documents processed so far.
     pub indexed: u64,
-    /// Hex-encoded bytes of the last successfully processed key.
-    /// `None` if no key has been processed yet.
-    pub last_key_hex: Option<String>,
-    /// Error message if `status == "failed"`.
+    /// Hex-encoded key a restart resumes after. Never ahead of what the
+    /// field index has made durable: the build names a key only once an index
+    /// checkpoint covers it. `None`: start from the first key.
+    pub resume_after_hex: Option<String>,
+    /// Why the build failed, when `status == Failed`.
     pub error: Option<String>,
 }
 
-/// Path to the build-progress file for `(ns_id, field_id)`.
-///
-/// The directory comes from [`crate::layout`] — the engine owns where index
-/// files live; the doc store only owns the filename it puts there.
-pub(crate) fn build_progress_path(db_path: &Path, ns_id: NamespaceId, field_id: FieldId) -> PathBuf {
-    crate::layout::namespace_index_dir(&crate::layout::index_root(db_path), ns_id)
-        .join(field_id.to_string())
-        .join("build_progress.json")
-}
+impl FieldBuildRecord {
+    /// A build that has started and processed nothing yet.
+    pub fn started() -> Self {
+        Self {
+            status: BuildStatus::Running,
+            total: 0,
+            indexed: 0,
+            resume_after_hex: None,
+            error: None,
+        }
+    }
 
-/// Read the persisted build progress for a field.  Returns `None` if the file
-/// does not exist or cannot be parsed.
-pub(crate) fn read_disk_progress(path: &Path) -> Option<DiskBuildProgress> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    /// Whether the build is still to finish (running, or cut short by a crash).
+    pub fn is_running(&self) -> bool {
+        self.status == BuildStatus::Running
+    }
 }
 
 /// A snapshot of the progress of a background index build.

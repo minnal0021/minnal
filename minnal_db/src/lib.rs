@@ -298,7 +298,7 @@ pub use storage::value_log::SegmentStats;
 // NOT re-listed here — they already live at the crate root.
 #[cfg(feature = "doc-store")]
 pub use doc_store::{
-    AttributeDef, AttributeType, CursorPage, DiskBuildProgress, DocId, DocStore, DocStoreError, DocStoreSchema, IndexBuildHandle, IndexBuildManager,
+    AttributeDef, AttributeType, CursorPage, DocId, DocStore, DocStoreError, DocStoreSchema, FieldBuildRecord, IndexBuildHandle, IndexBuildManager,
     IndexBuildProgress, IndexKind, IndexSpec, IndexType, KeyType, KvKeyType, KvStoreSchema, KvValueType, MAX_INDICES, MAX_STR_KEY_LEN, Page,
     Pagination, SchemaAmendment, SchemaError, StoreType, StrKey, prefix_upper_bound,
 };

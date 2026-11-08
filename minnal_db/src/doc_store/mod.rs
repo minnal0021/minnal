@@ -26,7 +26,7 @@ use crate::{AsyncDb, AsyncNamespace, DbConfig, FieldId};
 use log::warn;
 use log::{debug, info};
 
-use self::indexing::observer::{ChainedObserver, DiskProgress, InMemoryProgress, IndexProgressObserver};
+use self::indexing::observer::{ChainedObserver, InMemoryProgress, IndexProgressObserver, RecordProgress};
 use self::indexing::progress::BuildStatus;
 #[cfg(feature = "semantic-search")]
 use self::indexing::progress::now_ms;
@@ -49,6 +49,7 @@ pub mod indexing;
 pub mod key;
 mod kv;
 mod lifecycle;
+mod maintenance;
 pub mod pagination;
 mod query;
 pub mod schema;
@@ -58,12 +59,11 @@ mod vector;
 mod write_gate;
 
 pub use self::diagnostics::RowMapStats;
-pub use self::indexing::progress::{DiskBuildProgress, IndexBuildHandle, IndexBuildProgress};
-pub(crate) use self::indexing::progress::{build_progress_path, read_disk_progress};
+pub use self::indexing::progress::{FieldBuildRecord, IndexBuildHandle, IndexBuildProgress};
+pub use self::maintenance::MAINTENANCE_NAMESPACE;
+pub(crate) use self::maintenance::{MaintenanceStore, TaskKey};
 #[cfg(feature = "semantic-search")]
 pub use self::vector::VectorReindexOutcome;
-#[cfg(feature = "semantic-search")]
-pub(crate) use self::vector::vec_reindex_path;
 pub use self::vector::{ReindexStats, VecReindexProgress};
 #[cfg(feature = "semantic-search")]
 pub(crate) use self::write_gate::{InFlightWrite, InFlightWrites};
@@ -121,6 +121,9 @@ pub struct DocStore {
     db_path: PathBuf,
     /// Every store's schema: the only way the doc store reads or writes one.
     schemas: Arc<SchemaStore>,
+    /// Maintenance tasks and their progress (index builds, reindexes): the only
+    /// way the doc store reads or writes one.
+    maintenance: Arc<MaintenanceStore>,
     /// Semantic-search context used by query paths (embedding + cluster index).
     /// `None` when semantic search is not configured.
     #[cfg(feature = "semantic-search")]
@@ -193,10 +196,12 @@ impl DocStore {
         db.hold_dir_lock(lock);
         // After WAL recovery (done by the open above), before anything reads a schema.
         let schemas = Arc::new(SchemaStore::open(&db).await?);
+        let maintenance = Arc::new(MaintenanceStore::open(&db).await?);
         let store = Self {
             db,
             db_path,
             schemas,
+            maintenance,
             #[cfg(feature = "semantic-search")]
             semantic_ctx: None,
             #[cfg(feature = "semantic-search")]
@@ -214,7 +219,7 @@ impl DocStore {
             in_flight: Arc::default(),
         };
 
-        lifecycle::finish_interrupted_drops(&store.db, &store.db_path, &store.schemas).await?;
+        lifecycle::finish_interrupted_drops(&store.db, &store.db_path, &store.schemas, &store.maintenance).await?;
 
         let schemas = store.load_all_schemas()?;
         info!("loaded {} schema(s)", schemas.len());

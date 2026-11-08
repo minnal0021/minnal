@@ -1,5 +1,6 @@
 //! Vector-index queue administration and bulk (re)indexing.
 
+use crate::doc_store::indexing::progress::BuildStatus;
 use crate::doc_store::*;
 
 mod lifecycle;
@@ -388,39 +389,48 @@ impl DocStore {
     /// Return the persisted vector-index reindex record for `namespace`, or
     /// `None` when no reindex has been started for that namespace.
     ///
-    /// A `"running"` record is brought up to date as it is read: it becomes
-    /// `"complete"` once every document was enqueued and none of the namespace's
-    /// work is left in the queue, and `"failed"` if its enqueue never finished and
+    /// A `Running` record is brought up to date as it is read: it becomes
+    /// `Complete` once every document was enqueued and none of the namespace's
+    /// work is left in the queue, and `Failed` if its enqueue never finished and
     /// no reindex of the namespace is enqueueing in this process (a crash cut it
-    /// short). Records used to stay `"running"` for good, which also refused every
-    /// later reindex.
+    /// short).
     #[cfg(feature = "semantic-search")]
     pub async fn vec_reindex_progress(&self, namespace: &str) -> Option<VecReindexProgress> {
         let ns_id = match self.load_schema(namespace) {
             Ok(schema) => schema.ns_id?,
             Err(_) => self.load_kv_schema(namespace).ok()?.ns_id?,
         };
-        let path = vec_reindex_path(&self.db_path, ns_id);
-        let mut record = read_vec_reindex(&path)?;
-        if record.status != "running" || self.vec_reindexing.lock().contains(namespace) {
+        let key = TaskKey::vector_reindex(ns_id);
+        let mut record: VecReindexProgress = self.maintenance.get(key).ok()??;
+        if record.status != BuildStatus::Running || self.vec_reindexing.lock().contains(namespace) {
             return Some(record);
         }
         if !record.enqueue_done {
-            record.status = "failed".to_owned();
+            record.status = BuildStatus::Failed;
             record.completed_at_ms = Some(now_ms());
             record.error = Some("interrupted before every document was enqueued (a restart); run reindex-all again".to_owned());
-            write_vec_reindex(&path, &record);
+            self.save_vec_reindex(key, &record);
         } else if !vector_kv::list_queue_entries(&self.db)
             .await
             .ok()?
             .iter()
             .any(|e| e.namespace == namespace)
         {
-            record.status = "complete".to_owned();
+            record.status = BuildStatus::Complete;
             record.completed_at_ms = Some(now_ms());
-            write_vec_reindex(&path, &record);
+            self.save_vec_reindex(key, &record);
         }
         Some(record)
+    }
+
+    /// Save a vector reindex's record. A failed save is logged, not returned:
+    /// the record it would have replaced is still there, and only the progress
+    /// it shows is behind.
+    #[cfg(feature = "semantic-search")]
+    fn save_vec_reindex(&self, key: TaskKey, record: &VecReindexProgress) {
+        if let Err(e) = self.maintenance.put(key, record) {
+            log::warn!("vector reindex progress: could not save {key:?}: {e}");
+        }
     }
 
     /// Re-enqueue every document in `namespace` for vector indexing.
@@ -434,9 +444,8 @@ impl DocStore {
     ///    enqueued with `retry_count = 0`.  Documents already in the queue
     ///    are overwritten (natural deduplication — only the latest text is
     ///    kept).
-    /// 4. A reindex record is written to
-    ///    `{db_path}/field-index/{ns_id}/vector_reindex.json` so the progress API
-    ///    can track this reindex across server restarts.
+    /// 4. A reindex record is saved in the maintenance namespace so the
+    ///    progress API can track this reindex across server restarts.
     /// 5. The vector-index worker is notified to start processing immediately.
     ///
     /// The documents and the queue are read a page of `REINDEX_PAGE` (1,000) at a
@@ -478,17 +487,16 @@ impl DocStore {
     ) -> Result<ReindexStats, DocStoreError> {
         // 409 guard: one reindex of a namespace enqueues at a time. Held until
         // this function returns, however it returns.
-        let reindex_path = vec_reindex_path(&self.db_path, ns_id);
+        let key = TaskKey::vector_reindex(ns_id);
         let _write = self.writes.enter(namespace)?;
         let _claim = ReindexClaim::take(&self.vec_reindexing, namespace)?;
         self.check_not_dropping(namespace)?;
 
-        // Write "running" reindex record immediately so the guard works even
-        // if the process crashes before we finish enqueueing.
+        // Save the running record before enqueueing anything, so a crash part
+        // way through leaves a record that says so.
         let started_at_ms = now_ms();
-        std::fs::create_dir_all(reindex_path.parent().unwrap())?;
         let record = |enqueued: usize, exhausted_cleared: usize, enqueue_done: bool| VecReindexProgress {
-            status: "running".to_owned(),
+            status: BuildStatus::Running,
             started_at_ms,
             completed_at_ms: None,
             total_enqueued: enqueued,
@@ -496,7 +504,7 @@ impl DocStore {
             error: None,
             enqueue_done,
         };
-        write_vec_reindex(&reindex_path, &record(0, 0, false));
+        self.maintenance.put(key, &record(0, 0, false))?;
 
         let max_retries = self.vector_index_config.max_retries;
         let mut exhausted_cleared = 0usize;
@@ -536,7 +544,7 @@ impl DocStore {
                         None => skipped_empty_text += 1,
                     }
                 }
-                write_vec_reindex(&reindex_path, &record(enqueued, exhausted_cleared, false));
+                self.save_vec_reindex(key, &record(enqueued, exhausted_cleared, false));
                 match next {
                     Some(c) => cursor = Some(c),
                     None => break,
@@ -552,10 +560,10 @@ impl DocStore {
         );
 
         if let Err(e) = commit_result {
-            write_vec_reindex(
-                &reindex_path,
+            self.save_vec_reindex(
+                key,
                 &VecReindexProgress {
-                    status: "failed".to_owned(),
+                    status: BuildStatus::Failed,
                     completed_at_ms: Some(now_ms()),
                     error: Some(e.to_string()),
                     ..record(enqueued, exhausted_cleared, false)
@@ -564,9 +572,9 @@ impl DocStore {
             return Err(e);
         }
 
-        // The final count; status stays "running" until the worker finishes
+        // The final count; the status stays `Running` until the worker finishes
         // (tracked via queue depth).
-        write_vec_reindex(&reindex_path, &record(enqueued, exhausted_cleared, true));
+        self.save_vec_reindex(key, &record(enqueued, exhausted_cleared, true));
 
         if let Some(notify) = &self.notify {
             notify.notify_one();
@@ -719,8 +727,8 @@ pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace
     })
 }
 
-/// Persistent record for one `index_all` reindex, written to
-/// `{db_path}/field-index/{ns_id}/vector_reindex.json`.
+/// Persistent record for one `index_all` reindex, kept in the maintenance
+/// namespace (`TaskKey::vector_reindex`).
 ///
 /// A reindex is the unit of work created by a single `index_all` call: it
 /// tracks the total documents enqueued, how many have been indexed, and the
@@ -728,8 +736,9 @@ pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace
 /// show historical reindexs even after the server restarts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VecReindexProgress {
-    /// `"running"`, `"complete"`, or `"failed"`.
-    pub status: String,
+    /// `Running` until the worker has embedded everything enqueued, then
+    /// `Complete`; `Failed` if the enqueue failed or a restart cut it short.
+    pub status: BuildStatus,
     /// Unix milliseconds when `index_all` was called.
     pub started_at_ms: u64,
     /// Unix milliseconds when the reindex finished (terminal states only).
@@ -738,33 +747,14 @@ pub struct VecReindexProgress {
     pub total_enqueued: usize,
     /// Number of exhausted entries cleared before enqueueing.
     pub exhausted_cleared: usize,
-    /// Error message when `status == "failed"`.
+    /// Error message when `status == Failed`.
     pub error: Option<String>,
-    /// Whether every document was enqueued. A `"running"` record without it, and
+    /// Whether every document was enqueued. A `Running` record without it, and
     /// with no reindex enqueueing in this process, was cut short by a crash.
     #[serde(default)]
     pub enqueue_done: bool,
 }
 
-#[cfg(feature = "semantic-search")]
-pub(crate) fn vec_reindex_path(db_path: &Path, ns_id: crate::namespace::NamespaceId) -> PathBuf {
-    crate::layout::namespace_index_dir(&crate::layout::index_root(db_path), ns_id).join("vector_reindex.json")
-}
-
-#[cfg(feature = "semantic-search")]
-pub(crate) fn read_vec_reindex(path: &Path) -> Option<VecReindexProgress> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-#[cfg(feature = "semantic-search")]
-pub(crate) fn write_vec_reindex(path: &Path, reindex: &VecReindexProgress) {
-    let tmp = path.with_extension("tmp");
-    if let Ok(bytes) = serde_json::to_vec(reindex) {
-        let _ = std::fs::write(&tmp, &bytes);
-        let _ = std::fs::rename(&tmp, path);
-    }
-}
 /// Outcome of a single-document vector reindex
 /// ([`DocStore::reindex_doc_vector`](crate::doc_store::DocStore::reindex_doc_vector) /
 /// [`DocStore::kv_reindex_doc_vector`](crate::doc_store::DocStore::kv_reindex_doc_vector)).
@@ -1110,11 +1100,11 @@ mod tests {
         for e in store.list_queue_entries().await {
             vector_kv::remove_queue_entry(&store.db, &e.namespace, &e.doc_id_bytes).await.unwrap();
         }
-        assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, "complete");
+        assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, BuildStatus::Complete);
         store.check_kv_index_all_preconditions("sem_kv").unwrap();
         store.kv_index_all("sem_kv").await.expect("a second reindex must be allowed");
         // While its work is still queued, it is running.
-        assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, "running");
+        assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, BuildStatus::Running);
     }
 
     /// A reindex reads the store a page at a time: every entry is enqueued across
@@ -1167,26 +1157,27 @@ mod tests {
                 .await
                 .unwrap();
             let ns_id = store.load_kv_schema("sem_kv").unwrap().ns_id.unwrap();
-            // What a crash right after the reindex started leaves on disk.
-            let path = vec_reindex_path(&store.db_path, ns_id);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            write_vec_reindex(
-                &path,
-                &VecReindexProgress {
-                    status: "running".to_owned(),
-                    started_at_ms: now_ms(),
-                    completed_at_ms: None,
-                    total_enqueued: 0,
-                    exhausted_cleared: 0,
-                    error: None,
-                    enqueue_done: false,
-                },
-            );
+            // What a crash right after the reindex started leaves behind.
+            store
+                .maintenance
+                .put(
+                    TaskKey::vector_reindex(ns_id),
+                    &VecReindexProgress {
+                        status: BuildStatus::Running,
+                        started_at_ms: now_ms(),
+                        completed_at_ms: None,
+                        total_enqueued: 0,
+                        exhausted_cleared: 0,
+                        error: None,
+                        enqueue_done: false,
+                    },
+                )
+                .unwrap();
             store.db.shutdown().await.unwrap();
         }
         let store = with_worker_notify(open_fresh(db_dir.path()).await);
         let progress = store.vec_reindex_progress("sem_kv").await.unwrap();
-        assert_eq!(progress.status, "failed", "{progress:?}");
+        assert_eq!(progress.status, BuildStatus::Failed, "{progress:?}");
         store.kv_index_all("sem_kv").await.expect("a new reindex must be allowed");
     }
 
@@ -1415,9 +1406,8 @@ mod tests {
         vector_kv::create_vector_namespaces(&store.db, "sem_kv").await.unwrap();
         assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_some());
         let ns_id = store.load_kv_schema("sem_kv").unwrap().ns_id.unwrap();
-        let record = vec_reindex_path(&store.db_path, ns_id);
-        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
-        std::fs::write(&record, "{}").unwrap();
+        let record = TaskKey::vector_reindex(ns_id);
+        store.maintenance.put(record, &"a record the drop must remove").unwrap();
 
         store.disable_semantic_search("sem_kv").unwrap();
         assert!(!store.load_kv_schema("sem_kv").unwrap().is_semantic_search_enabled());
@@ -1435,7 +1425,7 @@ mod tests {
             .filter(|(n, _)| vector_kv::vector_data_base(n).is_some())
             .collect();
         assert!(companions.is_empty(), "{companions:?}");
-        assert!(!record.exists());
+        assert!(store.maintenance.keys_of(ns_id).is_empty(), "the reindex record is removed");
         assert_eq!(store.kv_get("sem_kv", &key).await.unwrap(), Some(value.clone()));
 
         // New writes queue nothing.

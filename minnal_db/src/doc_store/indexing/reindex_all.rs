@@ -1,11 +1,11 @@
 //! `reindex-all`: drop every field index of a store, free its row IDs, and
-//! rebuild every index — crash-safe through an intent file.
+//! rebuild every index — crash-safe through an intent record.
 //!
 //! Dropping an index demotes it to a plain attribute in the saved schema, so a
 //! crash between the drops and the re-adds would leave the store with no
-//! indexes at all. The intent file (`field-index/{ns_id}/reindex_all.json`) records
-//! the index specs and how far the run got; [`DocStore::resume_pending_builds`]
-//! finishes an interrupted run at startup.
+//! indexes at all. The intent, a record in the maintenance namespace
+//! (`TaskKey::reindex_all`), lists the index specs and how far the run got;
+//! [`DocStore::resume_pending_builds`] finishes an interrupted run at startup.
 //!
 //! Between the drops and the re-adds no field index of the namespace exists, so
 //! no row ID is referenced anywhere: that is when the row map is reset
@@ -15,10 +15,7 @@
 use crate::doc_store::*;
 use crate::namespace::NamespaceId;
 
-/// Name of the intent file in the namespace's index directory.
-const INTENT_FILE: &str = "reindex_all.json";
-
-/// How far a `reindex-all` run got. Each phase is finished before the file
+/// How far a `reindex-all` run got. Each phase is finished before the record
 /// moves to the next, so a resumed run repeats at most one idempotent step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,48 +26,12 @@ enum Phase {
     Readding,
 }
 
-/// Contents of the intent file.
+/// The intent record.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Intent {
     /// The indexes to rebuild, as the schema listed them before the run.
     specs: Vec<IndexSpec>,
     phase: Phase,
-}
-
-fn intent_path(db_path: &Path, ns_id: NamespaceId) -> PathBuf {
-    crate::layout::namespace_index_dir(&crate::layout::index_root(db_path), ns_id).join(INTENT_FILE)
-}
-
-fn write_intent(path: &Path, intent: &Intent) -> Result<(), DocStoreError> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let bytes = serde_json::to_vec_pretty(intent).map_err(|e| DocStoreError::Io(std::io::Error::other(e)))?;
-    crate::support::write_atomic_durable(path, &bytes)?;
-    Ok(())
-}
-
-fn read_intent(path: &Path) -> Option<Intent> {
-    let bytes = std::fs::read(path).ok()?;
-    match serde_json::from_slice(&bytes) {
-        Ok(intent) => Some(intent),
-        Err(e) => {
-            log::warn!("ignoring unreadable reindex-all intent file {}: {e}", path.display());
-            None
-        }
-    }
-}
-
-fn remove_intent(path: &Path) -> Result<(), DocStoreError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    }
-    if let Some(dir) = path.parent() {
-        crate::support::fsync_dir(dir)?;
-    }
-    Ok(())
 }
 
 impl DocStore {
@@ -104,11 +65,11 @@ impl DocStore {
                 field,
             });
         }
-        let path = intent_path(&self.db_path, ns_id);
+        let key = TaskKey::reindex_all(ns_id);
         // A run that stopped part-way left its intent, which lists every index it
         // set out to rebuild, some of them dropped already. Finish that one: a new
         // intent from the schema as it is now would leave those out for good.
-        if let Some(intent) = read_intent(&path) {
+        if let Some(intent) = self.maintenance.get::<Intent>(key)? {
             log::warn!(
                 "reindex-all '{namespace}': finishing an earlier run that stopped part-way (phase {:?})",
                 intent.phase
@@ -122,7 +83,7 @@ impl DocStore {
             specs: schema.indices.clone(),
             phase: Phase::Dropping,
         };
-        write_intent(&path, &intent)?;
+        self.maintenance.put(key, &intent)?;
         info!("reindex-all '{namespace}': rebuilding {} index(es)", intent.specs.len());
         self.drive_reindex_all(namespace, ns_id, intent, stop_after).await
     }
@@ -135,7 +96,7 @@ impl DocStore {
         mut intent: Intent,
         stop_after: Option<usize>,
     ) -> Result<Vec<IndexBuildHandle>, DocStoreError> {
-        let path = intent_path(&self.db_path, ns_id);
+        let key = TaskKey::reindex_all(ns_id);
         let mut steps = 0usize;
         let stop = |steps: usize| stop_after.is_some_and(|n| steps >= n);
 
@@ -157,7 +118,7 @@ impl DocStore {
             // referenced: free them all before the rebuild allocates new ones.
             self.db.reset_rowmap(ns_id)?;
             intent.phase = Phase::Readding;
-            write_intent(&path, &intent)?;
+            self.maintenance.put(key, &intent)?;
             steps += 1;
         }
 
@@ -167,13 +128,13 @@ impl DocStore {
                 return Ok(handles);
             }
             // Already re-added by an interrupted run: its build resumes from
-            // its own progress file.
+            // its own build record.
             if !self.load_schema(namespace)?.indices.iter().any(|s| s.field == spec.field) {
                 handles.push(self.add_index_inner(namespace, spec.clone(), true).await?);
             }
             steps += 1;
         }
-        remove_intent(&path)?;
+        self.maintenance.delete(key)?;
         info!("reindex-all '{namespace}': every index re-added; builds running");
         Ok(handles)
     }
@@ -185,8 +146,9 @@ impl DocStore {
         let mut handles = Vec::new();
         for schema in self.load_all_schemas()? {
             let Some(ns_id) = schema.ns_id else { continue };
-            let path = intent_path(&self.db_path, ns_id);
-            let Some(intent) = read_intent(&path) else { continue };
+            let Some(intent) = self.maintenance.get::<Intent>(TaskKey::reindex_all(ns_id))? else {
+                continue;
+            };
             info!("resuming interrupted reindex-all of '{}' (phase {:?})", schema.namespace, intent.phase);
             handles.extend(self.drive_reindex_all(&schema.namespace, ns_id, intent, None).await?);
         }
@@ -197,6 +159,7 @@ impl DocStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doc_store::indexing::progress::BuildStatus;
     use crate::doc_store::schema::IndexType;
     use crate::doc_store::tests::test_support::*;
 
@@ -285,7 +248,10 @@ mod tests {
             Some(live.len() as u64),
             "{what}: the row map numbers the live documents only"
         );
-        assert!(!intent_path(&store.db_path, ns_id).exists(), "{what}: intent file removed");
+        assert!(
+            store.maintenance.get::<Intent>(TaskKey::reindex_all(ns_id)).unwrap().is_none(),
+            "{what}: intent record removed"
+        );
     }
 
     #[tokio::test]
@@ -330,7 +296,7 @@ mod tests {
     }
 
     /// The two crash windows around a re-add: the build killed before it reports
-    /// anything (only the `in_progress` record `add_index` writes first), and a
+    /// anything (only the running record `add_index` saves first), and a
     /// crash after that record but before the schema lists the index. Both are
     /// finished at the next start.
     #[tokio::test]
@@ -343,26 +309,15 @@ mod tests {
             h.task.abort();
             let _ = h.task.await;
         }
-        let blank = DiskBuildProgress {
-            status: "in_progress".to_owned(),
-            total: 0,
-            indexed: 0,
-            last_key_hex: None,
-            error: None,
-        };
+        let blank = FieldBuildRecord::started();
         let fields = store.db.list_index_fields(ns_id);
-        let field_dir = |name: &str| {
-            let fid = fields.iter().find(|f| f.field_name == name).unwrap().field_id;
-            build_progress_path(&store.db_path, ns_id, fid)
-        };
-        // `active`: as if the process died before the build wrote anything.
-        std::fs::write(field_dir("active"), serde_json::to_vec(&blank).unwrap()).unwrap();
+        let record_of = |name: &str| TaskKey::field_build(ns_id, fields.iter().find(|f| f.field_name == name).unwrap().field_id);
+        // `active`: as if the process died before the build saved anything.
+        store.maintenance.put(record_of("active"), &blank).unwrap();
         // `tier`: re-registered (which clears its `dropped` flag) and its record
-        // written, the schema not yet saved.
+        // saved, the schema not yet saved.
         store.db.register_index_field(ns_id, "tier", to_ivt(IndexType::Int)).unwrap();
-        let tier = field_dir("tier");
-        std::fs::create_dir_all(tier.parent().unwrap()).unwrap();
-        std::fs::write(&tier, serde_json::to_vec(&blank).unwrap()).unwrap();
+        store.maintenance.put(record_of("tier"), &blank).unwrap();
         drop(store);
 
         let store = open_fresh(db_dir.path()).await;
@@ -387,25 +342,24 @@ mod tests {
             .find(|f| f.field_name == "active")
             .unwrap()
             .field_id;
-        let progress = build_progress_path(&store.db_path, ns_id, fid);
-        let set = |status: &str| {
-            let p = DiskBuildProgress {
-                status: status.to_owned(),
+        let set = |status: BuildStatus| {
+            let record = FieldBuildRecord {
+                status,
                 total: 10,
                 indexed: 3,
-                last_key_hex: None,
+                resume_after_hex: None,
                 error: None,
             };
-            std::fs::write(&progress, serde_json::to_vec(&p).unwrap()).unwrap();
+            store.maintenance.put(TaskKey::field_build(ns_id, fid), &record).unwrap();
         };
         assert!(ids(&store, "active = true").await.1.is_empty());
-        set("in_progress");
+        set(BuildStatus::Running);
         assert_eq!(ids(&store, "active = true").await.1, vec!["active".to_owned()]);
         assert_eq!(ids(&store, "active = true AND tier = 1").await.1, vec!["active".to_owned()]);
         assert!(ids(&store, "tier = 1").await.1.is_empty(), "an untouched field does not taint the query");
-        set("failed");
+        set(BuildStatus::Failed);
         assert_eq!(ids(&store, "NOT active = true").await.1, vec!["active".to_owned()]);
-        set("complete");
+        set(BuildStatus::Complete);
         assert!(ids(&store, "active = true").await.1.is_empty());
     }
 
@@ -431,11 +385,11 @@ mod tests {
         );
     }
 
-    /// A power loss can leave a build's progress record empty, as its writes
-    /// are not fsynced. The next start rebuilds that field from the first key;
-    /// it used to skip the field, leaving its index half built for good.
+    /// A build killed part-way leaves its record running; the next start
+    /// resumes every such build from its record and finishes it, and the
+    /// records then say complete.
     #[tokio::test]
-    async fn a_build_with_an_unreadable_progress_record_is_rebuilt_at_the_next_start() {
+    async fn a_killed_build_is_resumed_from_its_record_at_the_next_start() {
         let db_dir = TempDir::new().unwrap();
         let (store, live) = seeded(db_dir.path()).await;
         for h in store.reindex_all_attribute_indices("events").await.unwrap() {
@@ -444,18 +398,31 @@ mod tests {
             let _ = h.task.await;
         }
         let ns_id = store.load_schema("events").unwrap().ns_id.unwrap();
-        for field in store.db.list_index_fields(ns_id) {
-            std::fs::write(build_progress_path(&store.db_path, ns_id, field.field_id), b"").unwrap();
-        }
+        let records = |store: &DocStore| -> Vec<FieldBuildRecord> {
+            store
+                .db
+                .list_index_fields(ns_id)
+                .iter()
+                .map(|f| {
+                    store
+                        .maintenance
+                        .get(TaskKey::field_build(ns_id, f.field_id))
+                        .unwrap()
+                        .expect("a record per field")
+                })
+                .collect()
+        };
+        assert!(records(&store).iter().all(FieldBuildRecord::is_running));
         drop(store);
 
         let store = open_fresh(db_dir.path()).await;
         let handles = store.resume_pending_builds().await.unwrap();
-        assert_eq!(handles.len(), 2, "both fields are rebuilt");
+        assert_eq!(handles.len(), 2, "both fields are resumed");
         for h in handles {
             h.wait().await.unwrap();
         }
-        assert_rebuilt(&store, &live, "after rebuilding from an unreadable record").await;
+        assert_rebuilt(&store, &live, "after resuming killed builds").await;
+        assert!(records(&store).iter().all(|r| r.status == BuildStatus::Complete));
     }
 
     /// While a build of the store runs, `reindex-all` is refused before it

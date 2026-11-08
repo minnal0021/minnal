@@ -2539,6 +2539,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   ns_system_pending_vec_index/       ← queue of documents waiting to be embedded
   ns_system_qemb_cache/              ← cached query embeddings
   ns_system_schema/                  ← every store's schema, keyed by store name
+  ns_system_namespace_maintenance/   ← maintenance tasks and their progress (index builds, reindex-all, vector reindexes)
   field-index/
     {ns_id}/                  ← the namespace's id (a UUID); doc stores only, KV stores have no field indices
       {field_id}/

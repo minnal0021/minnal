@@ -112,7 +112,7 @@ impl DocStore {
         self.without_writes(namespace, async {
             self.without_partition_maintenance(
                 namespace,
-                cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, namespace, ns_id),
+                cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, &self.maintenance, namespace, ns_id),
             )
             .await
         })
@@ -183,7 +183,7 @@ impl DocStore {
         self.without_writes(namespace, async {
             self.without_partition_maintenance(
                 namespace,
-                cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, namespace, ns_id),
+                cleanup_store_namespaces(&self.db, &self.db_path, &self.schemas, &self.maintenance, namespace, ns_id),
             )
             .await
         })
@@ -360,7 +360,12 @@ impl DocStore {
 /// removed before it, so nothing else leaves one. Called by `open` before it
 /// touches any store: opening would recreate a KV store's namespace (under an
 /// id its schema does not name) and fail on a document store's field indexes.
-pub(super) async fn finish_interrupted_drops(db: &AsyncDb, db_path: &Path, schemas: &SchemaStore) -> Result<(), DocStoreError> {
+pub(super) async fn finish_interrupted_drops(
+    db: &AsyncDb,
+    db_path: &Path,
+    schemas: &SchemaStore,
+    maintenance: &MaintenanceStore,
+) -> Result<(), DocStoreError> {
     let registered: std::collections::HashSet<String> = db.list_namespaces().into_iter().map(|(n, _)| n).collect();
     let stores: Vec<(String, Option<NamespaceId>)> = schemas
         .docs()
@@ -374,7 +379,7 @@ pub(super) async fn finish_interrupted_drops(db: &AsyncDb, db_path: &Path, schem
             continue;
         }
         log::warn!("finishing the drop of store '{namespace}' (ns_id={ns_id}) that a crash interrupted");
-        cleanup_store_namespaces(db, db_path, schemas, &namespace, ns_id).await?;
+        cleanup_store_namespaces(db, db_path, schemas, maintenance, &namespace, ns_id).await?;
     }
     Ok(())
 }
@@ -388,6 +393,7 @@ async fn cleanup_store_namespaces(
     db: &AsyncDb,
     db_path: &Path,
     schemas: &SchemaStore,
+    maintenance: &MaintenanceStore,
     namespace: &str,
     ns_id: NamespaceId,
 ) -> Result<(), DocStoreError> {
@@ -434,6 +440,7 @@ async fn cleanup_store_namespaces(
     if index_dir.exists() {
         std::fs::remove_dir_all(&index_dir)?;
     }
+    maintenance.delete_store(ns_id)?;
 
     // Last, as the schema file used to be: until here the store still exists,
     // so a failed or interrupted cleanup can be retried by dropping it again.

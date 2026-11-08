@@ -332,8 +332,15 @@ impl DocStore {
     fn degraded_field_names(&self, ns_id: NamespaceId, outcome: &crate::QueryOutcome) -> Vec<String> {
         let mut degraded = outcome.degraded_fields.clone();
         for &fid in &outcome.touched_fields {
-            let building = read_disk_progress(&build_progress_path(&self.db_path, ns_id, fid))
-                .is_some_and(|p| p.status == "in_progress" || p.status == "failed");
+            // A record that does not parse counts as degraded: losing the
+            // signal is the wrong way to fail.
+            let building = match self
+                .maintenance
+                .get::<crate::doc_store::FieldBuildRecord>(crate::doc_store::TaskKey::field_build(ns_id, fid))
+            {
+                Ok(record) => record.is_some_and(|r| r.status != crate::doc_store::indexing::progress::BuildStatus::Complete),
+                Err(_) => true,
+            };
             if building && !degraded.contains(&fid) {
                 degraded.push(fid);
             }

@@ -282,7 +282,7 @@ KV stores have no field indices; field-index predicate queries belong to documen
 
 **Index builds**
 
-Adding an index to a namespace that already has documents triggers a background rebuild. Progress is tracked in a `build_progress.json` checkpoint file. If the server is stopped mid-build, it automatically detects the incomplete state on the next startup and resumes from the last checkpoint — no data is lost.
+Adding an index to a namespace that already has documents triggers a background rebuild. Progress is saved in a record in the `system_namespace_maintenance` namespace, written through the WAL. If the server is stopped mid-build, it finds the unfinished build on the next startup and resumes from the last saved point — no data is lost.
 
 **Semantic search integration — async vector indexing**
 

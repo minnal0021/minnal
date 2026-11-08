@@ -185,7 +185,7 @@ impl DocStore {
     /// - All entries in the `{namespace}_sparse_vector_meta` companion namespace.
     /// - All entries in the `{namespace}_sparse_vector` companion namespace.
     /// - All entries in the `{namespace}_dense_vector` companion namespace.
-    /// - The `vector_reindex.json` progress file (if present).
+    /// - The store's vector reindex record in the maintenance namespace (if present).
     ///
     /// This does **not** update the schema — the caller must call
     /// [`disable_semantic_search`] (or equivalent) before spawning this as a
@@ -276,7 +276,7 @@ impl DocStore {
         }
 
         if let Some(ns_id) = self.schemas.get(namespace).and_then(|s| s.ns_id()) {
-            let _ = std::fs::remove_file(vec_reindex_path(&self.db_path, ns_id));
+            self.maintenance.delete(TaskKey::vector_reindex(ns_id))?;
         }
 
         info!("drop_vector_index_data: namespace='{namespace}' cleanup complete");
