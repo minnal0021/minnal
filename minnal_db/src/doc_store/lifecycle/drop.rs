@@ -150,8 +150,8 @@ async fn cleanup_store_namespaces(
     if db.existing_namespace(namespace.to_owned()).await?.is_some() {
         db.remove_namespace(namespace.to_owned()).await?;
     }
-    // Again, now that no write can reach the store: a `put` that landed
-    // between the first clear and the removal enqueued its embedding.
+    // Again, after the removal: no write is admitted any more, but the vector
+    // worker may have rewritten an entry it read before the first clear.
     #[cfg(feature = "semantic-search")]
     clear_queue_entries(db, namespace).await;
 
@@ -178,8 +178,8 @@ async fn cleanup_store_namespaces(
     }
     maintenance.delete_store(ns_id)?;
 
-    // Last, as the schema file used to be: until here the store still exists,
-    // so a failed or interrupted cleanup can be retried by dropping it again.
+    // Last: until here the store still exists, so a failed or interrupted
+    // cleanup is finished by running the teardown again.
     schemas.remove(namespace)?;
 
     // Drop any in-memory vector corruption counters for this namespace so a

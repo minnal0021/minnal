@@ -22,6 +22,7 @@ Both store kinds live under a single `/stores` path; the kind is set by a mandat
   - [Attributes](#attributes)
   - [Semantic search (async vector indexing)](#semantic-search-async-vector-indexing)
   - [KV store](#kv-store-concept)
+  - [Store states and index jobs](#store-states-and-index-jobs)
 - [REST API reference](#rest-api-reference)
   - [Store lifecycle](#store-lifecycle)
   - [Index management](#index-management)
@@ -34,6 +35,7 @@ Both store kinds live under a single `/stores` path; the kind is set by a mandat
   - [KV prefix scan](#kv-prefix-scan)
   - [KV semantic search](#kv-semantic-search)
   - [Admin Stores API](#admin-stores-api)
+  - [Index jobs and the lifecycle audit log](#index-jobs-and-the-lifecycle-audit-log)
   - [Operational & Storage Metrics](#operational--storage-metrics)
   - [Admin Storage API](#admin-storage-api)
   - [Admin Indices API](#admin-indices-api)
@@ -88,8 +90,12 @@ curl -s -X POST http://localhost:8080/stores \
       {"field": "age",    "index_type": "int"}
     ]
   }'
-# → 201 Created
+# → 202 Accepted  {"namespace":"users","state":"creating"}
 ```
+
+The store is set up in the background and takes requests once `GET /stores`
+lists it as `"created"`, a moment later (see [Store states and index
+jobs](#store-states-and-index-jobs)).
 
 ### 4 — Write a document
 
@@ -129,20 +135,20 @@ Every endpoint at a glance, grouped by task. The [REST API reference](#rest-api-
 
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
-| `POST` | `/stores` | `201` | Create a store (`store_type` in body selects doc vs KV) |
-| `GET` | `/stores` | `200` | List all stores (doc and KV; each carries its `store_type`) |
-| `DELETE` | `/stores/{ns}` | `204` | Drop a store and all its data (kind resolved from its schema) |
+| `POST` | `/stores` | `202` | Create a store (`store_type` in body selects doc vs KV); set up in the background |
+| `GET` | `/stores` | `200` | List all stores (doc and KV; each carries its `store_type` and `state`) |
+| `DELETE` | `/stores/{ns}` | `202` | Drop a store and all its data, in the background (kind resolved from its schema) |
 | `GET` | `/stores/{ns}/schema` | `200` | Fetch a store's current schema |
-| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute (doc stores only) |
+| `PATCH` | `/stores/{ns}/schema` | `204` | Add / update / remove a non-indexed attribute (doc stores only); `202` when it removes the last embedding field |
 
 **Document store data:**
 
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
-| `GET` | `/stores/{ns}/indices` | `200` | List indices and vector campaign status |
-| `POST` | `/stores/{ns}/indices` | `202` | Add an index (background rebuild if data exists) |
-| `DELETE` | `/stores/{ns}/indices/vector` | `202` | Drop the vector index (background cleanup) |
-| `DELETE` | `/stores/{ns}/indices/{field}` | `202` | Drop a field index (background cleanup) |
+| `GET` | `/stores/{ns}/indices` | `200` | The store's field-index builds and vector reindex, with progress |
+| `POST` | `/stores/{ns}/indices` | `202` | Add an index (a `field_build` job) |
+| `DELETE` | `/stores/{ns}/indices/vector` | `202` | Drop the vector index (a `vector_cleanup` job) |
+| `DELETE` | `/stores/{ns}/indices/{field}` | `202` | Drop a field index (a `field_drop` job) |
 | `PUT` | `/stores/{ns}/docs/{id}` | `204` | Upsert a document |
 | `GET` | `/stores/{ns}/docs/{id}` | `200` | Retrieve a document by primary key |
 | `DELETE` | `/stores/{ns}/docs/{id}` | `204` | Delete a document |
@@ -168,8 +174,17 @@ Every endpoint at a glance, grouped by task. The [REST API reference](#rest-api-
 | Method | Path | Response | Purpose |
 |--------|------|----------|---------|
 | `GET` | `/admin/stores/{ns}/schema/export` | `200` | Download a store's schema as a JSON attachment (doc or KV) |
-| `POST` | `/admin/stores/import` | `201` | Create a store from an exported schema (`store_type` selects the kind) |
+| `POST` | `/admin/stores/import` | `202` | Create a store from an exported schema (`store_type` selects the kind) |
 | `GET` | `/admin/stores/{ns}/row-count` | `200` | Number of documents in a doc-store namespace |
+
+**Index jobs and the lifecycle audit log (admin):**
+
+| Method | Path | Response | Purpose |
+|--------|------|----------|---------|
+| `GET` | `/admin/jobs` | `200` | Every store's running index jobs |
+| `GET` | `/admin/stores/{ns}/jobs` | `200` | One store's index jobs, running and ended, with progress |
+| `DELETE` | `/admin/stores/{ns}/jobs/{job}` | `202` | Cancel a running job |
+| `GET` | `/admin/lifecycle/audit` | `200` | Every store create, drop and index-job event, newest first |
 
 ---
 
@@ -214,6 +229,11 @@ segment_size_bytes = 67108864  # 64 MiB per WAL segment
 
 [value_log]
 segment_size_bytes = 268435456 # 256 MiB per value-log segment file
+
+[lifecycle]
+max_restarts = 3               # runs again of a failed create, drop or index job
+restart_backoff_ms = 1000      # wait before each run again
+audit_retention_days = 30      # how long GET /admin/lifecycle/audit keeps a record
 
 [vector_index]
 retry_wait_secs = 2            # seconds to wait before retrying after an embedding failure
@@ -335,6 +355,44 @@ KV stores share the same underlying minnal_db namespace registry, WAL, LSM compa
 
 ---
 
+### Store states and index jobs
+
+Every store is in one of four states, shown as `state` in `GET /stores`:
+
+| State | Data requests | Can be dropped | How it gets there |
+|---|---|---|---|
+| `creating` | refused (`409`) | no | `POST /stores` accepted; the store is being set up |
+| `created` | yes | yes | set up, and no index job is running |
+| `index_maintenance` | yes | no (`409`): wait for its jobs, or cancel them | an index job is running |
+| `deleting` | refused (`409`) | already being dropped | `DELETE /stores/{ns}` accepted; its data is being removed |
+
+Creating and dropping a store, and every operation that builds or removes an
+index, run in the background and answer `202 Accepted` at once. The index
+operations are **index jobs**:
+
+| Job | Started by | Can be cancelled |
+|---|---|---|
+| `field_build:{field}` | `POST /stores/{ns}/indices` | yes: the half-built index is dropped |
+| `field_drop:{field}` | `DELETE /stores/{ns}/indices/{field}` | no (it is short) |
+| `reindex_all` | `POST /admin/indices/{ns}/attribute/reindex-all`, `DELETE /admin/indices/{ns}/attribute/drop-all` | no: its first step drops the old indexes |
+| `vector_enable` | `PATCH /stores/{ns}/schema` with `add_embedding_attribute` or `enable_vector_index` | yes |
+| `vector_cleanup` | `DELETE /stores/{ns}/indices/vector`, removing the last embedding field | no: a half-removed vector index is no use |
+| `vector_reindex` | `POST /admin/indices/{ns}/vector/reindex-all` | yes: it stops enqueueing; what it queued is embedded |
+| `partition_rebuild` | `POST /admin/indices/{ns}/vector/rebuild` | until its plan is recorded (after k-means) |
+
+Several jobs of one store may run together, except those that touch the same
+index: two jobs on one field, a `reindex_all` and any field job, and any two
+vector jobs. A job that would conflict is refused with `409`, naming the job it
+waits for. A job's progress is saved as it goes, so a job cut short by a crash
+or a restart is picked up where it stopped when the server starts again; a job
+that fails is run again a few times (`[lifecycle] max_restarts`), then recorded
+as failed. `GET /admin/stores/{ns}/jobs` shows each job's status and progress,
+and every create, drop and job event is kept in the [lifecycle audit
+log](#get-adminlifecycleaudit). How this is built, and what keeps it safe across crashes and
+failures: [Namespace-Lifecycle.md](../minnal_db/docs/Namespace-Lifecycle.md).
+
+---
+
 ## REST API reference
 
 All request and response bodies are JSON, and errors are returned as `{"error": "<message>"}`.
@@ -367,7 +425,8 @@ curl http://localhost:8080/stores
       {"field": "status", "index_type": "str"},
       {"field": "age",    "index_type": "int"}
     ],
-    "semantic_search_enabled": false
+    "semantic_search_enabled": false,
+    "state": "created"
   },
   {
     "namespace": "session-cache",
@@ -375,10 +434,14 @@ curl http://localhost:8080/stores
     "store_type": "kv",
     "key_type": "str",
     "value_type": "str",
-    "semantic_search_enabled": false
+    "semantic_search_enabled": false,
+    "state": "index_maintenance"
   }
 ]
 ```
+
+`state` is the store's [state](#store-states-and-index-jobs): `creating`,
+`created`, `index_maintenance` or `deleting`.
 
 ---
 
@@ -433,8 +496,12 @@ curl -X POST http://localhost:8080/stores \
       {"name": "customer_id", "attr_type": "str"}
     ]
   }'
-# → 201 Created
+# → 202 Accepted  {"namespace":"orders","state":"creating"}
 ```
+
+The store is set up in the background; poll `GET /stores` until its `state` is
+`created`. Returns `409` if a store of that name exists, or is still being
+dropped, and `503` if the lifecycle governor has stopped (restart the server).
 
 **Example with semantic search.** `vector_index` is optional; whatever it leaves
 out takes its default, and the filled-in object is saved in the schema
@@ -461,7 +528,7 @@ curl -X POST http://localhost:8080/stores \
       "search": {"max_probes": 128}
     }
   }'
-# → 201 Created
+# → 202 Accepted  {"namespace":"articles","state":"creating"}
 ```
 
 | `vector_index` field | Default | Can change later? |
@@ -483,12 +550,19 @@ The fixed settings are kept if the vector index is dropped, and re-enabling it
 
 #### `DELETE /stores/{ns}`
 
-Permanently delete a store and all its documents, indices, and schema.
+Permanently delete a store and all its documents, indices, and schema. The
+store refuses every request at once, and its data is removed in the
+background; it disappears from `GET /stores` when it is gone. A drop of a store
+already being dropped answers the same.
 
 ```bash
 curl -X DELETE http://localhost:8080/stores/orders
-# → 204 No Content
+# → 202 Accepted  {"namespace":"orders","state":"deleting"}
 ```
+
+Returns `409` while the store is being created, or while an index job of it
+runs (wait for it, or [cancel it](#delete-adminstoresnsjobsjob)), and `404` for
+no store.
 
 ---
 
@@ -528,7 +602,7 @@ Returns `404 Not Found` if the namespace does not exist.
 
 Amend the schema. Cannot be used to change indexed fields — drop the index first.
 
-**Removing an embedding field:** if `remove_attribute` targets a field listed in `embedding_fields` and it is the last such field, semantic search is disabled synchronously and all vector index data (queue entries, the `{ns}_sparse_vector`, `{ns}_dense_vector` and `{ns}_sparse_vector_meta` companion namespaces, and the store's partition in `{ns}_ivf_centres`, `{ns}_ivf_postings` and `{ns}_ivf_journal`) is cleaned up in a background task. This is equivalent to calling `DELETE /stores/{ns}/indices/vector`.
+**Removing an embedding field:** if `remove_attribute` targets a field listed in `embedding_fields` and it is the last such field, semantic search is turned off before the reply and all vector index data (queue entries, the `{ns}_sparse_vector`, `{ns}_dense_vector` and `{ns}_sparse_vector_meta` companion namespaces, and the store's partition in `{ns}_ivf_centres`, `{ns}_ivf_postings` and `{ns}_ivf_journal`) is removed by a `vector_cleanup` job. The reply is then `202 Accepted` with the job, as for `DELETE /stores/{ns}/indices/vector`.
 
 **Add an attribute:**
 
@@ -587,8 +661,11 @@ So the post-create workflow to **change which fields are embedded** is: drop the
 vector index (`DELETE /stores/{ns}/indices/vector` — data is preserved) then
 `enable_vector_index` with the new field set. A field that is already a `str`
 attribute (as the old embedding fields are after the drop) becomes an
-embedding field; any other name is added as a `str` attribute. It returns `409`
-if a vector index already exists or the previous one is still being removed, and
+embedding field; any other name is added as a `str` attribute. The enable seeds
+the store's partition, then saves the schema (a `vector_enable` job; the reply
+comes when it is done). It returns `409`
+if a vector index already exists or the previous one is still being removed (its
+`vector_cleanup` job runs), and
 `400` if `fields` is empty, contains
 duplicates, or names an index field or an attribute of another type.
 
@@ -636,58 +713,58 @@ without semantic search returns `422`. Read the current values with
 
 ### Index management
 
-These endpoints add and drop the secondary indices that make predicate queries fast, including the vector index that powers semantic search. Adding or dropping an index on a store that already holds documents runs as a background job and returns `202 Accepted`; monitor it through the [admin progress endpoints](#admin-indices-api).
+These endpoints add and drop the secondary indices that make predicate queries fast, including the vector index that powers semantic search. Each runs as an [index job](#store-states-and-index-jobs) and returns `202 Accepted` with the job's name, `{"namespace", "job", "state"}`; follow it with [`GET /admin/stores/{ns}/jobs`](#get-adminstoresnsjobs) or the [admin progress endpoints](#admin-indices-api).
 
 #### `GET /stores/{ns}/indices`
 
-List all active or recently completed field-index builds and the vector campaign status (if any) for the namespace.
+The store's field-index builds (each field's latest, running or ended, and the builds a running `reindex-all` has still to do) and its latest vector reindex, with their progress.
 
 ```bash
 curl http://localhost:8080/stores/users/indices
 ```
 
-Returns an array of build-progress entries, in the same shape as `attribute_builds` in [`GET /admin/indices/progress`](#get-adminindicesprogress). It is empty when no build has run since the server started. Use `GET /admin/indices/{ns}/progress` for the monitoring view that also includes the vector queue.
+Returns an array of build-progress entries, in the same shape as `attribute_builds` in [`GET /admin/indices/progress`](#get-adminindicesprogress), read from the jobs' records, so it survives a restart. Use `GET /admin/indices/{ns}/progress` for the monitoring view that also includes the vector queue.
 
 ---
 
 #### `POST /stores/{ns}/indices`
 
-Add a new field index. If the store already has documents the rebuild runs in the background.
+Add a new field index. The index is activated before the reply, so writes are indexed from then on, and a `field_build` job indexes the documents already stored; queries on the field list it in `degraded_fields` until the build is complete.
 
 ```bash
 curl -X POST http://localhost:8080/stores/users/indices \
   -H 'Content-Type: application/json' \
   -d '{"field": "country", "index_type": "str"}'
-# → 202 Accepted
+# → 202 Accepted  {"namespace":"users","job":"field_build:country","state":"index_maintenance"}
 ```
 
-Returns `409 Conflict` if the field is already indexed or a rebuild is in progress. Returns `400 Bad Request` (`TooManyIndices`) if the namespace is already at the **5-index limit** — the cap is enforced here, not just at create/import time. Monitor progress via `GET /admin/indices/{ns}/progress`.
+Returns `409 Conflict` if the field is already indexed, or while another job on the field or a `reindex-all` runs. Returns `400 Bad Request` (`TooManyIndices`) if the namespace is already at the **5-index limit** — the cap is enforced here, not just at create/import time. Monitor progress via `GET /admin/indices/{ns}/progress`.
 
 ---
 
 #### `DELETE /stores/{ns}/indices/vector`
 
-Disable semantic search and drop all vector index data for the namespace. The schema is updated synchronously before the background cleanup runs, preventing new embeddings from being enqueued during cleanup. Returns `202 Accepted`.
+Turn semantic search off and remove all vector index data for the namespace, as a `vector_cleanup` job. Semantic search is off before the reply, so writes stop enqueueing embeddings at once.
 
 ```bash
 curl -X DELETE http://localhost:8080/stores/users/indices/vector
-# → 202 Accepted
+# → 202 Accepted  {"namespace":"users","job":"vector_cleanup","state":"index_maintenance"}
 ```
 
-Returns `409 Conflict` if a vector cleanup or reindex campaign is already in progress. Returns `422 Unprocessable Entity` if semantic search is not enabled for the namespace.
+Returns `409 Conflict` while another vector job of the store runs. Returns `422 Unprocessable Entity` if semantic search is not enabled for the namespace.
 
 ---
 
 #### `DELETE /stores/{ns}/indices/{field}`
 
-Drop a field index. The bitmap files are deleted in a background task; the field is demoted to a plain attribute in the schema. Returns `202 Accepted`.
+Drop a field index, as a `field_drop` job: the field is demoted to a plain attribute in the schema (its data stays in every document) and its index files are deleted.
 
 ```bash
 curl -X DELETE http://localhost:8080/stores/users/indices/country
-# → 202 Accepted
+# → 202 Accepted  {"namespace":"users","job":"field_drop:country","state":"index_maintenance"}
 ```
 
-Returns `404 Not Found` if the store does not exist or `{field}` is not an indexed field, and `409 Conflict` if an attribute index operation is already active for this namespace.
+Returns `404 Not Found` if the store does not exist or `{field}` is not an indexed field, and `409 Conflict` while the field's build or a `reindex-all` runs (cancel the build first).
 
 ---
 
@@ -958,7 +1035,7 @@ combinations.
 curl -X POST http://localhost:8080/stores \
   -H 'Content-Type: application/json' \
   -d '{"namespace": "session-cache", "store_type": "kv", "key_type": "str", "value_type": "str"}'
-# → 201 Created
+# → 202 Accepted
 
 # With semantic search
 curl -X POST http://localhost:8080/stores \
@@ -970,7 +1047,7 @@ curl -X POST http://localhost:8080/stores \
     "value_type": "str",
     "semantic_search_enabled": true
   }'
-# → 201 Created
+# → 202 Accepted
 ```
 
 Returns `409 Conflict` if a store with that namespace already exists (doc or KV).
@@ -1198,7 +1275,7 @@ Create a store from a previously exported schema. The payload's `store_type` sel
 curl -X POST http://localhost:8080/admin/stores/import \
   -H 'Content-Type: application/json' \
   --data-binary @users-schema.json
-# → 201 Created
+# → 202 Accepted
 ```
 
 Returns `409 Conflict` if a store with that namespace already exists.
@@ -1216,6 +1293,107 @@ curl http://localhost:8080/admin/stores/users/row-count
 ```json
 { "namespace": "users", "count": 1280 }
 ```
+
+---
+
+### Index jobs and the lifecycle audit log
+
+What each store's [index jobs](#store-states-and-index-jobs) are doing, and
+what has happened to every store. A job is named by its kind, and a field job
+by its field too: `field_build:country`, `reindex_all`, `vector_cleanup`.
+
+#### `GET /admin/stores/{ns}/jobs`
+
+The store's state and its jobs with a record: for each kind (and field), its
+latest run, running or ended. `progress` is the job's own: a build's `total`,
+`indexed` and resume point, a vector reindex's `enqueued`, and so on.
+
+```bash
+curl http://localhost:8080/admin/stores/users/jobs
+```
+```json
+{
+  "namespace": "users",
+  "state": "index_maintenance",
+  "jobs": [
+    {
+      "job": "field_build:country",
+      "status": "running",
+      "subject": "country",
+      "started_at_ms": 1794128639000,
+      "updated_at_ms": 1794128641000,
+      "error": null,
+      "progress": {"spec": {"field": "country", "index_type": "str"}, "total": 50000, "indexed": 12000, "resume_after_hex": "0000000000002ee0"}
+    }
+  ]
+}
+```
+
+`status` is `running`, `cancelling`, `complete`, `failed` or `cancelled`.
+Returns `404` for no store.
+
+---
+
+#### `GET /admin/jobs`
+
+Every store's running jobs, each with its `namespace` and the fields above.
+
+```bash
+curl http://localhost:8080/admin/jobs
+```
+
+---
+
+#### `DELETE /admin/stores/{ns}/jobs/{job}`
+
+Ask a running job to stop. It stops at its next batch, undoes its work, and is
+recorded `cancelled`; a store with no other job goes back to `created`.
+
+```bash
+curl -X DELETE http://localhost:8080/admin/stores/users/jobs/field_build:country
+# → 202 Accepted  {"namespace":"users","job":"field_build:country","status":"cancelling"}
+```
+
+Returns `404` for no running job of that name, and `409` for one that cannot
+be stopped part-way (`field_drop`, `reindex_all`, `vector_cleanup`).
+
+---
+
+#### `GET /admin/lifecycle/audit`
+
+The lifecycle audit log, newest first: every store's creation and drop, every
+index job's start, cancel and end, work a restart picked up again, and every
+create or drop the governor gave up on. It outlives the stores it describes:
+a dropped store's history stays until it expires (`[lifecycle]
+audit_retention_days`, default 30).
+
+| Query | Default | Meaning |
+|---|---|---|
+| `namespace` | all | One store's records only |
+| `limit` | 100 | Records per page (at most 1,000) |
+| `cursor` | — | The `next_cursor` of the page before |
+
+```bash
+curl 'http://localhost:8080/admin/lifecycle/audit?namespace=users&limit=3'
+```
+```json
+{
+  "results": [
+    {"at_ms": 1794128650000, "namespace": "users", "event": "job_completed", "job": "field_build", "subject": "country"},
+    {"at_ms": 1794128639000, "namespace": "users", "event": "job_started", "job": "field_build", "subject": "country"},
+    {"at_ms": 1794128600000, "namespace": "users", "event": "created"}
+  ],
+  "next_cursor": "fffffe5e3c1d2b47ffaa01c3e95b0e11"
+}
+```
+
+`event` is one of `creating`, `created`, `deleting`, `deleted`, `job_started`,
+`job_cancel_requested`, `job_completed`, `job_failed` (with the error in
+`detail`), `job_cancelled`, `resumed` (a create, drop or job a restart found
+part-way), `task_parked` (a create or drop given up on; the store stays as it
+is until the server restarts) and `governor_stopped`. `next_cursor` is `null`
+on the last page; a filtered page can come back short with a cursor to go on
+from. Returns `400` for a malformed cursor.
 
 ---
 
@@ -1658,7 +1836,7 @@ HTTP/1.1 202 Accepted
 
 ### Admin Indices API
 
-Index monitoring and bulk operations. All write operations that touch index data return `202 Accepted` and run in the background. Only one attribute-index operation and one vector-index operation may be active per namespace at a time.
+Index monitoring and bulk operations. Every operation that builds or removes index data is an [index job](#store-states-and-index-jobs): it returns `202 Accepted` with the job's name and runs in the background, and one that conflicts with a running job of the store is refused with `409`.
 
 #### Quick reference
 
@@ -1685,7 +1863,7 @@ Index monitoring and bulk operations. All write operations that touch index data
 | `GET` | `/admin/indices/{ns}/vector/partition` | `200` | The store's IVF partition at a glance: postings, sizes, maintenance done, last rebuild |
 | `GET` | `/admin/indices/{ns}/vector/postings` | `200` | Every posting with its size, state and lineage (cursor-paginated, filterable by state) |
 | `GET` | `/admin/indices/{ns}/vector/centres` | `200` | Every IVF centre's metadata and, with `codes=true`, how many chunk codes use it (cursor-paginated) |
-| `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes, in the background; `409` while one runs |
+| `POST` | `/admin/indices/{ns}/vector/rebuild` | `202` | Re-cluster the store's partition from its stored codes (a `partition_rebuild` job); `409` while another vector job runs |
 | `GET` | `/admin/indices/vector/settings` | `200` | The server's semantic-search settings: embedding service, models, TTLs, maintenance and rebuild threads, defaults for new stores |
 | `GET` | `/admin/indices/{ns}/vector/recall-check` | `200` | How much of a full read's results the store's searches find among the postings they read: the signal for a rebuild |
 | `GET` | `/admin/indices/{ns}/vector/probe-trace` | `200` | One query's walk through the partition: a window of its postings in probe order, with each one's documents and lowest and highest Pass-1 score, against what a normal search returns at a chosen `top_k` |
@@ -1709,9 +1887,9 @@ curl http://localhost:8080/admin/indices/progress
 {
   "attribute_builds": [
     {
-      "kind": "Attribute",
-      "id": {"Field": {"namespace": "users", "field": "country"}},
-      "status": "Running",
+      "kind": "attribute",
+      "id": {"kind": "field", "namespace": "users", "field": "country"},
+      "status": "running",
       "total": 50000,
       "indexed": 12340,
       "failed": 0,
@@ -1896,14 +2074,14 @@ curl "http://localhost:8080/admin/indices/vector/queue/retried?page_no=1&page_si
 
 Drop every field index for `{ns}` and rebuild them all from scratch. Returns `202 Accepted`; progress is visible via `GET /admin/indices/{ns}/progress`.
 
-Between dropping and rebuilding, no index refers to any document, so the store's row map — the dense numbering of documents the indexes use — is reset: the rebuilt indexes number only the documents that exist now, and the IDs of deleted documents are freed (see [`GET /admin/indices/{ns}/rowmap`](#get-adminindicesnsrowmap)). The run is crash-safe: it records the indexes it is rebuilding before dropping any, and a run interrupted by a crash is finished when the server next starts. While the indexes rebuild, queries that use them list them in `degraded_fields`.
+Between dropping and rebuilding, no index refers to any document, so the store's row map — the dense numbering of documents the indexes use — is reset: the rebuilt indexes number only the documents that exist now, and the IDs of deleted documents are freed (see [`GET /admin/indices/{ns}/rowmap`](#get-adminindicesnsrowmap)). The run is one `reindex_all` job, which cannot be cancelled: it records the indexes it is rebuilding before dropping any, rebuilds them one after the other, and a run interrupted by a crash is finished when the server next starts. A run that failed is taken over by the next one, from its own list. While the indexes rebuild, queries that use them list them in `degraded_fields`.
 
 ```bash
 curl -X POST http://localhost:8080/admin/indices/users/attribute/reindex-all
-# → 202 Accepted
+# → 202 Accepted  {"namespace":"users","job":"reindex_all","state":"index_maintenance"}
 ```
 
-Returns `409` when an attribute operation is already active for `{ns}`, or while one of its index builds is still running (including the builds an earlier `reindex-all` started); retry when the builds finish. Returns `422` when the namespace has no indices to rebuild.
+Returns `409` while any field job of `{ns}` runs, and `422` when the namespace has no indices to rebuild.
 
 ---
 
@@ -1923,14 +2101,14 @@ curl http://localhost:8080/admin/indices/users/rowmap
 
 #### `DELETE /admin/indices/{ns}/attribute/drop-all`
 
-Drop every field index for `{ns}` without rebuilding, and reset the store's row map (no index is left to refer to it). Returns `202 Accepted`.
+Drop every field index for `{ns}` without rebuilding, and reset the store's row map (no index is left to refer to it). It is a `reindex_all` job that stops after the drops.
 
 ```bash
 curl -X DELETE http://localhost:8080/admin/indices/users/attribute/drop-all
-# → 202 Accepted
+# → 202 Accepted  {"namespace":"users","job":"reindex_all","state":"index_maintenance"}
 ```
 
-Returns `409` when an attribute operation is already active. Returns `422` when the namespace has no indices.
+Returns `409` while any field job of `{ns}` runs, and `422` when the namespace has no indices.
 
 ---
 
@@ -1982,14 +2160,14 @@ Returns `404` when `{field}` has no active index in `{ns}` (unknown field, or st
 
 #### `POST /admin/indices/{ns}/vector/reindex-all`
 
-Re-enqueue every document in `{ns}` for embedding (equivalent to a fresh full index build). Returns `202 Accepted`. The store is read 1,000 documents at a time, so memory stays bounded on any store size; the vector entry of `GET /stores/{ns}/indices` shows the count enqueued so far (`total`). Writes may continue meanwhile: the worker checks every entry against its document before embedding, so a document changed during the reindex is embedded with its current text.
+Re-enqueue every document in `{ns}` for embedding (equivalent to a fresh full index build), as a `vector_reindex` job. The store is read 1,000 documents at a time, and the job saves how far it got after each page, so a restart resumes it; so memory stays bounded on any store size; the vector entry of `GET /stores/{ns}/indices` shows the count enqueued so far (`total`). Writes may continue meanwhile: the worker checks every entry against its document before embedding, so a document changed during the reindex is embedded with its current text.
 
 ```bash
 curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-all
-# → 202 Accepted
+# → 202 Accepted  {"namespace":"products","job":"vector_reindex","state":"index_maintenance"}
 ```
 
-Returns `409` when a campaign or cleanup is already running. Returns `422` when semantic search is not enabled.
+A cancel stops it at its next page; what it has queued is embedded as usual. Returns `409` while another vector job of the store runs, and `422` when semantic search is not enabled.
 
 ---
 
@@ -2027,16 +2205,16 @@ curl -X POST http://localhost:8080/admin/indices/products/vector/reindex-failed
 
 #### `DELETE /admin/indices/{ns}/vector/drop-all`
 
-Disable semantic search and clear all vector index data: queue entries and the `{ns}_sparse_vector`, `{ns}_dense_vector`, and `{ns}_sparse_vector_meta` companion namespaces. The schema is updated synchronously before the background cleanup runs. Returns `202 Accepted`.
+Turn semantic search off and clear all vector index data: queue entries, the `{ns}_sparse_vector`, `{ns}_dense_vector`, and `{ns}_sparse_vector_meta` companion namespaces, and the partition. Semantic search is off before the reply; the removal is a `vector_cleanup` job, the same as [`DELETE /stores/{ns}/indices/vector`](#delete-storesnsindicesvector).
 
 ```bash
 curl -X DELETE http://localhost:8080/admin/indices/products/vector/drop-all
-# → 202 Accepted
+# → 202 Accepted  {"namespace":"products","job":"vector_cleanup","state":"index_maintenance"}
 ```
 
 Works for both document stores and semantic-search KV stores. A document store can turn semantic search back on by amending its schema; a KV store chooses it when it is created, so turning it back on means re-creating the store.
 
-Returns `409` when a cleanup or campaign is already running. Returns `422` when semantic search is not enabled.
+Returns `409` while another vector job of the store runs, and `422` when semantic search is not enabled.
 
 ---
 
@@ -2117,8 +2295,11 @@ curl 'http://localhost:8080/admin/indices/products/vector/centres?codes=true&sta
 Re-cluster the store's partition from its stored chunk codes: k-means over every
 chunk, then each chunk moves to its nearest new posting, and the usual splits
 and merges follow. No embedding request is made and no code is re-encoded.
-Searches and writes continue throughout; a crash part-way is finished at the
-next start. Centres chosen one split at a time are a worse map than one fit on
+Searches and writes continue throughout. It is a `partition_rebuild` job: a
+cancel stops it until its plan is recorded (after k-means), never after, and a
+rebuild cut short by a crash is not run again: the partition's journal finishes
+it if it got past its publish, or abandons it, and the job is recorded
+complete or failed to match. Centres chosen one split at a time are a worse map than one fit on
 everything stored now, which costs recall when a search reads a small share of
 the store (measured: up to 4.4 points of recall@10 at a 1% read, up to 1.3 at
 5%, nothing at the default `max_probes` on stores of 5k and 57k documents). Run the
@@ -2133,18 +2314,19 @@ searches use.
 
 ```bash
 curl -X POST http://localhost:8080/admin/indices/products/vector/rebuild
-# → 202 {"namespace": "products", "rebuild": {"state": "running", ...}}
+# → 202 {"namespace": "products", "job": "partition_rebuild", "state": "index_maintenance",
+#        "rebuild": {"state": "running", ...}}
 curl -X POST http://localhost:8080/admin/indices/products/vector/rebuild \
   -H 'Content-Type: application/json' -d '{"postings": 500}'
 ```
 
 Progress and the result are the `rebuild` field of
 [`GET /admin/indices/{ns}/vector/partition`](#get-adminindicesnsvectorpartition):
-`state` (`running`, `done`, `failed`), `started_at_ms`, `finished_at_ms`, and
+`state` (`running`, `done`, `failed`, `cancelled`), `started_at_ms`, `finished_at_ms`, and
 `report` (`postings_before`, `postings_fitted`, `postings_after`, `chunks`,
 `iterations`, `chunks_moved`) or `error`. The finished status is also recorded in
-the [history](#get-adminindicesnsvectorhistory). Returns `409` while a rebuild of
-the store runs, `400` for `postings` of 0, and `422` when semantic search is not
+the [history](#get-adminindicesnsvectorhistory). Returns `409` while another
+vector job of the store runs, `400` for `postings` of 0, and `422` when semantic search is not
 enabled.
 
 ---
@@ -2448,9 +2630,10 @@ All errors return JSON with an `"error"` key:
 |-------------|----------------------------------------------------------|
 | `400`       | Invalid ID / key format, bad schema, type mismatch, malformed request |
 | `404`       | Namespace, document, or KV key not found                 |
-| `409`       | Store already exists, field already indexed, build in progress, attribute/vector operation already active for namespace |
+| `409`       | Store already exists; field already indexed; the store is being created or dropped; it has index jobs running (no drop); an index job conflicts with a running one; the job cannot be cancelled |
 | `422`       | Semantic search requested but not enabled, or its model not allowed or not served; no indices to rebuild; entry not yet exhausted |
 | `500`       | Internal database error                                  |
+| `503`       | The lifecycle governor has stopped (it failed too often): no store can be created or dropped and no index job started until the server restarts; the embedding service is unavailable |
 
 ---
 
@@ -2539,7 +2722,9 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   ns_system_pending_vec_index/       ← queue of documents waiting to be embedded
   ns_system_qemb_cache/              ← cached query embeddings
   ns_system_schema/                  ← every store's schema, keyed by store name
-  ns_system_namespace_maintenance/   ← maintenance tasks and their progress (index builds, reindex-all, vector reindexes)
+  ns_system_namespace_maintenance/   ← every index job's record and progress (builds, reindex-all, vector jobs)
+  ns_system_lifecycle_audit/         ← the lifecycle audit log (TTL: `[lifecycle] audit_retention_days`)
+  ns_system_partition_history/       ← partition health reads, recall checks and rebuilds (TTL)
   field-index/
     {ns_id}/                  ← the namespace's id (a UUID); doc stores only, KV stores have no field indices
       {field_id}/
@@ -2552,7 +2737,10 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
 
 Schemas are stored in `system_schema` as JSON, one entry per store, written
 through the write-ahead log (durable when the call returns); the server serves
-them from an in-memory copy that each schema change updates. Every schema
+them from an in-memory copy that each schema change updates. A store's schema
+record also holds its [state](#store-states-and-index-jobs): it is written first
+when the store is created (`creating`, which reserves the name) and removed last
+when it is dropped. Every schema
 declares a mandatory `store_type` field — `"doc"` or `"kv"` — which tells the
 two kinds apart. Both kinds share the namespace names, so a doc store and a KV
 store cannot have the same name, and no store may be named `system` or start

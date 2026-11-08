@@ -479,6 +479,13 @@ The reason this order matters is recovery. The cleanup touches only the namespac
 
 **The WAL leak self-heals — it never becomes permanent.** A crash before step 3 leaves the dropped namespace's entries above the saved cut. That is not a standing leak: the next startup runs WAL recovery, which skips them (their namespace is gone) and then retires the whole log, moving the cut to the tail. WAL GC reclaims those segments on its next cycle.
 
+**A store has a lifecycle of its own on top of this.** A document or KV store of
+the doc store is one namespace plus its record, and moves through states
+(`creating`, `created`, `index_maintenance`, `deleting`) as it is created in the
+background, changed by index jobs and dropped, with one supervised governor
+running every step and resuming it after a crash: see
+[`docs/Namespace-Lifecycle.md`](docs/Namespace-Lifecycle.md).
+
 ### Background Workers
 
 Everything expensive happens off the foreground path, on `tokio` tasks that run on their own intervals and shut down gracefully when the database closes:

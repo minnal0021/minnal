@@ -1721,7 +1721,7 @@ mod with_service {
     /// in the lifecycle leaves that, but a partition-less schema would refuse
     /// every write and enable) is given its partition by the open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_crash_before_a_drop_reseeds_is_healed_at_open() {
+    async fn a_semantic_store_missing_its_partition_gets_one_at_open() {
         let (url, _seen) = spawn_service();
         let db_dir = TempDir::new().unwrap();
         let store = open_fresh(db_dir.path()).await.with_semantic_search(context(&url));

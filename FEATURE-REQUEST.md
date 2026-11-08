@@ -1015,6 +1015,10 @@ document ID, so they are unaffected.
   window where a crash left a half-built index nothing resumed.
 - Queries list a field whose build is in progress or failed in
   `degraded_fields` (`QueryOutcome::touched_fields`).
+- Now (2026-11-08, branch `store-lifecycle`): `reindex-all` and `drop-all` are
+  one `reindex_all` index job whose record in `system_namespace_maintenance`
+  holds the specs and phase, resumed by the lifecycle governor; the intent file
+  and `resume_pending_builds` are gone (`minnal_db/docs/Namespace-Lifecycle.md`).
 - `GET /admin/indices/{ns}/rowmap`: IDs allocated, live documents, dead IDs,
   bytes.
 - Manual test (100k uuid documents, 90k deleted): 100,000 → 10,000 IDs, row map

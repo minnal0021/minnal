@@ -379,8 +379,9 @@ async fn resolve_doc_key_type(client: &Client, base_url: &str, namespace: &str) 
     }
 }
 
-/// Wait until `namespace` is `created`: a store takes no writes while it is
-/// being created (`POST /stores` and the import answer before it is ready).
+/// Wait until `namespace` takes writes (`created`, or `index_maintenance`
+/// while an index job runs): a store takes none while it is being created
+/// (`POST /stores` and the import answer before it is ready).
 /// Fails at once if the store is being deleted, and after ten minutes.
 async fn wait_until_created(client: &Client, base_url: &str, namespace: &str) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
@@ -391,7 +392,7 @@ async fn wait_until_created(client: &Client, base_url: &str, namespace: &str) ->
             return Err(namespace_not_found("namespace", namespace, &stores));
         };
         match entry.get("state").and_then(Value::as_str) {
-            Some("created") | None => return Ok(()),
+            Some("created" | "index_maintenance") | None => return Ok(()),
             Some("deleting") => return Err(format!("store '{namespace}' is being deleted").into()),
             Some(other) => {
                 if std::time::Instant::now() >= deadline {
