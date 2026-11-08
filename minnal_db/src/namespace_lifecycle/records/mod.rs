@@ -6,14 +6,13 @@
 //! record is a WAL-backed write, durable when the call returns and never torn,
 //! so there is no file to sync and no half-written record to recover from.
 //!
-//! `key` names a record: the store's [`NamespaceId`](crate::NamespaceId), then
-//! the task. `store` owns the namespace: nothing else reads or writes it.
+//! A record's key is a [`JobKey`](super::jobs::JobKey): the namespace's
+//! [`NamespaceId`](crate::NamespaceId), then the job. `store` owns the
+//! namespace: nothing else reads or writes it.
 
-mod key;
 mod progress;
 mod store;
 
-pub(crate) use key::TaskKey;
 pub use progress::{BuildStatus, FieldBuildRecord};
 pub use store::MAINTENANCE_NAMESPACE;
 pub(crate) use store::MaintenanceStore;

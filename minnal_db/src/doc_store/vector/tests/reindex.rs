@@ -160,7 +160,7 @@ async fn a_reindex_interrupted_by_a_crash_does_not_block_the_next() {
         store
             .maintenance
             .put(
-                TaskKey::vector_reindex(ns_id),
+                JobKey::vector_reindex(ns_id),
                 &VecReindexProgress {
                     status: BuildStatus::Running,
                     started_at_ms: now_ms(),

@@ -1,24 +1,32 @@
 //! The lifecycle governor: one task per [`LifecycleHost`] that runs every
-//! namespace's creation and drop, supervised.
+//! namespace's creation, drop and index job, supervised.
 //!
 //! A create or drop first writes the namespace's new state (`Creating`,
 //! `Deleting`), then hands it to the governor, which runs its task
 //! ([`Task::Provision`] or [`Task::Teardown`], through
-//! [`LifecycleHost::run`]) in a coordinator task of its own. The governor is single-threaded: it only starts coordinators and
-//! collects their results; the work is theirs.
+//! [`LifecycleHost::run`]) in a coordinator task of its own. An index job is
+//! first recorded and its namespace moved to `IndexMaintenance`
+//! ([`Jobs::start`]), then handed over the same way as a [`Task::Job`]; when
+//! it ends, its coordinator records how ([`Jobs::finish`]). A namespace runs
+//! one creation or drop at a time and nothing beside it; its jobs may run
+//! together (`Jobs` refuses the ones that conflict). The governor is
+//! single-threaded: it only starts coordinators and collects their results;
+//! the work is theirs.
 //!
 //! **Supervision.** A coordinator whose task fails or panics is run again,
 //! after `restart_backoff`, up to `max_restarts` times: every task is
-//! idempotent, so a run again finishes what the last one left. Past that the
-//! namespace is *parked*: a CRITICAL error is logged, its state stays as it is,
-//! and later requests to create or drop it fail at once, until the process
-//! restarts (the escape hatch; the count is kept in memory only). The governor
-//! itself is supervised the same way; if it gives up, its channel closes and
-//! every create and drop fails with `GovernorUnavailable`, while namespaces that
-//! exist keep working.
+//! idempotent, so a run again finishes what the last one left. Past that a
+//! job is recorded failed, with a CRITICAL error logged, and its namespace
+//! goes on. A creation or a drop past that *parks* its namespace: a CRITICAL
+//! error is logged, its state stays as it is, and later tasks for it fail at
+//! once, until the process restarts (the escape hatch; the count is kept in
+//! memory only). The governor itself is supervised the same way; if it gives
+//! up, its channel closes and every create, drop and job fails with
+//! `GovernorUnavailable`, while namespaces that exist keep working.
 //!
 //! At start the governor picks up every namespace that is still `Creating` or
-//! `Deleting`, so a crash or a parked namespace from before a restart is finished.
+//! `Deleting`, and every live job ([`Jobs::repair`]), so what a crash or a
+//! parked namespace left before a restart is finished.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -27,12 +35,12 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::namespace_lifecycle::{LifecycleError, LifecycleHost, NamespaceState};
+use crate::namespace_lifecycle::{JobKey, Jobs, LifecycleError, LifecycleHost, NamespaceState};
 
 /// How the governor restarts what fails.
 #[derive(Debug, Clone)]
 pub struct LifecycleConfig {
-    /// Runs again of a namespace's failed task before it is parked.
+    /// Runs again of a failed task before it is given up on.
     pub max_restarts: u32,
     /// Wait before each run again.
     pub restart_backoff: Duration,
@@ -48,12 +56,31 @@ impl Default for LifecycleConfig {
 }
 
 /// What a namespace's lifecycle task does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Task {
     /// Set up a `Creating` namespace, then move it to `Created`.
     Provision,
     /// Remove a `Deleting` namespace, its record last.
     Teardown,
+    /// Run (or resume) a started index job; its record says how far it got.
+    Job(JobKey),
+}
+
+impl Task {
+    fn is_job(self) -> bool {
+        matches!(self, Self::Job(_))
+    }
+}
+
+/// `creation`, `drop`, or `job field_build:7`.
+impl std::fmt::Display for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provision => f.write_str("creation"),
+            Self::Teardown => f.write_str("drop"),
+            Self::Job(key) => write!(f, "job {}", key.kind),
+        }
+    }
 }
 
 /// A task that ended without finishing: what to tell every caller waiting for
@@ -81,13 +108,13 @@ pub(crate) struct Governor {
 }
 
 impl Governor {
-    /// Start the governor for `host`. It holds the host weakly: when the last
-    /// `Arc` of it goes, so does the governor.
-    pub(crate) fn start<H: LifecycleHost>(host: Weak<H>, config: LifecycleConfig) -> Self {
+    /// Start the governor for `host`, whose jobs `jobs` records. It holds the
+    /// host weakly: when the last `Arc` of it goes, so does the governor.
+    pub(crate) fn start<H: LifecycleHost>(host: Weak<H>, jobs: Arc<Jobs>, config: LifecycleConfig) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let parked = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
-        let supervisor = tokio::spawn(supervise(host, rx, config, Arc::clone(&parked)));
+        let supervisor = tokio::spawn(supervise(host, jobs, rx, config, Arc::clone(&parked)));
         Self { tx, parked, supervisor }
     }
 
@@ -97,8 +124,8 @@ impl Governor {
     }
 
     /// Hand `namespace`'s `task` to the governor; the receiver says how it
-    /// ended. A task already running for the namespace is joined, not started
-    /// again.
+    /// ended. The same task already running is joined, not started again. A
+    /// job must have been started with [`Jobs::start`] first.
     pub(crate) fn submit(&self, namespace: &str, task: Task) -> Result<oneshot::Receiver<Outcome>, LifecycleError> {
         let (done, rx) = oneshot::channel();
         self.tx
@@ -144,6 +171,7 @@ impl Drop for Governor {
 /// Run the governor, and run it again if it panics, up to `max_restarts`.
 async fn supervise<H: LifecycleHost>(
     host: Weak<H>,
+    jobs: Arc<Jobs>,
     rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Command>>>,
     config: LifecycleConfig,
     parked: Arc<parking_lot::Mutex<HashMap<String, TaskFailure>>>,
@@ -152,14 +180,15 @@ async fn supervise<H: LifecycleHost>(
     loop {
         // Its own task, so a panic in it is a `JoinError` here, not ours; and
         // aborting this future aborts it with every coordinator it holds.
-        let mut run = AbortOnDrop(tokio::spawn(govern(host.clone(), Arc::clone(&rx), config.clone(), Arc::clone(&parked))));
+        let governor = govern(host.clone(), Arc::clone(&jobs), Arc::clone(&rx), config.clone(), Arc::clone(&parked));
+        let mut run = AbortOnDrop(tokio::spawn(governor));
         match run.await_join().await {
             Ok(()) => return,
             Err(e) => {
                 restarts += 1;
                 if restarts > config.max_restarts {
                     log::error!(
-                        "CRITICAL: the namespace lifecycle governor failed {restarts} times ({e}); no namespace can be created or dropped until the process restarts"
+                        "CRITICAL: the namespace lifecycle governor failed {restarts} times ({e}); no namespace can be created, dropped or have an index job until the process restarts"
                     );
                     rx.lock().await.close();
                     return;
@@ -174,33 +203,46 @@ async fn supervise<H: LifecycleHost>(
     }
 }
 
-/// A namespace's task in progress: who waits for it.
-struct Running {
-    task: Task,
-    waiters: Vec<oneshot::Sender<Outcome>>,
+/// Every task in progress, by namespace and task: who waits for each.
+#[derive(Default)]
+struct Running(HashMap<(String, Task), Vec<oneshot::Sender<Outcome>>>);
+
+impl Running {
+    /// Why `task` cannot start on `namespace` now, if it cannot: a creation or
+    /// drop runs with nothing else beside it.
+    fn refusal(&self, namespace: &str, task: Task) -> Option<String> {
+        let other = self
+            .0
+            .keys()
+            .find(|(n, t)| n == namespace && *t != task && (!t.is_job() || !task.is_job()))?;
+        Some(format!("the {} of this namespace is running", other.1))
+    }
 }
 
 /// The governor proper: take commands, start coordinators, hand out results.
 async fn govern<H: LifecycleHost>(
     host: Weak<H>,
+    jobs: Arc<Jobs>,
     rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Command>>>,
     config: LifecycleConfig,
     parked: Arc<parking_lot::Mutex<HashMap<String, TaskFailure>>>,
 ) {
     let mut rx = rx.lock().await;
-    let mut running: HashMap<String, Running> = HashMap::new();
-    let mut coordinators: JoinSet<(String, Outcome)> = JoinSet::new();
+    let mut running = Running::default();
+    let mut coordinators: JoinSet<(String, Task, Outcome)> = JoinSet::new();
+    let spawn = |running: &mut Running,
+                 coordinators: &mut JoinSet<(String, Task, Outcome)>,
+                 namespace: String,
+                 task: Task,
+                 waiters: Vec<oneshot::Sender<Outcome>>| {
+        running.0.insert((namespace.clone(), task), waiters);
+        coordinators.spawn(coordinate(host.clone(), Arc::clone(&jobs), namespace, task, config.clone()));
+    };
 
-    // Every namespace a crash, or a parked task, left part-way.
+    // Everything a crash, or a parked task, left part-way.
     if let Some(h) = host.upgrade() {
-        for (namespace, state) in h.states() {
-            let task = match state {
-                NamespaceState::Creating => Task::Provision,
-                NamespaceState::Deleting => Task::Teardown,
-                NamespaceState::Created => continue,
-            };
-            running.insert(namespace.clone(), Running { task, waiters: Vec::new() });
-            coordinators.spawn(coordinate(host.clone(), namespace, task, config.clone()));
+        for (namespace, task) in leftover_tasks(&*h, &jobs) {
+            spawn(&mut running, &mut coordinators, namespace, task, Vec::new());
         }
     }
 
@@ -208,77 +250,112 @@ async fn govern<H: LifecycleHost>(
         tokio::select! {
             command = rx.recv() => {
                 let Some(Command { namespace, task, done }) = command else { break };
-                if let Some(failure) = parked.lock().get(&namespace) {
+                let refusal = match parked.lock().get(&namespace) {
+                    Some(failure) => Some(failure.clone()),
+                    None => running.refusal(&namespace, task).map(|error| TaskFailure { attempts: 0, error }),
+                };
+                if let Some(failure) = refusal {
                     if let Some(done) = done {
-                        let _ = done.send(Err(failure.clone()));
+                        let _ = done.send(Err(failure));
                     }
                     continue;
                 }
-                match running.get_mut(&namespace) {
-                    // The same task already runs: wait for it. (Another task
-                    // cannot: a namespace is in one state at a time, and each state
-                    // has one task.)
-                    Some(run) if run.task == task => run.waiters.extend(done),
-                    Some(_) => {
-                        if let Some(done) = done {
-                            let _ = done.send(Err(TaskFailure { attempts: 0, error: "another lifecycle task of this namespace is running".to_owned() }));
-                        }
-                    }
-                    None => {
-                        running.insert(namespace.clone(), Running { task, waiters: done.into_iter().collect() });
-                        coordinators.spawn(coordinate(host.clone(), namespace, task, config.clone()));
-                    }
+                match running.0.get_mut(&(namespace.clone(), task)) {
+                    // The same task already runs: wait for it.
+                    Some(waiters) => waiters.extend(done),
+                    None => spawn(&mut running, &mut coordinators, namespace, task, done.into_iter().collect()),
                 }
             }
             Some(joined) = coordinators.join_next(), if !coordinators.is_empty() => {
                 // A coordinator never panics (its task runs in a task of its own).
-                let Ok((namespace, outcome)) = joined else { continue };
-                if let Err(failure) = &outcome {
+                let Ok((namespace, task, outcome)) = joined else { continue };
+                if let Err(failure) = &outcome
+                    && !task.is_job()
+                {
                     parked.lock().insert(namespace.clone(), failure.clone());
                 }
-                if let Some(run) = running.remove(&namespace) {
-                    for waiter in run.waiters {
-                        let _ = waiter.send(outcome.clone());
-                    }
+                for waiter in running.0.remove(&(namespace, task)).unwrap_or_default() {
+                    let _ = waiter.send(outcome.clone());
                 }
             }
         }
     }
 }
 
+/// The tasks to pick up at start: the creation or drop of every namespace
+/// still `Creating` or `Deleting`, and every live job of the others (their
+/// states put in step with their records first).
+fn leftover_tasks<H: LifecycleHost>(host: &H, jobs: &Jobs) -> Vec<(String, Task)> {
+    let mut tasks = Vec::new();
+    for (namespace, state) in host.states() {
+        match state {
+            NamespaceState::Creating => tasks.push((namespace, Task::Provision)),
+            NamespaceState::Deleting => tasks.push((namespace, Task::Teardown)),
+            NamespaceState::Created | NamespaceState::IndexMaintenance => {
+                let Some(id) = host.namespace_id(&namespace) else { continue };
+                match jobs.repair(host, &namespace, id) {
+                    Ok(live) => tasks.extend(live.into_iter().map(|key| (namespace.clone(), Task::Job(key)))),
+                    Err(e) => log::error!("namespace '{namespace}': cannot pick up its index jobs: {e}"),
+                }
+            }
+        }
+    }
+    tasks
+}
+
 /// Run `namespace`'s `task`, and run it again after a failure or a panic, up
-/// to `max_restarts` times; then give up (the namespace is parked).
-async fn coordinate<H: LifecycleHost>(host: Weak<H>, namespace: String, task: Task, config: LifecycleConfig) -> (String, Outcome) {
+/// to `max_restarts` times; then give up (a job is recorded failed, any other
+/// task parks the namespace). A job's end is recorded here either way.
+async fn coordinate<H: LifecycleHost>(
+    host: Weak<H>,
+    jobs: Arc<Jobs>,
+    namespace: String,
+    task: Task,
+    config: LifecycleConfig,
+) -> (String, Task, Outcome) {
+    let outcome = run_with_restarts(&host, &namespace, task, &config).await;
+    if let Task::Job(key) = task
+        && let Some(h) = host.upgrade()
+        && let Err(e) = jobs.finish(&*h, &namespace, key, outcome.clone().map_err(|f| f.error))
+    {
+        log::error!("namespace '{namespace}': cannot record the end of its {task}: {e}");
+    }
+    (namespace, task, outcome)
+}
+
+/// [`coordinate`]'s loop: run, and run again, until done or out of runs.
+async fn run_with_restarts<H: LifecycleHost>(host: &Weak<H>, namespace: &str, task: Task, config: &LifecycleConfig) -> Outcome {
     let mut attempts = 0u32;
     loop {
         attempts += 1;
         let Some(h) = host.upgrade() else {
-            return (
-                namespace,
-                Err(TaskFailure {
-                    attempts,
-                    error: "the host was closed".to_owned(),
-                }),
-            );
+            return Err(TaskFailure {
+                attempts,
+                error: "the host was closed".to_owned(),
+            });
         };
-        let ns = namespace.clone();
+        let ns = namespace.to_owned();
         let mut run = AbortOnDrop(tokio::spawn(async move { h.run(&ns, task).await.map_err(|e| e.to_string()) }));
         let error = match run.await_join().await {
-            Ok(Ok(())) => return (namespace, Ok(())),
+            Ok(Ok(())) => return Ok(()),
             Ok(Err(e)) => e,
             Err(e) => format!("the task panicked: {e}"),
         };
         if attempts > config.max_restarts {
-            log::error!(
-                "CRITICAL: namespace '{namespace}': its {task:?} task failed {attempts} times, last: {error}; it is left {} until the process restarts",
-                host.upgrade()
-                    .and_then(|h| h.state(&namespace))
-                    .map_or("as it was", NamespaceState::as_str)
-            );
-            return (namespace, Err(TaskFailure { attempts, error }));
+            if task.is_job() {
+                log::error!("CRITICAL: namespace '{namespace}': its {task} failed {attempts} times, last: {error}; the job is recorded failed");
+            } else {
+                log::error!(
+                    "CRITICAL: namespace '{namespace}': its {task} failed {attempts} times, last: {error}; it is left {} until the process restarts",
+                    host.upgrade()
+                        .and_then(|h| h.state(namespace))
+                        .map_or("as it was", NamespaceState::as_str)
+                );
+            }
+            return Err(TaskFailure { attempts, error });
         }
         log::warn!(
-            "namespace '{namespace}': its {task:?} task failed ({error}); running it again ({attempts} of {})",
+            "namespace '{namespace}': its {task} failed ({error}); running it again ({attempts} of {})",
             config.max_restarts
         );
         tokio::time::sleep(config.restart_backoff).await;

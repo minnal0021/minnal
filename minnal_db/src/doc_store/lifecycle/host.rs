@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use super::super::*;
+use crate::namespace::NamespaceId;
 use crate::namespace_lifecycle::{Governor, LifecycleHost, Task};
 
 impl LifecycleHost for DocStore {
@@ -18,10 +19,20 @@ impl LifecycleHost for DocStore {
         self.schemas.state(namespace)
     }
 
+    fn namespace_id(&self, namespace: &str) -> Option<NamespaceId> {
+        self.schemas.get(namespace).and_then(|s| s.ns_id())
+    }
+
+    fn transition(&self, namespace: &str, from: &[NamespaceState], to: NamespaceState) -> Result<NamespaceState, DocStoreError> {
+        self.schemas.transition(namespace, from, to)
+    }
+
     async fn run(&self, namespace: &str, task: Task) -> Result<(), DocStoreError> {
         match task {
             Task::Provision => self.provision(namespace).await,
             Task::Teardown => self.teardown(namespace).await,
+            // No job is started by this store yet, so none is left to resume.
+            Task::Job(key) => Err(DocStoreError::Io(std::io::Error::other(format!("no body for index job {}", key.kind)))),
         }
     }
 }
@@ -36,7 +47,8 @@ impl DocStore {
     /// their tasks inline (once, unsupervised), and the `begin_*` forms fail
     /// with [`DocStoreError::GovernorUnavailable`].
     pub fn start_lifecycle(self: &Arc<Self>, config: LifecycleConfig) {
-        self.governor.get_or_init(|| Governor::start(Arc::downgrade(self), config));
+        self.governor
+            .get_or_init(|| Governor::start(Arc::downgrade(self), Arc::clone(&self.jobs), config));
     }
 
     /// The governor, if it is started and running.

@@ -324,21 +324,20 @@ impl SchemaStore {
 
     /// Move a store from one of `from` to `to`, durably. Under the writer lock,
     /// so two callers cannot both make the same move (two drops of one store:
-    /// the second finds it `Deleting`). A store in another state gets the error
-    /// a request to it would (`StoreCreating`, `StoreDeleting`); `NotFound` if
-    /// there is none. Returns the state it was in.
+    /// the second finds it `Deleting`). A store in another state gets the
+    /// refusal of that state (`StoreCreating`, `StoreDeleting`, and
+    /// `StoreInMaintenance` for a drop of a store with jobs running), else
+    /// `InvalidTransition`; `NotFound` if there is none. Returns the state it
+    /// was in; a move to the state it is in writes nothing.
     pub(crate) fn transition(&self, namespace: &str, from: &[NamespaceState], to: NamespaceState) -> Result<NamespaceState, DocStoreError> {
         let _w = self.writer.lock();
         let entry = self.entry(namespace).ok_or_else(|| Self::not_found(namespace))?;
         if !from.contains(&entry.state) {
-            entry.state.admit(namespace)?;
-            return Err(DocStoreError::InvalidTransition {
-                namespace: namespace.to_owned(),
-                from: entry.state,
-                to,
-            });
+            return Err(entry.state.refusal(namespace, to).into());
         }
-        self.persist(entry.schema.clone(), to)?;
+        if entry.state != to {
+            self.persist(entry.schema.clone(), to)?;
+        }
         Ok(entry.state)
     }
 

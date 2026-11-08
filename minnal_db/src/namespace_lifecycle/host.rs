@@ -1,22 +1,36 @@
-//! `LifecycleHost`: what the governor needs from the layer that owns the
-//! namespaces (the doc store): their states, and the tasks to run.
+//! `LifecycleHost`: what the governor and the jobs registry need from the
+//! layer that owns the namespaces (the doc store): their states, the moves
+//! between them, and the work of each task.
 
 use std::future::Future;
 
-use crate::namespace_lifecycle::{NamespaceState, Task};
+use crate::namespace::NamespaceId;
+use crate::namespace_lifecycle::{LifecycleError, NamespaceState, Task};
 
-/// The owner of a set of namespaces, as the governor sees it. The governor
-/// decides when a task runs and how often it is run again; the host does the
-/// work, and keeps each namespace's state.
+/// The owner of a set of namespaces, as the lifecycle layer sees it. The
+/// governor decides when a task runs and how often it is run again, and the
+/// jobs registry which jobs may run; the host does the work, and keeps each
+/// namespace's state.
 pub trait LifecycleHost: Send + Sync + 'static {
-    /// Why a task failed.
-    type Error: std::fmt::Display + Send;
+    /// The host's error type; lifecycle errors become it.
+    type Error: std::fmt::Display + Send + From<LifecycleError>;
 
     /// Every namespace, with its state.
     fn states(&self) -> Vec<(String, NamespaceState)>;
 
     /// `namespace`'s state, if it exists.
     fn state(&self, namespace: &str) -> Option<NamespaceState>;
+
+    /// `namespace`'s id, once it has one (a namespace being created gets it
+    /// part-way).
+    fn namespace_id(&self, namespace: &str) -> Option<NamespaceId>;
+
+    /// Move `namespace` from one of `from` to `to`, durably, and return the
+    /// state it left. In any other state, the error
+    /// [`NamespaceState::refusal`](crate::namespace_lifecycle::NamespaceState)
+    /// gives. Moving to the state it is in, when listed in `from`, is a no-op
+    /// that succeeds.
+    fn transition(&self, namespace: &str, from: &[NamespaceState], to: NamespaceState) -> Result<NamespaceState, Self::Error>;
 
     /// Run `namespace`'s `task` once. It must be idempotent: a run cut short
     /// (an error, a panic, a crash) is finished by running it again.

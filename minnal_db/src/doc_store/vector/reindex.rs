@@ -43,7 +43,7 @@ impl DocStore {
             Ok(schema) => schema.ns_id?,
             Err(_) => self.view_kv_schema(namespace).ok()?.ns_id?,
         };
-        let key = TaskKey::vector_reindex(ns_id);
+        let key = JobKey::vector_reindex(ns_id);
         let mut record: VecReindexProgress = self.maintenance.get(key).ok()??;
         if record.status != BuildStatus::Running || self.vec_reindexing.lock().contains(namespace) {
             return Some(record);
@@ -70,7 +70,7 @@ impl DocStore {
     /// the record it would have replaced is still there, and only the progress
     /// it shows is behind.
     #[cfg(feature = "semantic-search")]
-    fn save_vec_reindex(&self, key: TaskKey, record: &VecReindexProgress) {
+    fn save_vec_reindex(&self, key: JobKey, record: &VecReindexProgress) {
         if let Err(e) = self.maintenance.put(key, record) {
             log::warn!("vector reindex progress: could not save {key:?}: {e}");
         }
@@ -130,7 +130,7 @@ impl DocStore {
     ) -> Result<ReindexStats, DocStoreError> {
         // 409 guard: one reindex of a namespace enqueues at a time. Held until
         // this function returns, however it returns.
-        let key = TaskKey::vector_reindex(ns_id);
+        let key = JobKey::vector_reindex(ns_id);
         let _write = self.writes.enter(namespace)?;
         let _claim = ReindexClaim::take(&self.vec_reindexing, namespace)?;
         self.check_not_dropping(namespace)?;

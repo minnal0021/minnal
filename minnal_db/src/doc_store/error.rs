@@ -216,6 +216,23 @@ pub enum DocStoreError {
     #[error("namespace '{namespace}' is being deleted")]
     StoreDeleting { namespace: String },
 
+    /// The store has index jobs running, and cannot be dropped until they end.
+    #[error("namespace '{namespace}' has index jobs running; wait for them to end, or cancel them, before dropping it")]
+    StoreInMaintenance { namespace: String },
+
+    /// An index job cannot start while a job it conflicts with runs.
+    #[error("namespace '{namespace}': job {job} cannot start while job {running} runs")]
+    JobConflict { namespace: String, job: String, running: String },
+
+    /// The store has no running job of that name.
+    #[error("namespace '{namespace}' has no running job {job}")]
+    JobNotFound { namespace: String, job: String },
+
+    /// The job cannot be cancelled: stopping it part-way would leave its index
+    /// unusable.
+    #[error("namespace '{namespace}': job {job} cannot be cancelled")]
+    JobNotCancellable { namespace: String, job: String },
+
     /// A lifecycle move the store's state does not allow (a drop of a store
     /// that is not created, say).
     #[error("store '{namespace}' cannot move from {from:?} to {to:?}")]
@@ -347,6 +364,11 @@ impl From<crate::namespace_lifecycle::LifecycleError> for DocStoreError {
             L::InvalidTransition { namespace, from, to } => Self::InvalidTransition { namespace, from, to },
             L::TaskFailed { namespace, attempts, error } => Self::LifecycleTaskFailed { namespace, attempts, error },
             L::GovernorUnavailable => Self::GovernorUnavailable,
+            L::InMaintenance { namespace } => Self::StoreInMaintenance { namespace },
+            L::NotFound { namespace } => Self::NotFound { namespace },
+            L::JobConflict { namespace, job, running } => Self::JobConflict { namespace, job, running },
+            L::JobNotFound { namespace, job } => Self::JobNotFound { namespace, job },
+            L::JobNotCancellable { namespace, job } => Self::JobNotCancellable { namespace, job },
             L::Db(e) => Self::Db(e),
             L::Record(e) => Self::Io(std::io::Error::other(format!("maintenance record: {e}"))),
         }

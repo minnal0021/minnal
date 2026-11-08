@@ -23,6 +23,52 @@ pub enum LifecycleError {
         namespace: String,
     },
 
+    /// The namespace has index jobs running, so it cannot be dropped until
+    /// they end or are cancelled.
+    #[error("namespace '{namespace}' has index jobs running; wait for them to end, or cancel them, before dropping it")]
+    InMaintenance {
+        /// The namespace.
+        namespace: String,
+    },
+
+    /// There is no namespace of that name.
+    #[error("namespace '{namespace}' not found")]
+    NotFound {
+        /// The namespace.
+        namespace: String,
+    },
+
+    /// An index job cannot start while another job of the namespace runs that
+    /// touches the same index.
+    #[error("namespace '{namespace}': job {job} cannot start while job {running} runs")]
+    JobConflict {
+        /// The namespace.
+        namespace: String,
+        /// The job asked for.
+        job: String,
+        /// The running job it conflicts with.
+        running: String,
+    },
+
+    /// No live job of that name.
+    #[error("namespace '{namespace}' has no running job {job}")]
+    JobNotFound {
+        /// The namespace.
+        namespace: String,
+        /// The job asked for.
+        job: String,
+    },
+
+    /// The job cannot be cancelled: stopping it part-way would leave its index
+    /// unusable.
+    #[error("namespace '{namespace}': job {job} cannot be cancelled")]
+    JobNotCancellable {
+        /// The namespace.
+        namespace: String,
+        /// The job.
+        job: String,
+    },
+
     /// A move its state does not allow (a drop of a namespace that is not
     /// created, say).
     #[error("namespace '{namespace}' cannot move from {from:?} to {to:?}")]

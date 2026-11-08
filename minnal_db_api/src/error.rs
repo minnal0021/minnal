@@ -42,7 +42,10 @@ impl From<DocStoreError> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match &self.inner {
-            DocStoreError::NotFound { .. } | DocStoreError::IndexNotFound { .. } | DocStoreError::Schema(SchemaError::NotFound { .. }) => {
+            DocStoreError::NotFound { .. }
+            | DocStoreError::IndexNotFound { .. }
+            | DocStoreError::JobNotFound { .. }
+            | DocStoreError::Schema(SchemaError::NotFound { .. }) => {
                 StatusCode::NOT_FOUND
             }
 
@@ -63,6 +66,9 @@ impl IntoResponse for AppError {
             // its lifecycle state, and the message says which.
             | DocStoreError::StoreCreating { .. }
             | DocStoreError::StoreDeleting { .. }
+            | DocStoreError::StoreInMaintenance { .. }
+            | DocStoreError::JobConflict { .. }
+            | DocStoreError::JobNotCancellable { .. }
             | DocStoreError::InvalidTransition { .. } => StatusCode::CONFLICT,
 
             DocStoreError::InvalidId(_)

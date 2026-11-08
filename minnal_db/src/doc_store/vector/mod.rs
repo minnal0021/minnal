@@ -49,7 +49,7 @@ pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace
 }
 
 /// Persistent record for one `index_all` reindex, kept in the maintenance
-/// namespace (`TaskKey::vector_reindex`).
+/// namespace (`JobKey::vector_reindex`).
 ///
 /// A reindex is the unit of work created by a single `index_all` call: it
 /// tracks the total documents enqueued, how many have been indexed, and the

@@ -127,3 +127,33 @@ async fn two_drops_at_once_remove_the_store_once() {
     assert!(store.get("docs", DocId::U64(1)).await.unwrap().is_some());
     store.shutdown().await.unwrap();
 }
+
+/// A store with index jobs running takes every request, cannot be dropped,
+/// and comes back from a restart still taking them (its indexes active).
+#[tokio::test]
+async fn a_store_in_index_maintenance_takes_requests_but_cannot_be_dropped() {
+    let db_dir = TempDir::new().unwrap();
+    {
+        let store = open_fresh(db_dir.path()).await;
+        store.create(make_schema("docs", vec![index()])).await.unwrap();
+        store
+            .schemas
+            .transition("docs", &[NamespaceState::Created], NamespaceState::IndexMaintenance)
+            .unwrap();
+
+        store.put("docs", DocId::U64(1), serde_json::json!({"active": true})).await.unwrap();
+        assert!(store.get("docs", DocId::U64(1)).await.unwrap().is_some());
+        assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
+        assert!(matches!(store.remove("docs").await, Err(DocStoreError::StoreInMaintenance { .. })));
+        assert_eq!(store.list().unwrap()[0]["state"], "index_maintenance");
+        store.shutdown().await.unwrap();
+    }
+    let store = open_fresh(db_dir.path()).await;
+    assert_eq!(
+        store.schemas.state("docs"),
+        Some(NamespaceState::IndexMaintenance),
+        "left for the governor"
+    );
+    assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
+    store.shutdown().await.unwrap();
+}

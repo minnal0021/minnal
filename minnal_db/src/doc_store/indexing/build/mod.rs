@@ -69,7 +69,7 @@ impl DocStore {
         // means there is no build to resume.
         let fields = self.db.list_index_fields(ns_id);
         if let Some(meta) = fields.iter().find(|f| f.field_name == field) {
-            self.maintenance.delete(TaskKey::field_build(ns_id, meta.field_id))?;
+            self.maintenance.delete(JobKey::field_build(ns_id, meta.field_id))?;
             self.db.drop_field_index(ns_id, meta.field_id)?;
         }
 
@@ -142,7 +142,7 @@ impl DocStore {
         if !resuming {
             let ivt = to_ivt(spec.index_type);
             if let Ok(fid) = self.db.register_index_field(ns_id, &spec.field, ivt) {
-                let running = self.maintenance.get::<FieldBuildRecord>(TaskKey::field_build(ns_id, fid))?;
+                let running = self.maintenance.get::<FieldBuildRecord>(JobKey::field_build(ns_id, fid))?;
                 if running.is_some_and(|r| r.is_running()) {
                     return Err(DocStoreError::IndexBuildInProgress {
                         namespace: namespace.to_owned(),
@@ -163,7 +163,7 @@ impl DocStore {
         // index holds what it did before the crash (the WAL replay brings that
         // up to date). The store takes writes meanwhile only in the first case;
         // see `activate_field_index_for_build`.
-        let record_key = TaskKey::field_build(ns_id, field_id);
+        let record_key = JobKey::field_build(ns_id, field_id);
         let interrupted = self.maintenance.get::<FieldBuildRecord>(record_key)?.filter(FieldBuildRecord::is_running);
         let takes_over_a_build = interrupted.as_ref().is_some_and(|r| r.resume_after_hex.is_some());
         if takes_over_a_build {
@@ -289,7 +289,7 @@ impl DocStore {
                 };
                 let ivt = to_ivt(spec.index_type);
                 let field_id = self.db.register_index_field(ns_id, &spec.field, ivt)?;
-                let record_key = TaskKey::field_build(ns_id, field_id);
+                let record_key = JobKey::field_build(ns_id, field_id);
 
                 // No record, or a finished one: no build of this field is left
                 // to finish. A record is a WAL-backed write, so it is never torn.
@@ -360,7 +360,7 @@ impl DocStore {
         let Some(meta) = fields.iter().find(|f| f.field_name == field) else {
             return Ok(None);
         };
-        Ok(self.maintenance.get(TaskKey::field_build(ns_id, meta.field_id))?)
+        Ok(self.maintenance.get(JobKey::field_build(ns_id, meta.field_id))?)
     }
 }
 

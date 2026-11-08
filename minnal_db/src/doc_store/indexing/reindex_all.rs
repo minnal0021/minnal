@@ -4,7 +4,7 @@
 //! Dropping an index demotes it to a plain attribute in the saved schema, so a
 //! crash between the drops and the re-adds would leave the store with no
 //! indexes at all. The intent, a record in the maintenance namespace
-//! (`TaskKey::reindex_all`), lists the index specs and how far the run got;
+//! (`JobKey::reindex_all`), lists the index specs and how far the run got;
 //! [`DocStore::resume_pending_builds`] finishes an interrupted run at startup.
 //!
 //! Between the drops and the re-adds no field index of the namespace exists, so
@@ -65,7 +65,7 @@ impl DocStore {
                 field,
             });
         }
-        let key = TaskKey::reindex_all(ns_id);
+        let key = JobKey::reindex_all(ns_id);
         // A run that stopped part-way left its intent, which lists every index it
         // set out to rebuild, some of them dropped already. Finish that one: a new
         // intent from the schema as it is now would leave those out for good.
@@ -96,7 +96,7 @@ impl DocStore {
         mut intent: Intent,
         stop_after: Option<usize>,
     ) -> Result<Vec<IndexBuildHandle>, DocStoreError> {
-        let key = TaskKey::reindex_all(ns_id);
+        let key = JobKey::reindex_all(ns_id);
         let mut steps = 0usize;
         let stop = |steps: usize| stop_after.is_some_and(|n| steps >= n);
 
@@ -146,7 +146,7 @@ impl DocStore {
         let mut handles = Vec::new();
         for schema in self.load_all_schemas()? {
             let Some(ns_id) = schema.ns_id else { continue };
-            let Some(intent) = self.maintenance.get::<Intent>(TaskKey::reindex_all(ns_id))? else {
+            let Some(intent) = self.maintenance.get::<Intent>(JobKey::reindex_all(ns_id))? else {
                 continue;
             };
             info!("resuming interrupted reindex-all of '{}' (phase {:?})", schema.namespace, intent.phase);
@@ -249,7 +249,7 @@ mod tests {
             "{what}: the row map numbers the live documents only"
         );
         assert!(
-            store.maintenance.get::<Intent>(TaskKey::reindex_all(ns_id)).unwrap().is_none(),
+            store.maintenance.get::<Intent>(JobKey::reindex_all(ns_id)).unwrap().is_none(),
             "{what}: intent record removed"
         );
     }
@@ -311,7 +311,7 @@ mod tests {
         }
         let blank = FieldBuildRecord::started();
         let fields = store.db.list_index_fields(ns_id);
-        let record_of = |name: &str| TaskKey::field_build(ns_id, fields.iter().find(|f| f.field_name == name).unwrap().field_id);
+        let record_of = |name: &str| JobKey::field_build(ns_id, fields.iter().find(|f| f.field_name == name).unwrap().field_id);
         // `active`: as if the process died before the build saved anything.
         store.maintenance.put(record_of("active"), &blank).unwrap();
         // `tier`: re-registered (which clears its `dropped` flag) and its record
@@ -350,7 +350,7 @@ mod tests {
                 resume_after_hex: None,
                 error: None,
             };
-            store.maintenance.put(TaskKey::field_build(ns_id, fid), &record).unwrap();
+            store.maintenance.put(JobKey::field_build(ns_id, fid), &record).unwrap();
         };
         assert!(ids(&store, "active = true").await.1.is_empty());
         set(BuildStatus::Running);
@@ -406,7 +406,7 @@ mod tests {
                 .map(|f| {
                     store
                         .maintenance
-                        .get(TaskKey::field_build(ns_id, f.field_id))
+                        .get(JobKey::field_build(ns_id, f.field_id))
                         .unwrap()
                         .expect("a record per field")
                 })

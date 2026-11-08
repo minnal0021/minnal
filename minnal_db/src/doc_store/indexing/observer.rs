@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::namespace_lifecycle::{BuildStatus, FieldBuildRecord};
-use crate::namespace_lifecycle::{MaintenanceStore, TaskKey};
+use crate::namespace_lifecycle::{JobKey, MaintenanceStore};
 use crate::support::hex::bytes_to_hex;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ impl IndexProgressObserver for InMemoryProgress {
 /// an earlier resume point, which only costs work on a restart.
 pub struct RecordProgress {
     store: Arc<MaintenanceStore>,
-    key: TaskKey,
+    key: JobKey,
     /// Save interval in documents: on every `indexed % every_n == 0`.
     every_n: u64,
     total: AtomicU64,
@@ -137,7 +137,7 @@ pub struct RecordProgress {
 impl RecordProgress {
     /// Saves to `key` in `store`, starting from `start` (the record a resumed
     /// build continues, or a new one).
-    pub(crate) fn new(store: Arc<MaintenanceStore>, key: TaskKey, every_n: u64, start: &FieldBuildRecord) -> Self {
+    pub(crate) fn new(store: Arc<MaintenanceStore>, key: JobKey, every_n: u64, start: &FieldBuildRecord) -> Self {
         Self {
             store,
             key,
@@ -193,7 +193,7 @@ mod tests {
         _dir: tempfile::TempDir,
         _db: AsyncDb,
         store: Arc<MaintenanceStore>,
-        key: TaskKey,
+        key: JobKey,
     }
 
     async fn fixture() -> Fixture {
@@ -202,7 +202,7 @@ mod tests {
             .await
             .unwrap();
         let store = Arc::new(MaintenanceStore::open(&db).await.unwrap());
-        let key = TaskKey::field_build(NamespaceId::random().unwrap(), 3);
+        let key = JobKey::field_build(NamespaceId::random().unwrap(), 3);
         Fixture {
             _dir: dir,
             _db: db,

@@ -276,7 +276,7 @@ impl DocStore {
         }
 
         if let Some(ns_id) = self.schemas.get(namespace).and_then(|s| s.ns_id()) {
-            self.maintenance.delete(TaskKey::vector_reindex(ns_id))?;
+            self.maintenance.delete(JobKey::vector_reindex(ns_id))?;
         }
 
         info!("drop_vector_index_data: namespace='{namespace}' cleanup complete");

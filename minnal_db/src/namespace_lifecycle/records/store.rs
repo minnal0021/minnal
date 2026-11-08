@@ -16,8 +16,8 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::key::TaskKey;
 use crate::namespace::NamespaceId;
+use crate::namespace_lifecycle::JobKey;
 use crate::namespace_lifecycle::LifecycleError;
 use crate::{AsyncDb, AsyncNamespace};
 
@@ -28,7 +28,7 @@ pub const MAINTENANCE_NAMESPACE: &str = "system_namespace_maintenance";
 /// in memory as its stored JSON.
 pub(crate) struct MaintenanceStore {
     ns: AsyncNamespace,
-    map: RwLock<BTreeMap<TaskKey, Arc<[u8]>>>,
+    map: RwLock<BTreeMap<JobKey, Arc<[u8]>>>,
     /// Held by every write across its persist and its cache update.
     writer: Mutex<()>,
 }
@@ -41,7 +41,7 @@ impl MaintenanceStore {
         let ns = db.namespace(MAINTENANCE_NAMESPACE.to_owned()).await?;
         let mut map = BTreeMap::new();
         for (key, value) in ns.scan_prefix(Vec::new()).await? {
-            match TaskKey::from_bytes(&key) {
+            match JobKey::from_bytes(&key) {
                 Some(k) => {
                     map.insert(k, Arc::from(value));
                 }
@@ -60,7 +60,7 @@ impl MaintenanceStore {
     /// A record that does not parse as `T` is an error, not an absence: records
     /// are never torn, so it means a record of another shape, and treating it as
     /// missing could restart or skip a task.
-    pub(crate) fn get<T: DeserializeOwned>(&self, key: TaskKey) -> Result<Option<T>, LifecycleError> {
+    pub(crate) fn get<T: DeserializeOwned>(&self, key: JobKey) -> Result<Option<T>, LifecycleError> {
         let Some(bytes) = self.map.read().get(&key).cloned() else {
             return Ok(None);
         };
@@ -70,13 +70,13 @@ impl MaintenanceStore {
     }
 
     /// Save `record` at `key`, durably.
-    pub(crate) fn put<T: Serialize>(&self, key: TaskKey, record: &T) -> Result<(), LifecycleError> {
+    pub(crate) fn put<T: Serialize>(&self, key: JobKey, record: &T) -> Result<(), LifecycleError> {
         let _w = self.writer.lock();
         self.persist(key, record)
     }
 
     /// Remove the record at `key`, durably. Removing an absent record is a no-op.
-    pub(crate) fn delete(&self, key: TaskKey) -> Result<(), LifecycleError> {
+    pub(crate) fn delete(&self, key: JobKey) -> Result<(), LifecycleError> {
         let _w = self.writer.lock();
         self.remove(key)
     }
@@ -91,12 +91,12 @@ impl MaintenanceStore {
     }
 
     /// The keys of `store`'s records, in key order.
-    pub(crate) fn keys_of(&self, store: NamespaceId) -> Vec<TaskKey> {
-        self.map.read().keys().filter(|k| k.store == store).copied().collect()
+    pub(crate) fn keys_of(&self, store: NamespaceId) -> Vec<JobKey> {
+        self.map.read().keys().filter(|k| k.namespace == store).copied().collect()
     }
 
     /// Persist and cache. Caller holds `writer`.
-    fn persist<T: Serialize>(&self, key: TaskKey, record: &T) -> Result<(), LifecycleError> {
+    fn persist<T: Serialize>(&self, key: JobKey, record: &T) -> Result<(), LifecycleError> {
         let json = serde_json::to_vec(record).map_err(|e| LifecycleError::Record(e.to_string()))?;
         crate::support::run_blocking_pass(|| self.ns.put_blocking(&key.to_bytes(), &json))?;
         self.map.write().insert(key, Arc::from(json));
@@ -104,7 +104,7 @@ impl MaintenanceStore {
     }
 
     /// Delete and uncache. Caller holds `writer`.
-    fn remove(&self, key: TaskKey) -> Result<(), LifecycleError> {
+    fn remove(&self, key: JobKey) -> Result<(), LifecycleError> {
         if !self.map.read().contains_key(&key) {
             return Ok(());
         }
@@ -139,19 +139,19 @@ mod tests {
         let b = NamespaceId::random().unwrap();
         {
             let (db, store) = open(&dir).await;
-            store.put(TaskKey::field_build(a, 1), &Note { n: 1 }).unwrap();
-            store.put(TaskKey::reindex_all(a), &Note { n: 2 }).unwrap();
-            store.put(TaskKey::vector_reindex(b), &Note { n: 3 }).unwrap();
-            store.put(TaskKey::field_build(a, 1), &Note { n: 11 }).unwrap();
-            store.delete(TaskKey::reindex_all(a)).unwrap();
+            store.put(JobKey::field_build(a, 1), &Note { n: 1 }).unwrap();
+            store.put(JobKey::reindex_all(a), &Note { n: 2 }).unwrap();
+            store.put(JobKey::vector_reindex(b), &Note { n: 3 }).unwrap();
+            store.put(JobKey::field_build(a, 1), &Note { n: 11 }).unwrap();
+            store.delete(JobKey::reindex_all(a)).unwrap();
             // A write returns once it is durable: nothing is flushed here.
             drop(store);
             db.crash().await;
         }
         let (_db, store) = open(&dir).await;
-        assert_eq!(store.get::<Note>(TaskKey::field_build(a, 1)).unwrap(), Some(Note { n: 11 }));
-        assert_eq!(store.get::<Note>(TaskKey::reindex_all(a)).unwrap(), None);
-        assert_eq!(store.keys_of(b), vec![TaskKey::vector_reindex(b)]);
+        assert_eq!(store.get::<Note>(JobKey::field_build(a, 1)).unwrap(), Some(Note { n: 11 }));
+        assert_eq!(store.get::<Note>(JobKey::reindex_all(a)).unwrap(), None);
+        assert_eq!(store.keys_of(b), vec![JobKey::vector_reindex(b)]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -159,19 +159,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (a, b) = (NamespaceId::random().unwrap(), NamespaceId::random().unwrap());
         let (_db, store) = open(&dir).await;
-        store.put(TaskKey::field_build(a, 1), &Note { n: 1 }).unwrap();
-        store.put(TaskKey::field_build(a, 2), &Note { n: 2 }).unwrap();
-        store.put(TaskKey::field_build(b, 1), &Note { n: 3 }).unwrap();
+        store.put(JobKey::field_build(a, 1), &Note { n: 1 }).unwrap();
+        store.put(JobKey::field_build(a, 2), &Note { n: 2 }).unwrap();
+        store.put(JobKey::field_build(b, 1), &Note { n: 3 }).unwrap();
         store.delete_store(a).unwrap();
         assert!(store.keys_of(a).is_empty());
-        assert_eq!(store.keys_of(b), vec![TaskKey::field_build(b, 1)]);
+        assert_eq!(store.keys_of(b), vec![JobKey::field_build(b, 1)]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_record_of_another_shape_is_an_error_not_an_absence() {
         let dir = TempDir::new().unwrap();
         let (_db, store) = open(&dir).await;
-        let key = TaskKey::reindex_all(NamespaceId::random().unwrap());
+        let key = JobKey::reindex_all(NamespaceId::random().unwrap());
         store.put(key, &"text").unwrap();
         assert!(store.get::<Note>(key).is_err());
     }

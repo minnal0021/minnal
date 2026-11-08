@@ -135,3 +135,21 @@ async fn the_governor_finishes_what_it_finds_at_start() {
     wait_for(&store, "new", Some(NamespaceState::Created)).await;
     store.shutdown().await.unwrap();
 }
+
+/// A store left in maintenance with no live job (its last job ended, a crash
+/// came before the move back) is made `Created` when the governor starts, and
+/// can then be dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_governor_frees_a_store_left_in_maintenance_with_no_job() {
+    let db_dir = TempDir::new().unwrap();
+    let store = Arc::new(open_fresh(db_dir.path()).await);
+    store.create(make_schema("docs", vec![])).await.unwrap();
+    store
+        .schemas
+        .transition("docs", &[NamespaceState::Created], NamespaceState::IndexMaintenance)
+        .unwrap();
+    store.start_lifecycle(quick(3));
+    wait_for(&store, "docs", Some(NamespaceState::Created)).await;
+    store.remove("docs").await.unwrap();
+    store.shutdown().await.unwrap();
+}

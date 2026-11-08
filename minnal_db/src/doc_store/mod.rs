@@ -66,7 +66,7 @@ pub use self::vector::{ReindexStats, VecReindexProgress};
 pub(crate) use self::write_gate::{InFlightWrite, InFlightWrites};
 pub(crate) use self::write_gate::{LifecycleLocks, WriteGate, WriteGuard};
 pub use crate::namespace_lifecycle::{FieldBuildRecord, LifecycleConfig, MAINTENANCE_NAMESPACE, NamespaceState};
-pub(crate) use crate::namespace_lifecycle::{MaintenanceStore, TaskKey};
+pub(crate) use crate::namespace_lifecycle::{JobKey, MaintenanceStore};
 #[cfg(feature = "semantic-search")]
 pub use crate::semantic_search::context::{NamespaceSemantics, SemanticSearchContext};
 
@@ -123,6 +123,8 @@ pub struct DocStore {
     /// Maintenance tasks and their progress (index builds, reindexes): the only
     /// way the doc store reads or writes one.
     maintenance: Arc<MaintenanceStore>,
+    /// The index jobs of every store, recorded in `maintenance`.
+    jobs: Arc<crate::namespace_lifecycle::Jobs>,
     /// Semantic-search context used by query paths (embedding + cluster index).
     /// `None` when semantic search is not configured.
     #[cfg(feature = "semantic-search")]
@@ -207,6 +209,7 @@ impl DocStore {
             db,
             db_path,
             schemas,
+            jobs: Arc::new(crate::namespace_lifecycle::Jobs::new(Arc::clone(&maintenance))),
             maintenance,
             #[cfg(feature = "semantic-search")]
             semantic_ctx: None,
@@ -236,7 +239,7 @@ impl DocStore {
             let finished = match state {
                 NamespaceState::Creating => store.provision(&namespace).await,
                 NamespaceState::Deleting => store.teardown(&namespace).await,
-                NamespaceState::Created => continue,
+                NamespaceState::Created | NamespaceState::IndexMaintenance => continue,
             };
             if let Err(e) = finished {
                 log::error!("store '{namespace}' is left {}: finishing it at open failed: {e}", state.as_str());
@@ -246,7 +249,7 @@ impl DocStore {
         let schemas = store.load_all_schemas()?;
         info!("loaded {} schema(s)", schemas.len());
         for schema in schemas {
-            if store.schemas.state(&schema.namespace) != Some(NamespaceState::Created) {
+            if !store.schemas.state(&schema.namespace).is_some_and(NamespaceState::is_ready) {
                 continue;
             }
             if let Some(ns_id) = schema.ns_id {
@@ -258,7 +261,7 @@ impl DocStore {
         let kv_schemas = store.load_all_kv_schemas()?;
         info!("loaded {} KV schema(s)", kv_schemas.len());
         for schema in kv_schemas {
-            if schema.ns_id.is_some() && store.schemas.state(&schema.namespace) == Some(NamespaceState::Created) {
+            if schema.ns_id.is_some() && store.schemas.state(&schema.namespace).is_some_and(NamespaceState::is_ready) {
                 debug!("opening KV namespace '{}'", schema.namespace);
                 store.db.namespace(schema.namespace.clone()).await?;
             }

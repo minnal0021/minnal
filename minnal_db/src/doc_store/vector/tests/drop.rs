@@ -14,7 +14,7 @@ async fn a_kv_store_can_drop_its_vector_index() {
     vector_kv::create_vector_namespaces(&store.db, "sem_kv").await.unwrap();
     assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_some());
     let ns_id = store.load_kv_schema("sem_kv").unwrap().ns_id.unwrap();
-    let record = TaskKey::vector_reindex(ns_id);
+    let record = JobKey::vector_reindex(ns_id);
     store.maintenance.put(record, &"a record the drop must remove").unwrap();
 
     store.disable_semantic_search("sem_kv").unwrap();

@@ -336,7 +336,7 @@ impl DocStore {
             // signal is the wrong way to fail.
             let building = match self
                 .maintenance
-                .get::<crate::doc_store::FieldBuildRecord>(crate::doc_store::TaskKey::field_build(ns_id, fid))
+                .get::<crate::doc_store::FieldBuildRecord>(crate::doc_store::JobKey::field_build(ns_id, fid))
             {
                 Ok(record) => record.is_some_and(|r| r.status != crate::namespace_lifecycle::BuildStatus::Complete),
                 Err(_) => true,
