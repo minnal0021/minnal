@@ -22,8 +22,24 @@ pub(crate) fn make_schema(namespace: &str, indices: Vec<IndexSpec>) -> DocStoreS
     }
 }
 
+/// Open the store at `db_dir`, as a restart would.
+///
+/// A test that simulates a kill drops its store without `shutdown` and opens
+/// it again. A background worker's pass can still hold the old database, and
+/// with it the directory lock, for a while after the drop (on a real disk its
+/// fsyncs make that long enough to hit). A restart waits for the old process
+/// to exit; this waits, up to a bound, for the old instance in this process to
+/// let go. A lock held by another process still fails at once.
 pub(crate) async fn open_fresh(db_dir: &Path) -> DocStore {
-    DocStore::open_with_config(db_dir, crate::support::test_db_config()).await.unwrap()
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match DocStore::open_with_config(db_dir, crate::support::test_db_config()).await {
+            Err(DocStoreError::StoreLocked { owner_pid, .. }) if owner_pid == Some(std::process::id()) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            opened => return opened.unwrap(),
+        }
+    }
 }
 
 pub(crate) fn make_kv_schema(namespace: &str, key_type: KvKeyType, value_type: KvValueType) -> KvStoreSchema {
