@@ -73,7 +73,14 @@ impl DocStore {
             JobKind::FieldBuild(_) => self.field_build_job(namespace, key).await,
             JobKind::FieldDrop(_) => self.field_drop_job(namespace, key).await,
             JobKind::ReindexAll => self.reindex_all_job(namespace, key).await,
-            other => Err(DocStoreError::Io(std::io::Error::other(format!("no body for index job {other}")))),
+            JobKind::VectorEnable => self.vector_enable_job(namespace, key).await,
+            JobKind::VectorCleanup => self.vector_cleanup_job(namespace, key).await,
+            #[cfg(feature = "semantic-search")]
+            JobKind::VectorReindex => self.vector_reindex_job(namespace, key).await,
+            #[cfg(feature = "semantic-search")]
+            JobKind::PartitionRebuild => self.partition_rebuild_job(namespace, key).await,
+            #[cfg(not(feature = "semantic-search"))]
+            JobKind::VectorReindex | JobKind::PartitionRebuild => Err(DocStoreError::SemanticSearchNotCompiled),
         }
     }
 

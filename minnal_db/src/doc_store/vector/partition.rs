@@ -1,5 +1,5 @@
 //! A store's vector partition through the doc store: health, centres, recall
-//! checks, probe traces, history and rebuilds.
+//! checks, probe traces, history, and rebuilds (a `partition_rebuild` job).
 
 use crate::doc_store::*;
 
@@ -161,21 +161,118 @@ impl DocStore {
         Ok(ctx.partition_history(&self.db, namespace, kind, limit).await?)
     }
 
-    /// Start rebuilding `namespace`'s partition from its codes (design doc M4)
-    /// in the background: k-means into `postings` postings (default: as many as
-    /// are active), every chunk moved to its nearest, then the usual splits and
-    /// merges. No embedding call is made. Progress and the result show in
-    /// [`vector_rebuild_status`](Self::vector_rebuild_status). Fails with
-    /// [`DocStoreError::VecRebuildInProgress`] while one is running.
+    /// Rebuild `namespace`'s partition from its codes (design doc M4), as a
+    /// `partition_rebuild` job in the background; returns the job's name. K-means
+    /// into `postings` postings (default: as many as are active), every chunk
+    /// moved to its nearest, then the usual splits and merges. No embedding call
+    /// is made. Progress and the result show in
+    /// [`vector_rebuild_status`](Self::vector_rebuild_status). Refused with
+    /// [`DocStoreError::JobConflict`] while another vector job of the store runs.
     #[cfg(feature = "semantic-search")]
-    pub fn start_vector_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<(), DocStoreError> {
-        let (ctx, settings, ns_id) = self.vector_admin_target(namespace)?;
-        Ok(ctx.start_rebuild(&self.db, namespace, ns_id, settings, postings)?)
+    pub fn start_vector_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<String, DocStoreError> {
+        self.running_governor()?;
+        let key = self.start_partition_rebuild(namespace, postings)?;
+        self.submit_job(namespace, key)?;
+        Ok(key.kind.name().to_owned())
     }
 
-    /// `namespace`'s last partition rebuild since the server started.
+    /// [`start_vector_rebuild`](Self::start_vector_rebuild), returning once
+    /// the rebuild has ended.
+    #[cfg(feature = "semantic-search")]
+    pub async fn rebuild_vector_partition(&self, namespace: &str, postings: Option<usize>) -> Result<(), DocStoreError> {
+        let key = self.start_partition_rebuild(namespace, postings)?;
+        self.run_job(namespace, key).await
+    }
+
+    #[cfg(feature = "semantic-search")]
+    pub(in crate::doc_store) fn start_partition_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<JobKey, DocStoreError> {
+        self.job_runner_ready()?;
+        let (_, _, ns_id) = self.vector_admin_target(namespace)?;
+        let key = JobKey::new(ns_id, crate::namespace_lifecycle::JobKind::PartitionRebuild);
+        let progress = RebuildProgress {
+            postings,
+            above: None,
+            report: None,
+        };
+        self.start_job(namespace, key, "partition", &progress)?;
+        Ok(key)
+    }
+
+    /// The body of a `partition_rebuild` job.
+    ///
+    /// A run that started before (a crash, or a failure) is not run again:
+    /// the partition's journal finished the rebuild if it got past its
+    /// publish, and abandoned it otherwise, and the job is closed with that
+    /// outcome. K-means is minutes on a large store, and repeating it after
+    /// an error would repeat whatever caused it.
+    #[cfg(feature = "semantic-search")]
+    pub(in crate::doc_store) async fn partition_rebuild_job(&self, namespace: &str, key: JobKey) -> Result<(), DocStoreError> {
+        use crate::doc_store::indexing::record_error;
+        let Some(record) = self.jobs.get(key)?.filter(crate::namespace_lifecycle::JobRecord::is_live) else {
+            return Ok(());
+        };
+        let mut progress: RebuildProgress = record.progress().ok_or_else(|| record_error(key, "no rebuild progress"))?;
+        let (ctx, settings, ns_id) = self.vector_admin_target(namespace)?;
+        if let Some(above) = progress.above {
+            if ctx.rebuilt_above(&self.db, namespace, ns_id, &settings, above).await? {
+                return Ok(());
+            }
+            // Closed failed here, so the governor does not run it again.
+            let error = "the rebuild was cut short before it published, and recovery abandoned it; start it again".to_owned();
+            self.jobs.finish(self, namespace, key, Err(error))?;
+            return Ok(());
+        }
+        let cancelled = || self.jobs.is_cancelling(key);
+        if cancelled() {
+            return Ok(());
+        }
+        progress.above = Some(ctx.max_posting_id(&self.db, namespace, ns_id, &settings).await?);
+        self.jobs.save_progress(key, serde_json::to_value(&progress)?)?;
+        if let Some(report) = ctx.rebuild(&self.db, namespace, ns_id, &settings, progress.postings, &cancelled).await? {
+            // A cancel asked after the plan was recorded came too late.
+            self.jobs.refuse_cancel(key)?;
+            progress.report = Some(report);
+            self.save_job_progress(key, &progress);
+        }
+        Ok(())
+    }
+
+    /// `namespace`'s last partition rebuild (its `partition_rebuild` job), if
+    /// it has had one.
     #[cfg(feature = "semantic-search")]
     pub fn vector_rebuild_status(&self, namespace: &str) -> Option<crate::semantic_search::ivf_split::rebuild::RebuildStatus> {
-        self.semantic_ctx.as_ref()?.rebuild_status(namespace)
+        use crate::semantic_search::ivf_split::rebuild::{RebuildState, RebuildStatus};
+        let ns_id = self.schemas.get(namespace)?.ns_id()?;
+        let record = self
+            .jobs
+            .get(JobKey::new(ns_id, crate::namespace_lifecycle::JobKind::PartitionRebuild))
+            .ok()??;
+        let progress: RebuildProgress = record.progress()?;
+        let state = match record.status {
+            BuildStatus::Complete => RebuildState::Done,
+            BuildStatus::Failed => RebuildState::Failed,
+            BuildStatus::Cancelled => RebuildState::Cancelled,
+            BuildStatus::Pending | BuildStatus::Running | BuildStatus::Cancelling => RebuildState::Running,
+        };
+        Some(RebuildStatus {
+            state,
+            postings_requested: progress.postings,
+            started_at_ms: record.started_at_ms,
+            finished_at_ms: record.status.is_terminal().then_some(record.updated_at_ms),
+            report: progress.report,
+            error: record.error,
+        })
     }
+}
+
+/// The progress of a `partition_rebuild` job.
+#[cfg(feature = "semantic-search")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RebuildProgress {
+    /// Postings asked for (`None`: as many as are active).
+    postings: Option<usize>,
+    /// The highest posting id before the rebuild started; set when it starts.
+    above: Option<u32>,
+    /// What it did, once done.
+    report: Option<crate::semantic_search::ivf_split::rebuild::RebuildReport>,
 }

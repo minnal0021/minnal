@@ -26,8 +26,6 @@ use crate::{AsyncDb, AsyncNamespace, DbConfig, FieldId};
 use log::warn;
 use log::{debug, info};
 
-#[cfg(feature = "semantic-search")]
-use self::indexing::progress::now_ms;
 use self::pagination::clamp_cursor;
 use self::schema::store::SchemaStore;
 #[cfg(feature = "semantic-search")]
@@ -139,11 +137,6 @@ pub struct DocStore {
     /// [`DocStore::with_semantic_search`]; defaults are used otherwise.
     #[cfg(feature = "semantic-search")]
     vector_index_config: VectorIndexConfig,
-    /// Namespaces whose `index_all` / `kv_index_all` is still enqueueing in this
-    /// process. A second reindex of one of them is refused; the on-disk record
-    /// only reports progress (see [`DocStore::vec_reindex_progress`]).
-    #[cfg(feature = "semantic-search")]
-    vec_reindexing: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Writes in progress per store, which a drop waits for.
     writes: Arc<WriteGate>,
     /// Keeps a store's create, amendments and drop apart ([`LifecycleLocks`]).
@@ -210,7 +203,6 @@ impl DocStore {
             #[cfg(feature = "semantic-search")]
             worker_handle: std::sync::Mutex::new(None),
             #[cfg(feature = "semantic-search")]
-            vec_reindexing: Arc::default(),
             #[cfg(feature = "semantic-search")]
             vector_index_config: VectorIndexConfig::default(),
             writes: Arc::default(),
@@ -259,9 +251,9 @@ impl DocStore {
         }
 
         // Before any vector worker can start (`with_semantic_search` comes after
-        // this): finish vector-index drops a crash interrupted.
-        #[cfg(feature = "semantic-search")]
-        store.finish_interrupted_vector_index_drops().await?;
+        // this). A vector-index drop a crash interrupted is a live
+        // `vector_cleanup` job, which the governor (or `run_pending_jobs`)
+        // finishes.
         #[cfg(feature = "semantic-search")]
         store.ensure_vector_indexes().await?;
 

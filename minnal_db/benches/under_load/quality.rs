@@ -82,14 +82,8 @@ pub async fn quality(args: &[String]) -> Result<(), String> {
     for stage in ["before", "rebuilt"] {
         if stage == "rebuilt" {
             let t = Instant::now();
-            store.start_vector_rebuild(ns, None).map_err(|e| format!("rebuild: {e}"))?;
-            let status = loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                match store.vector_rebuild_status(ns) {
-                    Some(s) if s.state != RebuildState::Running => break s,
-                    _ => {}
-                }
-            };
+            store.rebuild_vector_partition(ns, None).await.map_err(|e| format!("rebuild: {e}"))?;
+            let status = store.vector_rebuild_status(ns).ok_or("rebuild: no status")?;
             if status.state != RebuildState::Done {
                 return Err(format!("rebuild failed: {:?}", status.error));
             }

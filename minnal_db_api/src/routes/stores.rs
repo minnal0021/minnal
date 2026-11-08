@@ -9,8 +9,6 @@
 //! PATCH  /stores/{ns}/schema     → amend schema (doc stores only; KV → 409)
 //! ```
 
-use std::sync::Arc;
-
 use axum::{
     Json,
     extract::{Path, State},
@@ -20,7 +18,7 @@ use axum::{
 use minnal_db::doc_store::schema::vector_settings::{MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 use minnal_db::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, SchemaError, StoreType};
 use serde::Deserialize;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{AppState, error::AppError};
 
@@ -210,16 +208,13 @@ pub async fn amend_schema(
     // Search defaults apply to doc and KV stores alike.
     if let AmendRequest::UpdateVectorSearch { search, maintenance } = &req {
         state.store.update_vector_search(&ns, search, maintenance.as_ref()).await?;
-        return Ok(StatusCode::NO_CONTENT);
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
     // Enabling the vector index (single- or multi-field) requires semantic
     // search infrastructure, and a model the embedding service serves.
     if matches!(&req, AmendRequest::AddEmbeddingAttribute { .. } | AmendRequest::EnableVectorIndex { .. }) {
         require_semantic_search(&state)?;
-        if state.vec_index_cleanup.lock().contains(&ns) {
-            return Err(DocStoreError::VectorCleanupInProgress { namespace: ns }.into());
-        }
         // Apply to a copy first: the probe needs the resulting settings, and a
         // rejected model must leave the stored schema untouched.
         let mut preview = state.store.get_schema(&ns)?;
@@ -246,36 +241,20 @@ pub async fn amend_schema(
         }
     }
 
-    // For RemoveAttribute we use the dedicated path that returns whether the
-    // last embedding field was removed (triggering background vector cleanup).
+    // Removing the last embedding field turns semantic search off, and the
+    // vector index is removed by a `vector_cleanup` job: 202 with its name.
     if let AmendRequest::RemoveAttribute { name } = &req {
-        // Claimed before semantic search can go off, as the drop routes do. `false`
-        // means a cleanup is already running, and this spawns no other.
-        let claimed = state.vec_index_cleanup.lock().insert(ns.clone());
-        let removed = state.store.remove_attribute(&ns, name);
-        if claimed && !matches!(removed, Ok(true)) {
-            state.vec_index_cleanup.lock().remove(&ns);
-        }
-
-        if removed? && claimed {
-            info!(namespace = %ns, "last embedding field removed — cleaning up vector index data in background");
-            let store = Arc::clone(&state.store);
-            let ops_ref = Arc::clone(&state.vec_index_cleanup);
-            let ns_clone = ns.clone();
-            tokio::spawn(async move {
-                match store.drop_vector_index_data(&ns_clone).await {
-                    Ok(()) => info!(namespace = %ns_clone, "vector index data cleanup complete"),
-                    Err(e) => error!(namespace = %ns_clone, error = %e, "vector index data cleanup failed"),
-                }
-                ops_ref.lock().remove(&ns_clone);
-            });
-        }
-
-        return Ok(StatusCode::NO_CONTENT);
+        return Ok(match state.store.begin_remove_attribute(&ns, name)? {
+            Some(job) => {
+                info!(namespace = %ns, "last embedding field removed — vector index cleanup started");
+                crate::routes::indices::job_accepted(&ns, &job).into_response()
+            }
+            None => StatusCode::NO_CONTENT.into_response(),
+        });
     }
 
     state.store.amend(&ns, req.into()).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Refuse a semantic-search operation when the server runs without semantic

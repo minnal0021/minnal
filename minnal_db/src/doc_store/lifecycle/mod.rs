@@ -15,3 +15,5 @@ mod jobs;
 mod provision;
 #[cfg(test)]
 mod tests;
+
+pub(in crate::doc_store) use amend::apply_amendment;

@@ -125,6 +125,21 @@ impl Jobs {
         self.records.put(key, &record)
     }
 
+    /// Take back a cancel of job `key` that came too late: its body got past
+    /// the point a cancel can stop it, and finishes. The job then ends
+    /// complete, not cancelled.
+    pub fn refuse_cancel(&self, key: JobKey) -> Result<(), LifecycleError> {
+        let _g = self.lock.lock();
+        if let Some(mut record) = self.records.get::<JobRecord>(key)?
+            && record.status == BuildStatus::Cancelling
+        {
+            record.status = BuildStatus::Running;
+            record.updated_at_ms = crate::support::now_ms();
+            self.records.put(key, &record)?;
+        }
+        Ok(())
+    }
+
     /// Whether job `key` has been asked to stop. A memory read, for a job body
     /// to check between batches.
     pub fn is_cancelling(&self, key: JobKey) -> bool {

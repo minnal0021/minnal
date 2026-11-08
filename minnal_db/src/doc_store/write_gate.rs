@@ -76,12 +76,6 @@ impl WriteGate {
         })
     }
 
-    /// Whether `namespace` is being dropped.
-    #[cfg(feature = "semantic-search")]
-    pub(crate) fn is_closed(&self, namespace: &str) -> bool {
-        self.state.lock().closed.contains(namespace)
-    }
-
     /// Refuse new writes to `namespace` and wait for those in progress.
     pub(crate) async fn close(&self, namespace: &str) {
         self.state.lock().closed.insert(namespace.to_owned());

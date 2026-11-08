@@ -43,11 +43,11 @@ async fn open_cost_with_a_full_vector_queue() {
 }
 
 /// A vector-index drop cut short by a crash (schema saved with semantic
-/// search off, data and queue not yet cleared) is finished at the next open,
+/// search off, data and queue not yet cleared) is finished at the next start,
 /// before a worker could process the leftover queue entries.
 #[cfg(feature = "semantic-search")]
 #[tokio::test]
-async fn an_interrupted_vector_index_drop_is_finished_at_open() {
+async fn an_interrupted_vector_index_drop_is_finished_at_the_next_start() {
     let db_dir = TempDir::new().unwrap();
     {
         let store = open_kv_semantic(&db_dir).await;
@@ -63,17 +63,12 @@ async fn an_interrupted_vector_index_drop_is_finished_at_open() {
             .kv_put("sem_kv", &serde_json::json!("y"), &serde_json::json!("other text"))
             .await
             .unwrap(); // still queued
-        // The drop's first step only: the schema, then a crash.
-        store
-            .schemas
-            .update_kv("sem_kv", |schema| {
-                schema.semantic_search_enabled = false;
-                Ok(())
-            })
-            .unwrap();
+        // The drop's first step only: the job and the schema, then a crash.
+        store.start_vector_cleanup("sem_kv", || store.turn_semantic_search_off("sem_kv")).unwrap();
         store.db.shutdown().await.unwrap();
     }
     let store = open_fresh(db_dir.path()).await;
+    store.run_pending_jobs().await.unwrap();
     let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
     assert!(
         !names.iter().any(|n| vector_kv::companion_base(n) == Some("sem_kv")),
@@ -100,7 +95,6 @@ async fn a_finished_reindex_does_not_block_the_next() {
         vector_kv::remove_queue_entry(&store.db, &e.namespace, &e.doc_id_bytes).await.unwrap();
     }
     assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, BuildStatus::Complete);
-    store.check_kv_index_all_preconditions("sem_kv").unwrap();
     store.kv_index_all("sem_kv").await.expect("a second reindex must be allowed");
     // While its work is still queued, it is running.
     assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, BuildStatus::Running);
@@ -143,11 +137,11 @@ async fn a_reindex_covers_every_page() {
     assert_eq!((progress.total_enqueued, progress.exhausted_cleared), (n, 2));
 }
 
-/// A reindex interrupted by a crash mid-enqueue is reported as failed and does
-/// not block a new one.
+/// A reindex cut short by a crash leaves its job live; the next start
+/// resumes it and enqueues what it had not, and a new one can follow.
 #[cfg(feature = "semantic-search")]
 #[tokio::test]
-async fn a_reindex_interrupted_by_a_crash_does_not_block_the_next() {
+async fn a_reindex_interrupted_by_a_crash_is_resumed_at_the_next_start() {
     let db_dir = TempDir::new().unwrap();
     {
         let store = open_kv_semantic(&db_dir).await;
@@ -155,27 +149,22 @@ async fn a_reindex_interrupted_by_a_crash_does_not_block_the_next() {
             .kv_put("sem_kv", &serde_json::json!("x"), &serde_json::json!("some text"))
             .await
             .unwrap();
-        let ns_id = store.load_kv_schema("sem_kv").unwrap().ns_id.unwrap();
+        // The worker embedded it: nothing queued.
+        for e in store.list_queue_entries().await {
+            vector_kv::remove_queue_entry(&store.db, &e.namespace, &e.doc_id_bytes).await.unwrap();
+        }
         // What a crash right after the reindex started leaves behind.
-        store
-            .maintenance
-            .put(
-                JobKey::vector_reindex(ns_id),
-                &VecReindexProgress {
-                    status: BuildStatus::Running,
-                    started_at_ms: now_ms(),
-                    completed_at_ms: None,
-                    total_enqueued: 0,
-                    exhausted_cleared: 0,
-                    error: None,
-                    enqueue_done: false,
-                },
-            )
-            .unwrap();
+        store.start_vector_reindex("sem_kv").unwrap();
         store.db.shutdown().await.unwrap();
     }
     let store = with_worker_notify(open_fresh(db_dir.path()).await);
+    assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, BuildStatus::Running);
+    store.run_pending_jobs().await.unwrap();
+    assert!(
+        vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_some(),
+        "the resumed reindex enqueued it"
+    );
     let progress = store.vec_reindex_progress("sem_kv").await.unwrap();
-    assert_eq!(progress.status, BuildStatus::Failed, "{progress:?}");
+    assert!(progress.enqueue_done && progress.total_enqueued == 1, "{progress:?}");
     store.kv_index_all("sem_kv").await.expect("a new reindex must be allowed");
 }

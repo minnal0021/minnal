@@ -256,7 +256,7 @@ async fn the_cache_matches_storage_after_every_schema_change() {
     check(&store, "add_index").await;
     store.drop_index("docs", "level").await.unwrap();
     check(&store, "drop_index").await;
-    store.remove_attribute("docs", "status").unwrap();
+    store.remove_attribute("docs", "status").await.unwrap();
     check(&store, "remove_attribute").await;
     store.remove_kv("kv").await.unwrap();
     check(&store, "remove_kv").await;

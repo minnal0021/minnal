@@ -5,3 +5,5 @@
 mod build;
 pub mod progress;
 mod reindex_all;
+
+pub(in crate::doc_store) use build::record_error;

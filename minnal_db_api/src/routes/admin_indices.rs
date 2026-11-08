@@ -25,7 +25,7 @@
 //! ```
 
 use crate::limits::Limit;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use axum::{
     Json,
@@ -297,158 +297,30 @@ pub async fn attribute_reindex_doc(
 
 // ── Vector index operations ───────────────────────────────────────────────────
 
-/// Whether a vector reindex of store `ns` (document or KV) is still enqueueing.
-pub(crate) fn vector_reindex_running(state: &AppState, ns: &str) -> bool {
-    let check = match state.store.store_type(ns) {
-        Ok(minnal_db::StoreType::Kv) => state.store.check_kv_index_all_preconditions(ns),
-        _ => state.store.check_index_all_preconditions(ns),
-    };
-    matches!(check, Err(DocStoreError::VecReindexInProgress { .. }))
-}
-
 /// `DELETE /admin/indices/{ns}/vector/drop-all`
 ///
-/// Clears all vector index data for `{ns}`, a document or KV store: embedding queue entries and the
-/// `{ns}_sparse_vector`, `{ns}_dense_vector`, and `{ns}_sparse_vector_meta` companion stores.
-/// The schema is updated synchronously (semantic search disabled) before the
-/// background cleanup runs, preventing new embeddings from being enqueued.
-/// Returns `202 Accepted`.
-/// Returns `409` when a cleanup or reindex is already in progress.
-/// Returns `422` when semantic search is not enabled for `{ns}`.
-pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // Claim the cleanup before semantic search goes off, atomically with the check:
-    // an enable landing in between would see nothing running.
-    if !state.vec_index_cleanup.lock().insert(ns.clone()) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("vector index cleanup already in progress for '{ns}'")
-            })),
-        ));
-    }
-    let release = || {
-        state.vec_index_cleanup.lock().remove(&ns);
-    };
-
-    // Block if a reindex is running.
-    if vector_reindex_running(&state, &ns) {
-        release();
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("a vector index reindex is already running for '{ns}' — wait for it to complete")
-            })),
-        ));
-    }
-
-    // Disable semantic search in the schema immediately so new writes stop enqueuing.
-    state.store.disable_semantic_search(&ns).map_err(|e| {
-        release();
-        let status = if matches!(e, DocStoreError::SemanticSearchNotEnabled { .. }) {
-            StatusCode::UNPROCESSABLE_ENTITY
-        } else if matches!(e, DocStoreError::NotFound { .. }) {
-            StatusCode::NOT_FOUND
-        } else {
-            error!(namespace = %ns, error = %e, "vector drop-all: failed to disable semantic search");
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (status, Json(serde_json::json!({ "error": e.to_string() })))
-    })?;
-
+/// Turns semantic search off for `{ns}`, a document or KV store, and removes
+/// its vector index (embedding queue entries, the vector namespaces and the
+/// partition), as a `vector_cleanup` job. Semantic search is off before the
+/// reply, so writes stop enqueueing. Returns `202 Accepted` with the job's
+/// name; `409` while another vector job of the store runs; `422` when
+/// semantic search is not enabled.
+pub async fn vector_drop_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
+    let job = state.store.begin_drop_vector_index(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
     info!(namespace = %ns, "vector drop-all accepted — running in background");
-
-    let store = Arc::clone(&state.store);
-    let ops_ref = Arc::clone(&state.vec_index_cleanup);
-
-    tokio::spawn(async move {
-        match store.drop_vector_index_data(&ns).await {
-            Ok(()) => info!(namespace = %ns, "vector drop-all cleanup complete"),
-            Err(e) => error!(namespace = %ns, error = %e, "vector drop-all cleanup failed"),
-        }
-        ops_ref.lock().remove(&ns);
-    });
-
-    Ok(StatusCode::ACCEPTED)
+    Ok(crate::routes::indices::job_accepted(&ns, &job))
 }
 
 /// `POST /admin/indices/{ns}/vector/reindex-all`
 ///
-/// Re-enqueues every document in `{ns}` for embedding (equivalent to a fresh
-/// full index build).  Returns `202 Accepted`.
-/// Returns `409` when a reindex is already running or a cleanup is active.
-/// Returns `422` when semantic search is not enabled.
-/// Returns `404` when the namespace does not exist.
-pub async fn vector_reindex_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // Block if vector cleanup is in progress.
-    {
-        let ops = state.vec_index_cleanup.lock();
-        if ops.contains(&ns) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("vector index cleanup is in progress for '{ns}' — wait for it to complete")
-                })),
-            ));
-        }
-    }
-
-    let is_kv = {
-        let kv_schemas = state.kv_schemas();
-        kv_schemas.contains_key(&ns)
-    };
-
-    let map_precondition_err = |label: &'static str| {
-        move |e: DocStoreError| {
-            let status = match &e {
-                DocStoreError::NotFound { .. } => StatusCode::NOT_FOUND,
-                DocStoreError::SemanticSearchNotEnabled { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-                DocStoreError::VecReindexInProgress { .. } => StatusCode::CONFLICT,
-                _ => {
-                    error!(error = %e, "{label}: unexpected error");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            };
-            (status, Json(serde_json::json!({ "error": e.to_string() })))
-        }
-    };
-
-    if is_kv {
-        state
-            .store
-            .check_kv_index_all_preconditions(&ns)
-            .map_err(map_precondition_err("vector reindex-all (kv)"))?;
-        info!(namespace = %ns, "vector reindex-all (kv) accepted — running in background");
-        tokio::spawn(async move {
-            match state.store.kv_index_all(&ns).await {
-                Ok(stats) => info!(
-                    namespace = %ns,
-                    enqueued = stats.enqueued,
-                    exhausted_cleared = stats.exhausted_cleared,
-                    "vector reindex-all (kv) complete",
-                ),
-                Err(e) => error!(namespace = %ns, error = %e, "vector reindex-all (kv) failed"),
-            }
-        });
-    } else {
-        state
-            .store
-            .check_index_all_preconditions(&ns)
-            .map_err(map_precondition_err("vector reindex-all"))?;
-        info!(namespace = %ns, "vector reindex-all accepted — running in background");
-        tokio::spawn(async move {
-            match state.store.index_all(&ns).await {
-                Ok(stats) => info!(
-                    namespace = %ns,
-                    enqueued = stats.enqueued,
-                    exhausted_cleared = stats.exhausted_cleared,
-                    "vector reindex-all complete",
-                ),
-                Err(e) => error!(namespace = %ns, error = %e, "vector reindex-all failed"),
-            }
-        });
-    }
-
-    Ok(StatusCode::ACCEPTED)
+/// Re-enqueues every document of `{ns}` (document or KV store) for embedding,
+/// as a `vector_reindex` job. Returns `202 Accepted` with the job's name;
+/// `409` while another vector job of the store runs; `422` when semantic
+/// search is not enabled; `404` when the store does not exist.
+pub async fn vector_reindex_all(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
+    let job = state.store.begin_vector_reindex(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
+    info!(namespace = %ns, "vector reindex-all accepted — running in background");
+    Ok(crate::routes::indices::job_accepted(&ns, &job))
 }
 
 // ── POST /admin/indices/{ns}/vector/reindex/{doc_id} ──────────────────────────
@@ -515,19 +387,6 @@ pub async fn vector_reindex_failed(
     State(state): State<AppState>,
     Path(ns): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // Block if vector cleanup is in progress.
-    {
-        let ops = state.vec_index_cleanup.lock();
-        if ops.contains(&ns) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("vector index cleanup is in progress for '{ns}'")
-                })),
-            ));
-        }
-    }
-
     info!(namespace = %ns, "vector reindex-failed — resetting exhausted queue entries");
     let retried = state.store.retry_all_failed_queue_entries(&ns).await.map_err(|e| {
         error!(namespace = %ns, error = %e, "vector reindex-failed: failed to reset queue entries");
@@ -919,9 +778,14 @@ pub async fn vector_rebuild(State(state): State<AppState>, Path(ns): Path<String
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "postings must be at least 1"}))).into_response();
     }
     match state.store.start_vector_rebuild(&ns, postings) {
-        Ok(()) => (
+        Ok(job) => (
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({"namespace": ns, "rebuild": state.store.vector_rebuild_status(&ns)})),
+            Json(serde_json::json!({
+                "namespace": ns,
+                "job": job,
+                "state": minnal_db::NamespaceState::IndexMaintenance.as_str(),
+                "rebuild": state.store.vector_rebuild_status(&ns),
+            })),
         )
             .into_response(),
         Err(e) => crate::routes::AppError::from(e).with_ns(&ns).into_response(),

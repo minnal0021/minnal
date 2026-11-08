@@ -5,11 +5,7 @@ mod id;
 mod limits;
 mod routes;
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use config::DocStoreApiConfig;
 use minnal_db::doc_store::StoredSchema;
@@ -41,8 +37,6 @@ pub struct AppState {
     ///
     /// Used by the `GET /admin/storage/health` endpoint to report uptime.
     pub started_at: Instant,
-    /// Tracks namespaces whose vector index is currently being dropped (background cleanup).
-    pub vec_index_cleanup: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Set while a (background) index checkpoint (field-index flush + compaction)
     /// is running, so the on-demand endpoint can reject overlapping runs instead
     /// of stacking expensive flush/compaction passes.
@@ -182,7 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store: Arc::new(store),
         embedding_service,
         started_at: Instant::now(),
-        vec_index_cleanup: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         index_checkpoint_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 

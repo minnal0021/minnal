@@ -7,8 +7,6 @@
 //! DELETE /stores/{ns}/indices/{field}    → drop field index (a field_drop job, returns 202)
 //! ```
 
-use std::sync::Arc;
-
 use axum::{
     Json,
     extract::{Path, State},
@@ -16,11 +14,11 @@ use axum::{
     response::IntoResponse,
 };
 use minnal_db::{
-    DocStoreError, IndexSpec, NamespaceState,
+    IndexSpec, NamespaceState,
     doc_store::indexing::progress::{IndexBuildSnapshot, IndexId},
     namespace_lifecycle::BuildStatus,
 };
-use tracing::{error, info};
+use tracing::info;
 
 use crate::{AppState, error::AppError};
 
@@ -83,63 +81,13 @@ pub async fn drop_index(State(state): State<AppState>, Path((ns, field)): Path<(
     Ok(job_accepted(&ns, &job))
 }
 
-/// `DELETE /stores/{ns}/indices/vector` — disable semantic search and drop all vector data.
-///
-/// Behaves identically to `DELETE /admin/indices/{ns}/vector/drop-all`.
-/// The schema is updated synchronously before the background cleanup runs.
-/// Returns `202 Accepted`.
-pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<String>) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // Claim the cleanup before semantic search goes off, atomically with the check:
-    // an enable landing in between would see nothing running.
-    if !state.vec_index_cleanup.lock().insert(ns.clone()) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("vector index cleanup already in progress for '{ns}'")
-            })),
-        ));
-    }
-    let release = || {
-        state.vec_index_cleanup.lock().remove(&ns);
-    };
-
-    // Block if a reindex is running.
-    if crate::routes::admin_indices::vector_reindex_running(&state, &ns) {
-        release();
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("a vector index reindex is already running for '{ns}' — wait for it to complete")
-            })),
-        ));
-    }
-
-    // Disable SS in schema synchronously so new writes stop enqueuing.
-    state.store.disable_semantic_search(&ns).map_err(|e| {
-        release();
-        let status = if matches!(e, DocStoreError::SemanticSearchNotEnabled { .. }) {
-            StatusCode::UNPROCESSABLE_ENTITY
-        } else if matches!(e, DocStoreError::NotFound { .. }) {
-            StatusCode::NOT_FOUND
-        } else {
-            error!(namespace = %ns, error = %e, "vector index drop: failed to disable semantic search");
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (status, Json(serde_json::json!({ "error": e.to_string() })))
-    })?;
-
+/// `DELETE /stores/{ns}/indices/vector` — turn semantic search off and remove
+/// the vector index, as a `vector_cleanup` job: `202 Accepted` with the job's
+/// name. Semantic search is off before the reply, so writes stop enqueueing.
+/// The same as `DELETE /admin/indices/{ns}/vector/drop-all`. `422` without
+/// semantic search, `409` while another vector job of the store runs.
+pub async fn drop_vector_index(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
+    let job = state.store.begin_drop_vector_index(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
     info!(namespace = %ns, "vector index drop accepted — running in background");
-
-    let store = Arc::clone(&state.store);
-    let ops_ref = Arc::clone(&state.vec_index_cleanup);
-
-    tokio::spawn(async move {
-        match store.drop_vector_index_data(&ns).await {
-            Ok(()) => info!(namespace = %ns, "vector index cleanup complete"),
-            Err(e) => error!(namespace = %ns, error = %e, "vector index cleanup failed"),
-        }
-        ops_ref.lock().remove(&ns);
-    });
-
-    Ok(StatusCode::ACCEPTED)
+    Ok(job_accepted(&ns, &job))
 }

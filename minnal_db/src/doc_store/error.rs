@@ -147,7 +147,6 @@ impl From<crate::semantic_search::context::ContextError> for DocStoreError {
             E::EmbeddingDimMismatch { model, dim, expected } => Self::EmbeddingDimMismatch { model, dim, expected },
             E::VectorIndexNotSeeded { namespace } => Self::VectorIndexNotSeeded { namespace },
             E::SemanticSearchNotEnabled { namespace } => Self::SemanticSearchNotEnabled { namespace },
-            E::VecRebuildInProgress { namespace } => Self::VecRebuildInProgress { namespace },
             E::EmbeddingFailed(reason) => Self::EmbeddingFailed(reason),
             E::InvalidProbeTrace { namespace, reason } => Self::InvalidProbeTrace { namespace, reason },
             E::Settings(e) => e.into(),
@@ -303,29 +302,10 @@ pub enum DocStoreError {
     #[error("semantic search is not enabled for namespace '{namespace}'")]
     SemanticSearchNotEnabled { namespace: String },
 
-    /// A vector-index reindex (`index_all`) is already running for this namespace.
-    /// Poll `GET /admin/indices/{namespace}/progress` and retry when it finishes.
-    #[error("a vector index reindex for namespace '{namespace}' is already in progress")]
-    VecReindexInProgress { namespace: String },
-
     /// A store cannot take this name: a namespace of that name, with no store,
     /// holds keys written directly through [`Db`](crate::Db).
     #[error("namespace '{namespace}' already holds keys and is not a store; remove it or choose another name")]
     NamespaceNotEmpty { namespace: String },
-
-    /// The namespace's vector index is still being removed. Enabling it again
-    /// now would lose what is written before the removal finishes.
-    #[error("the vector index of namespace '{namespace}' is still being removed; retry when it finishes")]
-    VectorCleanupInProgress { namespace: String },
-
-    /// A partition rebuild is already running for this namespace.
-    #[error("a partition rebuild for namespace '{namespace}' is already running")]
-    VecRebuildInProgress { namespace: String },
-
-    /// The vector index for this namespace is currently being dropped (background cleanup).
-    /// Wait for the cleanup to complete before re-enabling semantic search.
-    #[error("vector index cleanup for namespace '{namespace}' is already in progress")]
-    VecIndexCleanupInProgress { namespace: String },
 
     /// A probe trace was asked for something it cannot show: its window
     /// (`start..end` over the namespace's probe order) is empty, runs past the

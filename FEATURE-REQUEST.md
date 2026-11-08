@@ -20,7 +20,7 @@ re-check them before starting work.
 | [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
 | [FR-008](#fr-008--collect-unused-ivf-centres) | Collect unused IVF centres | `minnal_db` (`ivf_split`, `semantic_search`) | Low | Proposed |
 | [FR-009](#fr-009--a-blocked-simd-bloom-filter-for-l1-lookups) | A blocked SIMD Bloom filter for L1 lookups | `minnal_db` (`storage/lsm`) | Low | Proposed |
-| [FR-010](#fr-010--refuse-an-enable-for-as-long-as-a-vector-index-drop-is-pending) | Refuse an enable for as long as a vector-index drop is pending | `minnal_db` (`doc_store`), `minnal_db_api` | Low | Proposed |
+| [FR-010](#fr-010--refuse-an-enable-for-as-long-as-a-vector-index-drop-is-pending) | Refuse an enable for as long as a vector-index drop is pending | `minnal_db` (`doc_store`), `minnal_db_api` | Low | ✅ **Done — 2026-11-08** |
 | [FR-011](#fr-011--a-test-harness-for-api-routes) | A test harness for API routes | `minnal_db_api` | Low | Proposed |
 | [FR-012](#fr-012--make-a-skipped-upsert_vectors-visible-to-its-caller) | Make a skipped `upsert_vectors` visible to its caller | `minnal_db` (`vector_kv`) | Low | Proposed |
 | [FR-013](#fr-013--namespace-identity-without-a-central-registry-file) | Namespace identity without a central registry file | `minnal_db` (`db`), `minnal_db_api` | Medium | Proposed |
@@ -1343,7 +1343,11 @@ a crash cannot leave one layout on disk for the other to read.
 ## FR-010 — Refuse an enable for as long as a vector-index drop is pending
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/doc_store/lifecycle.rs`), `minnal_db_api`
+**Status:** Done (branch `store-lifecycle`, 2026-11-08). Enabling and dropping a
+vector index are now index jobs (`vector_enable`, `vector_cleanup`) of the
+namespace lifecycle, and the jobs registry refuses either while the other is
+live, with `JobConflict` (409). Test: `an_enable_is_refused_while_a_vector_cleanup_runs`.
+**Area:** `minnal_db` (`src/doc_store/vector/lifecycle.rs`), `minnal_db_api`
 (`src/routes/stores.rs`, `indices.rs`, `admin_indices.rs`)
 **Severity:** Low — needs an enable and a drop of one store within moments of each
 other; the affected documents are repaired by a reindex

@@ -150,7 +150,7 @@ pub struct IndexSpec {
 /// Only **non-indexed** attributes may be amended.  Attempting to remove or
 /// update an attribute that is currently indexed returns
 /// `DocStoreError::AttributeIsIndexed`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SchemaAmendment {
     /// Add a new non-indexed attribute.  Fails if the name already exists in
     /// `attributes` or `indices`.

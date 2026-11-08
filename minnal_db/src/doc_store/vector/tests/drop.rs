@@ -14,16 +14,15 @@ async fn a_kv_store_can_drop_its_vector_index() {
     vector_kv::create_vector_namespaces(&store.db, "sem_kv").await.unwrap();
     assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_some());
     let ns_id = store.load_kv_schema("sem_kv").unwrap().ns_id.unwrap();
-    let record = JobKey::vector_reindex(ns_id);
-    store.maintenance.put(record, &"a record the drop must remove").unwrap();
+    store.kv_index_all("sem_kv").await.unwrap();
+    assert!(store.jobs.get(JobKey::vector_reindex(ns_id)).unwrap().is_some());
 
-    store.disable_semantic_search("sem_kv").unwrap();
+    store.drop_vector_index("sem_kv").await.unwrap();
     assert!(!store.load_kv_schema("sem_kv").unwrap().is_semantic_search_enabled());
     assert!(matches!(
-        store.disable_semantic_search("sem_kv"),
+        store.drop_vector_index("sem_kv").await,
         Err(DocStoreError::SemanticSearchNotEnabled { .. })
     ));
-    store.drop_vector_index_data("sem_kv").await.unwrap();
 
     assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_none());
     let companions: Vec<_> = store
@@ -33,7 +32,8 @@ async fn a_kv_store_can_drop_its_vector_index() {
         .filter(|(n, _)| vector_kv::vector_data_base(n).is_some())
         .collect();
     assert!(companions.is_empty(), "{companions:?}");
-    assert!(store.maintenance.keys_of(ns_id).is_empty(), "the reindex record is removed");
+    let jobs: Vec<String> = store.jobs("sem_kv").unwrap().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(jobs, vec!["vector_cleanup".to_owned()], "the reindex record is removed");
     assert_eq!(store.kv_get("sem_kv", &key).await.unwrap(), Some(value.clone()));
 
     // New writes queue nothing.
@@ -41,34 +41,36 @@ async fn a_kv_store_can_drop_its_vector_index() {
     assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"y").await.unwrap().is_none());
 }
 
-/// A crash after semantic search went off and before the cleanup ran: the next
-/// open finishes the drop for a KV store too.
+/// A crash after semantic search went off and before the cleanup ran leaves
+/// the `vector_cleanup` job live; the next start finishes it.
 #[cfg(feature = "semantic-search")]
 #[tokio::test]
-async fn an_interrupted_kv_vector_drop_is_finished_at_open() {
+async fn an_interrupted_kv_vector_drop_is_finished_at_the_next_start() {
     let db_dir = TempDir::new().unwrap();
     let store = open_kv_semantic(&db_dir).await;
     let (key, value) = (serde_json::json!("x"), serde_json::json!("some text"));
     store.kv_put("sem_kv", &key, &value).await.unwrap();
     vector_kv::create_vector_namespaces(&store.db, "sem_kv").await.unwrap();
-    store.disable_semantic_search("sem_kv").unwrap();
+    store.start_vector_cleanup("sem_kv", || store.turn_semantic_search_off("sem_kv")).unwrap();
     store.shutdown().await.unwrap();
     drop(store);
 
     let store = open_fresh(db_dir.path()).await;
+    assert_eq!(store.schemas.state("sem_kv"), Some(NamespaceState::IndexMaintenance));
+    store.run_pending_jobs().await.unwrap();
     assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_none());
     assert!(!store.db.list_namespaces().iter().any(|(n, _)| vector_kv::vector_data_base(n).is_some()));
     assert!(!store.load_kv_schema("sem_kv").unwrap().is_semantic_search_enabled());
     assert_eq!(store.kv_get("sem_kv", &key).await.unwrap(), Some(value));
+    assert_eq!(store.schemas.state("sem_kv"), Some(NamespaceState::Created));
 }
 
 /// A store that does not exist is `NotFound`, for the route's 404.
-#[cfg(feature = "semantic-search")]
 #[tokio::test]
-async fn disabling_semantic_search_on_an_unknown_store_is_not_found() {
+async fn dropping_the_vector_index_of_an_unknown_store_is_not_found() {
     let db_dir = TempDir::new().unwrap();
     let store = open_fresh(db_dir.path()).await;
-    assert!(matches!(store.disable_semantic_search("missing"), Err(DocStoreError::NotFound { .. })));
+    assert!(matches!(store.drop_vector_index("missing").await, Err(DocStoreError::NotFound { .. })));
 }
 
 /// R3 through the real delete path: deleting a key whose older value is being

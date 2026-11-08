@@ -165,6 +165,19 @@ impl DocStore {
     /// immediately when at least one entry was reset.
     #[cfg(feature = "semantic-search")]
     pub async fn retry_all_failed_queue_entries(&self, namespace: &str) -> Result<usize, DocStoreError> {
+        // Rewriting entries while the cleanup clears them could leave one behind.
+        if let Some(ns_id) = self.schemas.get(namespace).and_then(|s| s.ns_id())
+            && self
+                .jobs
+                .get(JobKey::new(ns_id, crate::namespace_lifecycle::JobKind::VectorCleanup))?
+                .is_some_and(|r| r.is_live())
+        {
+            return Err(DocStoreError::JobConflict {
+                namespace: namespace.to_owned(),
+                job: "retry of failed queue entries".to_owned(),
+                running: crate::namespace_lifecycle::JobKind::VectorCleanup.name().to_owned(),
+            });
+        }
         let count = vector_kv::reset_exhausted_queue_entries(&self.db, namespace, self.vector_index_config.max_retries).await?;
         if count > 0
             && let Some(notify) = &self.notify

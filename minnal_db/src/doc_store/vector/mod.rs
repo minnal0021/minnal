@@ -48,17 +48,13 @@ pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace
     })
 }
 
-/// Persistent record for one `index_all` reindex, kept in the maintenance
-/// namespace (`JobKey::vector_reindex`).
-///
-/// A reindex is the unit of work created by a single `index_all` call: it
-/// tracks the total documents enqueued, how many have been indexed, and the
-/// lifecycle status.  The record survives restarts so that the progress API can
-/// show historical reindexs even after the server restarts.
+/// A vector reindex's progress, as the progress views report it: read from its
+/// `vector_reindex` job's record ([`DocStore::vec_reindex_progress`]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VecReindexProgress {
-    /// `Running` until the worker has embedded everything enqueued, then
-    /// `Complete`; `Failed` if the enqueue failed or a restart cut it short.
+    /// `Running` until every document is enqueued and the worker has embedded
+    /// what the store has queued, then `Complete`; `Failed` or `Cancelled` as
+    /// its job ended.
     pub status: BuildStatus,
     /// Unix milliseconds when `index_all` was called.
     pub started_at_ms: u64,
@@ -70,8 +66,7 @@ pub struct VecReindexProgress {
     pub exhausted_cleared: usize,
     /// Error message when `status == Failed`.
     pub error: Option<String>,
-    /// Whether every document was enqueued. A `Running` record without it, and
-    /// with no reindex enqueueing in this process, was cut short by a crash.
+    /// Whether every document was enqueued (the job is complete).
     #[serde(default)]
     pub enqueue_done: bool,
 }
