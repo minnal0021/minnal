@@ -6,8 +6,9 @@
 // given target would otherwise trip `dead_code` when that target is compiled.
 #![allow(dead_code)]
 
+use minnal_db::bench_internals::Db;
 use minnal_db::lsm::LSMConfig;
-use minnal_db::{AsyncDb, Db, DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
+use minnal_db::{AsyncDb, DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;

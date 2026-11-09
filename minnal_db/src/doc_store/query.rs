@@ -431,10 +431,8 @@ mod tests {
 
     /// Same scenario but with `semantic_search_enabled = true`, which makes
     /// `delete()` take the semantic-search path (cancel pending embed + delete
-    /// vector + delete doc).  No actual embedding service is needed because
-    /// writes without `with_semantic_search()` attached fall back to the
-    /// regular `ns.put()` path, while deletes always go through the
-    /// semantic-search path when the schema flag is set.
+    /// vector + delete doc). No embedding service is needed: a write only
+    /// queues its embed, and the test store points at no service.
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn test_scan_by_prefix_after_delete_semantic_search_enabled() {
@@ -736,11 +734,8 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn semantic_search_on_a_store_without_it_reports_not_enabled() {
-        use crate::semantic_search::service::SemanticSearchConfig;
-
         let db_dir = TempDir::new().unwrap();
-        let mut store = open_fresh(db_dir.path()).await;
-        store.semantic_ctx = Some(Arc::new(SemanticSearchContext::new(SemanticSearchConfig::default())));
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("plain", vec![])).await.unwrap();
         store
             .create_kv(make_kv_schema("plain_kv", KvKeyType::Str, KvValueType::Str))

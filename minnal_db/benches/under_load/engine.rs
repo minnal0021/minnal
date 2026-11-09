@@ -173,27 +173,28 @@ pub async fn open(cfg: &Config, dir: &Path, embed_url: &str, concurrency: Option
             .collect(),
         server_toml: cfg.server_toml.clone(),
     };
-    let store = DocStore::open_with_config(dir.join("db"), engine.to_db_config())
-        .await
-        .map_err(|e| format!("open {}: {e}", dir.display()))?;
     let service = SemanticSearchConfig {
         embedding_service_url: embed_url.to_string(),
         ..Default::default()
     };
-    let store = store
-        .with_vector_index_config(VectorIndexConfig {
+    let store = DocStore::builder(dir.join("db"))
+        .db_config(engine.to_db_config())
+        .vector_index_config(VectorIndexConfig {
             retry_wait_secs: extras.vector_index.retry_wait_secs,
             max_retries: settings.vector_worker_max_retries,
             concurrency: settings.vector_worker_concurrency,
         })
-        .with_semantic_search(
+        .semantic_search(
             SemanticSearchContext::new(service)
                 .with_supported_models(settings.supported_models.clone())
                 .with_index_defaults(IndexDefaults::default())
                 .with_maintenance_threads(settings.maintenance_threads)
                 .with_rebuild_threads(settings.rebuild_threads),
-        );
-    Ok((Arc::new(store), settings))
+        )
+        .open()
+        .await
+        .map_err(|e| format!("open {}: {e}", dir.display()))?;
+    Ok((store, settings))
 }
 
 /// Copy `snapshot/db` to `dir`.

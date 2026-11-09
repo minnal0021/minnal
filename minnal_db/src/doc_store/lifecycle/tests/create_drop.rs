@@ -91,7 +91,7 @@ async fn a_store_saved_under_a_companion_name_survives_a_restart_and_a_drop() {
     store.shutdown().await.unwrap();
     drop(store);
 
-    let store = DocStore::open_with_config(db_dir.path(), crate::support::test_db_config()).await.unwrap();
+    let store = open_fresh(db_dir.path()).await;
     assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by the restart");
     store.remove("foo").await.unwrap();
     assert!(store.get(NAME, DocId::U64(1)).await.unwrap().is_some(), "lost by dropping foo");
@@ -100,7 +100,8 @@ async fn a_store_saved_under_a_companion_name_survives_a_restart_and_a_drop() {
 
 /// A drop's future can be dropped at any await (the client of its route
 /// disconnecting). Once it has moved the store to `Deleting`, the store stays
-/// so, refusing requests, and the next drop finishes it.
+/// so, refusing requests, until the governor finishes the drop; a retry waits
+/// for that.
 #[tokio::test]
 async fn a_cancelled_drop_leaves_the_store_deleting_and_a_retry_finishes_it() {
     let db_dir = TempDir::new().unwrap();

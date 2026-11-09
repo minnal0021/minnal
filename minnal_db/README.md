@@ -65,7 +65,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ Public API                                                               │
 │                                                                          │
-│ Db / AsyncDb                  Namespace / AsyncNamespace                 │
+│ AsyncDb                       AsyncNamespace                             │
 │   the default namespace, plus   one named namespace                      │
 │   engine-wide operations                                                 │
 │                                                                          │
@@ -710,7 +710,7 @@ There is deliberately **no value-log GC recovery step**. GC unlinks a segment on
 
 ## MinnalDB as an Embedded Store
 
-MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `Db::open` (or `AsyncDb::open`) on a directory path, and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, WAL GC, TTL) running inside your process.
+MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `AsyncDb::open` on a directory path (the API is async, on tokio), and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, GC of both write-ahead logs, field-index checkpoints, TTL) running inside your process, started by the open.
 
 `minnal_db` is a **single crate**; the document and semantic-search layers are
 provided as cargo features (`doc-store`, `semantic-search`) that you opt into.

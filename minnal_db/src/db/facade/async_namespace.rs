@@ -25,7 +25,7 @@ impl AsyncNamespace {
 
     /// Insert or update a key-value pair.
     ///
-    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](AsyncDb#write-durability)
     /// for what that does and does not guarantee about immediate readability.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let db = self.db.clone();
@@ -122,7 +122,7 @@ impl AsyncNamespace {
 
     /// Delete a key.
     ///
-    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](AsyncDb#write-durability)
     /// for what that does and does not guarantee about immediate readability.
     pub async fn delete(&self, key: Vec<u8>) -> Result<()> {
         let db = self.db.clone();
@@ -145,7 +145,7 @@ impl AsyncNamespace {
 
     /// Atomically read-modify-write a key in this namespace.
     ///
-    /// See [`Db::merge`] for the full contract.
+    /// See [`AsyncDb::merge`] for the full contract.
     pub async fn merge<F>(&self, key: Vec<u8>, value: Vec<u8>, merge_fn: F) -> Result<Option<Vec<u8>>>
     where
         F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>> + Send + 'static,
@@ -199,7 +199,7 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Paginated cursor scan. See [`Db::scan`] for details.
+    /// Paginated cursor scan. See [`AsyncDb::scan`] for details.
     pub async fn scan(&self, cursor: Option<Vec<u8>>, end: Option<Vec<u8>>, limit: usize) -> Result<ScanPage> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_page_batch(cursor.as_deref(), end.as_deref(), limit))
@@ -223,7 +223,7 @@ impl AsyncNamespace {
 
     /// Insert a typed key-value pair, serialized via rkyv.
     ///
-    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](AsyncDb#write-durability)
     /// for what that does and does not guarantee about immediate readability.
     pub async fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
@@ -250,7 +250,7 @@ impl AsyncNamespace {
 
     /// Delete by typed key.
     ///
-    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](AsyncDb#write-durability)
     /// for what that does and does not guarantee about immediate readability.
     pub async fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
@@ -262,7 +262,7 @@ impl AsyncNamespace {
 
     /// Atomically merge a typed value, serialized via rkyv.
     ///
-    /// The typed twin of [`Db::merge`]; see [`Db::merge_typed`] for an example.
+    /// The typed twin of [`merge`](Self::merge); see [`AsyncDb::merge_typed`] for an example.
     pub async fn merge_typed<K, V, F>(&self, key: &K, value: &V, merge_fn: F) -> Result<Option<V>>
     where
         K: RkyvEncode,

@@ -168,7 +168,7 @@ impl DocStoreApiConfig {
         }
     }
 
-    /// Convert to the [`DbConfig`] consumed by `DocStore::open_with_config`.
+    /// Convert to the [`DbConfig`] consumed by `DocStoreBuilder::db_config`.
     pub fn to_db_config(&self) -> DbConfig {
         let scheduled = ScheduledTaskConfig::new(
             Duration::from_secs(self.scheduled_tasks.value_log_gc_interval_secs),

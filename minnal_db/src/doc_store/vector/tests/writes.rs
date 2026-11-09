@@ -23,12 +23,17 @@ async fn a_delete_cut_short_by_a_crash_is_redone_as_an_embed() {
     vector_kv::remove_queue_entry(&store.db, "sem_kv", b"x").await.unwrap();
     vector_kv::clear_vectors(&store.db, "sem_kv", b"x").await.unwrap(); // the delete, cut short by a crash
 
-    let ctx = SemanticSearchContext::new(SemanticSearchConfig {
-        embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
-        embedding_connect_timeout: std::time::Duration::from_millis(200),
-        ..SemanticSearchConfig::default()
-    });
-    let store = store.with_semantic_search(ctx);
+    let ctx = || {
+        SemanticSearchContext::new(SemanticSearchConfig {
+            embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
+            embedding_connect_timeout: std::time::Duration::from_millis(200),
+            ..SemanticSearchConfig::default()
+        })
+    };
+    // Reopened with a running worker, as after the crash.
+    store.shutdown().await.unwrap();
+    drop(store);
+    let store = open_with(db_dir.path(), |b| b.semantic_search(ctx())).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let entry = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap();
@@ -66,12 +71,17 @@ async fn an_upsert_cut_short_by_a_crash_embeds_what_the_store_holds() {
         .unwrap();
     vector_kv::enqueue_embed(&store.db, "sem_kv", b"x", "never written").await.unwrap(); // its value write was lost
 
-    let ctx = SemanticSearchContext::new(SemanticSearchConfig {
-        embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
-        embedding_connect_timeout: std::time::Duration::from_millis(200),
-        ..SemanticSearchConfig::default()
-    });
-    let store = store.with_semantic_search(ctx);
+    let ctx = || {
+        SemanticSearchContext::new(SemanticSearchConfig {
+            embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
+            embedding_connect_timeout: std::time::Duration::from_millis(200),
+            ..SemanticSearchConfig::default()
+        })
+    };
+    // Reopened with a running worker, as after the crash.
+    store.shutdown().await.unwrap();
+    drop(store);
+    let store = open_with(db_dir.path(), |b| b.semantic_search(ctx())).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let entry = vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap();
@@ -178,12 +188,17 @@ async fn the_worker_skips_a_document_with_a_write_in_progress() {
         .await
         .unwrap();
 
-    let ctx = SemanticSearchContext::new(SemanticSearchConfig {
-        embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
-        embedding_connect_timeout: std::time::Duration::from_millis(200),
-        ..SemanticSearchConfig::default()
-    });
-    let store = store.with_semantic_search(ctx);
+    let ctx = || {
+        SemanticSearchContext::new(SemanticSearchConfig {
+            embedding_service_url: "http://127.0.0.1:9".into(), // nothing listens: embeds fail and stay queued
+            embedding_connect_timeout: std::time::Duration::from_millis(200),
+            ..SemanticSearchConfig::default()
+        })
+    };
+    // Reopened with a running worker, as after the crash.
+    store.shutdown().await.unwrap();
+    drop(store);
+    let store = open_with(db_dir.path(), |b| b.semantic_search(ctx())).await;
     let writing = store.begin_vector_write("sem_kv", b"x");
     vector_kv::enqueue_embed(&store.db, "sem_kv", b"x", "being written").await.unwrap();
     store.notify.as_ref().unwrap().notify_one(); // a pass while the write is in progress

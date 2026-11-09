@@ -14,13 +14,16 @@ async fn test_vector_index_max_retries_default() {
 
 #[cfg(feature = "semantic-search")]
 #[tokio::test]
-async fn test_with_vector_index_config_sets_max_retries() {
+async fn the_vector_index_config_sets_max_retries() {
     let db_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path()).await.with_vector_index_config(VectorIndexConfig {
-        max_retries: 10,
-        retry_wait_secs: 1,
-        concurrency: 2,
-    });
+    let store = open_with(db_dir.path(), |b| {
+        b.vector_index_config(VectorIndexConfig {
+            max_retries: 10,
+            retry_wait_secs: 1,
+            concurrency: 2,
+        })
+    })
+    .await;
     assert_eq!(store.vector_index_max_retries(), 10);
 }
 
@@ -134,15 +137,18 @@ async fn test_semantic_create_rejected_without_feature() {
 #[tokio::test]
 async fn test_reindex_doc_vector_enqueues_single_doc() {
     let db_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path()).await;
+    let store = open_without_vector_worker(db_dir.path()).await;
     create_semantic_schema(&store, "sem").await;
 
-    // No SemanticSearchContext attached, so put() does not enqueue.
+    // Each put queues its document; empty the queue, as a worker would.
     for i in 1u64..=3 {
         store
             .put("sem", DocId::U64(i), serde_json::json!({"title": format!("doc {i}")}))
             .await
             .unwrap();
+    }
+    for e in store.list_queue_entries().await {
+        vector_kv::remove_queue_entry(&store.db, &e.namespace, &e.doc_id_bytes).await.unwrap();
     }
     assert_eq!(store.pending_vector_index_count().await, 0);
 

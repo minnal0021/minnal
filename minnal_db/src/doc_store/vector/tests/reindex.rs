@@ -68,7 +68,7 @@ async fn an_interrupted_vector_index_drop_is_finished_at_the_next_start() {
         store.db.shutdown().await.unwrap();
     }
     let store = open_fresh(db_dir.path()).await;
-    store.run_pending_jobs().await.unwrap();
+    wait_for_jobs(&store, "sem_kv").await;
     let names: Vec<String> = store.db.list_namespaces().into_iter().map(|(n, _)| n).collect();
     assert!(
         !names.iter().any(|n| vector_kv::companion_base(n) == Some("sem_kv")),
@@ -157,9 +157,9 @@ async fn a_reindex_interrupted_by_a_crash_is_resumed_at_the_next_start() {
         store.start_vector_reindex("sem_kv").unwrap();
         store.db.shutdown().await.unwrap();
     }
-    let store = with_worker_notify(open_fresh(db_dir.path()).await);
-    assert_eq!(store.vec_reindex_progress("sem_kv").await.unwrap().status, BuildStatus::Running);
-    store.run_pending_jobs().await.unwrap();
+    // The governor resumes the reindex as soon as the store opens.
+    let store = open_without_vector_worker(db_dir.path()).await;
+    wait_for_jobs(&store, "sem_kv").await;
     assert!(
         vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_some(),
         "the resumed reindex enqueued it"

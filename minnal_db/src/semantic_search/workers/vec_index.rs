@@ -144,12 +144,9 @@ pub(crate) async fn check_entry<H: WorkerHost>(db: &AsyncDb, host: &H, entry: &Q
 
 /// Tuning knobs for the async vector-index background worker.
 ///
-/// Pass this to [`DocStore::with_vector_index_config`] **before** calling
-/// [`DocStore::with_semantic_search`].  Defaults are conservative values
-/// suitable for most deployments.
-///
-/// [`DocStore::with_vector_index_config`]: crate::doc_store::DocStore::with_vector_index_config
-/// [`DocStore::with_semantic_search`]: crate::doc_store::DocStore::with_semantic_search
+/// Pass this to the store's builder,
+/// [`DocStoreBuilder::vector_index_config`](crate::doc_store::DocStoreBuilder::vector_index_config).
+/// Defaults are conservative values suitable for most deployments.
 #[derive(Debug, Clone)]
 pub struct VectorIndexConfig {
     /// Seconds to sleep after a pass that contained at least one failure,

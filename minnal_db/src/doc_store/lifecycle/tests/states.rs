@@ -128,8 +128,10 @@ async fn two_drops_at_once_remove_the_store_once() {
     store.shutdown().await.unwrap();
 }
 
-/// A store with index jobs running takes every request, cannot be dropped,
-/// and comes back from a restart still taking them (its indexes active).
+/// A store with index jobs running takes every request and cannot be
+/// dropped. Left in maintenance with no live job, it comes back from a
+/// restart `Created` (the governor puts it in step with its job records before
+/// the open returns), its indexes active.
 #[tokio::test]
 async fn a_store_in_index_maintenance_takes_requests_but_cannot_be_dropped() {
     let db_dir = TempDir::new().unwrap();
@@ -149,11 +151,7 @@ async fn a_store_in_index_maintenance_takes_requests_but_cannot_be_dropped() {
         store.shutdown().await.unwrap();
     }
     let store = open_fresh(db_dir.path()).await;
-    assert_eq!(
-        store.schemas.state("docs"),
-        Some(NamespaceState::IndexMaintenance),
-        "left for the governor"
-    );
+    assert_eq!(store.schemas.state("docs"), Some(NamespaceState::Created), "no live job");
     assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
     store.shutdown().await.unwrap();
 }

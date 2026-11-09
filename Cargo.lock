@@ -978,6 +978,7 @@ dependencies = [
  "log",
  "memmap2",
  "mimalloc",
+ "minnal_db",
  "mm3h",
  "parking_lot",
  "rand",

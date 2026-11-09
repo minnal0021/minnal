@@ -179,8 +179,7 @@ async fn test_add_index_and_wait() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_stops_a_running_build_and_drops_its_index() {
     let db_dir = TempDir::new().unwrap();
-    let store = std::sync::Arc::new(open_fresh(db_dir.path()).await);
-    store.start_lifecycle(LifecycleConfig::default());
+    let store = open_fresh(db_dir.path()).await;
     store.create(make_schema("ns", vec![])).await.unwrap();
     for i in 0..20_000u64 {
         store.put_no_wal("ns", DocId::U64(i), serde_json::json!({"status": "a"})).await.unwrap();
@@ -236,9 +235,9 @@ async fn a_build_cut_short_is_finished_at_the_next_start() {
             }
             assert_eq!(store.load_schema("ns").unwrap().indices.len(), usize::from(listed));
         }
+        // The governor resumes the build as soon as the store opens.
         let store = open_fresh(db_dir.path()).await;
-        assert_eq!(store.schemas.state("ns"), Some(NamespaceState::IndexMaintenance), "listed={listed}");
-        store.run_pending_jobs().await.unwrap();
+        wait_for_jobs(&store, "ns").await;
         assert_eq!(store.schemas.state("ns"), Some(NamespaceState::Created), "listed={listed}");
         let found = store.query("ns", "status = \"a\"", Pagination::default()).await.unwrap();
         assert_eq!(found.total, 50, "listed={listed}");
@@ -258,12 +257,12 @@ async fn a_drop_waits_for_the_fields_build_and_a_re_add_starts_afresh() {
     let store = open_fresh(db_dir.path()).await;
     store.create(make_schema("ns", vec![])).await.unwrap();
     store.put("ns", DocId::U64(1), serde_json::json!({"status": "a"})).await.unwrap();
-    store.start_field_build("ns", status_spec()).await.unwrap();
+    let build = store.start_field_build("ns", status_spec()).await.unwrap();
     assert!(matches!(
         store.drop_index("ns", "status").await,
         Err(DocStoreError::JobConflict { job, running, .. }) if job == "field_drop:status" && running == "field_build:status"
     ));
-    store.run_pending_jobs().await.unwrap();
+    store.run_job("ns", build).await.unwrap();
     store.drop_index("ns", "status").await.unwrap();
     let names: Vec<String> = store.jobs("ns").unwrap().into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, vec!["field_drop:status".to_owned()], "the old build's record is gone");
@@ -331,7 +330,7 @@ async fn test_add_index_covers_documents_whose_wal_was_reclaimed() {
     };
     let n = 300u64;
     {
-        let store = DocStore::open_with_config(db_dir.path(), config()).await.unwrap();
+        let store = open_with(db_dir.path(), |b| b.db_config(config())).await;
         store.create(make_schema("ns", vec![])).await.unwrap();
         for i in 0..n {
             store
@@ -341,7 +340,7 @@ async fn test_add_index_covers_documents_whose_wal_was_reclaimed() {
         }
         store.db.shutdown().await.unwrap(); // flush, so the WAL is persisted
     }
-    let store = DocStore::open_with_config(db_dir.path(), config()).await.unwrap();
+    let store = open_with(db_dir.path(), |b| b.db_config(config())).await;
     // The WAL worker's first tick comes right after open, so it can reclaim
     // these segments first, or be part-way through (this call then reclaims
     // nothing). So check that they are gone, not who removed them: only the

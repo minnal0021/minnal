@@ -428,11 +428,11 @@ Compaction runs in two places. The main one is `Database::run_index_checkpoint`,
 for each field over the waste threshold. That pass is reached four ways, all
 running the same code: the periodic `IndexCheckpointWorker` (1750 ms by default),
 an early request from the write path (§7), a clean shutdown, and the on-demand
-`Db::checkpoint_index()` exposed over REST as `POST
+`AsyncDb::checkpoint_index()` exposed over REST as `POST
 /admin/storage/index-checkpoint`. The other is WAL replay at open (§8), which
 compacts a field inline once its dead space passes
 `thresholds.index_blob_backpressure_bytes`, because the checkpoint worker has not
-started yet. (Do not confuse either with `Db::compact()` / `POST
+started yet. (Do not confuse either with `AsyncDb::compact()` / `POST
 /admin/storage/compact`, which is the unrelated KV-engine LSM and value-log
 compaction.)
 

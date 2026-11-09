@@ -7,7 +7,7 @@
 //! # Lifecycle
 //!
 //! ```text
-//! DocStore::open(db_path)               ← opens existing stores
+//! DocStore::open(db_path)               ← opens existing stores, starts every worker
 //!   .create(schema)                     ← define a new store
 //!   .put("users", id, doc)              ← write a document
 //!   .get("users", id)            ← read by primary key
@@ -44,6 +44,7 @@ pub mod indexing;
 pub mod key;
 mod kv;
 mod lifecycle;
+mod open;
 pub mod pagination;
 mod query;
 pub mod schema;
@@ -54,6 +55,7 @@ mod write_gate;
 
 pub use self::diagnostics::RowMapStats;
 pub use self::indexing::progress::FieldBuildProgress;
+pub use self::open::DocStoreBuilder;
 #[cfg(feature = "semantic-search")]
 pub use self::vector::VectorReindexOutcome;
 pub use self::vector::{ReindexStats, VecReindexProgress};
@@ -118,11 +120,11 @@ pub struct DocStore {
     /// The index jobs of every store, recorded in `maintenance`.
     jobs: Arc<crate::namespace_lifecycle::Jobs>,
     /// Semantic-search context used by query paths (embedding + cluster index).
-    /// `None` when semantic search is not configured.
+    /// Always set by [`DocStoreBuilder::open`]; `None` only in unit tests.
     #[cfg(feature = "semantic-search")]
     semantic_ctx: Option<Arc<SemanticSearchContext>>,
     /// Wake signal sent to the [`VecIndexWorker`] after each write that
-    /// enqueues a pending embedding.  `None` when semantic search is not
+    /// enqueues a pending embedding. Always set by [`DocStoreBuilder::open`]; `None` only in unit tests (configured
     /// configured.
     #[cfg(feature = "semantic-search")]
     notify: Option<Arc<tokio::sync::Notify>>,
@@ -132,9 +134,8 @@ pub struct DocStore {
     /// an `Arc`.
     #[cfg(feature = "semantic-search")]
     worker_handle: std::sync::Mutex<Option<VecIndexWorkerHandle>>,
-    /// Configuration for the vector-index background worker.
-    /// Set via [`DocStore::with_vector_index_config`] before calling
-    /// [`DocStore::with_semantic_search`]; defaults are used otherwise.
+    /// Configuration for the vector-index background worker
+    /// ([`DocStoreBuilder::vector_index_config`]).
     #[cfg(feature = "semantic-search")]
     vector_index_config: VectorIndexConfig,
     /// Writes in progress per store, which a drop waits for.
@@ -145,8 +146,8 @@ pub struct DocStore {
     /// vector worker skips (see [`InFlightWrites`]).
     #[cfg(feature = "semantic-search")]
     in_flight: Arc<InFlightWrites>,
-    /// The lifecycle governor, once [`start_lifecycle`](Self::start_lifecycle)
-    /// has started it.
+    /// The lifecycle governor, started by [`DocStoreBuilder::open`] once the
+    /// store is whole (set right after the store is put in its `Arc`).
     governor: std::sync::OnceLock<crate::namespace_lifecycle::Governor>,
     /// Test hook: failures to inject into a store's lifecycle tasks, per store
     /// (`(failures left, panic instead of an error)`).
@@ -157,174 +158,17 @@ pub struct DocStore {
 impl DocStore {
     // ── Construction ──────────────────────────────────────────────────────
 
-    /// Open (or create) a `DocStore` at `db_path` with a custom [`DbConfig`].
-    ///
-    /// Prefer this over [`open`] when you need to tune the underlying engine
-    /// (e.g. sync policy, GC intervals, WAL segment size).  For every stored
-    /// schema, the corresponding namespace is opened and all field indices are
-    /// activated automatically.
-    ///
-    /// [`open`]: DocStore::open
-    pub async fn open_with_config(db_path: impl AsRef<Path>, config: DbConfig) -> Result<Self, DocStoreError> {
-        let db_path = db_path.as_ref().to_path_buf();
-        info!("opening doc store at {}", db_path.display());
-        std::fs::create_dir_all(&db_path)?;
-
-        // Handed to the database once it is open, which releases it only when
-        // the database itself is dropped (`AsyncDb::hold_dir_lock`): a worker's
-        // pass can keep the database alive after this DocStore is gone. Kept as
-        // a local until then, so a failed open releases it.
-        let lock = match DirLock::acquire(&db_path) {
-            Ok(lock) => lock,
-            Err(LockError::Held { pid }) => {
-                return Err(DocStoreError::StoreLocked {
-                    path: db_path,
-                    owner_pid: pid,
-                });
-            }
-            Err(LockError::Io(e)) => return Err(DocStoreError::Io(e)),
-        };
-
-        let db = Arc::new(AsyncDb::open_with_config(db_path.clone(), config.clone()).await?);
-        db.hold_dir_lock(lock);
-        // After WAL recovery (done by the open above), before anything reads a schema.
-        let schemas = Arc::new(SchemaStore::open(&db).await?);
-        let maintenance = Arc::new(MaintenanceStore::open(&db).await?);
-        let audit = Arc::new(crate::namespace_lifecycle::AuditLog::open(&db, crate::namespace_lifecycle::DEFAULT_AUDIT_RETENTION).await?);
-        let store = Self {
-            db,
-            db_path,
-            schemas,
-            jobs: Arc::new(crate::namespace_lifecycle::Jobs::new(Arc::clone(&maintenance), audit)),
-            maintenance,
-            #[cfg(feature = "semantic-search")]
-            semantic_ctx: None,
-            #[cfg(feature = "semantic-search")]
-            notify: None,
-            #[cfg(feature = "semantic-search")]
-            worker_handle: std::sync::Mutex::new(None),
-            #[cfg(feature = "semantic-search")]
-            #[cfg(feature = "semantic-search")]
-            vector_index_config: VectorIndexConfig::default(),
-            writes: Arc::default(),
-            lifecycle: LifecycleLocks::default(),
-            #[cfg(feature = "semantic-search")]
-            in_flight: Arc::default(),
-            governor: std::sync::OnceLock::new(),
-            #[cfg(test)]
-            lifecycle_faults: parking_lot::Mutex::default(),
-        };
-
-        // Finish what a crash interrupted, before anything opens a store's
-        // namespace: a creation (its record `Creating`) and a drop (`Deleting`).
-        // A step that fails is logged and left for the next open; the store
-        // keeps refusing requests meanwhile.
-        for (namespace, state) in store.schemas.states() {
-            let finished = match state {
-                NamespaceState::Creating => store.provision(&namespace).await,
-                NamespaceState::Deleting => store.teardown(&namespace).await,
-                NamespaceState::Created | NamespaceState::IndexMaintenance => continue,
-            };
-            if let Err(e) = finished {
-                log::error!("store '{namespace}' is left {}: finishing it at open failed: {e}", state.as_str());
-            }
-        }
-
-        let schemas = store.load_all_schemas()?;
-        info!("loaded {} schema(s)", schemas.len());
-        for schema in schemas {
-            if !store.schemas.state(&schema.namespace).is_some_and(NamespaceState::is_ready) {
-                continue;
-            }
-            if let Some(ns_id) = schema.ns_id {
-                debug!("activating indices for namespace '{}' (ns_id={})", schema.namespace, ns_id);
-                activate_indices(&store.db, ns_id, &schema).await?;
-            }
-        }
-
-        let kv_schemas = store.load_all_kv_schemas()?;
-        info!("loaded {} KV schema(s)", kv_schemas.len());
-        for schema in kv_schemas {
-            if schema.ns_id.is_some() && store.schemas.state(&schema.namespace).is_some_and(NamespaceState::is_ready) {
-                debug!("opening KV namespace '{}'", schema.namespace);
-                store.db.namespace(schema.namespace.clone()).await?;
-            }
-        }
-
-        // Before any vector worker can start (`with_semantic_search` comes after
-        // this). A vector-index drop a crash interrupted is a live
-        // `vector_cleanup` job, which the governor (or `run_pending_jobs`)
-        // finishes.
-        #[cfg(feature = "semantic-search")]
-        store.ensure_vector_indexes().await?;
-
-        // Start background workers after all indices are activated so the
-        // index checkpoint worker's first immediate tick captures a complete
-        // (not empty) index state.
-        store.db.enable_all_workers(&config).await.map_err(DocStoreError::Db)?;
-
-        info!("doc store ready");
-        Ok(store)
+    /// Open (or create) a `DocStore` at `db_path` with the default
+    /// configuration: the same as `DocStore::builder(db_path).open()`. See
+    /// [`DocStoreBuilder`] for what opening starts.
+    pub async fn open(db_path: impl AsRef<Path>) -> Result<Arc<Self>, DocStoreError> {
+        Self::builder(db_path).open().await
     }
 
-    /// Open (or create) a `DocStore` at `db_path` with default [`DbConfig`].
-    ///
-    /// For every stored schema, the corresponding namespace is opened and all
-    /// field indices are activated automatically — no call to
-    /// `register_index_field` is needed after the first `create`.
-    pub async fn open(db_path: impl AsRef<Path>) -> Result<Self, DocStoreError> {
-        Self::open_with_config(db_path, DbConfig::default()).await
-    }
-
-    /// Set the tuning parameters for the background vector-index worker.
-    ///
-    /// Must be called **before** [`with_semantic_search`]; configuration set
-    /// after the worker has already started has no effect.
-    ///
-    /// [`with_semantic_search`]: DocStore::with_semantic_search
-    #[cfg(feature = "semantic-search")]
-    pub fn with_vector_index_config(mut self, config: VectorIndexConfig) -> Self {
-        self.vector_index_config = config;
-        self
-    }
-
-    /// Attach a [`SemanticSearchContext`] and start the background vector-index
-    /// worker.
-    ///
-    /// After this call:
-    /// - `put` / `kv_put` on semantic-search-enabled namespaces enqueue a
-    ///   pending embedding job (atomic, WAL-backed) instead of calling the
-    ///   embedding service inline.
-    /// - A `VecIndexWorker` drains the queue in the background using the
-    ///   parameters from [`with_vector_index_config`] (or built-in defaults).
-    /// - `search_semantic` / `kv_search_semantic` still embed query text
-    ///   synchronously (low count, TTL-cached).
-    /// - The worker first drains whatever a crash left queued. Every write queues
-    ///   its embed before it writes the document, so that queue lists every
-    ///   document whose vectors may be out of date; nothing scans the documents
-    ///   at startup (see `vector_kv`'s *Queue first*).
-    ///
-    /// Call [`shutdown_vec_index_worker`] for a clean stop before dropping the
-    /// store.
-    ///
-    /// [`with_vector_index_config`]: DocStore::with_vector_index_config
-    /// [`shutdown_vec_index_worker`]: DocStore::shutdown_vec_index_worker
-    #[cfg(feature = "semantic-search")]
-    pub fn with_semantic_search(mut self, ctx: SemanticSearchContext) -> Self {
-        let ctx = Arc::new(ctx);
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let handle = VecIndexWorker::start(
-            Arc::clone(&self.db),
-            Arc::clone(&ctx),
-            self.worker_host(),
-            Arc::clone(&notify),
-            self.vector_index_config.clone(),
-        );
-
-        self.semantic_ctx = Some(ctx);
-        self.notify = Some(notify);
-        *self.worker_handle.lock().unwrap() = Some(handle);
-        self
+    /// A builder for a `DocStore` at `db_path`, to set its engine, lifecycle
+    /// and semantic-search configuration before it opens.
+    pub fn builder(db_path: impl AsRef<Path>) -> DocStoreBuilder {
+        DocStoreBuilder::new(db_path)
     }
 
     /// The engine under this store, for what is not scoped to one store: statistics

@@ -11,7 +11,7 @@ const DOCS: u128 = 300;
 /// A uuid-keyed store with `active` and `tier` indexes over `DOCS`
 /// documents, 80% of them then deleted. Returns the store and the live
 /// `(id, active, tier)` set.
-async fn seeded(db_dir: &Path) -> (DocStore, Vec<(u128, bool, i64)>) {
+async fn seeded(db_dir: &Path) -> (Arc<DocStore>, Vec<(u128, bool, i64)>) {
     let store = open_fresh(db_dir).await;
     let mut schema = make_schema(
         "events",
@@ -108,7 +108,7 @@ async fn reindex_all_frees_the_row_ids_of_deleted_documents() {
     drop(store);
 
     let store = open_fresh(db_dir.path()).await;
-    store.run_pending_jobs().await.unwrap();
+    wait_for_jobs(&store, "events").await;
     assert_rebuilt(&store, &live, "after a restart").await;
 }
 
@@ -124,8 +124,9 @@ async fn an_interrupted_reindex_all_is_finished_at_the_next_start() {
         assert_eq!(store.schemas.state("events"), Some(NamespaceState::IndexMaintenance));
         drop(store);
 
+        // The governor resumes the job as soon as the store opens.
         let store = open_fresh(db_dir.path()).await;
-        store.run_pending_jobs().await.unwrap();
+        wait_for_jobs(&store, "events").await;
         assert_rebuilt(&store, &live, &format!("crash after step {stop}")).await;
     }
 }
@@ -140,8 +141,9 @@ async fn an_interrupted_drop_all_is_finished_at_the_next_start() {
         store.reindex_all_until("events", false, stop).await.unwrap();
         drop(store);
 
+        // The governor resumes the job as soon as the store opens.
         let store = open_fresh(db_dir.path()).await;
-        store.run_pending_jobs().await.unwrap();
+        wait_for_jobs(&store, "events").await;
         let schema = store.load_schema("events").unwrap();
         assert!(schema.indices.is_empty(), "crash after step {stop}");
         assert_eq!(store.db.rowmap_ids_allocated(schema.ns_id.unwrap()).unwrap(), Some(0));
@@ -186,7 +188,7 @@ async fn a_field_being_built_is_reported_degraded() {
         ids(&store, "active = true AND tier = 1").await.1,
         vec!["active".to_owned(), "tier".to_owned()]
     );
-    store.run_pending_jobs().await.unwrap();
+    store.run_live_jobs().await.unwrap();
     assert_rebuilt(&store, &live, "after the builds").await;
 }
 
@@ -229,7 +231,7 @@ async fn reindex_all_is_refused_while_a_build_runs() {
         Err(DocStoreError::JobConflict { running, .. }) if running.starts_with("field_build")
     ));
     assert_eq!(store.load_schema("events").unwrap().indices.len(), 3);
-    store.run_pending_jobs().await.unwrap();
+    store.run_live_jobs().await.unwrap();
     store.drop_index("events", "extra").await.unwrap();
     store.reindex_all_attribute_indices("events").await.unwrap();
     assert_rebuilt(&store, &live, "after the build").await;
@@ -246,7 +248,7 @@ async fn a_reindex_all_that_failed_part_way_is_taken_over_by_the_next() {
     store.reindex_all_until("events", true, 1).await.unwrap();
     store
         .jobs
-        .finish(&store, "events", JobKey::reindex_all(ns_id), Err("simulated".to_owned()))
+        .finish(&*store, "events", JobKey::reindex_all(ns_id), Err("simulated".to_owned()))
         .unwrap();
     assert_eq!(store.load_schema("events").unwrap().indices.len(), 1, "one index dropped, then failed");
     store.reindex_all_attribute_indices("events").await.unwrap();

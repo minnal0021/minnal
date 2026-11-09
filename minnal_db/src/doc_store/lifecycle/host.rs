@@ -1,9 +1,7 @@
 //! The doc store as the lifecycle governor's host: its stores' states come
 //! from their records, and their tasks are `provision`, `teardown` and the
 //! index jobs' bodies (`jobs.rs`). Also
-//! the `DocStore` methods that start the governor and hand it tasks.
-
-use std::sync::Arc;
+//! the `DocStore` methods that hand the governor tasks.
 
 use super::super::*;
 use crate::namespace::NamespaceId;
@@ -45,31 +43,14 @@ impl LifecycleHost for DocStore {
 }
 
 impl DocStore {
-    /// Start the lifecycle governor, which from now on runs every store's
-    /// creation and drop in the background, supervised (see `namespace_lifecycle`),
-    /// and finishes those a crash left part-way. Call once, after the store is
-    /// configured; a second call does nothing.
-    ///
-    /// Without it, [`create`](Self::create) and [`remove`](Self::remove) run
-    /// their tasks inline (once, unsupervised), and the `begin_*` forms fail
-    /// with [`DocStoreError::GovernorUnavailable`].
-    pub fn start_lifecycle(self: &Arc<Self>, config: LifecycleConfig) {
-        self.governor
-            .get_or_init(|| Governor::start(Arc::downgrade(self), Arc::clone(&self.jobs), config));
-    }
-
-    /// The governor, if it is started and running.
+    /// The governor, if it is running (it stops only after failing too often).
     pub(in crate::doc_store) fn running_governor(&self) -> Result<&Governor, DocStoreError> {
         self.governor.get().filter(|g| g.is_running()).ok_or(DocStoreError::GovernorUnavailable)
     }
 
-    /// Run `namespace`'s lifecycle `task` and wait for it: through the
-    /// governor when it is started, inline otherwise.
+    /// Hand `namespace`'s lifecycle `task` to the governor and wait for it.
     pub(in crate::doc_store) async fn run_lifecycle_task(&self, namespace: &str, task: Task) -> Result<(), DocStoreError> {
-        match self.governor.get() {
-            Some(governor) => Ok(governor.run(namespace, task).await?),
-            None => LifecycleHost::run(self, namespace, task).await,
-        }
+        Ok(self.running_governor()?.run(namespace, task).await?)
     }
 
     /// Stores whose lifecycle task the governor gave up on, with the last
@@ -78,7 +59,7 @@ impl DocStore {
         self.governor.get().map(Governor::parked).unwrap_or_default()
     }
 
-    /// Whether the lifecycle governor is started and running.
+    /// Whether the lifecycle governor is running.
     pub fn lifecycle_running(&self) -> bool {
         self.running_governor().is_ok()
     }

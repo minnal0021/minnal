@@ -83,7 +83,7 @@ mod common;
 use common::*;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use minnal_db::Db;
+use minnal_db::bench_internals::Db;
 use std::hint::black_box;
 use std::time::Duration;
 use tempfile::TempDir;

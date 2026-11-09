@@ -56,10 +56,10 @@ fn subsystem_errors_convert_into_kv_error() {
 /// `500 {"error":"internal server error"}` with the useful text dropped. The
 /// variant is what lets a caller distinguish "your query is wrong" from "the
 /// database broke", so these assertions are on the *type*, not just the text.
-#[test]
-fn invalid_predicates_surface_as_query_errors() {
+#[tokio::test]
+async fn invalid_predicates_surface_as_query_errors() {
     use minnal_db::field_index::query::QueryError;
-    use minnal_db::{DEFAULT_NAMESPACE_ID, Db, DbConfig, IndexValue, IndexValueType};
+    use minnal_db::{AsyncDb, DEFAULT_NAMESPACE_ID, DbConfig, IndexValue, IndexValueType};
     use std::sync::Arc;
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -67,7 +67,7 @@ fn invalid_predicates_surface_as_query_errors() {
         num_buckets: 2,
         ..DbConfig::default()
     };
-    let db = Db::open_with_config(dir.path(), config).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config).await.unwrap();
 
     let field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str).unwrap();
     db.activate_field_index(
@@ -76,11 +76,12 @@ fn invalid_predicates_surface_as_query_errors() {
         IndexValueType::Str,
         Arc::new(|bytes: &[u8]| Some(IndexValue::Str(String::from_utf8_lossy(bytes).into_owned()))),
     )
+    .await
     .unwrap();
-    db.put(b"k1", b"active").unwrap();
+    db.put(b"k1".to_vec(), b"active".to_vec()).await.unwrap();
 
     // A field with no index cannot be queried...
-    let err = db.query_index(DEFAULT_NAMESPACE_ID, r#"nosuchfield = "x""#).unwrap_err();
+    let err = db.query_index(DEFAULT_NAMESPACE_ID, r#"nosuchfield = "x""#).await.unwrap_err();
     match err {
         KVError::Query(inner) => {
             let named: QueryError = inner;
@@ -91,14 +92,14 @@ fn invalid_predicates_surface_as_query_errors() {
     }
 
     // ...nor is a syntactically broken predicate an engine failure.
-    let err = db.query_index(DEFAULT_NAMESPACE_ID, "status === ").unwrap_err();
+    let err = db.query_index(DEFAULT_NAMESPACE_ID, "status === ").await.unwrap_err();
     assert!(matches!(err, KVError::Query(QueryError::Syntax { .. })), "got {err:?}");
 
     // The complexity bound reports itself as a query fault too, so the API can
     // answer 400 instead of appearing to have crashed.
     let deep = format!("{}status = \"active\"{}", "(".repeat(50_000), ")".repeat(50_000));
-    let err = db.query_index(DEFAULT_NAMESPACE_ID, &deep).unwrap_err();
+    let err = db.query_index(DEFAULT_NAMESPACE_ID, deep).await.unwrap_err();
     assert!(matches!(err, KVError::Query(QueryError::TooComplex { .. })), "got {err:?}");
 
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 }

@@ -33,7 +33,7 @@ pub enum KVError {
     WalPoisoned(String),
     #[error("write too large: {0}")]
     WriteTooLarge(String),
-    /// A [`merge`](crate::Db::merge) was committed to the WAL but could not be
+    /// A [`merge`](crate::AsyncDb::merge) was committed to the WAL but could not be
     /// applied to the in-memory store, so its result is not readable until the
     /// next open replays it.
     ///
@@ -47,7 +47,7 @@ pub enum KVError {
     ///
     /// The write is not lost — the WAL entry replays on the next open — so this
     /// is "not readable yet", not "gone". `apply_failures` on
-    /// [`Db::ops_metrics`](crate::Db::ops_metrics) counts these.
+    /// [`AsyncDb::ops_metrics`](crate::AsyncDb::ops_metrics) counts these.
     #[error("merge is durable in the WAL (seq {seq}) but was not applied in memory; it becomes readable after the next open")]
     MergeNotApplied { seq: u64 },
     /// A `merge` closure declined to produce a value.

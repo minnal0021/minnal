@@ -1,5 +1,5 @@
 //! Index jobs on the doc store's side: starting one and running it (through
-//! the governor, or inline without one), which body each job runs, and the
+//! the governor), which body each job runs, and the
 //! admin views: a store's jobs by name, cancelling one, waiting for one.
 //!
 //! A job's name is its kind, and for a field job the field's name:
@@ -11,15 +11,11 @@ use super::super::*;
 use crate::namespace_lifecycle::{AuditEvent, AuditRecord, JobKind, JobRecord, Task};
 
 impl DocStore {
-    /// Whether a job started now can run: inline without the governor, or
-    /// through it while it runs. Checked before a job is recorded, so a dead
-    /// governor does not leave a store in `IndexMaintenance` with a job
-    /// nobody runs.
+    /// Whether a job started now can run: the governor is running. Checked
+    /// before a job is recorded, so a dead governor does not leave a store in
+    /// `IndexMaintenance` with a job nobody runs.
     pub(in crate::doc_store) fn job_runner_ready(&self) -> Result<(), DocStoreError> {
-        match self.governor.get() {
-            Some(g) if !g.is_running() => Err(DocStoreError::GovernorUnavailable),
-            _ => Ok(()),
-        }
+        self.running_governor().map(|_| ())
     }
 
     /// Record job `key` of `namespace` as started, its body to begin from
@@ -47,17 +43,10 @@ impl DocStore {
         }
     }
 
-    /// Run started job `key` and wait for it to end: through the governor
-    /// when it is started (supervised: run again after a failure), inline
-    /// otherwise (once; its end is recorded here).
+    /// Run started job `key` through the governor (supervised: run again
+    /// after a failure) and wait for it to end.
     pub(in crate::doc_store) async fn run_job(&self, namespace: &str, key: JobKey) -> Result<(), DocStoreError> {
-        if let Some(governor) = self.governor.get() {
-            return Ok(governor.run(namespace, Task::Job(key)).await?);
-        }
-        let outcome = self.job_body(namespace, key).await;
-        self.jobs
-            .finish(self, namespace, key, outcome.as_ref().map(|_| ()).map_err(ToString::to_string))?;
-        outcome
+        Ok(self.running_governor()?.run(namespace, Task::Job(key)).await?)
     }
 
     /// Hand started job `key` to the governor, to run in the background.
@@ -84,11 +73,11 @@ impl DocStore {
         }
     }
 
-    /// Run every job a crash left live, inline and one after the other, and
-    /// wait for them; each store's state is first put in step with its jobs'
-    /// records. For a doc store without the governor, which does this itself
-    /// when it starts.
-    pub async fn run_pending_jobs(&self) -> Result<(), DocStoreError> {
+    /// Test hook: hand every live job to the governor and wait for each, one
+    /// after the other (a job it already runs is joined). For a test that
+    /// recorded a job, or ran one part-way, without handing it over.
+    #[cfg(test)]
+    pub(crate) async fn run_live_jobs(&self) -> Result<(), DocStoreError> {
         for (namespace, state) in self.schemas.states() {
             if !state.is_ready() {
                 continue;
@@ -97,7 +86,6 @@ impl DocStore {
                 continue;
             };
             for key in self.jobs.repair(self, &namespace, id)? {
-                info!("resuming job {} of '{namespace}'", key.kind);
                 self.run_job(&namespace, key).await?;
             }
         }
@@ -121,13 +109,6 @@ impl DocStore {
         limit: usize,
     ) -> Result<(Vec<AuditRecord>, Option<Vec<u8>>), DocStoreError> {
         Ok(self.jobs.audit().read(namespace, cursor, limit).await?)
-    }
-
-    /// Keep lifecycle audit records for `retention` from now on (default 30
-    /// days). Records already written expire by the retention they were
-    /// written with.
-    pub async fn set_audit_retention(&self, retention: Duration) -> Result<(), DocStoreError> {
-        Ok(crate::namespace_lifecycle::AuditLog::set_retention(&self.db, retention).await?)
     }
 
     /// `namespace`'s lifecycle state, `None` for no store.

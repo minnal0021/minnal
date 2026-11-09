@@ -63,8 +63,14 @@ semantic-search = ["dep:reqwest", "dep:simsimd", "dep:rayon"]
 # JSON document store (schema, CRUD, field-index queries). Independent of
 # `semantic-search`: enable both together for embed-on-write + doc vector search.
 doc-store = ["dep:json_dotpath"]
+# Not API: exposes `bench_internals` (the synchronous engine handle behind
+# `AsyncDb`, and the typed layer's codec) so the benches can time the engine
+# without `AsyncDb`'s blocking-pool hop. Turned on for this crate's own tests
+# and benches by the dev-dependency on itself below.
+bench-internals = []
 
 [dev-dependencies]
+minnal_db = { path = ".", features = ["bench-internals"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 rand = "0.10"
 approx = "0.5.1"

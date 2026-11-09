@@ -26,7 +26,9 @@
 //!
 //! At start the governor picks up every namespace that is still `Creating` or
 //! `Deleting`, and every live job ([`Jobs::repair`]), so what a crash or a
-//! parked namespace left before a restart is finished.
+//! parked namespace left before a restart is finished. It finds them before
+//! [`Governor::start`] returns, so nothing handed over later is mistaken for
+//! one of them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -97,6 +99,9 @@ struct Command {
     namespace: String,
     task: Task,
     done: Option<oneshot::Sender<Outcome>>,
+    /// Left part-way by a crash or a parked task, found when the governor
+    /// started: recorded as resumed in the audit log.
+    resumed: bool,
 }
 
 /// The handle the host keeps: submits tasks, and stops the governor with it.
@@ -110,8 +115,23 @@ pub(crate) struct Governor {
 impl Governor {
     /// Start the governor for `host`, whose jobs `jobs` records. It holds the
     /// host weakly: when the last `Arc` of it goes, so does the governor.
+    ///
+    /// What a crash or a parked task left part-way is found here, before this
+    /// returns, and queued ahead of anything a caller hands over: found later,
+    /// by the task, a create handed over meanwhile would be taken for one a
+    /// crash left (and logged as resumed).
     pub(crate) fn start<H: LifecycleHost>(host: Weak<H>, jobs: Arc<Jobs>, config: LifecycleConfig) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        if let Some(h) = host.upgrade() {
+            for (namespace, task) in leftover_tasks(&*h, &jobs) {
+                let _ = tx.send(Command {
+                    namespace,
+                    task,
+                    done: None,
+                    resumed: true,
+                });
+            }
+        }
         let parked = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let supervisor = tokio::spawn(supervise(host, jobs, rx, config, Arc::clone(&parked)));
@@ -133,6 +153,7 @@ impl Governor {
                 namespace: namespace.to_owned(),
                 task,
                 done: Some(done),
+                resumed: false,
             })
             .map_err(|_| LifecycleError::GovernorUnavailable)?;
         Ok(rx)
@@ -179,8 +200,18 @@ async fn supervise<H: LifecycleHost>(
     let mut restarts = 0u32;
     loop {
         // Its own task, so a panic in it is a `JoinError` here, not ours; and
-        // aborting this future aborts it with every coordinator it holds.
-        let governor = govern(host.clone(), Arc::clone(&jobs), Arc::clone(&rx), config.clone(), Arc::clone(&parked));
+        // aborting this future aborts it with every coordinator it holds. A
+        // restart finds again what the failed run left part-way (`start`
+        // found what was left before the first).
+        let rescan = restarts > 0;
+        let governor = govern(
+            host.clone(),
+            Arc::clone(&jobs),
+            Arc::clone(&rx),
+            config.clone(),
+            Arc::clone(&parked),
+            rescan,
+        );
         let mut run = AbortOnDrop(tokio::spawn(governor));
         match run.await_join().await {
             Ok(()) => return,
@@ -227,6 +258,7 @@ async fn govern<H: LifecycleHost>(
     rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Command>>>,
     config: LifecycleConfig,
     parked: Arc<parking_lot::Mutex<HashMap<String, TaskFailure>>>,
+    rescan: bool,
 ) {
     let mut rx = rx.lock().await;
     let mut running = Running::default();
@@ -240,8 +272,8 @@ async fn govern<H: LifecycleHost>(
         coordinators.spawn(coordinate(host.clone(), Arc::clone(&jobs), namespace, task, config.clone()));
     };
 
-    // Everything a crash, or a parked task, left part-way.
-    if let Some(h) = host.upgrade() {
+    // After a restart: everything the failed run left part-way.
+    if rescan && let Some(h) = host.upgrade() {
         for (namespace, task) in leftover_tasks(&*h, &jobs) {
             let name = match task {
                 Task::Job(key) => key.kind.name().to_owned(),
@@ -255,7 +287,14 @@ async fn govern<H: LifecycleHost>(
     loop {
         tokio::select! {
             command = rx.recv() => {
-                let Some(Command { namespace, task, done }) = command else { break };
+                let Some(Command { namespace, task, done, resumed }) = command else { break };
+                if resumed {
+                    let name = match task {
+                        Task::Job(key) => key.kind.name().to_owned(),
+                        other => other.to_string(),
+                    };
+                    jobs.audit().record(&namespace, AuditEvent::Resumed, Some(&name), None, None);
+                }
                 let refusal = match parked.lock().get(&namespace) {
                     Some(failure) => Some(failure.clone()),
                     None => running.refusal(&namespace, task).map(|error| TaskFailure { attempts: 0, error }),

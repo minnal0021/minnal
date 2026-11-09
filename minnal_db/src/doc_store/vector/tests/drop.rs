@@ -55,9 +55,9 @@ async fn an_interrupted_kv_vector_drop_is_finished_at_the_next_start() {
     store.shutdown().await.unwrap();
     drop(store);
 
+    // The governor resumes the cleanup as soon as the store opens.
     let store = open_fresh(db_dir.path()).await;
-    assert_eq!(store.schemas.state("sem_kv"), Some(NamespaceState::IndexMaintenance));
-    store.run_pending_jobs().await.unwrap();
+    wait_for_jobs(&store, "sem_kv").await;
     assert!(vector_kv::get_queue_entry(&store.db, "sem_kv", b"x").await.unwrap().is_none());
     assert!(!store.db.list_namespaces().iter().any(|(n, _)| vector_kv::vector_data_base(n).is_some()));
     assert!(!store.load_kv_schema("sem_kv").unwrap().is_semantic_search_enabled());
@@ -120,7 +120,7 @@ async fn kv_put_empty_text_clears_old_vectors() {
 #[tokio::test]
 async fn doc_put_empty_embedding_text_clears_pending_embed() {
     let db_dir = TempDir::new().unwrap();
-    let store = with_worker_notify(open_fresh(db_dir.path()).await);
+    let store = open_without_vector_worker(db_dir.path()).await;
     create_semantic_schema(&store, "sem").await;
     store.put("sem", DocId::U64(1), serde_json::json!({"title": "old title"})).await.unwrap();
     let key = DocId::U64(1).to_bytes();

@@ -16,13 +16,54 @@ mod common;
 use common::*;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use minnal_db::{
-    Db,
-    rkyv_derives::{Archive, Deserialize, Serialize},
-};
+use minnal_db::bench_internals::{Db, deserialize_keys, deserialize_pairs, rkyv_deserialize, rkyv_serialize};
+use minnal_db::rkyv_derives::{Archive, Deserialize, Serialize};
+use minnal_db::{KVError, RkyvDecode, RkyvEncode};
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Duration;
+
+/// The typed layer over the engine handle, built from the same codec helpers
+/// and in the same order as `AsyncNamespace`'s typed methods, so these cases
+/// time the typed layer without `AsyncDb`'s blocking-pool hop.
+trait Typed {
+    fn put_typed<K: RkyvEncode, V: RkyvEncode>(&self, key: &K, value: &V) -> Result<(), KVError>;
+    fn get_typed<K: RkyvEncode, V: RkyvDecode>(&self, key: &K) -> Result<Option<V>, KVError>;
+    fn delete_typed<K: RkyvEncode>(&self, key: &K) -> Result<(), KVError>;
+    fn iter_typed<K: RkyvDecode, V: RkyvDecode>(&self) -> Result<Vec<(K, V)>, KVError>;
+    fn keys_typed<K: RkyvDecode>(&self) -> Result<Vec<K>, KVError>;
+    fn range_typed<K: RkyvEncode + RkyvDecode, V: RkyvDecode>(&self, start: &K, end: Option<&K>) -> Result<Vec<(K, V)>, KVError>;
+    fn scan_prefix_typed<K: RkyvDecode, V: RkyvDecode>(&self, prefix: &[u8]) -> Result<Vec<(K, V)>, KVError>;
+}
+
+impl Typed for Db {
+    fn put_typed<K: RkyvEncode, V: RkyvEncode>(&self, key: &K, value: &V) -> Result<(), KVError> {
+        self.put(&rkyv_serialize(key)?, &rkyv_serialize(value)?)
+    }
+    fn get_typed<K: RkyvEncode, V: RkyvDecode>(&self, key: &K) -> Result<Option<V>, KVError> {
+        match self.get(&rkyv_serialize(key)?)? {
+            Some(vb) => Ok(Some(rkyv_deserialize::<V>(&vb)?)),
+            None => Ok(None),
+        }
+    }
+    fn delete_typed<K: RkyvEncode>(&self, key: &K) -> Result<(), KVError> {
+        self.delete(&rkyv_serialize(key)?)
+    }
+    fn iter_typed<K: RkyvDecode, V: RkyvDecode>(&self) -> Result<Vec<(K, V)>, KVError> {
+        deserialize_pairs(self.iter()?)
+    }
+    fn keys_typed<K: RkyvDecode>(&self) -> Result<Vec<K>, KVError> {
+        deserialize_keys(self.keys()?)
+    }
+    fn range_typed<K: RkyvEncode + RkyvDecode, V: RkyvDecode>(&self, start: &K, end: Option<&K>) -> Result<Vec<(K, V)>, KVError> {
+        let start_bytes = rkyv_serialize(start)?;
+        let end_bytes = end.map(|e| rkyv_serialize(e)).transpose()?;
+        deserialize_pairs(self.range(&start_bytes, end_bytes.as_deref())?)
+    }
+    fn scan_prefix_typed<K: RkyvDecode, V: RkyvDecode>(&self, prefix: &[u8]) -> Result<Vec<(K, V)>, KVError> {
+        deserialize_pairs(self.scan_prefix(prefix)?)
+    }
+}
 
 /// Wrapper that calls `Db::shutdown()` on drop to release file handles promptly.
 /// Without this, `iter_batched_ref` accumulates open SSTable/value-log fds

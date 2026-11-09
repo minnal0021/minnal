@@ -38,7 +38,7 @@ where
 }
 
 /// Serialize a value to bytes via rkyv.
-pub(super) fn rkyv_serialize<T>(value: &T) -> Result<Vec<u8>>
+pub fn rkyv_serialize<T>(value: &T) -> Result<Vec<u8>>
 where
     T: RkyvEncode,
 {
@@ -57,7 +57,7 @@ where
 /// to follow archived relative pointers out of bounds — undefined behaviour. Every
 /// typed entry point already requires `T::Archived: CheckBytes`, so validating
 /// costs no API change; mismatched bytes are now a `Serialization` error.
-pub(super) fn rkyv_deserialize<T>(bytes: &[u8]) -> Result<T>
+pub fn rkyv_deserialize<T>(bytes: &[u8]) -> Result<T>
 where
     T: RkyvDecode,
 {
@@ -67,7 +67,7 @@ where
 // ── Shared helpers ─────────────────────────────────────────────────────
 
 /// Deserialize a list of raw key-value byte pairs into typed pairs.
-pub(super) fn deserialize_pairs<K, V>(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Vec<(K, V)>>
+pub fn deserialize_pairs<K, V>(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Vec<(K, V)>>
 where
     K: RkyvDecode,
     V: RkyvDecode,
@@ -83,7 +83,7 @@ where
 }
 
 /// Deserialize a list of raw key bytes into typed keys.
-pub(super) fn deserialize_keys<K>(keys: Vec<Vec<u8>>) -> Result<Vec<K>>
+pub fn deserialize_keys<K>(keys: Vec<Vec<u8>>) -> Result<Vec<K>>
 where
     K: RkyvDecode,
 {

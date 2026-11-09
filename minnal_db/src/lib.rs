@@ -8,62 +8,17 @@
 //!
 //! ## Quick start
 //!
-//! ```rust,no_run
-//! use minnal_db::Db;
-//!
-//! fn main() -> Result<(), minnal_db::KVError> {
-//!     let db = Db::open("/tmp/my_db")?;
-//!
-//!     db.put(b"hello", b"world")?;
-//!
-//!     if let Some(val) = db.get(b"hello")? {
-//!         println!("{}", String::from_utf8_lossy(&val));
-//!     }
-//!
-//!     db.shutdown()?;
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Atomic read-modify-write
-//!
-//! [`Db::merge`] reads a key, hands the stored value and your operand to a
-//! closure, and writes the result back as one indivisible step — the thing
-//! `get` + `put` cannot do safely, because a concurrent writer can land between
-//! the two and have its update erased.
-//!
-//! ```rust,no_run
-//! use minnal_db::Db;
-//!
-//! fn main() -> Result<(), minnal_db::KVError> {
-//!     let db = Db::open("/tmp/my_db")?;
-//!
-//!     // A counter, safe from any number of threads.
-//!     let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
-//!         let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-//!         let step = u64::from_le_bytes(operand.try_into().unwrap());
-//!         Ok(Some((current + step).to_le_bytes().to_vec()))
-//!     })?;
-//!     println!("{:?}", total);
-//!
-//!     db.shutdown()?;
-//!     Ok(())
-//! }
-//! ```
-//!
-//! The closure returns `Ok(Some(v))` to write, `Ok(None)` to delete the key, or
-//! `Err` to abort without writing anything. It runs while a per-key lock is
-//! held, so it must not call back into the database. The guarantee is per key:
-//! this is not a transaction.
-//!
-//! ## Async usage
+//! [`AsyncDb`] is the entry point. Opening a database starts its background
+//! workers (compaction, value-log GC, write-ahead-log GC, field-index
+//! checkpoints, TTL expiry); [`shutdown`](AsyncDb::shutdown) stops them and
+//! flushes buffered writes.
 //!
 //! ```rust,no_run
 //! use minnal_db::AsyncDb;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), minnal_db::KVError> {
-//!     let db = AsyncDb::open("/tmp/my_async_db").await?;
+//!     let db = AsyncDb::open("/tmp/my_db").await?;
 //!
 //!     db.put(b"hello".to_vec(), b"world".to_vec()).await?;
 //!
@@ -75,6 +30,40 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## Atomic read-modify-write
+//!
+//! [`AsyncDb::merge`] reads a key, hands the stored value and your operand to a
+//! closure, and writes the result back as one indivisible step — the thing
+//! `get` + `put` cannot do safely, because a concurrent writer can land between
+//! the two and have its update erased.
+//!
+//! ```rust,no_run
+//! use minnal_db::AsyncDb;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), minnal_db::KVError> {
+//!     let db = AsyncDb::open("/tmp/my_db").await?;
+//!
+//!     // A counter, safe from any number of tasks.
+//!     let total = db
+//!         .merge(b"visits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
+//!             let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+//!             let step = u64::from_le_bytes(operand.try_into().unwrap());
+//!             Ok(Some((current + step).to_le_bytes().to_vec()))
+//!         })
+//!         .await?;
+//!     println!("{:?}", total);
+//!
+//!     db.shutdown().await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! The closure returns `Ok(Some(v))` to write, `Ok(None)` to delete the key, or
+//! `Err` to abort without writing anything. It runs while a per-key lock is
+//! held, so it must not call back into the database. The guarantee is per key:
+//! this is not a transaction.
 
 // minnal_db's storage engine relies on Unix positional I/O (`pread`/`pwrite`,
 // via `std::os::unix::fs::FileExt`) and the server on POSIX signals. Windows is
@@ -116,31 +105,33 @@ pub struct QuickstartExamples;
 
 // ── Facade API (primary entry points) ─────────────────────────────────────────
 
-/// The primary synchronous entry point.
+/// The entry point: an open database, with its background workers running.
 ///
 /// ```rust,no_run
-/// use minnal_db::Db;
-/// let db = Db::open("/tmp/db").unwrap();
-/// db.put(b"k", b"v").unwrap();
-/// db.shutdown().unwrap();
+/// # async fn run() -> minnal_db::error::Result<()> {
+/// use minnal_db::AsyncDb;
+/// let db = AsyncDb::open("/tmp/db").await?;
+/// db.put(b"k".to_vec(), b"v".to_vec()).await?;
+/// db.shutdown().await?;
+/// # Ok(())
+/// # }
 /// ```
-pub use db::facade::Db;
-
-/// Async wrapper — offloads I/O via `spawn_blocking`.
 pub use db::facade::AsyncDb;
 
-/// Scoped handle to a single namespace (sync).
-pub use db::facade::Namespace;
-
-/// Scoped handle to a single namespace (async).
+/// Scoped handle to a single namespace.
 pub use db::facade::AsyncNamespace;
+
+/// Not API: for this crate's benches (feature `bench-internals`).
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub use db::facade::bench_internals;
 
 /// What the typed methods (`put_typed`, `get_typed` and the rest) need of a key
 /// or value type: every rkyv-derived type qualifies.
 pub use db::facade::{RkyvDecode, RkyvEncode};
 
 /// A prefix-batch scan's entries, packed into a few buffers
-/// ([`Namespace::scan_prefixes_batch`], [`AsyncNamespace::scan_prefixes_batch`]).
+/// ([`AsyncNamespace::scan_prefixes_batch`]).
 pub use kv_store::PrefixScan;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -208,25 +199,25 @@ pub use crate::field_index::IndexValueType;
 pub use crate::field_index::IndexValue;
 
 /// On-disk blob growth/waste metrics for one field index (logical vs. live
-/// bytes + waste ratios), returned by [`Db::field_index_blob_stats`].
+/// bytes + waste ratios), returned by [`AsyncDb::field_index_blob_stats`].
 pub use crate::field_index::IndexBlobStats;
-/// Field-index write-buffer use and limits ([`Db::index_overlay_stats`]).
+/// Field-index write-buffer use and limits ([`AsyncDb::index_overlay_stats`]).
 pub use crate::field_index::IndexOverlayStats;
 
 /// Unique identifier for a registered field within a namespace.
 pub use crate::field_index::FieldId;
 /// Metadata for a registered field: id, name, and value type.
 pub use crate::field_index::FieldMeta;
-/// Outcome of a targeted single-field reindex ([`Db::reindex_field`]).
+/// Outcome of a targeted single-field reindex ([`AsyncDb::reindex_field`]).
 pub use crate::field_index::FieldReindexOutcome;
-/// What a field-index repair did ([`Db::repair_field_index`]).
+/// What a field-index repair did ([`AsyncDb::repair_field_index`]).
 pub use crate::field_index::FieldRepairOutcome;
 /// A field-index query result: matching keys plus whether the indices that
 /// produced them are known to be incomplete.
 pub use crate::field_index::QueryOutcome;
 
 /// Health of one field index, including any outstanding gap
-/// ([`Db::index_health`]).
+/// ([`AsyncDb::index_health`]).
 pub use db::indexing::manager::FieldIndexHealth;
 /// Why a field index is incomplete, and what repair it needs.
 pub use db::indexing::manager::{GapCause, GapRecord, RepairMode};
@@ -236,14 +227,14 @@ pub use kv_store::index_set::ExtractorFn;
 
 /// Row-ID function type: derives a stable 128-bit row ID from raw key bytes.
 ///
-/// Register one via [`Db::set_row_id_fn`] to replace the default dense row-ID
+/// Register one via [`AsyncDb::set_row_id_fn`] to replace the default dense row-ID
 /// map with an explicit identifier (e.g. a UUID embedded in the key).
 pub use kv_store::index_set::RowIdFn;
 
 /// Inverse of [`RowIdFn`]: reconstructs the raw key bytes from a row ID.
 ///
 /// Registering this alongside [`RowIdFn`] enables O(|hits|) query resolution
-/// in [`Db::query_index`] with zero memory overhead — no in-memory map needed.
+/// in [`AsyncDb::query_index`] with zero memory overhead — no in-memory map needed.
 pub use kv_store::index_set::RowToKeyFn;
 
 /// Namespace ID for the implicit default namespace.
@@ -254,22 +245,22 @@ pub use namespace::{BadNamespaceId, NamespaceId};
 /// Name and ID for the system-wide namespace (always present, never removable).
 pub use namespace::{SYSTEM_NAMESPACE, SYSTEM_NAMESPACE_ID};
 
-/// Snapshot statistics returned by [`Db::stats`].
+/// Snapshot statistics returned by [`AsyncDb::stats`].
 pub use db::stats::Stats;
 
-/// Per-GC-run statistics returned by [`Db::garbage_collect`].
+/// Per-GC-run statistics returned by [`AsyncDb::garbage_collect`].
 pub use db::stats::GCStats;
 
 /// Engine-wide operational metrics (runtime counters) and their serializable
-/// snapshot, returned by [`Db::ops_metrics`].
+/// snapshot, returned by [`AsyncDb::ops_metrics`].
 pub use support::metrics::{Metrics, MetricsSnapshot};
 
 pub use db::wal::segmented_log::LogPosition;
-/// Snapshot of WAL state returned by [`Db::wal_metadata`].
+/// Snapshot of WAL state returned by [`AsyncDb::wal_metadata`].
 pub use db::wal::vector_index_wal::{VectorIndexWalHolder, VectorIndexWalPosition, VectorIndexWalSegment, VectorIndexWalStats};
 pub use db::wal::{WalMetadata, WalNamespaceProgress, WalSegmentState, WalStats};
 
-/// Live LSM manifest snapshot returned by [`Db::lsm_manifests`].
+/// Live LSM manifest snapshot returned by [`AsyncDb::lsm_manifests`].
 pub use storage::lsm::manifest::LsmManifest;
 
 /// Per-bucket entry inside a [`ManifestLevel`].
@@ -278,17 +269,17 @@ pub use storage::lsm::manifest::ManifestBucket;
 pub use storage::lsm::manifest::ManifestFile;
 /// Per-level entry in an [`LsmManifest`].
 pub use storage::lsm::manifest::ManifestLevel;
-/// In-memory (non-SSTable) LSM statistics, returned by [`Db::lsm_runtime_stats`].
+/// In-memory (non-SSTable) LSM statistics, returned by [`AsyncDb::lsm_runtime_stats`].
 pub use storage::lsm::tree::LSMStats;
 
-/// Per-bucket value-log metadata returned by [`Db::value_log_shard_stats`].
+/// Per-bucket value-log metadata returned by [`AsyncDb::value_log_shard_stats`].
 pub use storage::value_log::ValueLogMetadata;
 
 /// Physical (on-disk) value-log shard footprint, returned by
-/// [`Db::value_log_physical_stats`].
+/// [`AsyncDb::value_log_physical_stats`].
 pub use storage::value_log::sharded::ShardPhysicalStats;
 
-/// Per-page value-log garbage breakdown, returned by [`Db::value_log_segment_stats`].
+/// Per-page value-log garbage breakdown, returned by [`AsyncDb::value_log_segment_stats`].
 pub use storage::value_log::SegmentStats;
 
 // ── Document store (folded layer) ─────────────────────────────────────────────
@@ -320,7 +311,7 @@ pub mod rkyv_derives {
 /// Zero-copy access to an archived value, re-exported from rkyv.
 ///
 /// Useful inside a field-index [`ExtractorFn`] over values written with
-/// [`Db::put_typed`]: validate-and-borrow the archived struct, then pull out
+/// [`AsyncDb::put_typed`]: validate-and-borrow the archived struct, then pull out
 /// the indexed field — no full deserialisation. Pair with [`rancor`] for the
 /// error type, e.g. `access::<ArchivedT, rancor::Error>(bytes)`.
 pub use rkyv::access;
@@ -332,7 +323,7 @@ pub use rkyv::rancor;
 ///
 /// Spells the target type for [`access`] when no named `Archived*` struct is
 /// generated — e.g. `access::<Archived<u64>, rancor::Error>(key_bytes)` to read
-/// back a `u64` key written with [`Db::put_typed`].
+/// back a `u64` key written with [`AsyncDb::put_typed`].
 pub use rkyv::Archived;
 
 // ── LSM configuration ────────────────────────────────────────────────────────

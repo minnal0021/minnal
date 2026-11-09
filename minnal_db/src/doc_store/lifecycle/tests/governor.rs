@@ -15,9 +15,7 @@ fn quick(max_restarts: u32) -> LifecycleConfig {
 }
 
 async fn governed(db_dir: &TempDir, max_restarts: u32) -> Arc<DocStore> {
-    let store = Arc::new(open_fresh(db_dir.path()).await);
-    store.start_lifecycle(quick(max_restarts));
-    store
+    open_with(db_dir.path(), |b| b.lifecycle(quick(max_restarts))).await
 }
 
 /// Wait up to 10 s for `namespace` to reach `state` (`None`: gone).
@@ -47,24 +45,6 @@ async fn a_background_create_and_drop_finish() {
     ));
     wait_for(&store, "docs", None).await;
     assert!(!store.db.list_namespaces().iter().any(|(n, _)| n == "docs"));
-    store.shutdown().await.unwrap();
-}
-
-/// Without a running governor the background forms refuse before writing
-/// anything; the waiting forms run inline.
-#[tokio::test]
-async fn without_a_governor_the_background_forms_refuse() {
-    let db_dir = TempDir::new().unwrap();
-    let store = open_fresh(db_dir.path()).await;
-    assert!(!store.lifecycle_running());
-    assert!(matches!(
-        store.begin_create(make_schema("docs", vec![])).await,
-        Err(DocStoreError::GovernorUnavailable)
-    ));
-    assert!(!store.schemas.contains("docs"), "nothing written");
-    store.create(make_schema("docs", vec![])).await.unwrap();
-    assert!(matches!(store.begin_remove("docs").await, Err(DocStoreError::GovernorUnavailable)));
-    assert_eq!(store.schemas.state("docs"), Some(NamespaceState::Created), "nothing changed");
     store.shutdown().await.unwrap();
 }
 
@@ -115,12 +95,12 @@ async fn a_task_that_keeps_failing_parks_its_store_until_a_restart() {
     store.shutdown().await.unwrap();
 }
 
-/// A store whose drop was cut short is finished by the governor as soon as it
-/// starts, with no caller asking.
+/// A store whose create or drop was cut short is finished at the next open,
+/// with no caller asking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_governor_finishes_what_it_finds_at_start() {
+async fn what_a_crash_left_is_finished_at_the_next_open() {
     let db_dir = TempDir::new().unwrap();
-    let store = Arc::new(open_fresh(db_dir.path()).await);
+    let store = open_fresh(db_dir.path()).await;
     store.create(make_schema("gone", vec![])).await.unwrap();
     store
         .schemas
@@ -130,7 +110,10 @@ async fn the_governor_finishes_what_it_finds_at_start() {
         .schemas
         .insert(StoredSchema::Doc(Arc::new(make_schema("new", vec![]))), NamespaceState::Creating)
         .unwrap();
-    store.start_lifecycle(quick(3));
+    store.shutdown().await.unwrap();
+    drop(store);
+
+    let store = governed(&db_dir, 3).await;
     wait_for(&store, "gone", None).await;
     wait_for(&store, "new", Some(NamespaceState::Created)).await;
     store.shutdown().await.unwrap();
@@ -142,13 +125,16 @@ async fn the_governor_finishes_what_it_finds_at_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_governor_frees_a_store_left_in_maintenance_with_no_job() {
     let db_dir = TempDir::new().unwrap();
-    let store = Arc::new(open_fresh(db_dir.path()).await);
+    let store = open_fresh(db_dir.path()).await;
     store.create(make_schema("docs", vec![])).await.unwrap();
     store
         .schemas
         .transition("docs", &[NamespaceState::Created], NamespaceState::IndexMaintenance)
         .unwrap();
-    store.start_lifecycle(quick(3));
+    store.shutdown().await.unwrap();
+    drop(store);
+
+    let store = governed(&db_dir, 3).await;
     wait_for(&store, "docs", Some(NamespaceState::Created)).await;
     store.remove("docs").await.unwrap();
     store.shutdown().await.unwrap();

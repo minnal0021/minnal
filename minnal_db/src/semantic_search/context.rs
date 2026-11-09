@@ -57,8 +57,8 @@ pub enum ContextError {
 /// asynchronously, making the write path independent of embedding service
 /// availability.
 ///
-/// Construct once at startup and attach via
-/// [`DocStore::with_semantic_search`](crate::doc_store::DocStore::with_semantic_search).
+/// Construct once at startup and pass it to the store's builder,
+/// [`DocStoreBuilder::semantic_search`](crate::doc_store::DocStoreBuilder::semantic_search).
 ///
 /// It holds what is engine-wide: the embedding service settings, the defaults
 /// a namespace's vector-index settings start from, and optionally the models

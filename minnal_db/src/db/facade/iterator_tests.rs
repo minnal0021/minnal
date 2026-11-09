@@ -370,11 +370,9 @@ async fn a_simulated_crash_loses_unflushed_no_wal_writes() {
 /// A database with its workers running, holding one written namespace.
 #[cfg(target_os = "linux")]
 async fn open_with_workers(dir: &std::path::Path) -> crate::db::facade::AsyncDb {
-    let config = create_db_config();
-    let db = crate::db::facade::AsyncDb::open_with_config(dir.to_owned(), config.clone())
+    let db = crate::db::facade::AsyncDb::open_with_config(dir.to_owned(), create_db_config())
         .await
         .unwrap();
-    db.enable_all_workers(&config).await.unwrap();
     let ns = db.namespace("n".to_string()).await.unwrap();
     ns.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
     db.flush_namespaces(vec!["n".to_string()]).await.unwrap();

@@ -346,7 +346,7 @@ impl WalMetadata {
     }
 }
 
-/// The main WAL's state for operators, from [`Db::wal_stats`](crate::Db::wal_stats).
+/// The main WAL's state for operators, from [`AsyncDb::wal_stats`](crate::AsyncDb::wal_stats).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WalStats {
     /// The first record still on disk; segments below it were reclaimed.

@@ -70,7 +70,7 @@ impl DocStore {
     /// and it may hold field-index registrations the new store must not
     /// inherit. One holding keys is refused with
     /// [`DocStoreError::NamespaceNotEmpty`]: it was written directly through
-    /// [`Db`](crate::Db), and those keys are not this store's to delete or
+    /// [`AsyncDb`](crate::AsyncDb), and those keys are not this store's to delete or
     /// adopt. The default namespace always exists, so it is left alone.
     pub(super) async fn clear_orphaned_namespace(&self, name: &str) -> Result<(), DocStoreError> {
         self.refuse_a_namespace_holding_keys(name).await?;

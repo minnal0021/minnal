@@ -49,7 +49,7 @@ pub(crate) async fn document_text(db: &AsyncDb, schemas: &SchemaStore, namespace
 }
 
 /// A vector reindex's progress, as the progress views report it: read from its
-/// `vector_reindex` job's record ([`DocStore::vec_reindex_progress`]).
+/// `vector_reindex` job's record (`DocStore::vec_reindex_progress`, with `semantic-search`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VecReindexProgress {
     /// `Running` until every document is enqueued and the worker has embedded

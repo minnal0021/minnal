@@ -1,4 +1,5 @@
-//! Integration tests for the `Db` / `AsyncDb` facade.
+//! Integration tests for the `AsyncDb` facade, and for `Db`, the engine
+//! handle it wraps.
 //!
 //! Lives here rather than in `tests/` because it reaches internal configuration
 //! types.
@@ -321,24 +322,53 @@ mod tests {
         Ok(())
     }
 
-    /// A `Namespace` merge must stay inside its own keyspace.
-    #[test]
-    fn merge_is_scoped_to_its_namespace() -> Result<()> {
+    /// A namespace's merge must stay inside its own keyspace.
+    #[tokio::test]
+    async fn merge_is_scoped_to_its_namespace() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
 
-        db.put(b"k", b"default-value")?;
-        let orders = db.namespace("orders")?;
-        let written = orders.merge(b"k", b"ns-value", |existing, operand| {
-            assert_eq!(existing, None, "the namespace saw the default namespace's value");
-            Ok(Some(operand.to_vec()))
-        })?;
+        db.put(b"k".to_vec(), b"default-value".to_vec()).await?;
+        let orders = db.namespace("orders".to_string()).await?;
+        let written = orders
+            .merge(b"k".to_vec(), b"ns-value".to_vec(), |existing, operand| {
+                assert_eq!(existing, None, "the namespace saw the default namespace's value");
+                Ok(Some(operand.to_vec()))
+            })
+            .await?;
 
         assert_eq!(written, Some(b"ns-value".to_vec()));
-        assert_eq!(orders.get(b"k")?, Some(b"ns-value".to_vec()));
-        assert_eq!(db.get(b"k")?, Some(b"default-value".to_vec()));
+        assert_eq!(orders.get(b"k".to_vec()).await?, Some(b"ns-value".to_vec()));
+        assert_eq!(db.get(b"k".to_vec()).await?, Some(b"default-value".to_vec()));
 
-        db.shutdown()?;
+        db.shutdown().await?;
+        Ok(())
+    }
+
+    /// A namespace's no-WAL writes, `get_multiple` and `scan_prefixes_batch`.
+    #[tokio::test]
+    async fn a_namespace_has_batch_and_no_wal_operations() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
+        let ns = db.namespace("mirror".to_string()).await?;
+        let key = |prefix: u32, n: u8| {
+            let mut k = prefix.to_be_bytes().to_vec();
+            k.push(n);
+            k
+        };
+        ns.put_no_wal(key(7, 1), b"a".to_vec()).await?;
+        ns.put(key(7, 2), b"b".to_vec()).await?;
+        ns.put(key(9, 1), b"c".to_vec()).await?;
+        assert_eq!(
+            ns.get_multiple(vec![key(7, 1), key(8, 1), key(7, 1)]).await?,
+            vec![Some(b"a".to_vec()), None, Some(b"a".to_vec())]
+        );
+        let by_prefix = ns.scan_prefixes_batch(vec![7, 8]).await?;
+        assert_eq!(by_prefix.iter().filter(|(p, _, _)| *p == 7).count(), 2);
+        assert!(by_prefix.iter().all(|(p, _, _)| p == 7));
+        ns.delete_no_wal(key(7, 1)).await?;
+        assert_eq!(ns.get(key(7, 1)).await?, None);
+        db.shutdown().await?;
         Ok(())
     }
 
@@ -346,44 +376,16 @@ mod tests {
     /// be an archive of the requested type. It used unchecked access, so reading
     /// raw or differently-typed bytes followed archived pointers out of bounds —
     /// undefined behaviour from a safe function. Now it is an error.
-    /// The sync `Namespace` offers the same operations as `AsyncNamespace`
-    /// (it lacked the no-WAL writes, `get_multiple` and `scan_prefixes_batch`).
-    #[test]
-    fn sync_namespace_mirrors_the_async_batch_and_no_wal_operations() -> Result<()> {
+    #[tokio::test]
+    async fn get_typed_rejects_bytes_that_are_not_an_archive_of_that_type() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-        let ns = db.namespace("mirror")?;
-        let key = |prefix: u32, n: u8| {
-            let mut k = prefix.to_be_bytes().to_vec();
-            k.push(n);
-            k
-        };
-        ns.put_no_wal(&key(7, 1), b"a")?;
-        ns.put(&key(7, 2), b"b")?;
-        ns.put(&key(9, 1), b"c")?;
-        assert_eq!(
-            ns.get_multiple(&[key(7, 1), key(8, 1), key(7, 1)])?,
-            vec![Some(b"a".to_vec()), None, Some(b"a".to_vec())]
-        );
-        let by_prefix = ns.scan_prefixes_batch(&[7, 8])?;
-        assert_eq!(by_prefix.iter().filter(|(p, _, _)| *p == 7).count(), 2);
-        assert!(by_prefix.iter().all(|(p, _, _)| p == 7));
-        ns.delete_no_wal(&key(7, 1))?;
-        assert_eq!(ns.get(&key(7, 1))?, None);
-        db.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn get_typed_rejects_bytes_that_are_not_an_archive_of_that_type() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
 
         // Too short to hold a `Tally`: unchecked access read past the buffer.
         let short_key = rkyv::to_bytes::<rkyv::rancor::Error>(&"short".to_string()).unwrap().to_vec();
-        db.put(&short_key, &[0x01, 0x02, 0x03])?;
+        db.put(short_key, vec![0x01, 0x02, 0x03]).await?;
         assert!(matches!(
-            db.get_typed::<String, Tally>(&"short".to_string()),
+            db.get_typed::<String, Tally>(&"short".to_string()).await,
             Err(KVError::Serialization(_))
         ));
 
@@ -397,83 +399,91 @@ mod tests {
         let at = bytes.windows(7).position(|w| w == b"a label").expect("label bytes in the archive");
         bytes[at] = 0xFF;
         let corrupt_key = rkyv::to_bytes::<rkyv::rancor::Error>(&"corrupt".to_string()).unwrap().to_vec();
-        db.put(&corrupt_key, &bytes)?;
+        db.put(corrupt_key, bytes).await?;
         assert!(matches!(
-            db.get_typed::<String, Tally>(&"corrupt".to_string()),
+            db.get_typed::<String, Tally>(&"corrupt".to_string()).await,
             Err(KVError::Serialization(_))
         ));
 
         // A value stored as one type, read back as another.
-        db.put_typed(&"n".to_string(), &7u8)?;
-        assert!(matches!(db.get_typed::<String, Tally>(&"n".to_string()), Err(KVError::Serialization(_))));
+        db.put_typed(&"n".to_string(), &7u8).await?;
+        assert!(matches!(
+            db.get_typed::<String, Tally>(&"n".to_string()).await,
+            Err(KVError::Serialization(_))
+        ));
 
         // A correctly typed value still round-trips.
         let tally = Tally {
             count: 3,
             label: "ok".to_string(),
         };
-        db.put_typed(&"t".to_string(), &tally)?;
-        assert_eq!(db.get_typed::<String, Tally>(&"t".to_string())?, Some(tally));
-        db.shutdown()?;
+        db.put_typed(&"t".to_string(), &tally).await?;
+        assert_eq!(db.get_typed::<String, Tally>(&"t".to_string()).await?, Some(tally));
+        db.shutdown().await?;
         Ok(())
     }
 
-    #[test]
-    fn merge_typed_accumulates_a_typed_value() -> Result<()> {
+    #[tokio::test]
+    async fn merge_typed_accumulates_a_typed_value() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
 
         let step = Tally {
             count: 4,
             label: "clicks".to_string(),
         };
-        let first: Option<Tally> = db.merge_typed(&"stats".to_string(), &step, |current, operand| {
-            assert!(current.is_none());
-            Ok(Some(operand))
-        })?;
+        let first: Option<Tally> = db
+            .merge_typed(&"stats".to_string(), &step, |current, operand| {
+                assert!(current.is_none());
+                Ok(Some(operand))
+            })
+            .await?;
         assert_eq!(first.unwrap().count, 4);
 
-        let second: Option<Tally> = db.merge_typed(&"stats".to_string(), &step, |current, operand| {
-            let current = current.expect("the stored tally should be visible");
-            Ok(Some(Tally {
-                count: current.count + operand.count,
-                label: current.label,
-            }))
-        })?;
+        let second: Option<Tally> = db
+            .merge_typed(&"stats".to_string(), &step, |current, operand| {
+                let current = current.expect("the stored tally should be visible");
+                Ok(Some(Tally {
+                    count: current.count + operand.count,
+                    label: current.label,
+                }))
+            })
+            .await?;
         let second = second.expect("merge_typed returns the new value");
         assert_eq!(second.count, 8);
         assert_eq!(second.label, "clicks");
 
         // And it is what actually landed in storage.
-        let stored: Option<Tally> = db.get_typed(&"stats".to_string())?;
+        let stored: Option<Tally> = db.get_typed(&"stats".to_string()).await?;
         assert_eq!(stored.unwrap().count, 8);
 
-        db.shutdown()?;
+        db.shutdown().await?;
         Ok(())
     }
 
-    #[test]
-    fn merge_typed_aborts_without_touching_the_stored_value() -> Result<()> {
+    #[tokio::test]
+    async fn merge_typed_aborts_without_touching_the_stored_value() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
 
         let tally = Tally {
             count: 1,
             label: "clicks".to_string(),
         };
-        db.put_typed(&"stats".to_string(), &tally)?;
+        db.put_typed(&"stats".to_string(), &tally).await?;
 
         let err = db
             .merge_typed(&"stats".to_string(), &tally, |_current, _operand| -> Result<Option<Tally>> {
                 Err(KVError::MergeAborted("declined".into()))
             })
+            .await
             .unwrap_err();
         assert!(matches!(err, KVError::MergeAborted(_)), "unexpected error: {err:?}");
 
-        let stored: Option<Tally> = db.get_typed(&"stats".to_string())?;
+        let stored: Option<Tally> = db.get_typed(&"stats".to_string()).await?;
         assert_eq!(stored.unwrap().count, 1);
 
-        db.shutdown()?;
+        db.shutdown().await?;
         Ok(())
     }
 
@@ -560,13 +570,5 @@ mod tests {
         assert!(db.existing_namespace("ns".to_owned()).await.unwrap().is_none());
         assert!(!registered(&db), "the lookup brought the namespace back");
         db.shutdown().await.unwrap();
-
-        let temp_dir = TempDir::new().unwrap();
-        let db = Db::open_with_config(temp_dir.path(), create_db_config()).unwrap();
-        assert!(db.existing_namespace("ns").is_none());
-        db.namespace("ns").unwrap();
-        assert!(db.existing_namespace("ns").is_some());
-        db.remove_namespace("ns").unwrap();
-        assert!(db.existing_namespace("ns").is_none());
     }
 }

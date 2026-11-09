@@ -5,9 +5,63 @@ use crate::namespace::NamespaceId;
 
 // ── AsyncDb ────────────────────────────────────────────────────────────
 
-/// Async wrapper around [`Db`].
+/// The entry point for MinnalDB: an open database, with its background
+/// workers running.
 ///
-/// All blocking operations are offloaded via `tokio::task::spawn_blocking`.
+/// ```rust,no_run
+/// # async fn run() -> minnal_db::error::Result<()> {
+/// use minnal_db::AsyncDb;
+///
+/// let db = AsyncDb::open("/tmp/my_db").await?;
+/// db.put(b"hello".to_vec(), b"world".to_vec()).await?;
+/// assert_eq!(db.get(b"hello".to_vec()).await?, Some(b"world".to_vec()));
+/// db.shutdown().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Calls that touch the disk run on tokio's blocking pool
+/// (`tokio::task::spawn_blocking`), so they never hold up the runtime's
+/// threads; that is why they take owned buffers.
+///
+/// # Write durability
+///
+/// This contract applies to every write entry point on `AsyncDb` and
+/// [`AsyncNamespace`] — `put`, `delete`, [`merge`](AsyncDb::merge) and their
+/// `_typed` variants.
+///
+/// A write returns `Ok(())` once it is **durable**: its write-ahead-log entry
+/// has been fsynced to stable storage, so it survives power loss from that
+/// moment on.
+///
+/// `Ok(())` does **not** guarantee the write is immediately readable. After the
+/// WAL fsync the engine applies the operation to its in-memory structures, and
+/// that step is best-effort: it retries a bounded number of times, and if it
+/// still fails — a full disk, for instance — it logs at `ERROR`, increments the
+/// `apply_failures` metric, and returns `Ok(())` regardless. The data is
+/// already committed, so reporting an error would wrongly suggest it was lost.
+///
+/// In that rare window [`AsyncDb::get`] returns `None` for a key you successfully
+/// wrote. It is self-healing but not immediately so: the entry is replayed from
+/// the WAL on the next open, so state is correct again after a restart, and
+/// nothing repairs it while the process keeps running. `apply_failures` on
+/// [`AsyncDb::ops_metrics`] is how to detect it.
+///
+/// [`merge`](AsyncDb::merge) is the **one exception** to the paragraph above: it
+/// returns [`KVError::MergeNotApplied`] rather than `Ok` when its own write does
+/// not become readable, because a merge whose result is invisible poisons the
+/// next merge on that key. It cannot detect the converse — a merge reading a key
+/// whose *last write* is stuck in that window computes from the stale value and
+/// has no way to know.
+///
+/// Every write is its own transaction, and returns only once a WAL fsync covers
+/// it. Concurrent writes share fsyncs (group commit), so one writer's throughput
+/// is bounded by the storage's fsync rate and concurrent writers go further.
+/// There is no batch or multi-key transaction primitive. [`merge`](AsyncDb::merge) is a *single-key*
+/// exception and not a transaction: it makes one key's read-modify-write
+/// indivisible, and says nothing about any other key. The `_no_wal` variants
+/// (e.g. [`AsyncNamespace::put_no_wal`]) skip the WAL entirely and give up this
+/// durability guarantee in exchange for speed.
 #[derive(Clone)]
 pub struct AsyncDb {
     pub(super) inner: Arc<Db>,
@@ -32,22 +86,35 @@ impl AsyncDb {
 
     // ── Open / Close ──────────────────────────────────────────────────
 
-    /// Open a database with default config.
+    /// Open a database with default config, with every background worker
+    /// started (see [`open_with_config`](Self::open_with_config)).
     pub async fn open<P: AsRef<Path> + Send + 'static>(path: P) -> Result<Self> {
         Self::open_with_config(path, DbConfig::default()).await
     }
 
-    /// Open a database using a `minnal.toml` configuration file.
+    /// Open a database using a `minnal.toml` configuration file, with every
+    /// background worker started (see [`open_with_config`](Self::open_with_config)).
     pub async fn open_with_config_file<P: AsRef<Path> + Send + 'static>(config_path: P) -> Result<Self> {
-        let config_path_buf = config_path.as_ref().to_path_buf();
-        let db = tokio::task::spawn_blocking(move || Db::open_with_config_file(config_path_buf))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))??;
-        Ok(Self { inner: Arc::new(db) })
+        let toml_config = crate::db::config::toml::MinnalTomlConfig::from_file(config_path.as_ref())?;
+        Self::open_with_config(toml_config.db_path(), toml_config.to_db_config()).await
     }
 
-    /// Open a database with the given config.
+    /// Open a database with the given config, with every background worker
+    /// started: WAL GC (the main WAL and the vector index WAL), value-log GC,
+    /// LSM compaction, index checkpoints, and TTL expiry when a namespace has
+    /// a TTL. Their intervals and thresholds come from `config`. Call
+    /// [`shutdown`](Self::shutdown) to stop them and flush.
     pub async fn open_with_config<P: AsRef<Path> + Send + 'static>(path: P, config: DbConfig) -> Result<Self> {
+        let db = Self::open_without_workers(path, config.clone()).await?;
+        db.enable_all_workers(&config).await?;
+        Ok(db)
+    }
+
+    /// Open a database and start no worker: for an owner that starts them
+    /// itself once it is ready (the doc store activates its field indexes
+    /// first, so the first index checkpoint sees them), and for tests that
+    /// drive each step by hand.
+    pub(crate) async fn open_without_workers<P: AsRef<Path> + Send + 'static>(path: P, config: DbConfig) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let db = tokio::task::spawn_blocking(move || Db::open_with_config(path_buf, config))
             .await
@@ -149,10 +216,30 @@ impl AsyncDb {
         self.inner.inner.index_checkpoint_worker.read().await.is_some()
     }
 
+    /// Test-only: the background workers currently installed, by name.
+    #[cfg(test)]
+    pub(crate) async fn running_workers(&self) -> Vec<&'static str> {
+        let db = &self.inner.inner;
+        let mut running = Vec::new();
+        if db.wal_gc_worker.read().await.is_some() {
+            running.push("wal_gc");
+        }
+        if db.lsm_compaction_worker.read().await.is_some() {
+            running.push("lsm_compaction");
+        }
+        if db.value_log_gc_worker.read().await.is_some() {
+            running.push("value_log_gc");
+        }
+        if db.index_checkpoint_worker.read().await.is_some() {
+            running.push("index_checkpoint");
+        }
+        running
+    }
+
     // ── Background worker management ──────────────────────────────────
 
     /// Start the WAL GC background worker.
-    pub async fn enable_wal_gc_worker(&self, interval: Duration) -> Result<()> {
+    pub(crate) async fn enable_wal_gc_worker(&self, interval: Duration) -> Result<()> {
         let worker = WalGcWorker::new(Arc::clone(&self.inner), interval);
         *self.inner.inner.wal_gc_worker.write().await = Some(Arc::new(worker));
         info!("[AsyncDb] WAL GC worker enabled with {}ms interval", interval.as_millis());
@@ -160,7 +247,7 @@ impl AsyncDb {
     }
 
     /// Start the index checkpoint background worker.
-    pub async fn enable_index_checkpoint_worker(&self, interval: Duration) -> Result<()> {
+    pub(crate) async fn enable_index_checkpoint_worker(&self, interval: Duration) -> Result<()> {
         let worker = IndexCheckpointWorker::new(Arc::clone(&self.inner), interval);
         // Wire the write-path backpressure valve to this worker before publishing it.
         self.inner.inner.wire_index_checkpoint_trigger(&worker);
@@ -176,7 +263,7 @@ impl AsyncDb {
     /// Wires all existing KVStores' flush triggers to the new worker so that
     /// memtable flushes immediately schedule a compaction check.  Namespaces
     /// opened after this call are wired up at creation time.
-    pub async fn enable_lsm_compaction_worker(&self, interval: Duration) -> Result<()> {
+    pub(crate) async fn enable_lsm_compaction_worker(&self, interval: Duration) -> Result<()> {
         let worker = LsmCompactionWorker::new(Arc::clone(&self.inner), interval);
         let sender = worker.sender();
         {
@@ -195,7 +282,7 @@ impl AsyncDb {
     ///
     /// Runs GC on every namespace whose waste ratio exceeds `waste_threshold` on
     /// each `interval` tick.
-    pub async fn enable_value_log_gc_worker(&self, interval: Duration, waste_threshold: f64) -> Result<()> {
+    pub(crate) async fn enable_value_log_gc_worker(&self, interval: Duration, waste_threshold: f64) -> Result<()> {
         let worker = GCWorker::new(Arc::clone(&self.inner), interval, waste_threshold);
         *self.inner.inner.value_log_gc_worker.write().await = Some(Arc::new(worker));
         info!(
@@ -222,9 +309,10 @@ impl AsyncDb {
     /// Start all background maintenance workers using intervals and thresholds
     /// from the given [`DbConfig`].
     ///
-    /// This is the convenience call used by `DocStore::open_with_config` to
-    /// ensure every long-running process has all workers running.
-    pub async fn enable_all_workers(&self, config: &DbConfig) -> Result<()> {
+    /// [`open_with_config`](Self::open_with_config) calls it; the doc store
+    /// calls it once its field indexes are active. Call it once: each
+    /// `enable_*` installs a new worker.
+    pub(crate) async fn enable_all_workers(&self, config: &DbConfig) -> Result<()> {
         let st = config.scheduled_task_config;
         let threshold = config.threshold_config.value_log_waste_threshold;
         self.enable_wal_gc_worker(st.wal_gc_interval).await?;
@@ -249,7 +337,7 @@ impl AsyncDb {
 
     /// Insert or update a key-value pair.
     ///
-    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](AsyncDb#write-durability)
     /// for what that does and does not guarantee about immediate readability.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let db = self.inner.clone();
@@ -267,7 +355,7 @@ impl AsyncDb {
 
     /// Delete a key.
     ///
-    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](AsyncDb#write-durability)
     /// for what that does and does not guarantee about immediate readability.
     pub async fn delete(&self, key: Vec<u8>) -> Result<()> {
         let db = self.inner.clone();
@@ -276,11 +364,72 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Atomically read-modify-write a key.
+    /// Read `key`, hand the stored value and `value` to `merge_fn`, and write
+    /// the result back — atomically with respect to every other write to that key.
     ///
-    /// See [`Db::merge`] for the full contract. `merge_fn` must be `Send + 'static`
-    /// because it runs on a blocking worker thread, exactly as the rest of this
-    /// surface takes owned buffers for the same reason.
+    /// This is the read-modify-write that `get` + `put` cannot give you: two
+    /// callers that each `get`, compute, and `put` will silently lose one
+    /// update, because nothing stops the second read from happening before the
+    /// first write lands. `merge` closes that window.
+    ///
+    /// `merge_fn` receives `(existing, operand)` — `existing` is `None` when the
+    /// key is absent, `operand` is the `value` passed in — and returns:
+    ///
+    /// | Returns | Effect |
+    /// |---|---|
+    /// | `Ok(Some(new))` | write `new` |
+    /// | `Ok(None)` | delete the key (nothing is written if it was already absent) |
+    /// | `Err(e)` | abort — nothing is written, and `e` is returned to the caller |
+    ///
+    /// The call returns the value that was written, or `None` for the delete and
+    /// no-op cases. It can also fail *after* the closure ran — see *Durability*
+    /// below for [`KVError::MergeNotApplied`].
+    ///
+    /// ```rust,no_run
+    /// # async fn run() -> Result<(), minnal_db::KVError> {
+    /// # let db = minnal_db::AsyncDb::open("/tmp/merge_doc").await?;
+    /// // A counter that increments by the operand, starting from zero.
+    /// let total = db
+    ///     .merge(b"visits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
+    ///         let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    ///         let step = u64::from_le_bytes(operand.try_into().unwrap());
+    ///         Ok(Some((current + step).to_le_bytes().to_vec()))
+    ///     })
+    ///     .await?;
+    /// # let _ = total;
+    /// # db.shutdown().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Durability
+    ///
+    /// A merge is one ordinary WAL-backed write of the *result*, so it carries
+    /// the guarantee described in [*Write durability*](AsyncDb#write-durability) — with
+    /// one deliberate difference. Where `put` returns `Ok` for a write that is
+    /// durable but whose in-memory apply failed, `merge` returns
+    /// [`KVError::MergeNotApplied`]: its result never became readable, so the
+    /// next merge on this key would accumulate onto a stale base. The write is
+    /// **not lost** — the WAL entry replays on the next open — so treat that
+    /// error as "not readable yet", not "nothing happened".
+    ///
+    /// The converse is not detectable: if some earlier `put` to this key is
+    /// itself stuck in that window, the closure is handed the stale value and
+    /// nothing here can tell. `apply_failures` on [`AsyncDb::ops_metrics`] is the
+    /// signal that it has happened at all.
+    ///
+    /// Nothing re-runs `merge_fn` during recovery: the WAL records the value the
+    /// closure produced, not the closure.
+    ///
+    /// # `merge_fn` runs while a lock is held
+    ///
+    /// It must be quick, must not block, and must **not write back** into the
+    /// database — a re-entrant write to this key, or to any key that happens to
+    /// share its lock stripe, self-deadlocks. Reads are safe but pointless: a
+    /// read of this key returns the same pre-merge value the closure was handed.
+    ///
+    /// `merge_fn` must be `Send + 'static` because it runs on a blocking
+    /// worker thread, for the same reason the rest of this surface takes owned
+    /// buffers.
     pub async fn merge<F>(&self, key: Vec<u8>, value: Vec<u8>, merge_fn: F) -> Result<Option<Vec<u8>>>
     where
         F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>> + Send + 'static,
@@ -321,7 +470,14 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Paginated cursor scan. See [`Db::scan`] for details.
+    /// Paginated cursor scan over `[cursor, end)` on the default namespace.
+    ///
+    /// Returns up to `limit` key-value pairs starting from `cursor`
+    /// (or the beginning if `None`) and ending before `end` (or the last key if
+    /// `None`), plus an optional next cursor. Pass the returned cursor to the next
+    /// call to fetch the next page.
+    ///
+    /// Each page fetch resolves only the page's values, not the whole result set.
     pub async fn scan(&self, cursor: Option<Vec<u8>>, end: Option<Vec<u8>>, limit: usize) -> Result<ScanPage> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.scan(cursor.as_deref(), end.as_deref(), limit))
@@ -353,20 +509,22 @@ impl AsyncDb {
         })
     }
 
-    /// Async [`Db::existing_namespace`].
+    /// The namespace named `name`, if it exists. Unlike
+    /// [`namespace`](Self::namespace) it never creates one, so a caller racing
+    /// the namespace's removal cannot bring it back.
     ///
     /// Answered on the calling task: the lookup is two in-memory reads. A trip to
     /// the blocking pool and back cost more than the read that followed it (half
     /// of a slow document `get` under load). Only a namespace whose store is not
     /// in the store map yet takes the blocking path, where
-    /// [`Db::existing_namespace`] waits on the namespace-creation lock.
+    /// the engine waits on the namespace-creation lock.
     pub async fn existing_namespace(&self, name: String) -> Result<Option<AsyncNamespace>> {
         let found = match self.inner.inner.lookup_open_store(&name) {
             OpenStoreLookup::Open(ns_id, store) => Some((ns_id, store)),
             OpenStoreLookup::Absent => None,
             OpenStoreLookup::NotReady => {
                 let db = self.inner.clone();
-                tokio::task::spawn_blocking(move || db.existing_namespace(&name).map(|ns| (ns.ns_id, Arc::clone(&ns.store))))
+                tokio::task::spawn_blocking(move || db.existing_namespace(&name))
                     .await
                     .map_err(|e| KVError::Io(std::io::Error::other(e)))?
             }
@@ -445,7 +603,8 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Async [`Db::remove_unregistered_namespace_dir`].
+    /// Delete the data directory an interrupted drop left for `name`. Does nothing
+    /// if `name` is a namespace: its directory holds live files.
     pub async fn remove_unregistered_namespace_dir(&self, name: String) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.remove_unregistered_namespace_dir(&name))
@@ -618,7 +777,7 @@ impl AsyncDb {
 
     /// Insert a typed key-value pair, serialized via rkyv.
     ///
-    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](AsyncDb#write-durability)
     /// for what that does and does not guarantee about immediate readability.
     pub async fn put_typed<K, V>(&self, key: &K, value: &V) -> Result<()>
     where
@@ -639,7 +798,7 @@ impl AsyncDb {
 
     /// Delete by typed key.
     ///
-    /// Returns `Ok(())` once the write is durable. See [*Write durability*](Db#write-durability)
+    /// Returns `Ok(())` once the write is durable. See [*Write durability*](AsyncDb#write-durability)
     /// for what that does and does not guarantee about immediate readability.
     pub async fn delete_typed<K>(&self, key: &K) -> Result<()>
     where
@@ -650,7 +809,22 @@ impl AsyncDb {
 
     /// Atomically merge a typed value, serialized via rkyv.
     ///
-    /// The typed twin of [`Db::merge`]; see [`Db::merge_typed`] for an example.
+    /// The typed twin of [`merge`](Self::merge): `merge_fn` sees the stored
+    /// value and the operand already deserialized, and returns the new value
+    /// (or `None` to delete the key). Every caveat on [`merge`](Self::merge)
+    /// applies — in particular the closure runs under a lock and must not call
+    /// back into the database.
+    ///
+    /// ```rust,no_run
+    /// # async fn run() -> Result<(), minnal_db::KVError> {
+    /// # let db = minnal_db::AsyncDb::open("/tmp/merge_typed_doc").await?;
+    /// let total: Option<u64> = db
+    ///     .merge_typed(&"visits".to_string(), &1u64, |current, step| Ok(Some(current.unwrap_or(0) + step)))
+    ///     .await?;
+    /// # let _ = total;
+    /// # db.shutdown().await?;
+    /// # Ok(()) }
+    /// ```
     pub async fn merge_typed<K, V, F>(&self, key: &K, value: &V, merge_fn: F) -> Result<Option<V>>
     where
         K: RkyvEncode,
@@ -749,20 +923,30 @@ impl AsyncDb {
     /// Permanently drop a field index: persist the drop, deregister it, and
     /// delete its on-disk directory.
     ///
-    /// See [`Db::drop_field_index`] for the semantics and the ordering
-    /// guarantee. Synchronous — the work is a schema write plus a directory
-    /// removal, not a scan.
+    /// Use this rather than [`deactivate_field_index`](Self::deactivate_field_index)
+    /// when the index is going away for good — the latter is an in-memory
+    /// deregister that leaves every file in place. The field keeps its
+    /// [`FieldId`] for reuse, but must be re-registered before it can be
+    /// activated again. Synchronous — the work is a schema write plus a
+    /// directory removal, not a scan.
     pub fn drop_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         self.inner.inner.drop_field_index(namespace_id, field_id)
     }
 
-    /// See [`Db::reset_rowmap`]. Synchronous — a marker removal, a directory
-    /// fsync and three small file truncations.
+    /// Free every row ID of a namespace by replacing its dense row map with an
+    /// empty one; the next field builds allocate fresh dense IDs for the live
+    /// keys only. Every field index of the namespace must already be dropped
+    /// ([`drop_field_index`](Self::drop_field_index)) — otherwise this returns
+    /// an error and changes nothing. Returns `false` for a namespace whose row
+    /// IDs come from a key-derived `RowIdFn` (nothing to reset). Synchronous —
+    /// a marker removal, a directory fsync and three small file truncations.
     pub fn reset_rowmap(&self, namespace_id: NamespaceId) -> Result<bool> {
         self.inner.inner.reset_rowmap(namespace_id)
     }
 
-    /// See [`Db::rowmap_ids_allocated`].
+    /// Row IDs a namespace's dense row map has allocated — every key ever
+    /// indexed, live or deleted — or `None` when the namespace uses a
+    /// key-derived `RowIdFn` or no field index was ever activated.
     pub fn rowmap_ids_allocated(&self, namespace_id: NamespaceId) -> Result<Option<u64>> {
         self.inner.inner.rowmap_ids_allocated(namespace_id)
     }

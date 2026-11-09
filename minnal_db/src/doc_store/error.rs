@@ -303,7 +303,7 @@ pub enum DocStoreError {
     SemanticSearchNotEnabled { namespace: String },
 
     /// A store cannot take this name: a namespace of that name, with no store,
-    /// holds keys written directly through [`Db`](crate::Db).
+    /// holds keys written directly through [`AsyncDb`](crate::AsyncDb).
     #[error("namespace '{namespace}' already holds keys and is not a store; remove it or choose another name")]
     NamespaceNotEmpty { namespace: String },
 

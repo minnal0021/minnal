@@ -105,86 +105,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // debugged from the log without guessing which knob actually took effect.
     config_report::log_config_table(&cfg, raw_toml.as_ref());
 
-    let db_config = cfg.to_db_config();
-    let store = DocStore::open_with_config(cfg.db_path(), db_config).await?;
-
-    let all_schemas = store.schemas();
+    let semantic_cfg = cfg.semantic_search.resolve();
+    let service = semantic_cfg.service_config();
+    let supported = semantic_cfg.supported_models();
     info!(
-        "loaded {} store schema(s) from {}",
-        all_schemas.len(),
-        minnal_db::doc_store::SCHEMA_NAMESPACE
+        models = %if supported.is_empty() {
+            "any the embedding service serves".to_string()
+        } else {
+            supported.iter().map(|(m, d)| format!("{m} ({d}-d)")).collect::<Vec<_>>().join(", ")
+        },
+        "semantic search enabled",
     );
 
-    let semantic_cfg = cfg.semantic_search.resolve();
-    let embedding_service = Some(semantic_cfg.service_config());
-
-    // Attach a SemanticSearchContext so put/delete on semantic-search-enabled
-    // namespaces maintain their vector index. Each namespace picks its model
-    // and grows its own partition; the server only lists the allowed models,
-    // if any.
-    let store = if let Some(service) = embedding_service.clone() {
-        let supported = semantic_cfg.supported_models();
-        info!(
-            models = %if supported.is_empty() {
-                "any the embedding service serves".to_string()
-            } else {
-                supported.iter().map(|(m, d)| format!("{m} ({d}-d)")).collect::<Vec<_>>().join(", ")
-            },
-            "semantic search enabled",
-        );
-
-        // Probe the embedding service for each (model, dimension) an existing
-        // semantic namespace uses, so operators get an early warning if it is
-        // unreachable or misconfigured. Non-fatal: semantic requests surface the
-        // error at call time.
-        let mut in_use: std::collections::BTreeSet<(String, u32)> = std::collections::BTreeSet::new();
-        for settings in all_schemas.iter().filter(|s| s.is_semantic_search_enabled()).filter_map(|s| match s {
-            StoredSchema::Doc(s) => s.vector_settings().ok(),
-            StoredSchema::Kv(s) => s.vector_settings().ok(),
-        }) {
-            in_use.insert((settings.embedding_model, settings.embedding_dim));
-        }
-        for (model, dim) in in_use {
-            let probe = EmbeddingServiceConfig {
-                model_name: model.clone(),
-                embedding_dim: dim as usize,
-                ..service.clone()
-            };
-            match minnal_db::semantic_search::service::check_embedding_service(&probe).await {
-                Ok(()) => info!(url = %probe.embedding_service_url, model = %model, dim, "embedding service reachable"),
-                Err(e) => error!(
-                    url = %probe.embedding_service_url, model = %model, dim,
-                    "embedding service check failed — semantic search for this model will be unavailable: {e}",
-                ),
-            }
-        }
-
-        store.with_vector_index_config(cfg.to_vector_index_config()).with_semantic_search(
-            SemanticSearchContext::new(service)
+    // The same open as an embedded store's: every worker, the vector worker
+    // and the lifecycle governor start here, and the governor finishes
+    // whatever a crash left part-way. Each namespace picks its model and
+    // grows its own partition; the server only lists the allowed models, if
+    // any.
+    let store = DocStore::builder(cfg.db_path())
+        .db_config(cfg.to_db_config())
+        .lifecycle(cfg.lifecycle.config())
+        .audit_retention(cfg.lifecycle.audit_retention())
+        .vector_index_config(cfg.to_vector_index_config())
+        .semantic_search(
+            SemanticSearchContext::new(service.clone())
                 .with_supported_models(supported)
                 // Validated when the config was loaded.
                 .with_index_defaults(cfg.semantic_search.index_defaults().expect("validated at load"))
                 .with_maintenance_threads(cfg.semantic_search.maintenance.threads().expect("validated at load"))
                 .with_rebuild_threads(cfg.semantic_search.maintenance.rebuild_threads().expect("validated at load")),
         )
-    } else {
-        store
-    };
+        .open()
+        .await?;
+    info!(
+        "loaded {} store schema(s) from {}",
+        store.schemas().len(),
+        minnal_db::doc_store::SCHEMA_NAMESPACE
+    );
 
     let state = AppState {
         db: store.db(),
-        store: Arc::new(store),
-        embedding_service,
+        store,
+        embedding_service: Some(service),
         started_at: Instant::now(),
         index_checkpoint_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-
-    // Every store's create, drop and index job runs under the lifecycle
-    // governor from here on; it also finishes those a crash left part-way.
-    if let Err(e) = state.store.set_audit_retention(cfg.lifecycle.audit_retention()).await {
-        error!("could not set the lifecycle audit retention: {e}");
-    }
-    state.store.start_lifecycle(cfg.lifecycle.config());
 
     let shutdown_store = Arc::clone(&state.store);
     let app = routes::router().with_state(state);

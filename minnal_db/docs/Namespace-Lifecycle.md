@@ -73,14 +73,17 @@ reopen the old namespace with its documents.
 
 Both tasks are idempotent: each step skips what is already done, so a task
 cut short (an error, a panic, a crash) is finished by running it again. A
-drop whose HTTP request is cancelled leaves the store `deleting`; a retry, or
-the next start, finishes it.
+drop whose caller gives up (an HTTP client that disconnects) goes on: the
+governor runs it, not the caller, so the store stays `deleting` until the
+governor finishes it, and a retry waits for that.
 
 ## The governor
 
-One task per doc store, started by `DocStore::start_lifecycle`. It takes
-tasks from a channel and runs each in a coordinator task of its own; it does
-no work itself.
+One task per doc store, not per store inside it, started when the doc store
+opens: an embedded doc store and the API server's run the same governor, and
+there is no way to open one without it. It takes tasks from a channel and
+runs each in a coordinator task of its own while the task lasts; it does no
+work itself, and costs nothing while no task runs.
 
 - **One creation or drop of a store at a time, and nothing beside it.** Jobs
   of one store may run together, subject to the conflict table.
@@ -94,11 +97,15 @@ no work itself.
   channel closes and every create, drop and job start fails with
   `GovernorUnavailable` (503). Stores that exist keep serving data requests.
 - **At start** it picks up every store still `creating` or `deleting`, and
-  every live job, so whatever a crash or a parked task left is finished.
+  every live job, so whatever a crash or a parked task left is finished. It
+  finds them before the open returns, so a request that comes later is not
+  mistaken for one of them. (The open itself first finishes a create or drop
+  a crash cut short, before it opens any store's namespace; the governor
+  runs one again only if that failed.)
 
-Without a governor (a library user that never calls `start_lifecycle`),
-creates, drops and jobs run inline, once, and `DocStore::run_pending_jobs`
-resumes leftover jobs.
+The library's `create`, `remove`, `add_index` and the other plain forms hand
+their task to the governor and wait for it to end; the `begin_*` forms return
+once it is handed over.
 
 ## Index jobs
 

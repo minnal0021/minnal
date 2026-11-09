@@ -9,7 +9,9 @@ process — no server to run, no network hop. It gives you:
 - **quantised ANN semantic search**, behind the `semantic-search` cargo feature.
 
 Everything runs in your process, background workers included — compaction,
-value-log GC, WAL GC and TTL expiry all tick along inside your binary.
+value-log GC, write-ahead-log GC, field-index checkpoints and TTL expiry all
+tick along inside your binary, started when you open a database. The API is
+async and runs on [tokio](https://tokio.rs).
 
 **Semantic search is the one part that reaches outside.** Its ANN index,
 quantisation and search run in-process like the rest, but turning text into
@@ -99,19 +101,27 @@ minnal_db = { version = "0.3", features = ["doc-store", "semantic-search"] }
 minnal_db = { version = "0.3", features = ["semantic-search"] }
 ```
 
+Every build also needs tokio, since the API is async (the examples below use
+`#[tokio::main]`):
+
+```toml
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
 ---
 
 ## 3. Using the key-value engine (default `kv-store`)
 
-`Db` (and its async twin, `AsyncDb`) is the entry point: you open a database
-directory, and from there put, get, delete, merge, scan by prefix, or walk a key
-range.
-Keys and values are plain bytes — minnal does not interpret them. A database also
-carries any number of **namespaces**, each an isolated keyspace of its own, which
-is how you keep unrelated data apart inside one database.
+`AsyncDb` is the entry point: you open a database directory, and from there
+put, get, delete, merge, scan by prefix, or walk a key range. Keys and values
+are plain bytes — minnal does not interpret them. A database also carries any
+number of **namespaces**, each an isolated keyspace of its own, which is how you
+keep unrelated data apart inside one database.
 
-Whichever API you use, call `shutdown()` when you are done: it stops the
-background workers and flushes buffered writes.
+Calls that touch the disk run on tokio's blocking pool, so they never hold up
+your runtime's threads; that is why they take owned buffers (`Vec<u8>`) and are
+awaited. Opening a database starts its background workers. Call `shutdown()`
+when you are done: it stops them and flushes buffered writes.
 
 > **One rule about key bytes:** the storage bucket is chosen by hashing only the
 > **first 8 bytes** of the key, so keys that share a constant 8-byte prefix
@@ -120,26 +130,29 @@ background workers and flushes buffered writes.
 > there is no length limit; the typed doc/KV stores of §5–§6 cap string keys at
 > 50 bytes.
 
-### The synchronous API
+### Reading and writing
 
 ```rust,no_run
-use minnal_db::Db;
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use minnal_db::AsyncDb;
 
-let db = Db::open("/tmp/mydb")?;
+let db = AsyncDb::open("/tmp/mydb").await?;
 
-db.put(b"hello", b"world")?;
-let val = db.get(b"hello")?;          // Some(b"world")
-db.delete(b"hello")?;
+db.put(b"hello".to_vec(), b"world".to_vec()).await?;
+let val = db.get(b"hello".to_vec()).await?;          // Some(b"world")
+db.delete(b"hello".to_vec()).await?;
 
-for (key, value) in db.scan_prefix(b"user:")? { /* … */ }
-for (key, value) in db.range(b"a", Some(b"z"))? { /* … */ }
+for (key, value) in db.scan_prefix(b"user:".to_vec()).await? { /* … */ }
+for (key, value) in db.range(b"a".to_vec(), Some(b"z".to_vec())).await? { /* … */ }
 
 // Namespaces — each has its own isolated keyspace
-let ns = db.namespace("orders")?;
-ns.put(b"o1", b"shipped")?;
+let ns = db.namespace("orders".to_string()).await?;
+ns.put(b"o1".to_vec(), b"shipped".to_vec()).await?;
 
-db.shutdown()?;
-# Ok::<(), Box<dyn std::error::Error>>(())
+db.shutdown().await?;
+# Ok(())
+# }
 ```
 
 ### Read-modify-write with `merge`
@@ -150,20 +163,24 @@ hand as `get` → compute → `put` silently loses updates: two callers read the
 value, and whichever writes second wipes out the other's increment.
 
 `merge` is that sequence done atomically. It takes the same `(key, value)` as
-`put` plus a closure, and the closure decides what actually gets stored:
+`put` plus a closure, and the closure decides what actually gets stored. The
+closure must be `Send + 'static`, because it runs on the blocking pool:
 
 ```rust,no_run
-# use minnal_db::Db;
-let db = Db::open("/tmp/mydb")?;
-
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let db = minnal_db::AsyncDb::open("/tmp/mydb").await?;
 // Increment a counter by the operand, creating it at zero.
-let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
-    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-    let step = u64::from_le_bytes(operand.try_into().unwrap());
-    Ok(Some((current + step).to_le_bytes().to_vec()))
-})?;
-// → Some(new count). Run it from ten threads and none of them is lost.
-# Ok::<(), Box<dyn std::error::Error>>(())
+let total = db
+    .merge(b"visits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
+        let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        let step = u64::from_le_bytes(operand.try_into().unwrap());
+        Ok(Some((current + step).to_le_bytes().to_vec()))
+    })
+    .await?;
+// → Some(new count). Run it from ten tasks at once and none of them is lost.
+# Ok(())
+# }
 ```
 
 The closure receives `(existing, operand)` — `existing` is `None` when the key is
@@ -179,31 +196,39 @@ absent — and its return value drives the write:
 that so you needn't borrow an error variant that means something else:
 
 ```rust,no_run
-# let db = minnal_db::Db::open("/tmp/mydb")?;
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let db = minnal_db::AsyncDb::open("/tmp/mydb").await?;
 // A counter that refuses to go past a cap.
-let result = db.merge(b"quota", &1u64.to_le_bytes(), |existing, operand| {
-    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-    if current >= 100 {
-        return Err(minnal_db::KVError::MergeAborted("quota exhausted".into()));
-    }
-    let step = u64::from_le_bytes(operand.try_into().unwrap());
-    Ok(Some((current + step).to_le_bytes().to_vec()))
-});
-# Ok::<(), Box<dyn std::error::Error>>(())
+let result = db
+    .merge(b"quota".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
+        let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        if current >= 100 {
+            return Err(minnal_db::KVError::MergeAborted("quota exhausted".into()));
+        }
+        let step = u64::from_le_bytes(operand.try_into().unwrap());
+        Ok(Some((current + step).to_le_bytes().to_vec()))
+    })
+    .await;
+# Ok(())
+# }
 ```
 
 `merge_typed` is the same thing over rkyv values, so the closure works with your
 own type instead of bytes:
 
 ```rust,no_run
-# let db = minnal_db::Db::open("/tmp/mydb")?;
-let total: Option<u64> = db.merge_typed(&"visits".to_string(), &1u64, |current, step| {
-    Ok(Some(current.unwrap_or(0) + step))
-})?;
-# Ok::<(), Box<dyn std::error::Error>>(())
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let db = minnal_db::AsyncDb::open("/tmp/mydb").await?;
+let total: Option<u64> = db
+    .merge_typed(&"visits".to_string(), &1u64, |current, step| Ok(Some(current.unwrap_or(0) + step)))
+    .await?;
+# Ok(())
+# }
 ```
 
-Both are available on `Db`, `Namespace`, `AsyncDb` and `AsyncNamespace`. Three
+Both are available on `AsyncDb` and on a namespace's `AsyncNamespace`. Three
 things to know:
 
 - **The guarantee is per key, not a transaction.** A merge is indivisible for the
@@ -219,33 +244,6 @@ things to know:
   back into the database from inside it — a re-entrant write to the same key
   deadlocks. (Reading is safe, just pointless: you get the same value the
   closure was already handed.)
-
-### The asynchronous API
-
-`AsyncDb` mirrors the same operations for a tokio runtime. The shape is
-identical; the calls take owned buffers and are awaited. `merge` additionally
-needs its closure to be `Send + 'static`, because it runs on a blocking worker.
-
-```rust,no_run
-# #[tokio::main]
-# async fn main() -> Result<(), Box<dyn std::error::Error>> {
-use minnal_db::AsyncDb;
-
-let db = AsyncDb::open("/tmp/mydb").await?;
-db.put(b"hello".to_vec(), b"world".to_vec()).await?;
-let val = db.get(b"hello".to_vec()).await?;
-
-db.merge(b"visits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
-    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-    let step = u64::from_le_bytes(operand.try_into().unwrap());
-    Ok(Some((current + step).to_le_bytes().to_vec()))
-})
-.await?;
-
-db.shutdown().await?;
-# Ok(())
-# }
-```
 
 ---
 
@@ -264,10 +262,11 @@ with the predicate DSL.
 
 ```rust,no_run
 use std::sync::Arc;
-use minnal_db::{Db, ExtractorFn, IndexValue, IndexValueType, KVError, DEFAULT_NAMESPACE_ID};
+use minnal_db::{AsyncDb, ExtractorFn, IndexValue, IndexValueType, KVError, DEFAULT_NAMESPACE_ID};
 
-fn main() -> Result<(), KVError> {
-    let db = Db::open("/tmp/users_db")?;
+#[tokio::main]
+async fn main() -> Result<(), KVError> {
+    let db = AsyncDb::open("/tmp/users_db").await?;
 
     // 1. Declare which fields to index (persisted — re-activate, don't re-register, on restart).
     let status_field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
@@ -282,28 +281,28 @@ fn main() -> Result<(), KVError> {
         let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
         Some(IndexValue::Int(v["age"].as_i64()?))
     });
-    db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field, IndexValueType::Str, status_extractor)?;
-    db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field,    IndexValueType::Int, age_extractor)?;
+    db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field, IndexValueType::Str, status_extractor).await?;
+    db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field,    IndexValueType::Int, age_extractor).await?;
 
     // 3. Write records — each put updates the RoaringBitmap indices automatically.
-    db.put(b"user:1", br#"{"status":"active","age":30}"#)?;
-    db.put(b"user:2", br#"{"status":"inactive","age":25}"#)?;
-    db.put(b"user:3", br#"{"status":"active","age":42}"#)?;
-    db.put(b"user:4", br#"{"status":"active","age":18}"#)?;
+    db.put(b"user:1".to_vec(), br#"{"status":"active","age":30}"#.to_vec()).await?;
+    db.put(b"user:2".to_vec(), br#"{"status":"inactive","age":25}"#.to_vec()).await?;
+    db.put(b"user:3".to_vec(), br#"{"status":"active","age":42}"#.to_vec()).await?;
+    db.put(b"user:4".to_vec(), br#"{"status":"active","age":18}"#.to_vec()).await?;
 
     // 4. Query with the predicate DSL (=, !=, <, <=, >, >=, IN, AND, OR, NOT).
-    let outcome = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#)?;
+    let outcome = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#).await?;
     if !outcome.degraded_fields.is_empty() {
         eprintln!("an index is missing updates; results may be incomplete");
     }
     for key in outcome.keys {
-        if let Some(value) = db.get(&key)? {
+        if let Some(value) = db.get(key.clone()).await? {
             println!("{} => {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
         }
     }
     // → user:1 and user:3
 
-    db.shutdown()?;
+    db.shutdown().await?;
     Ok(())
 }
 ```
@@ -369,6 +368,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+An embedded doc store runs exactly as the REST server's does; the server opens
+its store the same way. Opening it starts every background worker (compaction,
+value-log GC, GC of both WALs, index checkpoints, TTL expiry, and with
+`semantic-search` the embed-worker and partition maintenance) and the
+*lifecycle governor*: one background task that runs every store's create, drop
+and index build, runs a step again if it fails, and finishes after a restart
+whatever a crash cut short. `create`, `remove` and `add_index` hand their work
+to it and wait for it to finish; their `begin_*` forms return at once. To tune
+the engine or the governor, open with `DocStore::builder(path)`, set
+`.db_config(..)` or `.lifecycle(..)`, then `.open()`.
 
 #### Key types
 
@@ -455,17 +465,18 @@ deletes empty, in the background.
 
 One last thing to expect before the code: indexing is **asynchronous**. A write
 returns as soon as the embed job is enqueued, and a background worker — started
-for you by `with_semantic_search` — calls the service, quantises the result and
+when the store opens — calls the service, quantises the result and
 stores the vector. A query issued immediately after a write may therefore not see
 it yet. If the service is down, writes still succeed and the worker keeps
 retrying; only vector *indexing* falls behind, while semantic *queries* error.
 
-### Shared setup: attaching a `SemanticSearchContext`
+### Shared setup: naming the embedding service
 
-Both storage layers are driven the same way. You build a `SemanticSearchConfig`
-naming the embedding service and hand it to the store as a
-`SemanticSearchContext`. Attach it once, at startup — it is also what spawns the
-embed-worker and the partition maintenance task.
+Both storage layers are driven the same way. A doc store always runs its
+embed-worker and partition maintenance, started when it opens. They use the
+embedding service at `http://localhost:8001` unless you name another: build a
+`SemanticSearchConfig` and pass it to the store's builder as a
+`SemanticSearchContext`.
 
 ```rust,no_run
 use minnal_db::doc_store::schema::vector_settings::{SearchSpec, VectorIndexSpec};
@@ -482,11 +493,12 @@ let config = SemanticSearchConfig {
     ..Default::default()
 };
 
-// `with_semantic_search` also starts the background embed-worker and the
-// partition maintenance, so attach it once, up front.
-let store = DocStore::open("/tmp/sem")
-    .await?
-    .with_semantic_search(SemanticSearchContext::new(config));
+// Opening starts every background worker, the embed-worker and the
+// partition maintenance included.
+let store = DocStore::builder("/tmp/sem")
+    .semantic_search(SemanticSearchContext::new(config))
+    .open()
+    .await?;
 # Ok(())
 # }
 # fn main() {}
@@ -506,7 +518,7 @@ bytes in `document_id`.
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let config = minnal_db::semantic_search::service::SemanticSearchConfig { embedding_service_url: "http://localhost:8001".into(), ..Default::default() };
-# let store = DocStore::open("/tmp/sem").await?.with_semantic_search(SemanticSearchContext::new(config));
+# let store = DocStore::builder("/tmp/sem").semantic_search(SemanticSearchContext::new(config)).open().await?;
 // A doc store whose `body` field is embedded with gemma (768 dimensions).
 let schema = DocStoreSchema {
     namespace: "articles".into(),
@@ -552,7 +564,7 @@ rather than encoded key bytes.
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let config = minnal_db::semantic_search::service::SemanticSearchConfig { embedding_service_url: "http://localhost:8001".into(), ..Default::default() };
-# let store = DocStore::open("/tmp/sem").await?.with_semantic_search(SemanticSearchContext::new(config));
+# let store = DocStore::builder("/tmp/sem").semantic_search(SemanticSearchContext::new(config)).open().await?;
 # let top5 = SearchSpec { top_k: Some(5), ..Default::default() };
 // A KV store whose string values are embedded, with the default settings (gemma, 768).
 let kv_schema = KvStoreSchema {
@@ -602,6 +614,7 @@ Add the allocator to your binary's `Cargo.toml`:
 ```toml
 [dependencies]
 minnal_db = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tikv-jemallocator = "0.7"
 ```
 
@@ -609,18 +622,19 @@ and declare it once in `src/main.rs`. Nothing else changes: every allocation in
 the process, minnal's included, now goes through jemalloc.
 
 ```rust,no_run
-use minnal_db::Db;
+use minnal_db::AsyncDb;
 
 // Every heap allocation in this program, minnal's background workers included,
 // now goes through jemalloc.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Db::open("/tmp/mydb")?;
-    db.put(b"hello", b"world")?;
-    assert_eq!(db.get(b"hello")?.as_deref(), Some(&b"world"[..]));
-    db.shutdown()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = AsyncDb::open("/tmp/mydb").await?;
+    db.put(b"hello".to_vec(), b"world".to_vec()).await?;
+    assert_eq!(db.get(b"hello".to_vec()).await?.as_deref(), Some(&b"world"[..]));
+    db.shutdown().await?;
     Ok(())
 }
 ```

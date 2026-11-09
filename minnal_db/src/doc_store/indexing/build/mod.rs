@@ -41,8 +41,7 @@ impl DocStore {
 
     /// [`add_index`](Self::add_index), returning the job's name
     /// (`field_build:{field}`) once the index is activated and its build
-    /// handed to the lifecycle governor. Needs the governor
-    /// ([`start_lifecycle`](Self::start_lifecycle)).
+    /// handed to the lifecycle governor, which the store starts when it opens.
     pub async fn begin_add_index(&self, namespace: &str, spec: IndexSpec) -> Result<String, DocStoreError> {
         self.running_governor()?;
         let name = format!("{}:{}", JobKind::FieldBuild(0).name(), spec.field);

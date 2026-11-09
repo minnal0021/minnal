@@ -36,7 +36,7 @@ pub struct FieldMeta {
 /// costume: a degraded index served results that *looked* complete, so a caller
 /// could not tell a genuinely empty result from a missing one. The status is
 /// carried here rather than only at the REST boundary because
-/// [`Db::query_index`](crate::Db::query_index) is a first-class documented path
+/// [`AsyncDb::query_index`](crate::AsyncDb::query_index) is a first-class documented path
 /// — flagging only in `doc_store` would fix HTTP callers and leave embedders
 /// exactly where they started.
 ///
@@ -72,7 +72,7 @@ impl QueryOutcome {
     }
 }
 
-/// What a field-index repair did ([`crate::Db::repair_field_index`]).
+/// What a field-index repair did ([`AsyncDb::repair_field_index`](crate::AsyncDb::repair_field_index)).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum FieldRepairOutcome {
@@ -96,7 +96,7 @@ pub enum FieldRepairOutcome {
     },
 }
 
-/// Outcome of a targeted single-field reindex ([`crate::Db::reindex_field`]).
+/// Outcome of a targeted single-field reindex ([`AsyncDb::reindex_field`](crate::AsyncDb::reindex_field)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldReindexOutcome {
     /// The field index entry for the key was re-derived from its current value

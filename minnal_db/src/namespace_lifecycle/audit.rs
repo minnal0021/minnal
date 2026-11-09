@@ -109,14 +109,6 @@ impl AuditLog {
         })
     }
 
-    /// Keep records for `retention` from now on (the server's setting). Records
-    /// already written expire by the retention they were written with.
-    pub(crate) async fn set_retention(db: &AsyncDb, retention: Duration) -> Result<(), crate::KVError> {
-        db.namespace_with_ttl(AUDIT_NAMESPACE.to_owned(), retention, MAX_DELETES_PER_RUN)
-            .await
-            .map(|_| ())
-    }
-
     /// Record `event` of `namespace`. Never fails: a record that cannot be
     /// written is logged.
     pub fn record(&self, namespace: &str, event: AuditEvent, job: Option<&str>, subject: Option<&str>, detail: Option<&str>) {

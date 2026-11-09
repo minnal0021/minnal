@@ -47,8 +47,8 @@ fn race_vectors() -> Vec<crate::semantic_search::VectorIndex> {
 }
 
 #[cfg(feature = "semantic-search")]
-async fn open_kv_semantic(db_dir: &TempDir) -> DocStore {
-    let store = with_worker_notify(open_fresh(db_dir.path()).await);
+async fn open_kv_semantic(db_dir: &TempDir) -> Arc<DocStore> {
+    let store = open_without_vector_worker(db_dir.path()).await;
     let mut schema = make_kv_schema("sem_kv", KvKeyType::Str, KvValueType::Str);
     schema.semantic_search_enabled = true;
     store.create_kv(schema).await.unwrap();
