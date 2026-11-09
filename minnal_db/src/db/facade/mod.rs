@@ -44,3 +44,5 @@ mod tests;
 /// Tests of the facade that reach into internal state.
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod iterator_tests;
