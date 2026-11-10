@@ -34,7 +34,11 @@ async fn a_rebuild_cut_short_is_closed_with_what_the_journal_did() {
             .unwrap();
     };
     started(&store);
-    store.run_live_jobs().await.unwrap();
+    // Not run again: the caller hears the job failed, after one run.
+    match store.run_live_jobs().await {
+        Err(DocStoreError::LifecycleTaskFailed { attempts: 1, error, .. }) => assert!(error.contains("abandoned"), "{error}"),
+        other => panic!("expected the abandoned rebuild's error, got {other:?}"),
+    }
     let record = store.jobs.get(key).unwrap().unwrap();
     assert_eq!(record.status, BuildStatus::Failed, "{record:?}");
     assert!(record.error.unwrap().contains("abandoned"));

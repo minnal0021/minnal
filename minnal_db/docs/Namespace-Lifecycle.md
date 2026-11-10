@@ -75,7 +75,14 @@ Both tasks are idempotent: each step skips what is already done, so a task
 cut short (an error, a panic, a crash) is finished by running it again. A
 drop whose caller gives up (an HTTP client that disconnects) goes on: the
 governor runs it, not the caller, so the store stays `deleting` until the
-governor finishes it, and a retry waits for that.
+governor finishes it, and a retry waits for that. Nothing is awaited between
+the state change and the hand-over to the governor, so a caller that goes
+away cannot leave a store `creating` or `deleting` with no task handed over.
+Both check the governor is running before they write anything.
+
+A store whose creation the governor gave up on (it is parked, below) can be
+dropped while still `creating`: the drop removes what the creation made, and
+frees the name.
 
 ## The governor
 
@@ -86,16 +93,31 @@ runs each in a coordinator task of its own while the task lasts; it does no
 work itself, and costs nothing while no task runs.
 
 - **One creation or drop of a store at a time, and nothing beside it.** Jobs
-  of one store may run together, subject to the conflict table.
+  of one store may run together, subject to the conflict table. A task that
+  may not run yet beside what runs is queued, in order, and started once the
+  governor has collected what blocks it; it is never refused for it. The
+  states alone do not keep tasks apart: a job's end moves its store back to
+  `created` before the governor collects the job, so a drop accepted at that
+  moment reaches the governor while the job still counts as running. The same
+  holds for a task asked for again while it runs (a field built again under
+  the same key just after its last build ended): it waits for a run of its own
+  rather than share the old run's result.
 - **Supervision.** A task that fails or panics is run again after
   `restart_backoff`, up to `max_restarts` times (`[lifecycle]` in the server
   config, defaults 3 and 1 s); the restart count is kept in memory. Past
   that, a job is recorded `failed`; a creation or drop *parks* its store:
   a CRITICAL error is logged, the store stays in its state, and later tasks
-  for it fail at once, until the process restarts.
-- **The governor itself is supervised the same way.** If it gives up, its
-  channel closes and every create, drop and job start fails with
-  `GovernorUnavailable` (503). Stores that exist keep serving data requests.
+  for it fail at once, until the process restarts. A body can also end its
+  task at once with an error a run again cannot mend (a partition rebuild cut
+  short before it published).
+- **The governor itself is supervised the same way**, counting only failures
+  within ten minutes of each other. If it gives up, its channel closes and
+  every create, drop and job start fails with `GovernorUnavailable` (503).
+  Stores that exist keep serving data requests.
+- **Shutdown waits for it.** `DocStore::shutdown` stops the governor first and
+  waits until every running task has stopped at its next `.await`, before the
+  engine shuts down. A job stopped this way stays live, and is resumed at the
+  next open.
 - **At start** it picks up every store still `creating` or `deleting`, and
   every live job, so whatever a crash or a parked task left is finished. It
   finds them before the open returns, so a request that comes later is not
@@ -111,7 +133,7 @@ once it is handed over.
 
 | Job | Started by (library / REST) | What the body does | Its saved progress | Cancel |
 |---|---|---|---|---|
-| `field_build` | `add_index` / `POST /stores/{ns}/indices` | Activate the index empty, list it in the schema, index every document | index spec, counts, resume key | yes: the half-built index is dropped |
+| `field_build` | `add_index` / `POST /stores/{ns}/indices` | Activate the index empty, list it in the schema, index every document (the start only records the job) | index spec, counts, resume key | yes: the half-built index is dropped |
 | `field_drop` | `drop_index` / `DELETE /stores/{ns}/indices/{field}` | Demote the index to an attribute, then delete its files | — | no |
 | `reindex_all` | `reindex_all_attribute_indices`, `drop_all_attribute_indices` / the attribute `reindex-all` and `drop-all` routes | Drop every index, reset the row map, list them again, build them one after the other | specs, phase, fields built, the current build | no: the old indexes are gone after its first step |
 | `vector_enable` | `amend` turning semantic search on / `PATCH …/schema` | Seed the partition, then save the schema | the amendment | yes: what the seeding made is removed |
@@ -127,10 +149,15 @@ wait for the job to end.
 `JobKey` in `system_namespace_maintenance`) and only then moves the store to
 `index_maintenance`. An end writes the record's final status (`complete`,
 `failed`, `cancelled`) and then moves the store back to `created` if no job of
-it is live. One lock in the jobs registry covers every start and end across
-both writes: without it an end could see no live job, a start write its record
-and find the store still in maintenance, and the end then move it to `created`
-with a job running. A crash between the two writes leaves a state that
+it is live. A lock in the jobs registry covers every start and end of one
+store's jobs across both writes: without it an end could see no live job, a
+start write its record and find the store still in maintenance, and the end
+then move it to `created` with a job running. The locks are striped by store,
+so jobs of different stores seldom wait for each other's writes, and audit
+records are written after the lock is released. A job started and then
+refused before any of its work ran (turning semantic search off failed a
+check) is withdrawn: its record is removed, and the audit log says why
+(`job_withdrawn`). A crash between the two writes leaves a state that
 disagrees with the records; at the next start the records win
 (`Jobs::repair`).
 
@@ -156,14 +183,14 @@ both. A refused start answers `JobConflict` (409), naming both jobs.
 /admin/stores/{ns}/jobs/{job}`) only marks the record `cancelling`. The body
 reads that between batches, undoes its own work and returns, and the job ends
 `cancelled`. The governor never reaches into a running body. A rebuild that has
-recorded its plan runs to its end, and the cancel is withdrawn
-(`Jobs::refuse_cancel`): the job ends `complete`.
+recorded its plan runs to its end: a cancel asked for already is taken back,
+and a later one is refused (`Jobs::refuse_cancel`); the job ends `complete`.
 
 **A rebuild found already started is not run again.** K-means takes minutes on
 a large store, and repeating it after an error would repeat whatever caused
 it. The partition's journal has already finished the rebuild (it got past its
 publish) or abandoned it (it had not); the job is closed `complete` or
-`failed` to match.
+`failed` to match, and the caller of the plain form hears which.
 
 ## Writes and drops: the write gate
 
@@ -171,16 +198,19 @@ A drop must not remove a store under a write that is in progress: the write
 could recreate the namespace after its removal, or leave an embedding queue
 entry the drop already cleared. Every document and KV write holds a guard
 from the write gate for its whole duration, and is admitted only while the
-store's state takes requests. The state check and the count are one step
-under the gate's lock, and teardown reads the count under the same lock
-after the move to `deleting`: a write either saw the old state and is counted,
-so the drop waits for it, or sees `deleting` and is refused.
+store's state takes requests. Each store keeps its own count of writes in its
+schema cache entry, for as long as the store exists; there is no lock shared
+across stores. A write counts itself first and then reads the state; teardown
+moves the state first and then reads the count. The state is read and written
+under the schema cache's lock, so a write either saw the old state, and the
+drop's later read of the count sees it, or sees `deleting` and takes itself
+back.
 
 ## The lifecycle audit log
 
 Every create (`creating`, `created`), drop (`deleting`, `deleted`), job event
 (`job_started`, `job_cancel_requested`, `job_completed`, `job_failed`,
-`job_cancelled`), task a restart picked up (`resumed`), parked store
+`job_cancelled`, `job_withdrawn`), task a restart picked up (`resumed`), parked store
 (`task_parked`) and governor stop (`governor_stopped`) is written to the TTL
 namespace `system_lifecycle_audit`. Records are kept for `[lifecycle]
 audit_retention_days` (default 30) and outlive the stores they describe. Keys
@@ -201,7 +231,8 @@ lost: an audit failure never fails the operation it describes.
 | `src/doc_store/lifecycle/` | The doc store as host: create, provision, drop, teardown, job plumbing (`jobs.rs`) |
 | `src/doc_store/indexing/` | The field-job bodies: `build/`, `reindex_all/` |
 | `src/doc_store/vector/` | The vector-job bodies: `lifecycle.rs` (enable, cleanup), `reindex.rs`, `partition.rs` (rebuild) |
-| `src/doc_store/write_gate.rs` | The write gate |
+| `src/doc_store/write_gate.rs` | The write gate (each store's count of writes in progress) |
+| `src/doc_store/lifecycle_locks.rs` | The per-store lock that keeps a create, an amendment and a drop apart |
 
 ## Tests that pin the rules
 
@@ -211,6 +242,13 @@ lost: an audit failure never fails the operation it describes.
 | A failed or panicking task runs again; past the limit it parks | `a_failed_or_panicked_task_is_run_again`, `a_failed_or_panicked_job_is_run_again` |
 | A restart picks up creations, drops and jobs, and records it | `what_a_crash_left_is_picked_up_at_start` |
 | The records win over a state a crash left behind | `the_governor_frees_a_store_left_in_maintenance_with_no_job` |
+| A drop or job asked for the moment the last task ended runs, queued, not refused | `a_drop_the_moment_a_job_ends_is_run`, `a_job_the_moment_a_creation_ends_is_run`, `a_drop_the_moment_a_build_ends_finishes` |
+| A task asked for again while it runs runs again | `a_task_asked_for_again_while_it_runs_runs_again` |
+| A store parked in its creation can be dropped | `a_store_parked_in_its_creation_can_be_dropped` |
+| Nothing is written while the governor is not running | `nothing_is_written_while_the_governor_is_not_running` |
+| The governor restarts after a panic, and stops past its restarts | `a_crashed_governor_restarts_and_picks_up_what_was_left`, `a_governor_that_keeps_crashing_stops` |
+| Shutdown waits for running tasks and leaves a job live | `stop_waits_for_the_tasks_and_leaves_a_job_live` |
+| A cancel past a rebuild's plan is refused | `a_cancel_past_the_cancel_point_is_refused` |
 | Two drops at once remove the store once | `two_drops_at_once_remove_the_store_once` |
 | No write outlives a drop | `writes_during_a_drop_leave_nothing_behind` |
 | A cancel stops a build and drops the half-built index | `a_cancel_stops_a_running_build_and_drops_its_index` |

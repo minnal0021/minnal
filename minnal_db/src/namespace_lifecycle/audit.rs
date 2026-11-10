@@ -60,6 +60,10 @@ pub enum AuditEvent {
     JobFailed,
     /// A job stopped on a cancel, its work undone.
     JobCancelled,
+    /// A job was taken back before any of its work ran: the request it
+    /// belonged to was refused after the job started; `detail` says why. Its
+    /// record is removed.
+    JobWithdrawn,
     /// A creation, drop or job a restart found part-way was picked up again.
     Resumed,
     /// A creation or drop failed every run the governor allows; the namespace

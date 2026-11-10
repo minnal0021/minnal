@@ -137,12 +137,19 @@ impl LifecycleHost for FakeHost {
             }
             return Err(LifecycleError::Record(format!("scripted failure in {task}")));
         }
+        // Like the doc store's: a creation or drop does nothing for a
+        // namespace in any other state (it is done already, or gone).
         match task {
             Task::Provision => {
-                self.transition(namespace, &[NamespaceState::Creating], NamespaceState::Created)?;
+                if self.state(namespace) == Some(NamespaceState::Creating) {
+                    self.transition(namespace, &[NamespaceState::Creating], NamespaceState::Created)?;
+                }
             }
             Task::Teardown => {
-                self.states.lock().remove(namespace);
+                let mut states = self.states.lock();
+                if states.get(namespace).is_some_and(|(s, _)| *s == NamespaceState::Deleting) {
+                    states.remove(namespace);
+                }
             }
             // A job's body: nothing to do, or to undo when cancelled.
             Task::Job(_) => {}

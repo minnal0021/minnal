@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use crate::AsyncDb;
+use crate::doc_store::InFlightWrites;
 use crate::doc_store::error::{DocStoreError, SchemaError};
 use crate::doc_store::schema::store::SchemaStore;
-use crate::doc_store::write_gate::InFlightWrites;
 use crate::namespace_lifecycle::NamespaceState;
 use crate::semantic_search::workers::{DocumentText, WorkerError, WorkerHost};
 use crate::vector_index::vector_settings::VectorIndexSettings;

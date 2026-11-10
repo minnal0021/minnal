@@ -40,10 +40,13 @@ mod diagnostics;
 mod documents;
 pub mod error;
 mod helpers;
+#[cfg(feature = "semantic-search")]
+mod in_flight;
 pub mod indexing;
 pub mod key;
 mod kv;
 mod lifecycle;
+mod lifecycle_locks;
 mod open;
 pub mod pagination;
 mod query;
@@ -54,14 +57,15 @@ mod vector;
 mod write_gate;
 
 pub use self::diagnostics::RowMapStats;
+#[cfg(feature = "semantic-search")]
+pub(crate) use self::in_flight::{InFlightWrite, InFlightWrites};
 pub use self::indexing::progress::FieldBuildProgress;
+pub(crate) use self::lifecycle_locks::LifecycleLocks;
 pub use self::open::DocStoreBuilder;
 #[cfg(feature = "semantic-search")]
 pub use self::vector::VectorReindexOutcome;
 pub use self::vector::{ReindexStats, VecReindexProgress};
-#[cfg(feature = "semantic-search")]
-pub(crate) use self::write_gate::{InFlightWrite, InFlightWrites};
-pub(crate) use self::write_gate::{LifecycleLocks, WriteGate, WriteGuard};
+pub(crate) use self::write_gate::{StoreWrites, WriteGuard};
 pub use crate::namespace_lifecycle::{AuditEvent, AuditRecord, BuildStatus, JobRecord, LifecycleConfig, MAINTENANCE_NAMESPACE, NamespaceState};
 pub(crate) use crate::namespace_lifecycle::{JobKey, MaintenanceStore};
 #[cfg(feature = "semantic-search")]
@@ -124,8 +128,8 @@ pub struct DocStore {
     #[cfg(feature = "semantic-search")]
     semantic_ctx: Option<Arc<SemanticSearchContext>>,
     /// Wake signal sent to the [`VecIndexWorker`] after each write that
-    /// enqueues a pending embedding. Always set by [`DocStoreBuilder::open`]; `None` only in unit tests (configured
-    /// configured.
+    /// enqueues a pending embedding. Always set by [`DocStoreBuilder::open`];
+    /// `None` only in unit tests.
     #[cfg(feature = "semantic-search")]
     notify: Option<Arc<tokio::sync::Notify>>,
     /// Handle to the background vector-index worker.  `None` when semantic
@@ -133,13 +137,11 @@ pub struct DocStore {
     /// taken out for an async graceful shutdown while `DocStore` is behind
     /// an `Arc`.
     #[cfg(feature = "semantic-search")]
-    worker_handle: std::sync::Mutex<Option<VecIndexWorkerHandle>>,
+    worker_handle: parking_lot::Mutex<Option<VecIndexWorkerHandle>>,
     /// Configuration for the vector-index background worker
     /// ([`DocStoreBuilder::vector_index_config`]).
     #[cfg(feature = "semantic-search")]
     vector_index_config: VectorIndexConfig,
-    /// Writes in progress per store, which a drop waits for.
-    writes: Arc<WriteGate>,
     /// Keeps a store's create, amendments and drop apart ([`LifecycleLocks`]).
     lifecycle: LifecycleLocks,
     /// Documents of semantic-search stores with a write in progress, which the
@@ -206,7 +208,7 @@ impl DocStore {
     /// be processed on the next startup.
     #[cfg(feature = "semantic-search")]
     pub async fn shutdown_vec_index_worker(&self) {
-        let handle = self.worker_handle.lock().unwrap().take();
+        let handle = self.worker_handle.lock().take();
         if let Some(h) = handle {
             h.shutdown().await;
         }
@@ -222,9 +224,10 @@ impl DocStore {
     /// avoid losing buffered writes or leaving the tokio runtime hanging on
     /// background tasks.
     pub async fn shutdown(&self) -> Result<(), DocStoreError> {
-        // First: a lifecycle task cut short is finished at the next open.
+        // First, and waited for: no lifecycle task runs on while the engine
+        // shuts down. A task cut short is finished at the next open.
         if let Some(governor) = self.governor.get() {
-            governor.stop();
+            governor.stop().await;
         }
         #[cfg(feature = "semantic-search")]
         self.shutdown_vec_index_worker().await;
@@ -255,12 +258,12 @@ impl DocStore {
             })
     }
 
-    /// The engine namespace holding store `namespace`'s data. Never creates it:
-    /// a call racing the store's drop fails with [`DocStoreError::NotFound`]
-    /// rather than bring the namespace back.
-    /// The namespace of `namespace`, a store taking requests: `NotFound`,
-    /// `StoreCreating` or `StoreDeleting` otherwise. Every read and write of a
-    /// store's data comes through here or [`load_schema`](Self::load_schema).
+    /// The engine namespace holding the data of `namespace`, a store taking
+    /// requests: `NotFound`, `StoreCreating` or `StoreDeleting` otherwise.
+    /// Every read and write of a store's data comes through here or
+    /// [`load_schema`](Self::load_schema). Never creates the namespace: a call
+    /// racing the store's drop fails with [`DocStoreError::NotFound`] rather
+    /// than bring it back.
     async fn store_ns(&self, namespace: &str) -> Result<AsyncNamespace, DocStoreError> {
         self.schemas.admit(namespace)?;
         self.db

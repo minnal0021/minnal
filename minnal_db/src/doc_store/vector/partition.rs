@@ -217,10 +217,11 @@ impl DocStore {
             if ctx.rebuilt_above(&self.db, namespace, ns_id, &settings, above).await? {
                 return Ok(());
             }
-            // Closed failed here, so the governor does not run it again.
-            let error = "the rebuild was cut short before it published, and recovery abandoned it; start it again".to_owned();
-            self.jobs.finish(self, namespace, key, Err(error))?;
-            return Ok(());
+            // Final, so the governor records the job failed without running it
+            // again.
+            return Err(DocStoreError::LifecycleTaskAbandoned(
+                "the rebuild was cut short before it published, and recovery abandoned it; start it again".to_owned(),
+            ));
         }
         let cancelled = || self.jobs.is_cancelling(key);
         if cancelled() {

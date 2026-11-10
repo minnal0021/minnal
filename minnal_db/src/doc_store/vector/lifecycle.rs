@@ -42,9 +42,12 @@ impl DocStore {
                 )
                 .await
             }
-            StoreType::Kv => self
-                .schemas
-                .update_kv(namespace, |schema| Ok(schema.update_vector_search(search, maintenance)?)),
+            // The state checked under the schema writer, so no drop moves the
+            // store on between the check and the change.
+            StoreType::Kv => self.schemas.update_kv(namespace, |schema| {
+                self.schemas.admit(namespace)?;
+                Ok(schema.update_vector_search(search, maintenance)?)
+            }),
         }
     }
 
@@ -245,7 +248,9 @@ impl DocStore {
         let key = JobKey::new(ns_id, JobKind::VectorCleanup);
         self.start_job(namespace, key, "vector index", &serde_json::Value::Null)?;
         if let Err(e) = turn_off() {
-            self.jobs.finish(self, namespace, key, Err(e.to_string()))?;
+            // Refused before any of the job's work: take the job back rather
+            // than leave a failed one on record.
+            self.jobs.withdraw(self, namespace, key, &e.to_string())?;
             return Err(e);
         }
         Ok(key)
@@ -254,7 +259,10 @@ impl DocStore {
     /// The body of a `vector_cleanup` job: semantic search off (a crash can
     /// have come before the start turned it off), then the vector data
     /// removed.
-    pub(in crate::doc_store) async fn vector_cleanup_job(&self, namespace: &str, _key: JobKey) -> Result<(), DocStoreError> {
+    pub(in crate::doc_store) async fn vector_cleanup_job(&self, namespace: &str, key: JobKey) -> Result<(), DocStoreError> {
+        if !self.jobs.get(key)?.is_some_and(|r| r.is_live()) {
+            return Ok(());
+        }
         match self.turn_semantic_search_off(namespace) {
             Ok(()) | Err(DocStoreError::SemanticSearchNotEnabled { .. }) => {}
             Err(e) => return Err(e),

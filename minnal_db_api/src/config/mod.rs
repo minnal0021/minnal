@@ -311,6 +311,7 @@ impl LifecycleSection {
         minnal_db::LifecycleConfig {
             max_restarts: self.max_restarts,
             restart_backoff: std::time::Duration::from_millis(self.restart_backoff_ms),
+            ..minnal_db::LifecycleConfig::default()
         }
     }
 }

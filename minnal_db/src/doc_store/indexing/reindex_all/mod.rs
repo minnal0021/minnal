@@ -113,34 +113,23 @@ impl DocStore {
 
     /// Start the `reindex_all` job, with the specs it works on; `None` if
     /// there is none.
+    ///
+    /// The specs are read again once the job has started: until then a field
+    /// build may finish and list its index, and a list read before would
+    /// leave that index out (its field still active when the row map is
+    /// reset). Once started, the job's conflicts keep every field job out.
     fn start_reindex_all(&self, namespace: &str, rebuild: bool) -> Result<Option<(JobKey, Vec<IndexSpec>)>, DocStoreError> {
         self.job_runner_ready()?;
-        let schema = self.load_schema(namespace)?;
-        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+        let ns_id = self.load_schema(namespace)?.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
         let key = JobKey::reindex_all(ns_id);
-        let mut specs = schema.indices.clone();
-        // A run that failed part-way may have dropped some indexes already;
-        // its list has them all. Leaving them out would lose them for good.
-        if let Some(failed) = self
-            .jobs
-            .get(key)?
-            .filter(|r| r.status == BuildStatus::Failed)
-            .and_then(|r| r.progress::<Intent>())
-        {
-            log::warn!("reindex-all '{namespace}': taking over the indexes of an earlier run that failed part-way");
-            for spec in failed.specs {
-                if !specs.iter().any(|s| s.field == spec.field) {
-                    specs.push(spec);
-                }
-            }
-        }
+        let specs = self.reindex_all_specs(namespace, key)?;
         if specs.is_empty() {
             return Ok(None);
         }
-        let intent = Intent {
-            specs: specs.clone(),
+        let mut intent = Intent {
+            specs,
             rebuild,
             phase: Phase::Dropping,
             built: 0,
@@ -148,12 +137,38 @@ impl DocStore {
         };
         let subject = if rebuild { "every index" } else { "every index, drop only" };
         self.start_job(namespace, key, subject, &intent)?;
+        let specs = self.reindex_all_specs(namespace, key)?;
+        if specs != intent.specs {
+            intent.specs = specs;
+            self.save_job_progress(key, &intent);
+        }
         info!(
             "{} '{namespace}': {} index(es)",
             if rebuild { "reindex-all" } else { "drop-all" },
-            specs.len()
+            intent.specs.len()
         );
-        Ok(Some((key, specs)))
+        Ok(Some((key, intent.specs)))
+    }
+
+    /// The indexes a `reindex_all` job (`key`) of `namespace` works on: the
+    /// schema's, and those of an earlier run that failed part-way. That run
+    /// may have dropped some already; its list has them all, and leaving
+    /// them out would lose them for good.
+    fn reindex_all_specs(&self, namespace: &str, key: JobKey) -> Result<Vec<IndexSpec>, DocStoreError> {
+        let mut specs = self.load_schema(namespace)?.indices.clone();
+        if let Some(earlier) = self
+            .jobs
+            .get(key)?
+            .filter(|r| matches!(r.status, BuildStatus::Failed | BuildStatus::Running))
+            .and_then(|r| r.progress::<Intent>())
+        {
+            for spec in earlier.specs {
+                if !specs.iter().any(|s| s.field == spec.field) {
+                    specs.push(spec);
+                }
+            }
+        }
+        Ok(specs)
     }
 
     /// The body of a `reindex_all` job.
@@ -239,12 +254,18 @@ impl DocStore {
     /// The fields of `ns_id` a live or failed `reindex-all` has not rebuilt
     /// yet: their indexes hold part of the store, or nothing.
     pub(in crate::doc_store) fn fields_reindexing(&self, ns_id: NamespaceId) -> Result<Vec<String>, DocStoreError> {
-        let Some(record) = self.jobs.get(JobKey::reindex_all(ns_id))? else {
-            return Ok(Vec::new());
-        };
-        if !matches!(record.status, BuildStatus::Running | BuildStatus::Pending | BuildStatus::Failed) {
+        // The status first, from memory: on every query, and most stores have
+        // no unfinished reindex-all to parse.
+        let key = JobKey::reindex_all(ns_id);
+        if !matches!(
+            self.jobs.status(key)?,
+            Some(BuildStatus::Running | BuildStatus::Pending | BuildStatus::Failed)
+        ) {
             return Ok(Vec::new());
         }
+        let Some(record) = self.jobs.get(key)? else {
+            return Ok(Vec::new());
+        };
         let intent: Intent = record
             .progress()
             .ok_or_else(|| record_error(JobKey::reindex_all(ns_id), "no reindex-all progress"))?;

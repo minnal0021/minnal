@@ -225,12 +225,16 @@ async fn reindex_all_is_refused_while_a_build_runs() {
         field: "extra".to_owned(),
         index_type: IndexType::Int,
     };
-    store.start_field_build("events", spec).await.unwrap();
+    store.start_field_build("events", spec).unwrap();
     assert!(matches!(
         store.reindex_all_attribute_indices("events").await,
         Err(DocStoreError::JobConflict { running, .. }) if running.starts_with("field_build")
     ));
-    assert_eq!(store.load_schema("events").unwrap().indices.len(), 3);
+    assert_eq!(
+        store.load_schema("events").unwrap().indices.len(),
+        2,
+        "the reindex-all changed nothing (the build lists its index when it runs)"
+    );
     store.run_live_jobs().await.unwrap();
     store.drop_index("events", "extra").await.unwrap();
     store.reindex_all_attribute_indices("events").await.unwrap();

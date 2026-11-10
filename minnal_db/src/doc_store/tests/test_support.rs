@@ -37,6 +37,7 @@ pub(crate) fn test_builder(db_dir: &Path) -> DocStoreBuilder {
         .lifecycle(LifecycleConfig {
             max_restarts: 3,
             restart_backoff: std::time::Duration::from_millis(5),
+            ..LifecycleConfig::default()
         });
     #[cfg(feature = "semantic-search")]
     let builder = builder.semantic_search(SemanticSearchContext::new(crate::semantic_search::service::SemanticSearchConfig {

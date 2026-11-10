@@ -33,6 +33,10 @@ impl LifecycleHost for DocStore {
         }
     }
 
+    fn is_final(error: &DocStoreError) -> bool {
+        matches!(error, DocStoreError::LifecycleTaskAbandoned(_))
+    }
+
     async fn run(&self, namespace: &str, task: Task) -> Result<(), DocStoreError> {
         match task {
             Task::Provision => self.provision(namespace).await,
@@ -46,11 +50,6 @@ impl DocStore {
     /// The governor, if it is running (it stops only after failing too often).
     pub(in crate::doc_store) fn running_governor(&self) -> Result<&Governor, DocStoreError> {
         self.governor.get().filter(|g| g.is_running()).ok_or(DocStoreError::GovernorUnavailable)
-    }
-
-    /// Hand `namespace`'s lifecycle `task` to the governor and wait for it.
-    pub(in crate::doc_store) async fn run_lifecycle_task(&self, namespace: &str, task: Task) -> Result<(), DocStoreError> {
-        Ok(self.running_governor()?.run(namespace, task).await?)
     }
 
     /// Stores whose lifecycle task the governor gave up on, with the last

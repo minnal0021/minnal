@@ -39,7 +39,7 @@ mod tests;
 
 pub use audit::{AUDIT_NAMESPACE, AuditEvent, AuditLog, AuditRecord, DEFAULT_AUDIT_RETENTION, MAX_AUDIT_LIMIT};
 pub use error::LifecycleError;
-pub(crate) use governor::Governor;
+pub(crate) use governor::{Governor, TaskDone};
 pub use governor::{LifecycleConfig, Task};
 pub use host::LifecycleHost;
 pub use jobs::{BuildStatus, JobKey, JobKind, JobRecord, Jobs, conflicts};

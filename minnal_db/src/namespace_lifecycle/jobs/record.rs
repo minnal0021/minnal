@@ -27,6 +27,11 @@ pub struct JobRecord {
     /// Why the job failed, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether the body got past the point a cancel can stop it
+    /// ([`Jobs::refuse_cancel`](super::Jobs::refuse_cancel)): a cancel is then
+    /// refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub past_cancel: bool,
     /// The job body's own progress, opaque here.
     #[serde(default)]
     pub progress: serde_json::Value,
@@ -43,6 +48,7 @@ impl JobRecord {
             started_at_ms: now,
             updated_at_ms: now,
             error: None,
+            past_cancel: false,
             progress,
         }
     }

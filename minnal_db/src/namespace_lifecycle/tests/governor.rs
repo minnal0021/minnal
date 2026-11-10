@@ -13,6 +13,7 @@ fn quick(max_restarts: u32) -> LifecycleConfig {
     LifecycleConfig {
         max_restarts,
         restart_backoff: Duration::from_millis(5),
+        ..LifecycleConfig::default()
     }
 }
 
@@ -131,10 +132,10 @@ async fn a_cancel_ends_a_running_job_cancelled() {
     assert_eq!(host.state("s"), Some(NamespaceState::Created));
 }
 
-/// A namespace's jobs run together; a drop or creation does not run beside
-/// them, and is refused at once rather than queued.
+/// A namespace's jobs run together; a drop does not run beside them: it waits
+/// for them, queued, and is not refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn jobs_run_together_but_not_beside_a_drop() {
+async fn jobs_run_together_and_a_drop_waits_for_them() {
     let host = FakeHost::new().await;
     host.add("s", NamespaceState::Created);
     let gov = governor(&host, 0);
@@ -152,13 +153,12 @@ async fn jobs_run_together_but_not_beside_a_drop() {
 
     let other = host.start("s", JobKind::FieldBuild(8)).unwrap();
     gov.run("s", Task::Job(other)).await.unwrap();
-    match gov.run("s", Task::Teardown).await {
-        Err(LifecycleError::TaskFailed { error, .. }) => assert!(error.contains("job field_build:7"), "{error}"),
-        other => panic!("expected a refusal, got {other:?}"),
-    }
-    assert!(gov.parked().is_empty(), "a refusal parks nothing");
 
+    let drop_done = gov.submit("s", Task::Teardown).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(host.runs(Task::Teardown), 0, "the drop waits for the running job");
     gate.add_permits(1);
     held_done.await.unwrap().unwrap();
-    assert_eq!(host.state("s"), Some(NamespaceState::Created));
+    drop_done.await.unwrap().unwrap();
+    assert_eq!(host.runs(Task::Teardown), 1);
 }

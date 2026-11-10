@@ -50,11 +50,16 @@ const TAG_VECTOR_CLEANUP: u8 = 6;
 const TAG_PARTITION_REBUILD: u8 = 7;
 
 impl JobKind {
+    /// The name of every field build, [`FieldBuild`](Self::FieldBuild).
+    pub const FIELD_BUILD: &'static str = "field_build";
+    /// The name of every field drop, [`FieldDrop`](Self::FieldDrop).
+    pub const FIELD_DROP: &'static str = "field_drop";
+
     /// The job's name, without its field: `field_build`, `reindex_all`, …
     pub fn name(self) -> &'static str {
         match self {
-            Self::FieldBuild(_) => "field_build",
-            Self::FieldDrop(_) => "field_drop",
+            Self::FieldBuild(_) => Self::FIELD_BUILD,
+            Self::FieldDrop(_) => Self::FIELD_DROP,
             Self::ReindexAll => "reindex_all",
             Self::VectorEnable => "vector_enable",
             Self::VectorCleanup => "vector_cleanup",

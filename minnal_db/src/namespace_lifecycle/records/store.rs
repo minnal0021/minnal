@@ -17,18 +17,37 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::namespace::NamespaceId;
-use crate::namespace_lifecycle::JobKey;
-use crate::namespace_lifecycle::LifecycleError;
+use crate::namespace_lifecycle::{BuildStatus, JobKey, JobKind, LifecycleError};
 use crate::{AsyncDb, AsyncNamespace};
+
+/// A cached record: its JSON, and its `status` field, read out when cached
+/// so the hot checks ([`MaintenanceStore::status`]) parse nothing. `None`
+/// for a record with no `status` that parses.
+#[derive(Clone)]
+struct Cached {
+    json: Arc<[u8]>,
+    status: Option<BuildStatus>,
+}
+
+impl Cached {
+    fn new(json: Arc<[u8]>) -> Self {
+        #[derive(serde::Deserialize)]
+        struct Status {
+            status: BuildStatus,
+        }
+        let status = serde_json::from_slice::<Status>(&json).ok().map(|s| s.status);
+        Self { json, status }
+    }
+}
 
 /// The system namespace that holds every maintenance record.
 pub const MAINTENANCE_NAMESPACE: &str = "system_namespace_maintenance";
 
 /// Every maintenance record, persisted in [`MAINTENANCE_NAMESPACE`] and cached
-/// in memory as its stored JSON.
+/// in memory as its stored JSON, with its status read out once.
 pub(crate) struct MaintenanceStore {
     ns: AsyncNamespace,
-    map: RwLock<BTreeMap<JobKey, Arc<[u8]>>>,
+    map: RwLock<BTreeMap<JobKey, Cached>>,
     /// Held by every write across its persist and its cache update.
     writer: Mutex<()>,
 }
@@ -43,7 +62,7 @@ impl MaintenanceStore {
         for (key, value) in ns.scan_prefix(Vec::new()).await? {
             match JobKey::from_bytes(&key) {
                 Some(k) => {
-                    map.insert(k, Arc::from(value));
+                    map.insert(k, Cached::new(Arc::from(value)));
                 }
                 None => log::warn!("{MAINTENANCE_NAMESPACE}: ignoring a record with an unknown key {key:02x?}"),
             }
@@ -61,12 +80,23 @@ impl MaintenanceStore {
     /// are never torn, so it means a record of another shape, and treating it as
     /// missing could restart or skip a task.
     pub(crate) fn get<T: DeserializeOwned>(&self, key: JobKey) -> Result<Option<T>, LifecycleError> {
-        let Some(bytes) = self.map.read().get(&key).cloned() else {
+        let Some(bytes) = self.map.read().get(&key).map(|c| Arc::clone(&c.json)) else {
             return Ok(None);
         };
         serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|e| LifecycleError::Record(format!("{key:?} does not parse: {e}")))
+    }
+
+    /// The `status` of the record at `key`, from memory, parsing nothing;
+    /// `None` if there is no record. A record with no status that parses is
+    /// an error, as in [`get`](Self::get).
+    pub(crate) fn status(&self, key: JobKey) -> Result<Option<BuildStatus>, LifecycleError> {
+        match self.map.read().get(&key) {
+            None => Ok(None),
+            Some(Cached { status: Some(status), .. }) => Ok(Some(*status)),
+            Some(Cached { status: None, .. }) => Err(LifecycleError::Record(format!("{key:?} has no status"))),
+        }
     }
 
     /// Save `record` at `key`, durably.
@@ -90,16 +120,22 @@ impl MaintenanceStore {
         Ok(())
     }
 
-    /// The keys of `store`'s records, in key order.
+    /// The keys of `store`'s records, in key order: a range of the map, as
+    /// keys sort by namespace first.
     pub(crate) fn keys_of(&self, store: NamespaceId) -> Vec<JobKey> {
-        self.map.read().keys().filter(|k| k.namespace == store).copied().collect()
+        self.map
+            .read()
+            .range(JobKey::new(store, JobKind::FieldBuild(0))..)
+            .map(|(k, _)| *k)
+            .take_while(|k| k.namespace == store)
+            .collect()
     }
 
     /// Persist and cache. Caller holds `writer`.
     fn persist<T: Serialize>(&self, key: JobKey, record: &T) -> Result<(), LifecycleError> {
         let json = serde_json::to_vec(record).map_err(|e| LifecycleError::Record(e.to_string()))?;
         crate::support::run_blocking_pass(|| self.ns.put_blocking(&key.to_bytes(), &json))?;
-        self.map.write().insert(key, Arc::from(json));
+        self.map.write().insert(key, Cached::new(Arc::from(json)));
         Ok(())
     }
 

@@ -241,6 +241,11 @@ pub enum DocStoreError {
         to: crate::namespace_lifecycle::NamespaceState,
     },
 
+    /// A lifecycle task ended with an error a run again cannot mend (a
+    /// partition rebuild cut short before it published, say).
+    #[error("{0}")]
+    LifecycleTaskAbandoned(String),
+
     /// A store's creation or drop failed every run the governor gave it; the
     /// store is left in its state until the process restarts.
     #[error("store '{namespace}': its lifecycle task failed {attempts} time(s), last: {error}")]
@@ -336,6 +341,7 @@ impl From<crate::namespace_lifecycle::LifecycleError> for DocStoreError {
             L::InvalidTransition { namespace, from, to } => Self::InvalidTransition { namespace, from, to },
             L::TaskFailed { namespace, attempts, error } => Self::LifecycleTaskFailed { namespace, attempts, error },
             L::GovernorUnavailable => Self::GovernorUnavailable,
+            L::Abandoned { reason } => Self::LifecycleTaskAbandoned(reason),
             L::InMaintenance { namespace } => Self::StoreInMaintenance { namespace },
             L::NotFound { namespace } => Self::NotFound { namespace },
             L::JobConflict { namespace, job, running } => Self::JobConflict { namespace, job, running },

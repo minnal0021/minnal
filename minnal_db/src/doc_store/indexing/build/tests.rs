@@ -184,7 +184,7 @@ async fn a_cancel_stops_a_running_build_and_drops_its_index() {
     for i in 0..20_000u64 {
         store.put_no_wal("ns", DocId::U64(i), serde_json::json!({"status": "a"})).await.unwrap();
     }
-    let job = store.begin_add_index("ns", status_spec()).await.unwrap();
+    let job = store.begin_add_index("ns", status_spec()).unwrap();
     assert_eq!(job, "field_build:status");
     assert_eq!(store.schemas.state("ns"), Some(NamespaceState::IndexMaintenance));
     // Wait for the build to save some progress, so the cancel lands mid-scan.
@@ -226,7 +226,8 @@ async fn a_build_cut_short_is_finished_at_the_next_start() {
                 store.put("ns", DocId::U64(i), serde_json::json!({"status": "a"})).await.unwrap();
             }
             if listed {
-                store.start_field_build("ns", status_spec()).await.unwrap();
+                let key = store.start_field_build("ns", status_spec()).unwrap();
+                store.list_index("ns", key.namespace, &status_spec()).await.unwrap();
             } else {
                 let ns_id = store.load_schema("ns").unwrap().ns_id.unwrap();
                 let field_id = store.db.register_index_field(ns_id, "status", to_ivt(IndexType::Str)).unwrap();
@@ -257,7 +258,7 @@ async fn a_drop_waits_for_the_fields_build_and_a_re_add_starts_afresh() {
     let store = open_fresh(db_dir.path()).await;
     store.create(make_schema("ns", vec![])).await.unwrap();
     store.put("ns", DocId::U64(1), serde_json::json!({"status": "a"})).await.unwrap();
-    let build = store.start_field_build("ns", status_spec()).await.unwrap();
+    let build = store.start_field_build("ns", status_spec()).unwrap();
     assert!(matches!(
         store.drop_index("ns", "status").await,
         Err(DocStoreError::JobConflict { job, running, .. }) if job == "field_drop:status" && running == "field_build:status"

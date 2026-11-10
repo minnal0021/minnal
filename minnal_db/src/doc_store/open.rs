@@ -74,9 +74,9 @@ impl DocStoreBuilder {
         self
     }
 
-    /// How long lifecycle audit records are kept from now on (default 30
-    /// days). Records already written expire by the retention they were
-    /// written with.
+    /// How long lifecycle audit records are kept (default 30 days). It
+    /// applies to every record, those already written included: a record
+    /// expires once it is older than the retention the store opens with.
     pub fn audit_retention(mut self, retention: Duration) -> Self {
         self.audit_retention = retention;
         self
@@ -153,10 +153,9 @@ impl DocStoreBuilder {
             #[cfg(feature = "semantic-search")]
             notify: Some(Arc::clone(&notify)),
             #[cfg(feature = "semantic-search")]
-            worker_handle: std::sync::Mutex::new(None),
+            worker_handle: parking_lot::Mutex::new(None),
             #[cfg(feature = "semantic-search")]
             vector_index_config: self.vector_index_config,
-            writes: Arc::default(),
             lifecycle: LifecycleLocks::default(),
             #[cfg(feature = "semantic-search")]
             in_flight: Arc::default(),
@@ -233,7 +232,7 @@ impl DocStoreBuilder {
                     notify,
                     store.vector_index_config.clone(),
                 );
-                *store.worker_handle.lock().unwrap() = Some(handle);
+                *store.worker_handle.lock() = Some(handle);
             }
         }
 

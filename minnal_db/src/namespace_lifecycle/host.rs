@@ -38,6 +38,13 @@ pub trait LifecycleHost: Send + Sync + 'static {
         kind.to_string()
     }
 
+    /// Whether `error`, returned by a run, ends its task at once: running it
+    /// again cannot mend it ([`LifecycleError::Abandoned`] converted, for a
+    /// host that maps it). By default every error is run again.
+    fn is_final(_error: &Self::Error) -> bool {
+        false
+    }
+
     /// Run `namespace`'s `task` once. It must be idempotent: a run cut short
     /// (an error, a panic, a crash) is finished by running it again.
     fn run(&self, namespace: &str, task: Task) -> impl Future<Output = Result<(), Self::Error>> + Send;

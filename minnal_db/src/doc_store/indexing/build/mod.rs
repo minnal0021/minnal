@@ -35,24 +35,26 @@ impl DocStore {
     /// indexed, and with [`DocStoreError::JobConflict`] while another job on
     /// the field (or a `reindex-all`) runs.
     pub async fn add_index(&self, namespace: &str, spec: IndexSpec) -> Result<(), DocStoreError> {
-        let key = self.start_field_build(namespace, spec).await?;
+        let key = self.start_field_build(namespace, spec)?;
         self.run_job(namespace, key).await
     }
 
     /// [`add_index`](Self::add_index), returning the job's name
-    /// (`field_build:{field}`) once the index is activated and its build
-    /// handed to the lifecycle governor, which the store starts when it opens.
-    pub async fn begin_add_index(&self, namespace: &str, spec: IndexSpec) -> Result<String, DocStoreError> {
+    /// (`field_build:{field}`) once the build is handed to the lifecycle
+    /// governor, which the store starts when it opens.
+    pub fn begin_add_index(&self, namespace: &str, spec: IndexSpec) -> Result<String, DocStoreError> {
         self.running_governor()?;
-        let name = format!("{}:{}", JobKind::FieldBuild(0).name(), spec.field);
-        let key = self.start_field_build(namespace, spec).await?;
+        let name = format!("{}:{}", JobKind::FIELD_BUILD, spec.field);
+        let key = self.start_field_build(namespace, spec)?;
         self.submit_job(namespace, key)?;
         Ok(name)
     }
 
-    /// Start a `field_build` job for `spec`: check it, record the job, and
-    /// activate and list the index. The job's body then does the build.
-    pub(in crate::doc_store) async fn start_field_build(&self, namespace: &str, spec: IndexSpec) -> Result<JobKey, DocStoreError> {
+    /// Start a `field_build` job for `spec`: check it and record the job. The
+    /// job's body then activates and lists the index, and builds it. Nothing
+    /// is awaited here, so a caller that goes away between the record and
+    /// the hand-over cannot leave a live job nobody runs.
+    pub(in crate::doc_store) fn start_field_build(&self, namespace: &str, spec: IndexSpec) -> Result<JobKey, DocStoreError> {
         self.job_runner_ready()?;
         let schema = self.load_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
@@ -76,10 +78,15 @@ impl DocStore {
         }
         // A field indexed before keeps its id. It is registered again (which
         // clears its `dropped` flag) only once the job has started: a drop of
-        // it may still be running, and the start is what refuses that.
+        // it may still be running, and the start is what refuses that. A new
+        // field needs its id for the job's key, so it is registered first,
+        // once a start is known to be accepted (no field job of it can run).
         let field_id = match self.db.list_index_fields(ns_id).iter().find(|f| f.field_name == spec.field) {
             Some(meta) => meta.field_id,
-            None => self.db.register_index_field(ns_id, &spec.field, to_ivt(spec.index_type))?,
+            None => {
+                self.jobs.check_start(self, namespace, JobKey::field_build(ns_id, FieldId::MAX))?;
+                self.db.register_index_field(ns_id, &spec.field, to_ivt(spec.index_type))?
+            }
         };
         let key = JobKey::field_build(ns_id, field_id);
         self.start_job(namespace, key, &spec.field, &FieldBuildProgress::new(spec.clone()))?;
@@ -87,19 +94,12 @@ impl DocStore {
             "adding index '{}' (type={:?}, field_id={field_id}) to namespace '{namespace}' (ns_id={ns_id})",
             spec.field, spec.index_type
         );
-        if let Err(e) = self.list_index(namespace, ns_id, &spec).await {
-            // The job never got going: record it failed, and take back what
-            // was done (an index activated but not listed).
-            self.jobs.finish(self, namespace, key, Err(e.to_string()))?;
-            self.unlist_index(namespace, ns_id, &spec.field)?;
-            return Err(e);
-        }
         Ok(key)
     }
 
-    /// The body of a `field_build` job: list the index if a crash cut the
-    /// start short, then index every document from where the record says the
-    /// build got to. On a cancel, the half-built index is dropped.
+    /// The body of a `field_build` job: activate and list the index (unless
+    /// an earlier run did), then index every document from where the record
+    /// says the build got to. On a cancel, the half-built index is dropped.
     pub(in crate::doc_store) async fn field_build_job(&self, namespace: &str, key: JobKey) -> Result<(), DocStoreError> {
         let JobKind::FieldBuild(field_id) = key.kind else {
             unreachable!("a field build's key")
@@ -109,8 +109,18 @@ impl DocStore {
         };
         let mut progress: FieldBuildProgress = record.progress().ok_or_else(|| record_error(key, "no build progress"))?;
         let ns_id = key.namespace;
-        if !self.load_schema(namespace)?.indices.iter().any(|s| s.field == progress.spec.field) {
-            self.list_index(namespace, ns_id, &progress.spec).await?;
+        if !self.load_schema(namespace)?.indices.iter().any(|s| s.field == progress.spec.field)
+            && let Err(e) = self.list_index(namespace, ns_id, &progress.spec).await
+        {
+            // Take back what was done (an index activated but not listed);
+            // a run again starts over.
+            if let Err(undo) = self.unlist_index(namespace, ns_id, &progress.spec.field) {
+                log::warn!(
+                    "index build of '{}' in '{namespace}': could not undo a failed start: {undo}",
+                    progress.spec.field
+                );
+            }
+            return Err(e);
         }
         if progress.resume_after_hex.is_some() {
             info!(
@@ -177,7 +187,7 @@ impl DocStore {
         self.running_governor()?;
         let key = self.start_field_drop(namespace, field)?;
         self.submit_job(namespace, key)?;
-        Ok(format!("{}:{field}", JobKind::FieldDrop(0).name()))
+        Ok(format!("{}:{field}", JobKind::FIELD_DROP))
     }
 
     fn start_field_drop(&self, namespace: &str, field: &str) -> Result<JobKey, DocStoreError> {
@@ -190,11 +200,14 @@ impl DocStore {
             namespace: namespace.to_owned(),
             field: field.to_owned(),
         };
-        if !schema.indices.iter().any(|s| s.field == field) {
-            return Err(not_found());
-        }
         let fields = self.db.list_index_fields(ns_id);
         let meta = fields.iter().find(|f| f.field_name == field).ok_or_else(not_found)?;
+        // A build whose body has not listed the index yet still owns the
+        // field: the start below refuses the drop as a conflict with it.
+        let building = self.jobs.status(JobKey::field_build(ns_id, meta.field_id))?.is_some_and(|s| s.is_live());
+        if !building && !schema.indices.iter().any(|s| s.field == field) {
+            return Err(not_found());
+        }
         let key = JobKey::field_drop(ns_id, meta.field_id);
         self.start_job(namespace, key, field, &serde_json::Value::Null)?;
         info!("dropping index '{field}' from namespace '{namespace}'");
@@ -206,6 +219,9 @@ impl DocStore {
         let JobKind::FieldDrop(field_id) = key.kind else {
             unreachable!("a field drop's key")
         };
+        if !self.jobs.get(key)?.is_some_and(|r| r.is_live()) {
+            return Ok(());
+        }
         let fields = self.db.list_index_fields(key.namespace);
         if let Some(meta) = fields.iter().find(|f| f.field_id == field_id) {
             self.unlist_index(namespace, key.namespace, &meta.field_name)?;

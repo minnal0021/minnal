@@ -66,7 +66,7 @@ pub(crate) fn job_accepted(namespace: &str, job: &str) -> (StatusCode, Json<serd
 /// job's name. `409` while another job on the field (or a reindex-all) runs.
 pub async fn add_index(State(state): State<AppState>, Path(ns): Path<String>, Json(spec): Json<IndexSpec>) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, field = %spec.field, index_type = ?spec.index_type, "adding index");
-    let job = state.store.begin_add_index(&ns, spec).await?;
+    let job = state.store.begin_add_index(&ns, spec)?;
     info!(namespace = %ns, job = %job, "index activated, build started");
     Ok(job_accepted(&ns, &job))
 }

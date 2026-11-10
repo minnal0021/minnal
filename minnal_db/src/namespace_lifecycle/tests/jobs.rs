@@ -140,3 +140,46 @@ async fn repair_puts_the_state_in_step_with_the_records() {
     assert_eq!(host.jobs.repair(&*host, "busy", busy).unwrap(), vec![key]);
     assert_eq!(host.state("busy"), Some(NamespaceState::IndexMaintenance));
 }
+
+/// Once a body is past the point a cancel can stop it, a cancel asked for
+/// already is taken back and a later one is refused: the job ends complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_past_the_cancel_point_is_refused() {
+    let host = FakeHost::new().await;
+    host.add("s", NamespaceState::Created);
+    let key = host.start("s", JobKind::PartitionRebuild).unwrap();
+    host.jobs.cancel("s", key).unwrap();
+    host.jobs.refuse_cancel(key).unwrap();
+    assert_eq!(status(&host, key), BuildStatus::Running, "the early cancel is taken back");
+    assert!(matches!(host.jobs.cancel("s", key), Err(LifecycleError::JobNotCancellable { .. })));
+    host.jobs.finish(&*host, "s", key, Ok(())).unwrap();
+    assert_eq!(status(&host, key), BuildStatus::Complete);
+}
+
+/// A job taken back before any of its work ran leaves no record, and its
+/// namespace goes back to `Created`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_job_leaves_no_record() {
+    let host = FakeHost::new().await;
+    host.add("s", NamespaceState::Created);
+    let key = host.start("s", JobKind::VectorCleanup).unwrap();
+    host.jobs.withdraw(&*host, "s", key, "refused").unwrap();
+    assert!(host.jobs.get(key).unwrap().is_none());
+    assert_eq!(host.state("s"), Some(NamespaceState::Created));
+    let (audit, _) = host.jobs.audit().read(Some("s"), None, 10).await.unwrap();
+    assert_eq!(audit[0].event, crate::namespace_lifecycle::AuditEvent::JobWithdrawn);
+}
+
+/// A job's status is read from memory, and follows its record.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_status_follows_the_record() {
+    let host = FakeHost::new().await;
+    host.add("s", NamespaceState::Created);
+    let key = host.start("s", BUILD_7).unwrap();
+    assert_eq!(host.jobs.status(key).unwrap(), Some(BuildStatus::Running));
+    host.jobs.cancel("s", key).unwrap();
+    assert!(host.jobs.is_cancelling(key));
+    host.jobs.finish(&*host, "s", key, Ok(())).unwrap();
+    assert_eq!(host.jobs.status(key).unwrap(), Some(BuildStatus::Cancelled));
+    assert_eq!(host.jobs.status(JobKey::new(key.namespace, BUILD_8)).unwrap(), None);
+}

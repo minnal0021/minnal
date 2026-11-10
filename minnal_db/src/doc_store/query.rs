@@ -340,8 +340,8 @@ impl DocStore {
         let reindexing = self.fields_reindexing(ns_id);
         for &fid in &outcome.touched_fields {
             let name = fields.iter().find(|f| f.field_id == fid).map(|f| f.field_name.as_str());
-            let building = match self.jobs.get(crate::doc_store::JobKey::field_build(ns_id, fid)) {
-                Ok(record) => record.is_some_and(|r| !matches!(r.status, BuildStatus::Complete | BuildStatus::Cancelled)),
+            let building = match self.jobs.status(crate::doc_store::JobKey::field_build(ns_id, fid)) {
+                Ok(status) => status.is_some_and(|s| !matches!(s, BuildStatus::Complete | BuildStatus::Cancelled)),
                 Err(_) => true,
             };
             let rebuilding = match &reindexing {

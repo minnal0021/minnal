@@ -93,6 +93,14 @@ pub enum LifecycleError {
         error: String,
     },
 
+    /// A task's run ended with an error a run again cannot mend: the
+    /// governor ends the task with it at once, without its runs again.
+    #[error("{reason}")]
+    Abandoned {
+        /// Why.
+        reason: String,
+    },
+
     /// The governor is not running (it stopped after too many restarts).
     #[error("the namespace lifecycle governor is not running; restart the process to create or drop namespaces")]
     GovernorUnavailable,

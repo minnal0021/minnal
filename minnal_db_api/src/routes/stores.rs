@@ -95,8 +95,8 @@ pub async fn drop_store(State(state): State<AppState>, Path(ns): Path<String>) -
     info!(namespace = %ns, "dropping store");
     let store_type = state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
     match store_type {
-        StoreType::Doc => state.store.begin_remove(&ns).await,
-        StoreType::Kv => state.store.begin_remove_kv(&ns).await,
+        StoreType::Doc => state.store.begin_remove(&ns),
+        StoreType::Kv => state.store.begin_remove_kv(&ns),
     }
     .map_err(|e| AppError::from(e).with_ns(&ns))?;
     Ok(accepted(&ns, minnal_db::NamespaceState::Deleting))

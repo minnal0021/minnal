@@ -361,10 +361,15 @@ Every store is in one of four states, shown as `state` in `GET /stores`:
 
 | State | Data requests | Can be dropped | How it gets there |
 |---|---|---|---|
-| `creating` | refused (`409`) | no | `POST /stores` accepted; the store is being set up |
+| `creating` | refused (`409`) | no, unless its setup was given up on (`parked`) | `POST /stores` accepted; the store is being set up |
 | `created` | yes | yes | set up, and no index job is running |
 | `index_maintenance` | yes | no (`409`): wait for its jobs, or cancel them | an index job is running |
 | `deleting` | refused (`409`) | already being dropped | `DELETE /stores/{ns}` accepted; its data is being removed |
+
+A store whose create or drop failed every retry the server allows is
+*parked*: it stays in its state until the server restarts, and `GET /stores`
+shows the last error under `parked`. A store parked while `creating` can be
+dropped, which removes what its setup made and frees the name.
 
 Creating and dropping a store, and every operation that builds or removes an
 index, run in the background and answer `202 Accepted` at once. The index
@@ -560,8 +565,8 @@ curl -X DELETE http://localhost:8080/stores/orders
 # → 202 Accepted  {"namespace":"orders","state":"deleting"}
 ```
 
-Returns `409` while the store is being created, or while an index job of it
-runs (wait for it, or [cancel it](#delete-adminstoresnsjobsjob)), and `404` for
+Returns `409` while the store is being created (unless its setup was given
+up on: see *parked* above), or while an index job of it runs (wait for it, or [cancel it](#delete-adminstoresnsjobsjob)), and `404` for
 no store.
 
 ---
@@ -1389,9 +1394,12 @@ curl 'http://localhost:8080/admin/lifecycle/audit?namespace=users&limit=3'
 
 `event` is one of `creating`, `created`, `deleting`, `deleted`, `job_started`,
 `job_cancel_requested`, `job_completed`, `job_failed` (with the error in
-`detail`), `job_cancelled`, `resumed` (a create, drop or job a restart found
-part-way), `task_parked` (a create or drop given up on; the store stays as it
-is until the server restarts) and `governor_stopped`. `next_cursor` is `null`
+`detail`), `job_cancelled`, `job_withdrawn` (a job taken back before any of
+its work ran, because the request that started it was refused; the reason in
+`detail`), `resumed` (a create, drop or job a restart found part-way),
+`task_parked` (a create or drop given up on; the store stays as it is until
+the server restarts, though a store whose create was given up on can be
+dropped) and `governor_stopped`. `next_cursor` is `null`
 on the last page; a filtered page can come back short with a cursor to go on
 from. Returns `400` for a malformed cursor.
 
