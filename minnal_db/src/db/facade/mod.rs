@@ -4,6 +4,9 @@
 //! user-facing API for CRUD, iteration, namespaces, and maintenance.
 
 mod async_db;
+mod async_db_index;
+mod async_db_maintenance;
+mod async_db_typed;
 mod async_namespace;
 mod db;
 
