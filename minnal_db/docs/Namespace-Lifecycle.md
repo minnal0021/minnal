@@ -216,7 +216,11 @@ namespace `system_lifecycle_audit`. Records are kept for `[lifecycle]
 audit_retention_days` (default 30) and outlive the stores they describe. Keys
 order the log newest first; `GET /admin/lifecycle/audit` reads it a page at a
 time, for every store or one. A record that cannot be written is logged and
-lost: an audit failure never fails the operation it describes.
+lost: an audit failure never fails the operation it describes. Each record is
+written after the change it describes, so a crash between the two loses the
+record too (a job shows `complete` in `GET /admin/stores/{ns}/jobs` with no
+`job_completed` in the log). The store's state and its job records are the
+truth; the audit log is the history.
 
 ## Where the code is
 

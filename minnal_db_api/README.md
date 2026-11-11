@@ -1403,6 +1403,12 @@ dropped) and `governor_stopped`. `next_cursor` is `null`
 on the last page; a filtered page can come back short with a cursor to go on
 from. Returns `400` for a malformed cursor.
 
+A record is written just after the change it describes, so a crash between
+the two loses that record: a job can show `complete` in
+[`GET /admin/stores/{ns}/jobs`](#get-adminstoresnsjobs) with no
+`job_completed` here. The store's state and its jobs are the truth; this log
+is their history.
+
 ---
 
 ### Operational & Storage Metrics
