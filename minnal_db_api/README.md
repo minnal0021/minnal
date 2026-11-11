@@ -296,7 +296,7 @@ Indices enable fast predicate queries (no full collection scan). Each index:
 
 **Limits:** up to **5 indices** per namespace.
 
-Adding an index to a store that already has documents triggers a **background rebuild**. The API returns `202 Accepted` immediately; the index is live for new writes straight away and historical documents are back-filled asynchronously. Use the [progress endpoint](#get-adminindicesprogress) to monitor the rebuild.
+Adding an index to a store that already has documents triggers a **background rebuild**. The API returns `202 Accepted` immediately; the job activates the index moments later, after which new writes are indexed as they happen, and it back-fills the documents already stored. Use the [progress endpoint](#get-adminindicesprogress) to monitor the rebuild.
 
 Rebuilds are **restartable** — if the server shuts down mid-rebuild, it automatically resumes from the last checkpoint on the next startup.
 
@@ -734,7 +734,7 @@ Returns an array of build-progress entries, in the same shape as `attribute_buil
 
 #### `POST /stores/{ns}/indices`
 
-Add a new field index. The index is activated before the reply, so writes are indexed from then on, and a `field_build` job indexes the documents already stored; queries on the field list it in `degraded_fields` until the build is complete.
+Add a new field index, as a `field_build` job. The job activates the index moments after the reply: from then on writes are indexed as they happen, the job indexes the documents already stored, and the index is listed in the store's schema. Until the build is complete, queries on the field list it in `degraded_fields`; one sent in the moment before the job activates the index gets `400` (`unknown field`).
 
 ```bash
 curl -X POST http://localhost:8080/stores/users/indices \

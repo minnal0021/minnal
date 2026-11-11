@@ -67,7 +67,7 @@ pub(crate) fn job_accepted(namespace: &str, job: &str) -> (StatusCode, Json<serd
 pub async fn add_index(State(state): State<AppState>, Path(ns): Path<String>, Json(spec): Json<IndexSpec>) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, field = %spec.field, index_type = ?spec.index_type, "adding index");
     let job = state.store.begin_add_index(&ns, spec)?;
-    info!(namespace = %ns, job = %job, "index activated, build started");
+    info!(namespace = %ns, job = %job, "index job started");
     Ok(job_accepted(&ns, &job))
 }
 
