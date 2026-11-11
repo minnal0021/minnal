@@ -90,8 +90,8 @@ mod tests {
     fn the_same_key_always_maps_to_the_same_stripe() {
         let locks = KeyLocks::new();
         assert_eq!(
-            locks.stripe_of(NamespaceId::from_u128(7), b"alpha"),
-            locks.stripe_of(NamespaceId::from_u128(7), b"alpha")
+            locks.stripe_of(NamespaceId::from_u64(7), b"alpha"),
+            locks.stripe_of(NamespaceId::from_u64(7), b"alpha")
         );
     }
 
@@ -100,9 +100,8 @@ mod tests {
         // Not a correctness requirement (a collision is legal), just a check
         // that the namespace is actually mixed in rather than ignored.
         let locks = KeyLocks::new();
-        let differs = (0..64u32).any(|ns| {
-            locks.stripe_of(NamespaceId::from_u128(u128::from(ns)), b"k") != locks.stripe_of(NamespaceId::from_u128(u128::from(ns + 1)), b"k")
-        });
+        let differs = (0..64u32)
+            .any(|ns| locks.stripe_of(NamespaceId::from_u64(u64::from(ns)), b"k") != locks.stripe_of(NamespaceId::from_u64(u64::from(ns + 1)), b"k"));
         assert!(differs, "namespace_id is not affecting the stripe");
     }
 
@@ -112,7 +111,7 @@ mod tests {
     fn keys_sharing_an_eight_byte_prefix_spread_across_stripes() {
         let locks = KeyLocks::new();
         let stripes: std::collections::HashSet<usize> = (0..64)
-            .map(|i| locks.stripe_of(NamespaceId::from_u128(0), format!("job_content_{}", i).as_bytes()))
+            .map(|i| locks.stripe_of(NamespaceId::from_u64(0), format!("job_content_{}", i).as_bytes()))
             .collect();
         assert!(stripes.len() > 32, "expected keys to spread, got {} distinct stripes", stripes.len());
     }
@@ -129,7 +128,7 @@ mod tests {
                 let (locks, counter, live, overlap) = (Arc::clone(&locks), Arc::clone(&counter), Arc::clone(&live), Arc::clone(&observed_overlap));
                 s.spawn(move || {
                     for _ in 0..500 {
-                        let _g = locks.guard(NamespaceId::from_u128(0), b"contended");
+                        let _g = locks.guard(NamespaceId::from_u64(0), b"contended");
                         if live.fetch_add(1, Ordering::SeqCst) != 0 {
                             overlap.fetch_add(1, Ordering::SeqCst);
                         }

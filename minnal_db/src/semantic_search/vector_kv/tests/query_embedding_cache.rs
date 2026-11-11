@@ -153,8 +153,11 @@ async fn test_cache_populates_bypass_wal_and_clears_use_it() {
     let dir = TempDir::new().unwrap();
     let db = open_db(&dir).await;
 
-    // Baseline after namespace setup, so we only measure the cache writes.
-    let before = db.ops_metrics();
+    // Baseline after namespace setup, so we only measure the cache writes. The
+    // cache's namespace is created on first use, which writes the system
+    // catalog: its puts are left out.
+    let catalog = || db.ops_metrics_for(crate::CATALOG_NAMESPACE).unwrap();
+    let (before, catalog_before) = (db.ops_metrics(), catalog());
 
     put_cached_query_embedding(&db, MODEL, "q1", &[1.0f32, 0.0], TEST_TTL).await;
     put_cached_query_embedding(&db, MODEL, "q2", &[0.0f32, 1.0], TEST_TTL).await;
@@ -162,8 +165,9 @@ async fn test_cache_populates_bypass_wal_and_clears_use_it() {
     assert_eq!(cleared, 2);
 
     let after = db.ops_metrics();
+    let catalog_puts = catalog().puts - catalog_before.puts;
     assert_eq!(after.no_wal_puts - before.no_wal_puts, 2, "two cache populates use put_no_wal");
-    assert_eq!(after.puts - before.puts, 0, "no WAL-backed puts from the cache");
+    assert_eq!(after.puts - before.puts - catalog_puts, 0, "no WAL-backed puts from the cache");
     assert_eq!(after.deletes - before.deletes, 2, "two cache clears use the WAL-backed delete");
     assert_eq!(after.no_wal_deletes - before.no_wal_deletes, 0, "no cache clear bypasses the WAL");
 }

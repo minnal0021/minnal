@@ -1,203 +1,25 @@
-use crc32fast::Hasher;
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-/// Namespace Registry
-///
-/// Persistent mapping of namespace names to unique random ids ([`NamespaceId`]).
-/// The "default" and "system" namespaces always exist, with fixed ids.
-/// Every other id is drawn at random on create, so an id is never reused.
-///
-/// Each namespace may also carry a [`NamespaceConfig`] on disk — a JSON file
-/// at `{db_path}/ns_{name}/config.json` — that stores the field schema for
-/// namespaces that use indexed fields.  KV-only namespaces have no config file.
-/// The schema is loaded automatically on [`NamespaceRegistry::open`] so field
-/// definitions survive restarts without the caller re-registering them.
+//! `NamespaceRegistry`: every namespace's name, id, TTL settings and field
+//! indexes, in memory, read from and saved to the system catalog
+//! (`catalog.rs`).
+//!
+//! `default`, `system` and `system_catalog` always exist, with fixed ids.
+//! Every other id comes from the catalog's counter (`next_id`), which is saved
+//! before the id is used, so an id is never handed out twice: a name dropped
+//! and created again gets a new id. Field ids come from the same counter.
+//!
+//! The registry does no I/O. Each change records the catalog writes it needs
+//! ([`take_writes`](NamespaceRegistry::take_writes)); `Database::update_registry`
+//! makes a change on a copy, writes them durably, and only then swaps the copy
+//! in.
+
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::NamespaceId;
+use super::catalog::{self, CATALOG_NAMESPACE, CatalogEntry, CatalogWrite};
+use super::schema::{NamespaceSchema, Registered};
 use crate::error::{KVError, Result};
-use crate::field_index::{FieldId, FieldMeta, IndexValueType};
-
-// ── Namespace config (persisted per namespace directory) ───────────────────
-
-/// A single field definition as stored in `config.json`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FieldDef {
-    pub field_id: FieldId,
-    pub field_name: String,
-    pub field_type: IndexValueType,
-    /// Whether this field's index has been dropped.
-    ///
-    /// The definition is retained so a later re-add reuses the same
-    /// [`FieldId`]; the flag is what makes the drop *durable*, so an
-    /// interrupted drop can be completed at the next open. Defaults to `false`
-    /// for definitions written before the flag existed.
-    #[serde(default)]
-    pub dropped: bool,
-}
-
-/// The schema section of a namespace config: all registered field definitions.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SchemaConfig {
-    pub fields: Vec<FieldDef>,
-    pub next_field_id: FieldId,
-}
-
-/// Persisted configuration for a namespace, stored at
-/// `{db_path}/ns_{name}/config.json`.
-///
-/// A KV-only namespace has no config file (all fields `None`).
-/// The presence of `schema` indicates at least one index field has been
-/// registered, making this namespace a structured doc store.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct NamespaceConfig {
-    pub schema: Option<SchemaConfig>,
-}
-
-// ── Namespace schema ───────────────────────────────────────────────────────
-
-/// Schema of a single namespace: the in-memory map of indexed fields.
-///
-/// Loaded from `config.json` on startup when present, so field definitions
-/// survive restarts without the caller re-registering them.
-pub struct NamespaceSchema {
-    /// Primary map: field name → FieldMeta.
-    fields: HashMap<String, FieldMeta>,
-    /// Monotonically increasing; never reused.
-    next_field_id: FieldId,
-}
-
-impl NamespaceSchema {
-    fn new() -> Self {
-        Self {
-            fields: HashMap::new(),
-            next_field_id: 0,
-        }
-    }
-
-    /// Restore a schema from a persisted [`SchemaConfig`].
-    fn from_config(cfg: SchemaConfig) -> Self {
-        let mut fields = HashMap::new();
-        for f in cfg.fields {
-            fields.insert(
-                f.field_name.clone(),
-                FieldMeta {
-                    field_id: f.field_id,
-                    field_name: f.field_name,
-                    field_type: f.field_type,
-                    dropped: f.dropped,
-                },
-            );
-        }
-        Self {
-            fields,
-            next_field_id: cfg.next_field_id,
-        }
-    }
-
-    /// Register a new indexed field and return its assigned [`FieldId`].
-    ///
-    /// **Idempotent**: if a field with the same name and type already exists
-    /// the existing [`FieldId`] is returned without error.  A name collision
-    /// with a *different* type is an error.
-    ///
-    /// Re-registering a previously **dropped** field clears its `dropped` flag
-    /// and reuses its [`FieldId`] — the documented id-reuse behaviour. The
-    /// caller is responsible for rebuilding the index; the flag only records
-    /// that the field is live again.
-    pub fn register_field(&mut self, field_name: &str, field_type: IndexValueType) -> Result<FieldId> {
-        if let Some(existing) = self.fields.get_mut(field_name) {
-            if existing.field_type != field_type {
-                return Err(KVError::Serialization(format!(
-                    "Field '{}' is already registered as {:?}, cannot re-register as {:?}",
-                    field_name, existing.field_type, field_type
-                )));
-            }
-            existing.dropped = false;
-            return Ok(existing.field_id);
-        }
-        let field_id = self.next_field_id;
-        self.next_field_id += 1;
-        self.fields.insert(
-            field_name.to_string(),
-            FieldMeta {
-                field_id,
-                field_name: field_name.to_string(),
-                field_type,
-                dropped: false,
-            },
-        );
-        Ok(field_id)
-    }
-
-    /// Mark a field's index as dropped, returning `false` if the field is not
-    /// registered.
-    ///
-    /// The [`FieldMeta`] is deliberately retained so a later
-    /// [`register_field`](Self::register_field) reuses the same [`FieldId`].
-    /// Persisting this flag is what makes a drop completable after a crash —
-    /// see `FEATURE-REQUEST.md` (FR-001).
-    pub fn mark_field_dropped(&mut self, field_id: FieldId) -> bool {
-        match self.fields.values_mut().find(|f| f.field_id == field_id) {
-            Some(f) => {
-                f.dropped = true;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Return the `FieldId`s of every field whose index has been dropped but
-    /// whose definition is retained, sorted ascending.
-    ///
-    /// Used at open to finish deleting the on-disk directories of drops that
-    /// were interrupted by a crash.
-    pub fn dropped_field_ids(&self) -> Vec<FieldId> {
-        let mut ids: Vec<FieldId> = self.fields.values().filter(|f| f.dropped).map(|f| f.field_id).collect();
-        ids.sort();
-        ids
-    }
-
-    /// Look up a field by name — the primary query-time access pattern, O(1).
-    pub fn get_field_by_name(&self, field_name: &str) -> Option<&FieldMeta> {
-        self.fields.get(field_name)
-    }
-
-    /// Look up a field by ID — used for index path resolution, O(n).
-    pub fn get_field(&self, field_id: FieldId) -> Option<&FieldMeta> {
-        self.fields.values().find(|f| f.field_id == field_id)
-    }
-
-    /// Return all fields sorted by `FieldId`.
-    pub fn list_fields(&self) -> Vec<FieldMeta> {
-        let mut fields: Vec<FieldMeta> = self.fields.values().cloned().collect();
-        fields.sort_by_key(|f| f.field_id);
-        fields
-    }
-
-    /// Return all registered `FieldId`s sorted ascending, **including dropped
-    /// fields** (whose definitions are retained for id reuse).
-    pub fn field_ids(&self) -> Vec<FieldId> {
-        let mut ids: Vec<FieldId> = self.fields.values().map(|f| f.field_id).collect();
-        ids.sort();
-        ids
-    }
-
-    /// Return the `FieldId`s of every field whose index has *not* been dropped,
-    /// sorted ascending.
-    pub fn live_field_ids(&self) -> Vec<FieldId> {
-        let mut ids: Vec<FieldId> = self.fields.values().filter(|f| !f.dropped).map(|f| f.field_id).collect();
-        ids.sort();
-        ids
-    }
-}
-
-const REGISTRY_MAGIC: [u8; 4] = *b"NSRG";
-const REGISTRY_VERSION: u32 = 2;
-const REGISTRY_FILENAME: &str = "namespace_registry";
-const CONFIG_FILENAME: &str = "config.json";
+use crate::field_index::{FieldId, IndexValueType};
 
 /// Default namespace name, always present with the fixed id [`NamespaceId::DEFAULT`].
 pub const DEFAULT_NAMESPACE: &str = "default";
@@ -226,132 +48,156 @@ pub const VECTOR_COMPANION_SUFFIXES: [&str; 6] = [
     "_ivf_journal",
 ];
 
-/// Persisted TTL configuration for one namespace (part of [`RegistryData`]).
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-struct TtlConfigData {
-    ns_id: NamespaceId,
-    /// Record lifetime in milliseconds.
-    ttl_millis: u64,
-    /// Cap on records tombstoned per TTL pass.
-    max_deletes: u64,
-}
+/// The namespaces every database has, with their fixed ids. The catalog's own
+/// record is implicit; the others are saved like any namespace (they can have
+/// TTL settings and field indexes).
+const FIXED: [(&str, NamespaceId); 3] = [
+    (DEFAULT_NAMESPACE, NamespaceId::DEFAULT),
+    (SYSTEM_NAMESPACE, NamespaceId::SYSTEM),
+    (CATALOG_NAMESPACE, NamespaceId::CATALOG),
+];
 
-/// Persistent namespace registry data (the `namespace_registry` binary file).
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
-struct RegistryData {
-    /// Active namespace mappings: name -> id
-    names: Vec<String>,
-    ids: Vec<NamespaceId>,
-    /// Per-namespace TTL configuration (only TTL-enabled namespaces appear here).
-    ttl_configs: Vec<TtlConfigData>,
-}
-
-impl RegistryData {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        Self {
-            names: vec![DEFAULT_NAMESPACE.to_string(), SYSTEM_NAMESPACE.to_string()],
-            ids: vec![DEFAULT_NAMESPACE_ID, SYSTEM_NAMESPACE_ID],
-            ttl_configs: Vec::new(),
-        }
-    }
-}
-
-/// In-memory namespace registry backed by a binary file on disk.
-///
-/// Also owns the [`NamespaceSchema`] for each namespace.  Schemas are loaded
-/// from per-namespace `config.json` files on startup and persisted back
-/// whenever a field is registered, so field definitions survive restarts.
+/// Every namespace's name, id, TTL settings and field indexes. See the module docs.
+#[derive(Debug, Clone)]
 pub struct NamespaceRegistry {
-    /// Root database directory — used to locate per-namespace config files.
-    db_path: PathBuf,
-    /// Path to the `namespace_registry` binary file.
-    path: PathBuf,
     /// name -> id
     namespaces: HashMap<String, NamespaceId>,
     /// id -> name (for reverse lookups)
     id_to_name: HashMap<NamespaceId, String>,
-    /// namespace_id -> schema (loaded from config.json on open; persisted on mutation)
+    /// namespace id -> its field indexes
     schemas: HashMap<NamespaceId, NamespaceSchema>,
-    /// namespace_id -> (ttl, max_deletes_per_run) for TTL-enabled namespaces.
-    /// Persisted in the registry file and reloaded on open, so TTL survives
-    /// restarts without the caller re-declaring it.
+    /// namespace id -> (ttl, max_deletes_per_run) for TTL-enabled namespaces.
     ttl_configs: HashMap<NamespaceId, (Duration, usize)>,
+    /// The next id the counter hands out.
+    next_id: u64,
+    /// Catalog writes of changes not yet saved.
+    pending: Vec<CatalogWrite>,
 }
 
 impl NamespaceRegistry {
-    /// Open or create a namespace registry rooted at `db_path`.
-    pub fn open(db_path: &Path) -> Result<Self> {
-        let path = db_path.join(REGISTRY_FILENAME);
-
-        if path.exists() {
-            let bytes =
-                fs::read(&path).map_err(|e| KVError::Io(std::io::Error::new(e.kind(), format!("Failed to read namespace registry: {}", e))))?;
-            let data = Self::deserialize_file(&bytes)?;
-            let mut namespaces = HashMap::new();
-            let mut id_to_name = HashMap::new();
-            let mut schemas = HashMap::new();
-            let mut stranded = false;
-            for (name, id) in data.names.iter().zip(data.ids.iter()) {
-                // A name that cannot be a directory never held data. A failed
-                // create used to leave one behind, and opening it would fail
-                // every start of the database, so it goes instead.
-                if let Some(problem) = crate::layout::namespace_name_problem(name) {
-                    log::error!("[namespace registry] removing namespace id {id}, which can hold no data: {problem}");
-                    stranded = true;
-                    continue;
-                }
-                namespaces.insert(name.clone(), *id);
-                id_to_name.insert(*id, name.clone());
-                let schema = match Self::load_config(db_path, name)? {
-                    Some(cfg) if cfg.schema.is_some() => NamespaceSchema::from_config(cfg.schema.unwrap()),
-                    _ => NamespaceSchema::new(),
-                };
-                schemas.insert(*id, schema);
+    /// A new database's registry: the fixed namespaces only. Their records and
+    /// the counter are pending, to be saved once the database is open.
+    pub(crate) fn new() -> Self {
+        let mut r = Self {
+            namespaces: HashMap::new(),
+            id_to_name: HashMap::new(),
+            schemas: HashMap::new(),
+            ttl_configs: HashMap::new(),
+            next_id: NamespaceId::FIRST_ALLOCATED,
+            pending: Vec::new(),
+        };
+        r.pending.push(catalog::next_id_write(r.next_id));
+        for (name, id) in FIXED {
+            r.insert(name, id);
+            if id != NamespaceId::CATALOG {
+                r.pending.push(catalog::namespace_write(name, id, None));
             }
-            let ttl_configs = data
-                .ttl_configs
-                .iter()
-                .map(|c| (c.ns_id, (Duration::from_millis(c.ttl_millis), c.max_deletes as usize)))
-                .collect();
-            let registry = Self {
-                db_path: db_path.to_path_buf(),
-                path,
-                namespaces,
-                id_to_name,
-                schemas,
-                ttl_configs,
-            };
-            if stranded {
-                registry.persist()?;
-            }
-            Ok(registry)
-        } else {
-            let mut registry = Self {
-                db_path: db_path.to_path_buf(),
-                path,
-                namespaces: HashMap::new(),
-                id_to_name: HashMap::new(),
-                schemas: HashMap::new(),
-                ttl_configs: HashMap::new(),
-            };
-            registry.namespaces.insert(DEFAULT_NAMESPACE.to_string(), DEFAULT_NAMESPACE_ID);
-            registry.id_to_name.insert(DEFAULT_NAMESPACE_ID, DEFAULT_NAMESPACE.to_string());
-            registry.schemas.insert(DEFAULT_NAMESPACE_ID, NamespaceSchema::new());
-            registry.namespaces.insert(SYSTEM_NAMESPACE.to_string(), SYSTEM_NAMESPACE_ID);
-            registry.id_to_name.insert(SYSTEM_NAMESPACE_ID, SYSTEM_NAMESPACE.to_string());
-            registry.schemas.insert(SYSTEM_NAMESPACE_ID, NamespaceSchema::new());
-            registry.persist()?;
-            Ok(registry)
         }
+        r
     }
 
-    /// Return the directory path used for namespace `name`: `{db_path}/ns_{name}`.
-    pub fn ns_dir(&self, name: &str) -> PathBuf {
-        crate::layout::namespace_data_dir(&self.db_path, name)
+    /// The registry the catalog's records describe; [`new`](Self::new) for an
+    /// empty catalog. Records a database cannot use — a namespace whose name
+    /// cannot be a directory, a field of a namespace that does not exist —
+    /// are left out, and their deletes are pending.
+    pub(crate) fn from_catalog(records: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) -> Result<Self> {
+        let mut entries = Vec::new();
+        for (key, value) in records {
+            entries.push((key.clone(), catalog::decode(&key, &value)?));
+        }
+        if entries.is_empty() {
+            return Ok(Self::new());
+        }
+        let mut r = Self {
+            namespaces: HashMap::new(),
+            id_to_name: HashMap::new(),
+            schemas: HashMap::new(),
+            ttl_configs: HashMap::new(),
+            next_id: 0,
+            pending: Vec::new(),
+        };
+        r.insert(CATALOG_NAMESPACE, NamespaceId::CATALOG);
+        let mut next_id = None;
+        let mut fields = Vec::new();
+        for (key, entry) in entries {
+            match entry {
+                CatalogEntry::NextId(n) => next_id = Some(n),
+                CatalogEntry::Namespace { name, id, ttl } => {
+                    if let Some(problem) = crate::layout::namespace_name_problem(&name) {
+                        // A failed create once left such an entry, and opening
+                        // it failed every later start of the database.
+                        log::error!("[catalog] removing namespace {id}, which can hold no data: {problem}");
+                        r.pending.push(CatalogWrite::Delete { key });
+                        continue;
+                    }
+                    r.insert(&name, id);
+                    if let Some(ttl) = ttl {
+                        r.ttl_configs.insert(id, ttl);
+                    }
+                }
+                CatalogEntry::Field { ns_id, meta } => fields.push((key, ns_id, meta)),
+            }
+        }
+        for (key, ns_id, meta) in fields {
+            match r.schemas.get_mut(&ns_id) {
+                Some(schema) => schema.insert(meta),
+                None => {
+                    log::warn!(
+                        "[catalog] removing field '{}' of namespace {ns_id}, which no longer exists",
+                        meta.field_name
+                    );
+                    r.pending.push(CatalogWrite::Delete { key });
+                }
+            }
+        }
+        for (name, id) in FIXED {
+            if !r.namespaces.contains_key(name) {
+                r.insert(name, id);
+                r.pending.push(catalog::namespace_write(name, id, None));
+            }
+        }
+        // The counter is saved before any id it hands out is used, so it is
+        // above every id on record; this only repairs a missing counter.
+        let above_all = r
+            .id_to_name
+            .keys()
+            .map(|id| id.as_u64())
+            .chain(r.schemas.values().flat_map(|s| s.field_ids()))
+            .max()
+            .map_or(0, |m| m + 1)
+            .max(NamespaceId::FIRST_ALLOCATED);
+        r.next_id = match next_id {
+            Some(n) if n >= above_all => n,
+            other => {
+                log::warn!("[catalog] the id counter is {other:?}, below an id in use; moving it to {above_all}");
+                r.pending.push(catalog::next_id_write(above_all));
+                above_all
+            }
+        };
+        Ok(r)
     }
 
-    /// Create a new namespace and return its id, a new random one.
+    fn insert(&mut self, name: &str, id: NamespaceId) {
+        self.namespaces.insert(name.to_string(), id);
+        self.id_to_name.insert(id, name.to_string());
+        self.schemas.insert(id, NamespaceSchema::default());
+    }
+
+    /// The next id of the counter. Its new value is the first pending write,
+    /// so it is saved before anything that uses the id.
+    fn allocate_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pending.push(catalog::next_id_write(self.next_id));
+        id
+    }
+
+    /// The catalog writes of the changes made since the last call, in order.
+    pub(crate) fn take_writes(&mut self) -> Vec<CatalogWrite> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Create a new namespace and return its id, a new one from the counter.
     /// Returns an error if the name already exists.
     pub fn create(&mut self, name: &str) -> Result<NamespaceId> {
         if let Some(problem) = crate::layout::namespace_name_problem(name) {
@@ -360,17 +206,9 @@ impl NamespaceRegistry {
         if self.namespaces.contains_key(name) {
             return Err(KVError::Serialization(format!("Namespace '{}' already exists", name)));
         }
-        let id = loop {
-            let id = NamespaceId::random()?;
-            // 2^-122 per pair, but the reserved ids and any live id are cheap to rule out.
-            if !self.id_to_name.contains_key(&id) {
-                break id;
-            }
-        };
-        self.namespaces.insert(name.to_string(), id);
-        self.id_to_name.insert(id, name.to_string());
-        self.schemas.insert(id, NamespaceSchema::new());
-        self.persist()?;
+        let id = NamespaceId::from_u64(self.allocate_id());
+        self.insert(name, id);
+        self.pending.push(catalog::namespace_write(name, id, None));
         Ok(id)
     }
 
@@ -380,7 +218,6 @@ impl NamespaceRegistry {
     }
 
     /// Get the name for a namespace by ID
-    #[allow(dead_code)]
     pub fn get_name(&self, id: NamespaceId) -> Option<&str> {
         self.id_to_name.get(&id).map(|s| s.as_str())
     }
@@ -395,45 +232,59 @@ impl NamespaceRegistry {
         self.namespaces.contains_key(name)
     }
 
-    /// Get all namespace IDs
-    #[allow(dead_code)]
-    pub fn all_ids(&self) -> Vec<NamespaceId> {
-        self.namespaces.values().copied().collect()
-    }
-
-    /// Remove a namespace. Cannot remove the default or system namespace.
+    /// Remove a namespace, with its TTL settings and field records. The
+    /// namespaces with fixed ids cannot be removed.
     pub fn remove(&mut self, name: &str) -> Result<NamespaceId> {
-        if name == DEFAULT_NAMESPACE {
-            return Err(KVError::Serialization("Cannot remove the default namespace".to_string()));
+        if FIXED.iter().any(|&(fixed, _)| fixed == name) {
+            return Err(KVError::Serialization(format!("Cannot remove the {name} namespace")));
         }
-        if name == SYSTEM_NAMESPACE {
-            return Err(KVError::Serialization("Cannot remove the system namespace".to_string()));
-        }
-        match self.namespaces.remove(name) {
-            Some(id) => {
-                self.id_to_name.remove(&id);
-                self.schemas.remove(&id);
-                self.ttl_configs.remove(&id);
-                self.persist()?;
-                Ok(id)
+        let id = self
+            .namespaces
+            .remove(name)
+            .ok_or_else(|| KVError::Serialization(format!("Namespace '{}' does not exist", name)))?;
+        self.id_to_name.remove(&id);
+        self.ttl_configs.remove(&id);
+        // The namespace's record first: once it is gone the namespace is, and
+        // a field record left by a crash is removed at the next open.
+        self.pending.push(CatalogWrite::Delete {
+            key: catalog::namespace_key(name),
+        });
+        if let Some(schema) = self.schemas.remove(&id) {
+            for f in schema.list_fields() {
+                self.pending.push(CatalogWrite::Delete {
+                    key: catalog::field_key(id, &f.field_name),
+                });
             }
-            None => Err(KVError::Serialization(format!("Namespace '{}' does not exist", name))),
         }
+        Ok(id)
     }
 
-    /// Record (and persist) the TTL configuration for a namespace, so the global
-    /// TTL worker expires its records after `ttl` (capped at `max_deletes` per
-    /// pass) and the configuration is restored on the next open.
+    fn save_namespace(&mut self, ns_id: NamespaceId) -> Result<()> {
+        let name = self
+            .id_to_name
+            .get(&ns_id)
+            .ok_or_else(|| KVError::Serialization(format!("Namespace {ns_id} not found")))?;
+        if ns_id == NamespaceId::CATALOG {
+            return Err(KVError::Serialization("the system catalog has no settings to change".to_owned()));
+        }
+        self.pending
+            .push(catalog::namespace_write(name, ns_id, self.ttl_configs.get(&ns_id).copied()));
+        Ok(())
+    }
+
+    /// Record the TTL configuration for a namespace, so the global TTL worker
+    /// expires its records after `ttl` (capped at `max_deletes` per pass) and
+    /// the configuration is restored on the next open.
     pub fn set_ttl_config(&mut self, ns_id: NamespaceId, ttl: Duration, max_deletes: usize) -> Result<()> {
         self.ttl_configs.insert(ns_id, (ttl, max_deletes));
-        self.persist()
+        self.save_namespace(ns_id)
     }
 
-    /// Stop expiring a namespace by removing (and persisting) its TTL config.
-    /// A no-op if the namespace has no TTL configured.
+    /// Stop expiring a namespace by removing its TTL config. A no-op if the
+    /// namespace has no TTL configured.
     pub fn remove_ttl_config(&mut self, ns_id: NamespaceId) -> Result<()> {
         if self.ttl_configs.remove(&ns_id).is_some() {
-            self.persist()?;
+            self.save_namespace(ns_id)?;
         }
         Ok(())
     }
@@ -456,48 +307,50 @@ impl NamespaceRegistry {
         self.schemas.get(&ns_id)
     }
 
-    /// Mutably borrow the schema for a namespace.
-    pub fn schema_mut(&mut self, ns_id: NamespaceId) -> Option<&mut NamespaceSchema> {
-        self.schemas.get_mut(&ns_id)
-    }
-
-    /// Register an indexed field in the namespace schema and persist the change
-    /// to `config.json`.
+    /// Register an indexed field of a namespace. A new field takes its id from
+    /// the counter.
     ///
     /// Idempotent: if the field already exists with the same type the existing
     /// [`FieldId`] is returned without error.
     pub fn register_schema_field(&mut self, ns_id: NamespaceId, field_name: &str, field_type: IndexValueType) -> Result<FieldId> {
-        let field_id = self
+        let mut schema = self
             .schemas
-            .get_mut(&ns_id)
-            .ok_or_else(|| KVError::Serialization(format!("Namespace {} not found", ns_id)))?
-            .register_field(field_name, field_type)?;
-        self.persist_schema(ns_id)?;
-        Ok(field_id)
+            .remove(&ns_id)
+            .ok_or_else(|| KVError::Serialization(format!("Namespace {} not found", ns_id)))?;
+        let registered = schema.register_field(field_name, field_type, || self.allocate_id());
+        self.schemas.insert(ns_id, schema);
+        match registered? {
+            Registered::Unchanged(id) => Ok(id),
+            Registered::Changed(meta) => {
+                self.pending.push(catalog::field_write(ns_id, &meta));
+                Ok(meta.field_id)
+            }
+        }
     }
 
-    /// Mark a field's index as dropped in the namespace schema and persist the
-    /// change to `config.json` **before** any file is deleted.
+    /// Mark a field's index as dropped. Saved **before** any file is deleted.
     ///
-    /// Returns `false` if the field is not registered (nothing to mark).
-    /// Persisting first is what makes an interrupted drop completable at the
-    /// next open; see `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
+    /// Returns `false` if no live field has `field_id` (nothing to mark).
+    /// Saving first is what makes an interrupted drop completable at the next
+    /// open; see `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
     pub fn mark_schema_field_dropped(&mut self, ns_id: NamespaceId, field_id: FieldId) -> Result<bool> {
-        let marked = self
+        let schema = self
             .schemas
             .get_mut(&ns_id)
-            .ok_or_else(|| KVError::Serialization(format!("Namespace {} not found", ns_id)))?
-            .mark_field_dropped(field_id);
-        if marked {
-            self.persist_schema(ns_id)?;
+            .ok_or_else(|| KVError::Serialization(format!("Namespace {} not found", ns_id)))?;
+        match schema.mark_field_dropped(field_id) {
+            Some(meta) => {
+                self.pending.push(catalog::field_write(ns_id, &meta));
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        Ok(marked)
     }
 
     /// Return all `(namespace_id, field_id)` pairs across every namespace,
     /// suitable for use by the index checkpoint worker.
     ///
-    /// **Excludes dropped fields.** Their definitions are retained for id reuse
+    /// **Excludes dropped fields.** Their definitions are kept for id reuse
     /// but their on-disk directories are gone, so checkpointing them would fail;
     /// and a dropped field's frozen checkpoint marker must never hold up WAL GC
     /// (FR-001, *The trap: active fields only*).
@@ -507,380 +360,7 @@ impl NamespaceRegistry {
             .flat_map(|(ns_id, schema)| schema.live_field_ids().into_iter().map(|fid| (*ns_id, fid)))
             .collect()
     }
-
-    // ── Config persistence ────────────────────────────────────────────────
-
-    /// Read `{db_path}/ns_{name}/config.json`, returning `None` if absent.
-    fn load_config(db_path: &Path, name: &str) -> Result<Option<NamespaceConfig>> {
-        let config_path = crate::layout::namespace_data_dir(db_path, name).join(CONFIG_FILENAME);
-        if !config_path.exists() {
-            return Ok(None);
-        }
-        let bytes =
-            fs::read(&config_path).map_err(|e| KVError::Io(std::io::Error::new(e.kind(), format!("Failed to read namespace config: {}", e))))?;
-        let config: NamespaceConfig = serde_json::from_slice(&bytes)
-            .map_err(|e| KVError::Serialization(format!("Failed to deserialize namespace config for '{}': {}", name, e)))?;
-        Ok(Some(config))
-    }
-
-    /// Write the current schema for `ns_id` to `{db_path}/ns_{name}/config.json`.
-    ///
-    /// Uses an atomic tmp-then-rename write.  No-ops for namespaces with no
-    /// registered fields (KV-only namespaces get no config file).
-    fn persist_schema(&self, ns_id: NamespaceId) -> Result<()> {
-        let name = self
-            .id_to_name
-            .get(&ns_id)
-            .ok_or_else(|| KVError::Serialization(format!("Namespace {} not found", ns_id)))?;
-        let schema = self
-            .schemas
-            .get(&ns_id)
-            .ok_or_else(|| KVError::Serialization(format!("Schema for namespace {} not found", ns_id)))?;
-
-        if schema.fields.is_empty() {
-            return Ok(());
-        }
-
-        let config = NamespaceConfig {
-            schema: Some(SchemaConfig {
-                fields: schema
-                    .list_fields()
-                    .into_iter()
-                    .map(|f| FieldDef {
-                        field_id: f.field_id,
-                        field_name: f.field_name,
-                        field_type: f.field_type,
-                        dropped: f.dropped,
-                    })
-                    .collect(),
-                next_field_id: schema.next_field_id,
-            }),
-        };
-
-        let config_dir = crate::layout::namespace_data_dir(&self.db_path, name);
-        fs::create_dir_all(&config_dir)?;
-        let config_path = config_dir.join(CONFIG_FILENAME);
-
-        let json =
-            serde_json::to_string_pretty(&config).map_err(|e| KVError::Serialization(format!("Failed to serialize namespace config: {}", e)))?;
-
-        crate::support::write_atomic_durable(&config_path, json.as_bytes())?;
-
-        Ok(())
-    }
-
-    /// Persist the registry name↔ID table to the `namespace_registry` binary file.
-    fn persist(&self) -> Result<()> {
-        let data = RegistryData {
-            names: self.namespaces.keys().cloned().collect(),
-            ids: self.namespaces.values().copied().collect(),
-            ttl_configs: self
-                .ttl_configs
-                .iter()
-                .map(|(ns_id, (ttl, max_deletes))| TtlConfigData {
-                    ns_id: *ns_id,
-                    ttl_millis: ttl.as_millis() as u64,
-                    max_deletes: *max_deletes as u64,
-                })
-                .collect(),
-        };
-
-        let payload = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
-            .map_err(|e| KVError::Serialization(format!("Failed to serialize namespace registry: {}", e)))?;
-
-        let mut hasher = Hasher::new();
-        hasher.update(&payload);
-        let checksum = hasher.finalize();
-
-        let mut out = Vec::with_capacity(16 + payload.len());
-        out.extend_from_slice(&REGISTRY_MAGIC);
-        out.extend_from_slice(&REGISTRY_VERSION.to_le_bytes());
-        out.extend_from_slice(&checksum.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&payload);
-
-        crate::support::write_atomic_durable(&self.path, &out)
-            .map_err(|e| KVError::Io(std::io::Error::new(e.kind(), format!("Failed to persist namespace registry: {}", e))))?;
-
-        Ok(())
-    }
-
-    /// Deserialize registry data from file bytes (magic + version + crc + payload)
-    fn deserialize_file(bytes: &[u8]) -> Result<RegistryData> {
-        if bytes.len() < 16 {
-            return Err(KVError::Serialization("Namespace registry file too small".to_string()));
-        }
-
-        if bytes[0..4] != REGISTRY_MAGIC {
-            return Err(KVError::Serialization("Invalid namespace registry magic".to_string()));
-        }
-
-        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        if version != REGISTRY_VERSION {
-            return Err(KVError::Serialization(format!("Unsupported namespace registry version: {}", version)));
-        }
-
-        let expected_checksum = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-
-        if bytes.len() < 16 + payload_len {
-            return Err(KVError::Serialization("Namespace registry file truncated".to_string()));
-        }
-
-        let payload = &bytes[16..16 + payload_len];
-
-        let mut hasher = Hasher::new();
-        hasher.update(payload);
-        let actual_checksum = hasher.finalize();
-        if actual_checksum != expected_checksum {
-            return Err(KVError::Serialization(format!(
-                "Namespace registry checksum mismatch: expected {}, got {}",
-                expected_checksum, actual_checksum
-            )));
-        }
-
-        let archived = rkyv::access::<rkyv::Archived<RegistryData>, rkyv::rancor::Error>(payload)
-            .map_err(|e| KVError::Serialization(format!("Namespace registry validation failed: {}", e)))?;
-        let mut names = Vec::new();
-        for name in archived.names.iter() {
-            names.push(name.as_str().to_string());
-        }
-        let ids: Vec<NamespaceId> = archived.ids.iter().map(NamespaceId::from).collect();
-
-        let mut ttl_configs = Vec::new();
-        for c in archived.ttl_configs.iter() {
-            ttl_configs.push(TtlConfigData {
-                ns_id: NamespaceId::from(&c.ns_id),
-                ttl_millis: c.ttl_millis.into(),
-                max_deletes: c.max_deletes.into(),
-            });
-        }
-
-        Ok(RegistryData { names, ids, ttl_configs })
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn a_name_that_cannot_be_a_directory_is_refused() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        let longest = "x".repeat(crate::layout::MAX_NAMESPACE_NAME_BYTES);
-        registry.create(&longest).unwrap();
-        fs::create_dir_all(crate::layout::namespace_data_dir(dir.path(), &longest)).unwrap();
-        for bad in [
-            "x".repeat(crate::layout::MAX_NAMESPACE_NAME_BYTES + 1),
-            String::new(),
-            "a/b".to_owned(),
-            "../up".to_owned(),
-        ] {
-            assert!(registry.create(&bad).is_err(), "{bad:?}");
-            assert!(!registry.exists(&bad));
-        }
-    }
-
-    /// A failed create used to leave such an entry, and opening it failed every
-    /// later start of the database.
-    #[test]
-    fn an_entry_that_cannot_be_a_directory_is_removed_at_open() {
-        let dir = TempDir::new().unwrap();
-        let too_long = "x".repeat(300);
-        let kept = {
-            let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-            let kept = registry.create("kept").unwrap();
-            let next = NamespaceId::random().unwrap();
-            registry.namespaces.insert(too_long.clone(), next);
-            registry.id_to_name.insert(next, too_long.clone());
-            registry.persist().unwrap();
-            kept
-        };
-        for _ in 0..2 {
-            let registry = NamespaceRegistry::open(dir.path()).expect("the database opens");
-            assert!(!registry.exists(&too_long));
-            assert_eq!(registry.get_id("kept"), Some(kept));
-        }
-    }
-
-    #[test]
-    fn test_ttl_config_persists_across_reopen() {
-        let dir = TempDir::new().unwrap();
-        let ns_id = {
-            let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-            let ns_id = registry.create("cache").unwrap();
-            registry.set_ttl_config(ns_id, Duration::from_secs(3600), 500).unwrap();
-            ns_id
-        };
-
-        // Reopen from disk: the TTL config must be restored.
-        let registry = NamespaceRegistry::open(dir.path()).unwrap();
-        assert_eq!(registry.ttl_config(ns_id), Some((Duration::from_secs(3600), 500)));
-    }
-
-    #[test]
-    fn test_remove_ttl_config_persists() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        let ns_id = registry.create("cache").unwrap();
-        registry.set_ttl_config(ns_id, Duration::from_secs(60), 10).unwrap();
-        registry.remove_ttl_config(ns_id).unwrap();
-        assert_eq!(registry.ttl_config(ns_id), None);
-
-        let reopened = NamespaceRegistry::open(dir.path()).unwrap();
-        assert_eq!(reopened.ttl_config(ns_id), None);
-    }
-
-    #[test]
-    fn test_remove_namespace_drops_ttl_config() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        let ns_id = registry.create("cache").unwrap();
-        registry.set_ttl_config(ns_id, Duration::from_secs(60), 10).unwrap();
-        registry.remove("cache").unwrap();
-        assert_eq!(registry.ttl_config(ns_id), None);
-    }
-
-    #[test]
-    fn test_new_registry_has_default() {
-        let dir = TempDir::new().unwrap();
-        let registry = NamespaceRegistry::open(dir.path()).unwrap();
-        assert_eq!(registry.get_id(DEFAULT_NAMESPACE), Some(DEFAULT_NAMESPACE_ID));
-        assert_eq!(registry.get_name(DEFAULT_NAMESPACE_ID), Some(DEFAULT_NAMESPACE));
-        assert!(registry.exists(DEFAULT_NAMESPACE));
-    }
-
-    #[test]
-    fn test_create_namespace() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        let id = registry.create("users").unwrap();
-        assert_ne!(id, DEFAULT_NAMESPACE_ID);
-        assert_ne!(id, SYSTEM_NAMESPACE_ID);
-        assert_eq!(registry.get_id("users"), Some(id));
-        assert_eq!(registry.get_name(id), Some("users"));
-    }
-
-    #[test]
-    fn test_duplicate_create_fails() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        registry.create("users").unwrap();
-        assert!(registry.create("users").is_err());
-    }
-
-    #[test]
-    fn a_recreated_name_gets_a_new_id() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        let first = registry.create("ns1").unwrap();
-        registry.remove("ns1").unwrap();
-        let second = registry.create("ns1").unwrap();
-        assert_ne!(first, second);
-        let reopened = NamespaceRegistry::open(dir.path()).unwrap();
-        assert_eq!(reopened.get_id("ns1"), Some(second));
-    }
-
-    #[test]
-    fn test_cannot_remove_default() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        assert!(registry.remove(DEFAULT_NAMESPACE).is_err());
-    }
-
-    #[test]
-    fn test_cannot_remove_system() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        assert!(registry.remove(SYSTEM_NAMESPACE).is_err());
-    }
-
-    #[test]
-    fn test_persistence_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let (users, orders) = {
-            let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-            (registry.create("users").unwrap(), registry.create("orders").unwrap())
-        };
-        let registry = NamespaceRegistry::open(dir.path()).unwrap();
-        assert!(registry.exists(DEFAULT_NAMESPACE));
-        assert!(registry.exists(SYSTEM_NAMESPACE));
-        assert!(registry.exists("users"));
-        assert!(registry.exists("orders"));
-        assert_eq!(registry.get_id("users"), Some(users));
-        assert_eq!(registry.get_id("orders"), Some(orders));
-    }
-
-    #[test]
-    fn test_list_namespaces() {
-        let dir = TempDir::new().unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        let alpha = registry.create("alpha").unwrap();
-        let beta = registry.create("beta").unwrap();
-        let mut list = registry.list();
-        list.sort();
-        let mut expected = vec![
-            ("alpha", alpha),
-            ("beta", beta),
-            ("default", DEFAULT_NAMESPACE_ID),
-            ("system", SYSTEM_NAMESPACE_ID),
-        ];
-        expected.sort();
-        assert_eq!(list, expected);
-    }
-
-    #[test]
-    fn test_schema_persists_across_restart() {
-        let dir = TempDir::new().unwrap();
-        // Create the ns_default directory so config.json has somewhere to live
-        std::fs::create_dir_all(dir.path().join("ns_default")).unwrap();
-        {
-            let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-            registry
-                .register_schema_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)
-                .unwrap();
-            registry.register_schema_field(DEFAULT_NAMESPACE_ID, "age", IndexValueType::Int).unwrap();
-        }
-        // Reopen — schema must be restored from config.json without re-registering
-        let registry = NamespaceRegistry::open(dir.path()).unwrap();
-        let schema = registry.schema(DEFAULT_NAMESPACE_ID).unwrap();
-        let status = schema.get_field_by_name("status").unwrap();
-        assert_eq!(status.field_type, IndexValueType::Str);
-        assert_eq!(status.field_id, 0);
-        let age = schema.get_field_by_name("age").unwrap();
-        assert_eq!(age.field_type, IndexValueType::Int);
-        assert_eq!(age.field_id, 1);
-    }
-
-    #[test]
-    fn test_register_field_idempotent() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("ns_default")).unwrap();
-        let mut registry = NamespaceRegistry::open(dir.path()).unwrap();
-        let id1 = registry
-            .register_schema_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)
-            .unwrap();
-        // Same name + type: returns existing id
-        let id2 = registry
-            .register_schema_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)
-            .unwrap();
-        assert_eq!(id1, id2);
-        // Same name, different type: error
-        assert!(
-            registry
-                .register_schema_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Int)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_kv_only_namespace_has_no_config_file() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("ns_default")).unwrap();
-        let _registry = NamespaceRegistry::open(dir.path()).unwrap();
-        // No fields registered — config.json must not exist
-        assert!(!dir.path().join("ns_default").join("config.json").exists());
-    }
-}
+mod tests;

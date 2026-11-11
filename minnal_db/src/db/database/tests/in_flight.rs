@@ -242,6 +242,9 @@ fn test_value_log_sync_does_not_mark_wal_entries_persisted() {
     config.lsm_config.skip_list_capacity = 100_000;
     let db = Database::open(dir.path(), config).unwrap();
     let ns = db.create_namespace("data").unwrap();
+    // Creating the namespace wrote and flushed the system catalog, which moved
+    // the cut past its records; nothing after this may move it.
+    let cut_before = db.wal_metadata.read().cut;
 
     for i in 0..200u32 {
         db.put_ns(ns, format!("k{i:04}").as_bytes(), b"value").unwrap();
@@ -252,12 +255,10 @@ fn test_value_log_sync_does_not_mark_wal_entries_persisted() {
     let meta = db.wal_metadata.read().clone();
     assert!(meta.tail > 0, "expected every write to be journalled");
     assert_eq!(
-        meta.cut,
-        crate::db::wal::segmented_log::segment_start(0),
+        meta.cut, cut_before,
         "a value-log fsync moved the cut to {} (tail {}), but nothing has reached an SSTable — \
              recovery would skip those entries and lose acknowledged writes",
-        meta.cut,
-        meta.tail
+        meta.cut, meta.tail
     );
 }
 

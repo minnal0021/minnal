@@ -519,7 +519,7 @@ pub async fn lsm(State(state): State<AppState>) -> impl IntoResponse {
 
 #[derive(Serialize)]
 pub struct FieldInfo {
-    field_id: u32,
+    field_id: u64,
     field_name: String,
     field_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -985,7 +985,7 @@ pub async fn trigger_index_checkpoint(State(state): State<AppState>) -> Result<S
 
 #[derive(Serialize)]
 pub struct FieldWasteInfo {
-    field_id: u32,
+    field_id: u64,
     field_name: String,
     field_type: String,
     /// Reclaimable fraction (`0.0..1.0`) of the bitmap value region; `null` when
@@ -1235,6 +1235,10 @@ pub fn is_system_ns(name: &str) -> bool {
 fn system_ns_purpose(name: &str) -> &'static str {
     match name {
         "system" => "system namespace root (reserved; never stores user data)",
+        "system_catalog" => "the system catalog: every namespace's id and TTL settings, every field index's id and type, and the id counter",
+        "system_schema" => "every store's schema and lifecycle state",
+        "system_lifecycle_audit" => "lifecycle audit log: store creates and drops, index-job events (TTL configurable; default 30 days)",
+        "system_pending_vec_index" => "embed queue: documents waiting for their vectors to be written",
         "system_qemb_cache" => "query-embedding cache shared across all semantic-search namespaces (TTL configurable; default 1 day)",
         "system_namespace_maintenance" => "maintenance tasks and their progress: field-index builds, reindex-all and vector reindexes, per store",
         "system_partition_history" => {

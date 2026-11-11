@@ -106,7 +106,11 @@ impl AuditLog {
     /// kept for `retention`.
     pub(crate) async fn open(db: &AsyncDb, retention: Duration) -> Result<Self, crate::KVError> {
         let ns = db.namespace_with_ttl(AUDIT_NAMESPACE.to_owned(), retention, MAX_DELETES_PER_RUN).await?;
-        let start = u64::from_le_bytes(crate::namespace::NamespaceId::random()?.to_bytes()[..8].try_into().expect("8 bytes")) >> 1;
+        // A random start, so records of another run of the database do not
+        // collide with this one's.
+        let mut bytes = [0u8; 8];
+        std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut bytes)?;
+        let start = u64::from_le_bytes(bytes) >> 1;
         Ok(Self {
             ns,
             next: AtomicU64::new(start),

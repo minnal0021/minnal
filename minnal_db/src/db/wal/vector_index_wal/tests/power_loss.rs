@@ -12,7 +12,7 @@ fn a_power_loss_keeps_exactly_what_an_fsync_covered() {
     let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
     let appended = append_n(&wal, 4); // segment 0 sealed (fsynced) with 3
     wal.sync().unwrap();
-    let lost = wal.append(NamespaceId::from_u128(1), &key(50), &value(50), 51).unwrap().appended();
+    let lost = wal.append(NamespaceId::from_u64(1), &key(50), &value(50), 51).unwrap().appended();
     assert!(!wal.covered(lost.end));
     wal.lose_unsynced();
     drop(wal);
@@ -68,9 +68,9 @@ fn vector_wal_power_loss_round(seed: u64) {
                     for _ in 0..1 + rng.below(12) {
                         let seq = next_seq.fetch_add(1, Ordering::SeqCst);
                         let at = wal
-                            .append(NamespaceId::from_u128(u128::from(w as u32)), &rec_key(seq), &rec_value(seq), seq)
+                            .append(NamespaceId::from_u64(u64::from(w as u32)), &rec_key(seq), &rec_value(seq), seq)
                             .unwrap();
-                        appended.lock().insert(at.start, (NamespaceId::from_u128(w as u128), seq));
+                        appended.lock().insert(at.start, (NamespaceId::from_u64(w as u64), seq));
                         mine.push(at.start);
                     }
                     wal.sync().unwrap();
@@ -128,7 +128,7 @@ fn vector_wal_power_loss_round(seed: u64) {
     for (at, ns, seq, key, value) in &rows {
         assert_eq!(
             appended.get(at),
-            Some(&(NamespaceId::from_u128(*ns), *seq)),
+            Some(&(NamespaceId::from_u64(*ns), *seq)),
             "seed {seed}: a record at {at:#x} that was never appended there"
         );
         assert_eq!(
@@ -148,7 +148,7 @@ fn vector_wal_power_loss_round(seed: u64) {
     let mut want = rows;
     for seq in first..first + 1 + rng.below(200) {
         let at = wal
-            .append(NamespaceId::from_u128(7), &rec_key(seq), &rec_value(seq), seq)
+            .append(NamespaceId::from_u64(7), &rec_key(seq), &rec_value(seq), seq)
             .unwrap()
             .appended();
         want.push((at.start, 7, seq, rec_key(seq), Some(rec_value(seq))));
@@ -190,7 +190,7 @@ fn measure_batch_sync_latency() {
     let mut batch = |wal: &VectorIndexWal| {
         for _ in 0..8 {
             seq += 1;
-            wal.append(NamespaceId::from_u128(1), format!("k{seq:09}").as_bytes(), &value, seq)
+            wal.append(NamespaceId::from_u64(1), format!("k{seq:09}").as_bytes(), &value, seq)
                 .unwrap();
         }
         wal.sync().unwrap();

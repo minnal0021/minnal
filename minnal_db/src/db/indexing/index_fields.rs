@@ -23,7 +23,7 @@ impl Database {
     /// `activate_field_index` is called, so type mismatches are caught at
     /// activation time rather than at query time.
     pub fn register_index_field(&self, namespace_id: NamespaceId, field_name: &str, value_type: IndexValueType) -> Result<FieldId> {
-        let field_id = self.registry.write().register_schema_field(namespace_id, field_name, value_type)?;
+        let field_id = self.update_registry(|r| r.register_schema_field(namespace_id, field_name, value_type))?;
         self.index_manager.ensure_field_path(namespace_id, field_id)?;
         Ok(field_id)
     }
@@ -495,7 +495,7 @@ impl Database {
     ///
     /// **Step order is load-bearing** (mirrors `remove_namespace`):
     ///
-    /// 1. persist `dropped` to `config.json`,
+    /// 1. save `dropped` in the field's catalog record,
     /// 2. deregister the in-memory index,
     /// 3. delete `field-index/{ns_id}/{field_id}/`.
     ///
@@ -510,7 +510,7 @@ impl Database {
     /// deregisters and reclaims any leftover directory.
     pub fn drop_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         // (1) Persist the drop before anything becomes unreachable.
-        self.registry.write().mark_schema_field_dropped(namespace_id, field_id)?;
+        self.update_registry(|r| r.mark_schema_field_dropped(namespace_id, field_id))?;
 
         // (2) Deregister in memory. Best-effort on the store lookup: a namespace
         // that is not open has no in-memory index to deregister, but its files

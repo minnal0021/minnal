@@ -434,7 +434,7 @@ mod tests {
 
             // Simulate a crash between step (1) persist and step (3) delete:
             // mark the field dropped durably, then leave every file in place.
-            db.registry.write().mark_schema_field_dropped(ns, field_id).unwrap();
+            db.update_registry(|r| r.mark_schema_field_dropped(ns, field_id)).unwrap();
             assert!(field_path.exists(), "precondition: files still present at the crash point");
             db.shutdown().unwrap();
         }
@@ -700,7 +700,7 @@ mod tests {
         use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
         let mk = |from: u64, to: u64, segs: Vec<u64>, keys: &[&str]| GapRecord {
-            namespace_id: NamespaceId::from_u128(0),
+            namespace_id: NamespaceId::from_u64(0),
             field_id: 1,
             cause: GapCause::BackstopReclaim,
             from,

@@ -111,31 +111,13 @@ impl Database {
             Arc::clone(&next_seq),
         ));
 
-        // Open namespace registry
-        let registry = NamespaceRegistry::open(db_path)?;
-
-        // Open index manager (creates {db_path}/field-index/ if needed)
+        // Open field-index manager (creates {db_path}/field-index/ if needed)
         let index_manager = IndexManager::open(db_path)?;
 
-        // Open KVStores for all registered namespaces, restoring each one's
-        // persisted TTL (if any) so `store.ttl` reflects the durable config.
+        // Only the catalog's store opens here: the other namespaces are known
+        // once its records are replayed (`finish_open`).
         let mut stores = HashMap::new();
-        for (name, ns_id) in registry.list() {
-            let ns_path = crate::layout::namespace_data_dir(db_path, name);
-            let ttl = registry.ttl_config(ns_id).map(|(ttl, _)| ttl);
-            let kv_store = KVStore::open_with_ttl(
-                ns_id,
-                name,
-                &ns_path,
-                config.lsm_config.clone(),
-                config.sync_config,
-                config.segment_size_bytes,
-                ttl,
-            )?;
-            kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
-            kv_store.cleanup_old_files_on_startup()?;
-            stores.insert(ns_id, Arc::new(kv_store));
-        }
+        stores.insert(NamespaceId::CATALOG, Arc::new(Self::open_catalog_store(db_path, &config)?));
 
         // Cleanup old WAL file
         let old_wal = db_path.join("wal.log.old");
@@ -153,7 +135,7 @@ impl Database {
 
         // The engine-wide counters, shared with the vector index WAL.
         let metrics = Arc::new(crate::support::metrics::Metrics::default());
-        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
+        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &metrics)?);
 
         // One write-buffer budget for every field index of this database.
         let index_overlay_budget = Arc::new(crate::field_index::IndexOverlayBudget::new(
@@ -169,7 +151,7 @@ impl Database {
             pending_wal_flushes,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             vector_index_wal,
-            registry: RwLock::new(registry),
+            registry: RwLock::new(NamespaceRegistry::new()),
             namespace_create_lock: Mutex::new(()),
             index_activate_lock: Mutex::new(()),
             stores: RwLock::new(stores),
@@ -190,49 +172,22 @@ impl Database {
             key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics,
+            #[cfg(test)]
+            catalog_flush_paused: AtomicBool::new(false),
         };
 
-        // Share the global WAL sequence counter with every store so that all
-        // writes — WAL-backed, recovery replay, TTL expiry and bulk — draw from
-        // one monotonic sequence space (required for highest-sequence-wins
-        // conflict resolution in the memtable). Must happen before recovery.
-        // Share the operational counters at the same time.
-        {
-            let stores = db.stores.read();
-            for kv_store in stores.values() {
-                kv_store.set_seq_counter(db.next_seq.clone());
-                kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
-                kv_store.set_index_gap_sink(Some(
-                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::kv_store::index_set::IndexGapSink>
-                ));
-            }
-        }
-
-        // Finish any field-index drop a crash interrupted, before recovery can
-        // replay into a directory that is meant to be gone.
-        db.complete_interrupted_field_drops();
-
-        // Report field indices left incomplete by no-WAL writes that an unclean
-        // shutdown caught before any checkpoint covered them.
-        db.record_no_wal_gaps_after_unclean_shutdown();
-
-        // Recover from WAL
-        db.recover_from_vector_index_wal()?;
-        db.recover_from_wal()?;
-
-        db.wire_up_flush_observers();
-
-        Ok(db)
+        // The global WAL sequence counter is shared with every store before
+        // recovery replays into it: all writes — WAL-backed, recovery replay,
+        // TTL expiry and bulk — draw from one monotonic sequence space
+        // (required for highest-sequence-wins conflict resolution in the
+        // memtable). `finish_open` does it, with the operational counters.
+        db.finish_open()
     }
 
     /// Open the vector index WAL in its directory, sharing the engine-wide
-    /// counters. Records of namespaces no longer in the registry are released
-    /// at once: replay skips them, so they must not hold the retired cut.
-    pub(super) fn open_vector_index_wal(
-        db_path: &Path,
-        registry: &NamespaceRegistry,
-        metrics: &Arc<crate::support::metrics::Metrics>,
-    ) -> Result<VectorIndexWal> {
+    /// counters. `finish_open` releases the records of namespaces no longer in
+    /// the registry once it is loaded.
+    pub(super) fn open_vector_index_wal(db_path: &Path, metrics: &Arc<crate::support::metrics::Metrics>) -> Result<VectorIndexWal> {
         let (wal, report) = VectorIndexWal::open(
             &crate::layout::vector_index_wal_dir(db_path),
             crate::db::wal::vector_index_wal::DEFAULT_SEGMENT_SIZE,
@@ -240,11 +195,6 @@ impl Database {
         )?;
         if report.torn_bytes_dropped > 0 {
             warn!("[STARTUP] vector index WAL: dropped a torn tail of {} bytes", report.torn_bytes_dropped);
-        }
-        for ns in wal.tracked_namespaces() {
-            if registry.get_name(ns).is_none() {
-                wal.forget_namespace(ns);
-            }
         }
         Ok(wal)
     }
@@ -274,7 +224,7 @@ impl Database {
     }
 
     /// Wire up LSM flush observers for all KVStores
-    pub(super) fn wire_up_flush_observers(&self) {
+    pub(in crate::db) fn wire_up_flush_observers(&self) {
         let stores = self.stores.read();
         for (ns_id, kv_store) in stores.iter() {
             let observer: Arc<dyn LsmFlushObserver> = Arc::new(LsmFlushObserverHub::new(

@@ -110,7 +110,7 @@ impl Database {
         };
 
         let touched = parking_lot::Mutex::new(Vec::new());
-        let get_index = |field_id: u32| {
+        let get_index = |field_id: FieldId| {
             touched.lock().push(field_id);
             let ns_index = store.namespace_index.read();
             ns_index.get(field_id).map(|e| Arc::clone(&e.index))

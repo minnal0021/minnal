@@ -94,7 +94,7 @@ fn a_restart_keeps_records_nobody_flushed() {
         log_and_apply(&db, v, b"k1", b"x");
         log_and_apply(&db, v, b"k2", b"y");
         // A namespace that no longer exists after the restart.
-        db.vector_index_wal.append(NamespaceId::from_u128(999), b"gone", b"z", 1).unwrap();
+        db.vector_index_wal.append(NamespaceId::from_u64(999), b"gone", b"z", 1).unwrap();
         db.vector_index_wal.sync().unwrap();
         db.mark_crashed();
         (v, first)

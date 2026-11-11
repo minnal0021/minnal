@@ -7,7 +7,7 @@ use crate::namespace::NamespaceId;
 fn test_kvstore_basic_operations() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -30,7 +30,7 @@ fn test_kvstore_basic_operations() {
 fn test_kvstore_update() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -58,7 +58,7 @@ fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
     // record counted live.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -105,7 +105,7 @@ fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
     // key absent.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -159,7 +159,7 @@ fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
 fn test_kvstore_recovery_replay() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -185,7 +185,7 @@ fn test_active_memtable_tombstone_shadows_sstable() {
     // until the next compaction.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -209,7 +209,7 @@ fn test_put_to_storage_seq_keeps_highest_sequence() {
     // sequence-ordered replay (live == recovery for racing same-key writes).
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -227,7 +227,7 @@ fn test_put_to_storage_seq_keeps_highest_sequence() {
 fn test_delete_from_storage_seq_respects_sequence() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),

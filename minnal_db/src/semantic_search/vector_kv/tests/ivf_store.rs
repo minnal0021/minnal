@@ -80,11 +80,15 @@ async fn a_new_partition_survives_a_crash_right_after_it_is_written() {
     let dir = TempDir::new().unwrap();
     let open = || AsyncDb::open_with_config(dir.path().to_owned(), crate::DbConfig::default());
     let db = open().await.unwrap();
-    let before = db.ops_metrics();
+    // Creating the partition's namespaces writes, and flushes, the system
+    // catalog: its flushes are left out.
+    let catalog = || db.ops_metrics_for(crate::CATALOG_NAMESPACE).unwrap();
+    let (before, catalog_before) = (db.ops_metrics(), catalog());
     init_ivf(&db, "ns", 16).await.unwrap();
     let after = db.ops_metrics();
+    let catalog_flushes = catalog().memtable_flushes - catalog_before.memtable_flushes;
     assert_eq!(after.no_wal_puts, before.no_wal_puts, "the partition is written WAL-backed");
-    assert_eq!(after.memtable_flushes, before.memtable_flushes, "and needs no flush");
+    assert_eq!(after.memtable_flushes - catalog_flushes, before.memtable_flushes, "and needs no flush");
     db.crash().await;
     let db = open().await.unwrap();
     let ivf = load_ivf(&db, "ns", 7).await.unwrap().expect("the root partition survived the crash");

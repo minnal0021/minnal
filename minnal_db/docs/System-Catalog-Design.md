@@ -1,10 +1,10 @@
-# System catalog: namespace and field registry in a namespace
+# System catalog: the namespace registry in a namespace
 
-**Status:** proposed, not implemented.
-
-This document describes how the engine keeps its list of namespaces and
-their field-index ids inside the database itself — in a reserved namespace,
-`system_catalog` — instead of in files beside it.
+The engine keeps its list of namespaces — each one's id, TTL settings and
+field indexes — inside the database itself, in a reserved namespace called
+`system_catalog`. There is no registry file and no per-namespace config file.
+This document says what the catalog holds, how ids are handed out, and how
+opening and recovery use it.
 
 ## Terms used here
 
@@ -12,199 +12,154 @@ their field-index ids inside the database itself — in a reserved namespace,
   and field indexes, in `{db_path}/ns_{name}/`. Doc stores and KV stores are
   namespaces, and so are their internal companions (`{ns}_sparse_vector`,
   `{ns}_ivf_postings`, …) and the `system_*` namespaces.
-- **`NamespaceId`** — a namespace's 128-bit id (a version-4 UUID), drawn at
-  random when it is created and never reused. Every main-WAL and vector-index-WAL
-  record names the namespace it belongs to by this id.
-- **`FieldId`** — the id of one field index of a namespace. It names the
-  index's directory, `{db_path}/field-index/{ns_id}/{field_id}/`.
-- **Catalog** — the engine's record of which namespaces exist (name ↔ id, TTL)
-  and which field indexes each has (field name ↔ field id, value type).
+- **`NamespaceId`** — a namespace's 64-bit id. Every main-WAL record and
+  every vector-index-WAL record names its namespace by this id (8 bytes).
+- **`FieldId`** — the 64-bit id of one field index of a namespace. It names
+  the index's directory, `{db_path}/field-index/{ns_id}/{field_id}/`.
+- **Registry** — the engine's in-memory copy of the catalog
+  (`NamespaceRegistry`, `src/namespace/registry.rs`). Every lookup reads it;
+  nothing reads the catalog's files on a request.
 
-## What the catalog holds today, and where
+## The catalog namespace
 
-| File | Format | Holds |
+| Namespace | Id | Holds |
 |---|---|---|
-| `{db_path}/namespace_registry` | binary: magic `NSRG`, version, CRC32, rkyv payload | every namespace's name ↔ id; TTL settings (lifetime, deletes per pass) of each TTL namespace |
-| `{db_path}/ns_{name}/config.json` | JSON, one per namespace that has field indexes | each field's id, name, value type and a `dropped` flag; the next field id to hand out |
+| `default` | 0 | the default keyspace |
+| `system` | 1 | system-wide stores such as the query-embedding cache |
+| `system_catalog` | 2 | every namespace's record, every field index's record, the id counter |
 
-Both are written with an atomic, fsynced tmp-then-rename and read once, at
-open, into `NamespaceRegistry` (`src/namespace/registry.rs`), which serves every
-lookup from memory.
-
-This works, but it is a second storage mechanism beside the engine's own:
-
-- Two durable formats to maintain, each with its own checksum and versioning,
-  and neither covered by the WAL's recovery or fail-log tooling.
-- Field ids are a per-namespace counter (`u32`). A dropped field keeps its
-  definition, marked `dropped`, so a later re-add can reuse the id — the flag is
-  also what lets an interrupted drop finish at the next open. That reuse rule
-  and the flag exist only because ids are counters.
-- The doc store already keeps its schemas in a namespace (`system_schema`,
-  `doc_store/schema/store.rs`); the engine is the one layer still using files.
-
-## The design
-
-### A reserved namespace with a compiled-in id
-
-The engine always has a namespace named `system_catalog` whose id is a constant
-in the source:
-
-```rust
-impl NamespaceId {
-    pub const DEFAULT: Self = Self(0);
-    pub const SYSTEM: Self = Self(1);
-    /// The catalog's fixed id: known before anything else is read.
-    pub const CATALOG: Self = Self(2);
-}
-```
-
-Opening a database opens `system_catalog` first, creating it if absent —
-the same for an embedded `AsyncDb`, an embedded doc store and the API server,
-since all three open through the engine. Because both its name (which fixes its
-data directory, `ns_system_catalog/`) and its id are known in advance, it can be
-opened without reading anything else.
-
-It is a separate namespace, not keys inside `system`: `system` holds the
-query-embedding cache, which is written without the WAL and expires by TTL. The
-catalog must never be either. Its rules:
-
-- every write is WAL-backed (`put` / `delete`), durable when it returns;
-- no TTL, no no-WAL writes, no field indexes, no vector index;
-- it cannot be removed, and it does not list itself;
-- the name falls under `system_*`, which `validate_store_name` already reserves.
+All three always exist. `system_catalog`'s name (so its directory,
+`ns_system_catalog/`) and its id are compiled in, so it is opened before
+anything else is read. It cannot be removed, has no TTL and no field
+indexes, and is written only by the registry, always WAL-backed. The doc
+store refuses store names starting with `system_`, so no REST call can
+reach it.
 
 ### Keys and values
 
-| Key | Value (rkyv) |
+| Key | Value |
 |---|---|
-| `ns/{name}` | `{ id: NamespaceId, ttl: Option<{ ttl_millis, max_deletes }> }` |
-| `field/{ns_id}/{field_name}` | `{ field_id: FieldId, value_type }` |
+| `next_id` | the next id to hand out (u64, little-endian) |
+| `ns/{name}` | the namespace's id and TTL settings (lifetime, deletes per pass) |
+| `field/{ns_id}/{field_name}` | the field's id, value type and `dropped` flag |
 
-`ns_id` is the 16-byte big-endian id, so all fields of one namespace share a
-prefix and are listed with one prefix scan. `default` and `system` are written
-like any other namespace, with their fixed ids.
+Record values start with a version byte, then an rkyv payload read with
+validation. `ns_id` in a field key is 8 big-endian bytes, so one namespace's
+fields are one prefix scan. The record layout lives in one module,
+`src/namespace/catalog.rs`.
 
-### In memory, written through
+## Ids: one counter
 
-`NamespaceRegistry` keeps its maps (name ↔ id, schemas, TTL) and is loaded from
-a scan of `system_catalog` at open instead of from the files. Every change
-follows the rule `SchemaStore` uses for `system_schema`:
+Namespace ids and field ids come from one counter, `next_id`, starting at
+1024; ids below it are reserved for namespaces with fixed ids. Creating a
+namespace or a new field writes the counter's new value **first**, then the
+record that uses the id. A crash between the two leaves a gap in the ids,
+never an id handed out twice. So a name dropped and created again gets a new
+id, and the old namespace's WAL records, field-index files and caches can
+never be taken for the new one's.
 
-1. take the registry's writer lock;
-2. write the catalog key (WAL-backed, fsynced on return);
-3. update the in-memory map.
+A field that is dropped keeps its record, marked `dropped`, and a later
+re-add reuses its id: the doc store keys a field's job records by its id, so
+a re-added field carries on from its own records. The flag is saved before
+the field's files are deleted, so a drop a crash cut short is finished at the
+next open (`complete_interrupted_field_drops`).
 
-So the map is always what is on disk, in write order, and reads stay
-lock-and-lookup with no I/O. The writer lock is the existing `RwLock` around
-the registry; a catalog write is one WAL commit, which the group commit shares
-with concurrent writers.
+## Changing the registry
 
-### Field ids become UUIDs
+Every change goes through `Database::update_registry`:
 
-`FieldId` becomes a 128-bit random id, drawn like a `NamespaceId`. On disk it
-appears only in directory names, so the change costs no space in any record.
-With ids never reused:
+1. take the registry's write lock;
+2. make the change on a copy, which records the catalog writes it needs;
+3. write them, in order, each WAL-backed and durable on return;
+4. swap the copy in, release the lock;
+5. flush the catalog's memtable.
 
-- a re-added field gets a **new** id and an empty directory; there is no reuse
-  rule and no `next_field_id` counter;
-- dropping a field is: delete its catalog key, then delete its directory. There
-  is no `dropped` flag. A crash between the two leaves a directory the catalog
-  does not list, which the open-time sweep (below) removes, in place of
-  `complete_interrupted_field_drops`;
-- the checkpoint worker's field list is simply the catalog's fields; nothing
-  needs filtering out.
+A change that fails, or whose writes fail, leaves the registry as it was, so
+the registry is always what the catalog holds. Holding the lock across the
+writes keeps changes in the order they are saved; the catalog's write never
+reads the registry (its store is always open), so it cannot wait on the lock
+it is called under.
 
-`FieldId::MAX`, which the doc store's job registry uses as a "whole namespace"
-sentinel in `JobKey::field_build`, becomes a named constant of the new type.
+Step 5 keeps the catalog from holding back the main WAL. Its writes are few
+and its memtable would rarely fill, so without a flush they would keep their
+WAL segments until WAL GC flushed the catalog, and every open would replay
+them. Changes are rare (a create, a drop, a field or TTL change), so one small
+flush each is cheap. It is best-effort: the writes are durable in the WAL
+already.
 
-### Opening and recovery
+## Opening and recovery
 
-Recovery replays the main WAL into every known namespace and skips records of
-namespaces it does not know (`db/wal/recovery.rs`). With the catalog inside a
-namespace, nothing is known until the catalog's own records have been
-replayed. Open becomes:
+Recovery replays the main WAL into every namespace it knows and skips the
+records of namespaces it does not. With the namespace list inside a
+namespace, nothing is known until the catalog's own records are replayed, so
+opening (`Database::finish_open`) goes:
 
-1. Open the main WAL and its metadata (unchanged).
-2. Open `system_catalog` (fixed name and id).
-3. **Replay the catalog's records only**: scan the WAL from its replay point
-   and apply the records whose namespace is `NamespaceId::CATALOG`.
-4. Load `NamespaceRegistry` from the catalog.
-5. Open every other namespace's store, then replay the rest of the WAL as today
-   (catalog records already applied are skipped by their namespace).
-6. Sweep: remove every `ns_*` directory and every `field-index/{ns_id}` or
-   `field-index/{ns_id}/{field_id}` directory the catalog does not list. This
-   finishes a drop of a namespace or a field that a crash cut short.
+1. Open the main WAL and its metadata.
+2. Open the catalog's store (fixed name and id).
+3. **Replay the catalog's records** of the main WAL, at their original seqs
+   (`recover_catalog_from_wal`).
+4. Load the registry from the catalog, and open every other namespace's
+   store with its saved TTL.
+5. Release vector-index-WAL records of namespaces no longer listed, finish
+   interrupted field drops, note no-WAL gaps.
+6. Recover both WALs into the other namespaces as before; the main-WAL pass
+   skips catalog records (already replayed).
+7. Wire the flush observers, then write what loading left pending: a new
+   database's first records (`next_id`, `default`, `system`), and the
+   deletes of records loading left out (a namespace whose name cannot be a
+   directory, a field of a namespace that no longer exists).
 
-Step 3 reads the WAL a second time. The WAL that needs replay is bounded by
-flushes and by the WAL GC backstop (`thresholds.max_pinned_wal_segments`), and
-the second read mostly comes from the page cache, so the cost is small and
-paid only at open. The alternative — one pass that holds every other
-namespace's records in memory until the catalog is loaded — costs memory in
-proportion to the WAL and is not simpler.
+Step 3 reads the main WAL a second time. The part that needs replay is
+bounded by flushes and by the WAL GC backstop, and the second read mostly
+comes from the page cache, so the cost is small and paid only at open.
 
-Ordering within the WAL needs nothing new: a namespace's catalog `put` commits
-before any write to that namespace can be issued, so it is always earlier in
-the log than the namespace's own records.
+Two orderings are load-bearing:
 
-### Create and remove
+- **Step 6 counts the catalog's replayed records.** Recovery flushes every
+  store and then retires the whole log only if it replayed something; a
+  reopen that replayed catalog records alone must flush them too, or a
+  second crash would lose them (`replaying_only_catalog_records_flushes_them_before_the_log_is_retired`).
+- **Step 7 comes after recovery and the observers.** Recovery's retirement is
+  right only while every write it covers was replayed and flushed; a write
+  made before it, and not replayed, would be retired from the WAL while still
+  only in a memtable.
 
-Creating a namespace keeps its current order, with the file write replaced by
-a catalog `put`: write `ns/{name}` (durable), then open the store. A failed open
-deletes the key again, as it removes the registry entry today.
-
-Removing a namespace: delete `ns/{name}` and its `field/{ns_id}/…` keys
-(durable point — recovery now skips its records), close the store, forget its
-WAL progress, delete its directories. A crash after the first delete leaves
-directories that step 6 of open removes.
-
-The removes are several single-key deletes, not one transaction; the
-`ns/{name}` delete goes first, so that once it is durable the namespace is
-gone, and leftover `field/` keys of an unknown namespace are deleted by the
-sweep at open.
-
-### Layout
-
-`layout.rs` gains nothing and loses nothing: the catalog is an ordinary
-namespace directory. The `namespace_registry` file and every `config.json` are
-gone, so `registry.rs` no longer builds file paths.
+Within the WAL, a namespace's catalog record always precedes its own records:
+the record is durable before the namespace's store opens.
 
 ## What stays in files
 
-Only configuration moves. The engine's own state files stay, because the
-namespaces depend on them to open and so cannot live inside one:
+Only configuration moved. The engine's own state stays in files, because the
+namespaces need it to open:
 
 - the main WAL's segments and metadata, and the vector index WAL's segments and
   `retired_cut`;
-- each LSM tree's manifest and each value log's segments;
+- each LSM tree's SSTables and each value log's segments and metadata;
 - each field index's `checkpoint` and `gap.json`, and the `no_wal_pending`
   marker;
 - `fail_logs/`.
 
-The server's TOML config file is unchanged.
+The API server's TOML config file is unchanged.
 
 ## Not changed
 
 - The doc store's `system_schema` keeps the doc store's own record of each
-  store (field declarations, vector settings, lifecycle state). The catalog is
-  the engine's record of field ids; each layer owns its own, as now.
-- `NamespaceId` stays random and never reused.
+  store (field declarations, vector settings, lifecycle state). The catalog
+  is the engine's record of ids and field indexes; each layer owns its own.
 
 ## Compatibility
 
-The project is greenfield: an existing database, with its `namespace_registry`
-file, will not open after this change and must be rebuilt. No migration tool.
+A database written before the catalog (with a `namespace_registry` file and
+128-bit ids) does not open and must be recreated. There is no migration.
 
-## Work, in order
+## Where the code is
 
-1. `FieldId` to a 128-bit random id; drop the `dropped` flag and reuse rule;
-   add the open-time sweep for field directories. (Self-contained; still on
-   `config.json`.)
-2. `system_catalog` namespace, `NamespaceId::CATALOG`, catalog keys and the
-   write-through registry; delete `namespace_registry` and `config.json`.
-3. Two-step recovery and the namespace-directory sweep.
-4. Tests: crash between each pair of steps in create, remove, field add and
-   field drop (`crash()` simulation), recovery with catalog records interleaved
-   with data records, a re-added field getting a new id, and the sweep removing
-   only what the catalog does not list.
-5. Docs: `WAL-Architecture.md` (recovery order), `Namespace-Lifecycle.md`,
-   the layout comment in `layout.rs`, and the agent notes.
+| Path | What |
+|---|---|
+| `src/namespace/id.rs` | `NamespaceId`, the fixed ids, `FIRST_ALLOCATED` |
+| `src/namespace/catalog.rs` | The catalog's keys and record encoding |
+| `src/namespace/registry.rs` | `NamespaceRegistry`: the in-memory registry and its changes |
+| `src/namespace/schema.rs` | `NamespaceSchema`: one namespace's field indexes |
+| `src/db/namespace/catalog.rs` | Opening the catalog, loading the registry, `update_registry` |
+| `src/db/wal/recovery.rs` | `recover_catalog_from_wal`, then `recover_from_wal` |
+| `src/db/database/tests/catalog.rs` | Crash, flush and record tests |

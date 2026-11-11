@@ -78,7 +78,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
                       │ Database coordinator         │
                       │ (db/database/)             │
                       │                              │
-                      │ • namespace registry         │
+                      │ • the system catalog         │
                       │ • the shared WAL             │
                       │ • one KVStore per namespace  │
                       │ • background workers         │
@@ -271,7 +271,7 @@ frame:   [size: 4B] [crc32(body): 4B] [body: rkyv-serialized WalEntry]
 
 WalEntry {
   operation:    Upsert | Delete
-  namespace_id: NamespaceId — 16 bytes, see below
+  namespace_id: NamespaceId — 8 bytes, see below
   sequence:     u64   — global monotonic counter
   op_name:      String — caller-supplied label, used in fail-log output
   key:          Vec<u8>
@@ -466,7 +466,7 @@ A namespace is a fully isolated keyspace inside a single database instance — t
 
 **Each namespace is self-contained.** It has its own LSM tree (skip list, L0 files, L1 SSTables), its own sharded value log (`num_buckets` shards), and its own on-disk directory at `<db_path>/ns_<name>/`. Keys in one namespace are invisible to another. (Maintenance — GC, LSM compaction, and TTL expiry — is run by single global workers that fan out over the namespaces, not one worker per namespace; see [Background Workers](#background-workers).)
 
-**Two things are shared across all namespaces:** the single global WAL (each entry tagged with its `namespace_id`), and the namespace registry — a persistent file that maps names to ids. A namespace id (`NamespaceId`) is a random 128-bit UUID drawn when the namespace is created, so an id is **never reused**: a name dropped and created again gets a new id, and the old namespace's WAL records and field-index files can never be taken for the new one's. The `default` and `system` namespaces have fixed ids (`NamespaceId::DEFAULT`, `NamespaceId::SYSTEM`). The registry also stores each TTL-enabled namespace's TTL configuration (`ttl` + `max_deletes_per_run`), so TTL expiry is restored automatically on restart rather than having to be re-declared.
+**Two things are shared across all namespaces:** the single global WAL (each entry tagged with its `namespace_id`), and the **system catalog** — a namespace of its own, `system_catalog`, that records every namespace's name and id, its TTL configuration (`ttl` + `max_deletes_per_run`) and its field indexes. A namespace id (`NamespaceId`) is a 64-bit number handed out by the catalog's counter when the namespace is created, and the counter is saved before the id is used, so an id is **never reused**: a name dropped and created again gets a new id, and the old namespace's WAL records and field-index files can never be taken for the new one's. The `default`, `system` and `system_catalog` namespaces have fixed ids (0, 1 and 2). Because TTL settings are in the catalog, TTL expiry is restored automatically on restart rather than having to be re-declared. At open, the catalog's WAL records are replayed first, since they say which namespaces exist; see [System-Catalog-Design.md](docs/System-Catalog-Design.md).
 
 **Dropping a namespace** (`remove_namespace`) reclaims its storage and is carefully ordered so that it is crash-safe:
 
@@ -497,7 +497,7 @@ Everything expensive happens off the foreground path, on `tokio` tasks that run 
 | `WalGcWorker` | Global | Interval | Remove WAL segments wholly below the cut |
 | `TtlWorker` | Global (fans out per namespace) | Interval (default 1h) | Tombstone expired records in each TTL-enabled namespace |
 
-**On "Scope":** every worker is a **single** background task — one interval, one handle on `Database`. `GCWorker`, `LsmWorker`, and `TtlWorker` are global tasks that loop over the relevant namespaces on each tick (each namespace has its own value log / LSM tree, so the per-store *work* is still isolated). `TtlWorker` reads the per-namespace TTL configuration (`ttl` / `max_deletes_per_run`) from the persistent namespace registry and expires only the namespaces that have it — so a database with many TTL stores still runs just one timer task, not one per store, and the configuration is restored on restart.
+**On "Scope":** every worker is a **single** background task — one interval, one handle on `Database`. `GCWorker`, `LsmWorker`, and `TtlWorker` are global tasks that loop over the relevant namespaces on each tick (each namespace has its own value log / LSM tree, so the per-store *work* is still isolated). `TtlWorker` reads the per-namespace TTL configuration (`ttl` / `max_deletes_per_run`) from the system catalog and expires only the namespaces that have it — so a database with many TTL stores still runs just one timer task, not one per store, and the configuration is restored on restart.
 
 These workers don't poll blindly; they are driven by an **observer pattern** that fires on LSM events. When a memtable is sealed, `LsmFlushObserver` wakes the LSM worker. When that sealed table's L0 files are written, `WalPersistObserver` moves the namespace's safe offset and the cut and saves them, before the files are registered. An `LsmFlushObserverHub` coordinates the observers so that the WAL's progress is durable before the flush completes — which is what lets WAL GC safely reclaim a segment the instant its data is durable in an SSTable.
 
@@ -505,12 +505,10 @@ These workers don't poll blindly; they are driven by an **observer pattern** tha
 
 ## Storage Layout
 
-Putting the pieces together, here is how a database lays itself out on disk. The top level holds the shared structures (registry, WAL, fail logs, field indexes); each namespace then gets its own directory containing the value log and LSM data described above.
+Putting the pieces together, here is how a database lays itself out on disk. The top level holds the shared structures (WAL, fail logs, field indexes); each namespace then gets its own directory containing the value log and LSM data described above. The list of namespaces is itself a namespace, `system_catalog`, so it is stored the same way.
 
 ```
 <db_path>/
-├── namespace_registry          # Namespace name → id (UUID) map, plus TTL settings (rkyv)
-│
 ├── wal/                        # The main WAL
 │   ├── 0000000000.log          # Segments, 64 MB each, created at full size; reclaimed
 │   ├── ...                     #  ones are deleted, and the next is prepared as
@@ -530,8 +528,10 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 │       ├── <field_id>/         # One field: bitmaps, value→bitmap map, checkpoint
 │       └── rowmap/             # Dense row-ID map shared by the namespace's fields
 │
+├── ns_system_catalog/          # Every namespace's id and TTL settings, every field
+│                               #  index's id and type, and the id counter
+│
 ├── ns_default/                 # Default namespace (always present)
-│   ├── config.json             # Field-index registrations (only once a field is indexed)
 │   ├── value_logs/
 │   │   ├── value_log_0.seg000007   # Bucket 0, sealed segment (immutable)
 │   │   ├── value_log_0.seg000008   # Bucket 0, active tail
@@ -691,15 +691,15 @@ The components above were each designed with one shared goal: surviving a crash 
 
 **Startup recovery** runs these steps in order, reconstructing in-memory state from what's on disk and then replaying anything the WAL still holds:
 
-1. Load the namespace registry.
-2. Load the WAL metadata (the cut, each namespace's safe offset, and the sequence high-water mark), then open the WAL from its cut: check every segment from there on, find the tail (zeroing a torn one), and read each entry's sequence number. Segments below the cut are not read; the head is the oldest segment on disk. If the saved progress names positions past what survived a power loss, new writes start in a new segment, above all of them.
-3. Load the LSM manifest and reopen the L0/L1 SSTables.
+1. Load the WAL metadata (the cut, each namespace's safe offset, and the sequence high-water mark), then open the WAL from its cut: check every segment from there on, find the tail (zeroing a torn one), and read each entry's sequence number. Segments below the cut are not read; the head is the oldest segment on disk. If the saved progress names positions past what survived a power loss, new writes start in a new segment, above all of them.
+2. Open the `system_catalog` namespace, replay its WAL entries, and load the list of namespaces from it.
+3. For every namespace it lists, load the LSM manifest and reopen the L0/L1 SSTables.
 4. Open each bucket's value-log segments: reconcile the segment files on disk against the recorded inventory, and seed the segment-id allocator from `max(persisted high-water mark, highest existing id + 1)` so an id is never reused. A bucket whose metadata was lost has its live/garbage accounting recomputed exactly from the LSM's pointers.
 5. Replay the vector index WAL: every record at or above its namespace's safe offset, with its original seq. Then flush the namespaces it replayed into and record them as retired, before anything below can compact (see [Vector index WAL](#vector-index-wal)).
 6. Replay the WAL entries at or above their namespace's safe offset (or the cut):
    - Sort all eligible entries by sequence number and apply them in that one global order — so writes to the same key resolve to whichever was written last — retrying each once on failure.
    - Any entry that fails both attempts is written to `fail_logs/<timestamp>.json`.
-   - Flush the replayed namespaces, then retire the whole log (cut = tail), so WAL GC can make progress.
+   - Flush the replayed namespaces (the catalog too, if step 2 replayed anything), then retire the whole log (cut = tail), so WAL GC can make progress.
 7. Spawn the background workers (GC, LSM compaction, WAL GC, TTL).
 
 There is deliberately **no value-log GC recovery step**. GC unlinks a segment only after its re-point is durable, so a crash can leave dead weight (a segment nothing points at) or an orphan, but never a dangling pointer — and the next GC pass reclaims both.

@@ -559,12 +559,12 @@ impl AsyncDb {
         // `namespace_with_ttl` is get-or-create, so re-persist the config, (re)start
         // the worker, and log only when the config is actually new or changed.
         // Otherwise a plain "get" of an already-registered TTL namespace — which the
-        // admin REST endpoints do on every request — would rewrite the registry file
+        // admin REST endpoints do on every request — would rewrite the catalog record
         // and emit a spurious "TTL registered" line on each access. The persisted
         // config (restored on the next open) is the source of truth the worker reads.
         let already_registered = self.inner.inner.registry.read().ttl_config(ns_id) == Some((ttl, max_deletes_per_run));
         if !already_registered {
-            self.inner.inner.registry.write().set_ttl_config(ns_id, ttl, max_deletes_per_run)?;
+            self.inner.inner.update_registry(|r| r.set_ttl_config(ns_id, ttl, max_deletes_per_run))?;
             self.ensure_ttl_worker().await;
             info!(
                 "[AsyncDb] TTL registered for namespace '{}' (ttl={}s, max_deletes={})",

@@ -5,7 +5,7 @@ use super::value::IndexValueType;
 
 /// Unique identifier for an indexed field within a namespace.
 /// Assigned monotonically; never reused after a field is removed.
-pub type FieldId = u32;
+pub type FieldId = u64;
 
 /// Metadata for a single indexed field within a namespace.
 #[derive(Debug, Clone, PartialEq)]

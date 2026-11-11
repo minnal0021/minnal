@@ -183,7 +183,7 @@ fn test_schema_survives_restart_and_index_activates_without_re_register() {
     }
 
     // ── Second open: do NOT call register_index_field ────────────────
-    // Schema must be loaded from config.json automatically.
+    // Schema must be loaded from the system catalog automatically.
     {
         let db = Database::open(dir.path(), create_db_config()).unwrap();
 
@@ -204,7 +204,7 @@ fn test_schema_survives_restart_and_index_activates_without_re_register() {
             let v: serde_json::Value = serde_json::from_str(s).ok()?;
             Some(IndexValue::Int(v["age"].as_i64()?))
         });
-        // These must succeed using the field IDs recovered from config.json
+        // These must succeed using the field IDs recovered from the catalog
         db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field_id, IndexValueType::Str, status_extractor)
             .unwrap();
         db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field_id, IndexValueType::Int, age_extractor)

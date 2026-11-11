@@ -84,14 +84,15 @@ pub struct FieldDef {
 
 Fields are registered through `Database::register_index_field`, which is
 idempotent: registering the same name-and-type pair twice returns the existing
-`FieldId` rather than allocating a new one. A fresh registration assigns the next
-monotonic `FieldId`, creates the field's on-disk home at
-`{db_path}/field-index/{namespace_id}/{field_id}/`, and persists the updated field list
-to `{db_path}/ns_{namespace}/config.json`.
+`FieldId` rather than allocating a new one. A fresh registration takes the next id
+from the catalog's counter (shared with namespace ids, never reused), creates the field's on-disk home at
+`{db_path}/field-index/{namespace_id}/{field_id}/`, and saves the field's record in
+the `system_catalog` namespace.
 
-That `config.json` is the authoritative schema record. It is written atomically on
-every registration and loaded on every `Database::open()`, so the set of indexed
-fields survives restarts without any separate bookkeeping.
+The catalog is the authoritative schema record. A field's record is written
+(WAL-backed, durable on return) on every registration and loaded on every
+`Database::open()`, so the set of indexed fields survives restarts without any
+separate bookkeeping. See `minnal_db/docs/System-Catalog-Design.md`.
 
 A field's type is one of three, drawn from `IndexValueType` in
 `value.rs`: `Bool`, `Int` (an i64), and `Str`. These match the variants
@@ -527,8 +528,8 @@ current.
 Database::open()
   ├── 1. Load WAL metadata (CRC-checked); if corrupt, rename → .corrupt, start fresh
   ├── 2. Recover next sequence: max(WAL scan, metadata hint) + 1
-  ├── 3. Load namespace schemas from config.json
-  ├── 4. Open KVStores
+  ├── 3. Open the system catalog; replay its WAL records first
+  ├── 4. Load namespace schemas from the catalog; open KVStores
   └── 5. recover_from_wal()                       ← data-layer recovery
         ├── Scan WAL cut→tail; replay each namespace's Upsert/Delete from its safe offset
         ├── Flush and compact affected stores
@@ -568,7 +569,7 @@ Each component's guarantee, in one place:
 
 | Component | Recovery mechanism |
 |---|---|
-| Field schema | `config.json` written synchronously on registration |
+| Field schema | A record in the `system_catalog` namespace, WAL-backed, written on registration and replayed first at open |
 | KVStore data | WAL replay in `recover_from_wal()` before any index activation |
 | Row map | `rows.*` + marker loaded; key→id table rebuilt from the id array; torn tail ignored |
 | Index bitmaps + keymap | mmap loaded (with `recover_compaction`); torn slots dropped; the two stores reconciled; then WAL tail replayed from the last checkpoint offset |

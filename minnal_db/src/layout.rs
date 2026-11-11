@@ -14,8 +14,9 @@
 //!
 //! ```text
 //! {db_path}/
-//!   ns_{name}/            ← per-namespace data: LSM SSTables, value log, config.json
-//!   index/
+//!   ns_{name}/            ← per-namespace data: LSM SSTables and value log
+//!   ns_system_catalog/    ← the system catalog: every namespace's id, TTL and field indexes
+//!   field-index/
 //!     {ns_id}/
 //!       {field_id}/       ← field index: bitmap blob, keymap, checkpoint, gap.json
 //!       rowmap/           ← dense row-ID map sidecar
@@ -58,7 +59,7 @@ pub(crate) fn namespace_name_problem(name: &str) -> Option<String> {
 
 /// A namespace's data directory: `{db_path}/ns_{name}`.
 ///
-/// Holds the LSM SSTables, the value-log segments, and `config.json`. Keyed by
+/// Holds the LSM SSTables and the value-log segments. Keyed by
 /// **name**, not id — this is the one path that is, for historical reasons.
 pub(crate) fn namespace_data_dir(db_path: &Path, name: &str) -> PathBuf {
     db_path.join(format!("{NAMESPACE_DIR_PREFIX}{name}"))
@@ -130,8 +131,8 @@ mod tests {
         assert_eq!(index_root(root), Path::new("/db/field-index"));
         assert_eq!(main_wal_dir(root), Path::new("/db/wal"));
         assert_eq!(
-            namespace_index_dir(&index_root(root), NamespaceId::from_u128(7)),
-            Path::new("/db/field-index/00000000-0000-0000-0000-000000000007")
+            namespace_index_dir(&index_root(root), NamespaceId::from_u64(7)),
+            Path::new("/db/field-index/7")
         );
         assert_eq!(vector_index_wal_dir(root), Path::new("/db/vector_index_wal"));
     }
@@ -144,7 +145,7 @@ mod tests {
         let root = Path::new("/db");
         assert!(namespace_data_dir(root, "users").to_string_lossy().contains("ns_users"));
         assert!(
-            !namespace_index_dir(&index_root(root), NamespaceId::from_u128(7))
+            !namespace_index_dir(&index_root(root), NamespaceId::from_u64(7))
                 .to_string_lossy()
                 .contains("users")
         );

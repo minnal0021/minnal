@@ -21,6 +21,7 @@ fn saved_wal_metadata(dir: &TempDir) -> WalMetadata {
 }
 
 mod async_db;
+mod catalog;
 mod crash;
 mod field_index;
 mod in_flight;

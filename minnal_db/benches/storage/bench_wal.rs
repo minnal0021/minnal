@@ -214,10 +214,10 @@ fn bench_wal_namespace_overhead(c: &mut Criterion) {
         });
     }
 
-    // Append with a non-default namespace (a random id, as a created one gets)
+    // Append with a non-default namespace (the first id a created one gets)
     {
         let value = value.clone();
-        let other = minnal_db::NamespaceId::random().unwrap();
+        let other = minnal_db::NamespaceId::from_u64(minnal_db::NamespaceId::FIRST_ALLOCATED);
         group.bench_function("ns_id_other", |b| {
             b.iter_custom(|iters| {
                 time_appends(iters, BATCH, true, || {

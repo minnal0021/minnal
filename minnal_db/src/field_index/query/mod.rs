@@ -20,7 +20,7 @@
 //! use minnal_db::field_index::query::{parse_and_evaluate, SchemaMap};
 //!
 //! // Build SchemaMap from NamespaceSchema::list_fields()
-//! let schema: SchemaMap = [("age".to_string(), 0u32)].into();
+//! let schema: SchemaMap = [("age".to_string(), 0u64)].into();
 //!
 //! // Provide a closure that looks up the live DynFieldIndex by FieldId
 //! let bitmap = parse_and_evaluate("age > 30 AND age < 50", &schema, &|id| {
