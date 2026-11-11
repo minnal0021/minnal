@@ -333,7 +333,7 @@ A **KV store** is a schema-lite namespace managed under `/stores`. Unlike a docu
 - Typed keys (`str` or `int`) and typed values (`str`, `int`, `f32`, `vec_f32`)
 - Optional semantic search when `value_type = str`
 
-KV stores share the same underlying minnal_db namespace registry, WAL, LSM compaction, and value-log GC as document stores. Its schema is kept with the doc-store schemas in the `system_schema` namespace and distinguished by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare.
+KV stores share the same underlying minnal_db system catalog, WAL, LSM compaction, and value-log GC as document stores. Its schema is kept with the doc-store schemas in the `system_schema` namespace and distinguished by a mandatory `store_type` field (`"doc"` vs `"kv"`) that every schema must declare.
 
 **Key types:**
 
@@ -422,7 +422,7 @@ curl http://localhost:8080/stores
 [
   {
     "namespace": "users",
-    "ns_id": "7f3e9c2a-5b1d-4e8f-9a6c-2d4b8e1f0a37",
+    "ns_id": 1024,
     "store_type": "doc",
     "key_type": "uuid",
     "attributes": [],
@@ -435,7 +435,7 @@ curl http://localhost:8080/stores
   },
   {
     "namespace": "session-cache",
-    "ns_id": "c41a6d08-93e2-4b7f-8d15-6e0f2a9b3c54",
+    "ns_id": 1031,
     "store_type": "kv",
     "key_type": "str",
     "value_type": "str",
@@ -582,7 +582,7 @@ curl http://localhost:8080/stores/users/schema
 ```json
 {
   "namespace": "users",
-  "ns_id": "7f3e9c2a-5b1d-4e8f-9a6c-2d4b8e1f0a37",
+  "ns_id": 1024,
   "store_type": "doc",
   "key_type": "uuid",
   "indices": [
@@ -596,7 +596,7 @@ curl http://localhost:8080/stores/users/schema
 }
 ```
 
-`ns_id` is the engine's internal id for the namespace. `embedding_fields` appears
+`ns_id` is the engine's internal id for the namespace, a number. `embedding_fields` appears
 when semantic search is enabled.
 
 Returns `404 Not Found` if the namespace does not exist.
@@ -1808,10 +1808,10 @@ curl http://localhost:8080/admin/storage/index-waste
   "namespaces": [
     {
       "namespace": "users",
-      "ns_id": "7f3e9c2a-5b1d-4e8f-9a6c-2d4b8e1f0a37",
+      "ns_id": 1024,
       "fields": [
         {
-          "field_id": 0,
+          "field_id": 1025,
           "field_name": "status",
           "field_type": "Str",
           "bitmap_waste_ratio": 0.12,
@@ -1951,8 +1951,8 @@ curl http://localhost:8080/admin/indices/users/health
   "degraded": false,
   "degraded_fields": [],
   "fields": [
-    {"field_id": 0, "field_name": "status", "namespace_id": 3, "active": true, "checkpoint_offset": 396, "gap": null},
-    {"field_id": 1, "field_name": "age",    "namespace_id": 3, "active": true, "checkpoint_offset": 396, "gap": null}
+    {"field_id": 1025, "field_name": "status", "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null},
+    {"field_id": 1026, "field_name": "age",    "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null}
   ]
 }
 ```
@@ -2719,12 +2719,11 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
 
 ```
 {db_path}/
-  namespace_registry          ← namespace name → id map (each id a random UUID), plus TTL settings
   wal/                        ← the main write-ahead log: {segment_id}.log segments (64 MiB), metadata
   vector_index_wal/           ← the vector index WAL: {segment_id}.log segments, retired_cut
   fail_logs/                  ← written only if WAL recovery could not apply an entry
+  ns_system_catalog/          ← every namespace's id and TTL settings, every field index's id and type, the id counter
   ns_{namespace}/             ← one directory per namespace (doc store, KV store, or vector companion)
-    config.json               ← namespace settings
     lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
     value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
   ns_{namespace}_sparse_vector/      ← chunk embeddings (1, 2 or 4 bits), keyed by [posting_id ‖ doc_id] (Pass 1)
@@ -2740,7 +2739,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   ns_system_lifecycle_audit/         ← the lifecycle audit log (TTL: `[lifecycle] audit_retention_days`)
   ns_system_partition_history/       ← partition health reads, recall checks and rebuilds (TTL)
   field-index/
-    {ns_id}/                  ← the namespace's id (a UUID); doc stores only, KV stores have no field indices
+    {ns_id}/                  ← the namespace's id (a number); doc stores only, KV stores have no field indices
       {field_id}/
         blobs.keys, blobs.vals ← one RoaringBitmap per field value (append-only blob store)
         keymap                ← field value → bitmap slot

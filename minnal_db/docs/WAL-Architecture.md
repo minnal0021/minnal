@@ -54,14 +54,14 @@ frame can have; its four bytes are reserved in every segment.
 | Log | Magic | Body |
 |---|---|---|
 | Main WAL | `MWAL` | an rkyv `WalEntry`: operation, namespace, sequence, op name, key, value |
-| Vector index WAL | `MVIW` | `[ns_id 16B][seq u64][key_len u32][key][value_len u32][value]`; a delete has `value_len = u32::MAX` and no value |
+| Vector index WAL | `MVIW` | `[ns_id 8B][seq u64][key_len u32][key][value_len u32][value]`; a delete has `value_len = u32::MAX` and no value |
 
 Each log also keeps a **progress file** (`segmented_log::ProgressFile`) in its
 directory: the cut and every safe offset above it, plus the log's own extra
 bytes, checksummed and written atomically.
 
 ```text
-[magic 4B][version u32][cut u64][count u32][count × (ns_id 16B, safe u64)]
+[magic 4B][version u32][cut u64][count u32][count × (ns_id 8B, safe u64)]
 [extra_len u32][extra][crc32 of everything before it]
 ```
 
@@ -157,6 +157,12 @@ compaction can merge them. Each log keeps a safe offset per namespace, and
 replay applies a record only at or above its own namespace's offset: a
 namespace that flushed past a record may since have had a delete of that key
 merged into L1, where its tombstone is dropped.
+
+At open the main WAL is replayed in two passes: the `system_catalog`
+namespace's records first, since they say which namespaces exist, then every
+other namespace's. The second pass counts the first's records when it decides
+whether to flush before retiring the log. See
+[System-Catalog-Design.md](System-Catalog-Design.md).
 
 - **Main WAL**: the cut is also held back by every active field index until it
   checkpoints past it (field indexes replay the WAL after a crash).

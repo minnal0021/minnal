@@ -23,7 +23,7 @@ re-check them before starting work.
 | [FR-010](#fr-010--refuse-an-enable-for-as-long-as-a-vector-index-drop-is-pending) | Refuse an enable for as long as a vector-index drop is pending | `minnal_db` (`doc_store`), `minnal_db_api` | Low | ✅ **Done — 2026-11-08** |
 | [FR-011](#fr-011--a-test-harness-for-api-routes) | A test harness for API routes | `minnal_db_api` | Low | Proposed |
 | [FR-012](#fr-012--make-a-skipped-upsert_vectors-visible-to-its-caller) | Make a skipped `upsert_vectors` visible to its caller | `minnal_db` (`vector_kv`) | Low | Proposed |
-| [FR-013](#fr-013--namespace-identity-without-a-central-registry-file) | Namespace identity without a central registry file | `minnal_db` (`db`), `minnal_db_api` | Medium | Proposed |
+| [FR-013](#fr-013--namespace-identity-without-a-central-registry-file) | Namespace identity without a central registry file | `minnal_db` (`db`), `minnal_db_api` | Medium | Done (2026-11-11, `system_catalog`) |
 | [FR-014](#fr-014--run-a-fraction-of-the-partition-crash-audits-by-default) | Run a fraction of the partition crash audits by default | `minnal_db` (`ivf_split` tests) | Low | Proposed |
 
 ---
@@ -1493,7 +1493,13 @@ at `warn`, but a drop racing the worker would then warn in normal operation.
 **Severity:** Medium — a damaged registry stops the whole database opening; no data
 is at risk from the design as it stands
 **Source:** Design discussion on how `ns_id` is generated. Not prototyped or measured.
-**Status:** Partly done (branch `namespace-uuid`, 2026-11-08). Ids are `NamespaceId`
+**Status:** Done 2026-11-11 (branch `system-catalog`), differently from the proposal
+below: the registry file and every `config.json` are gone, and the namespace list is
+kept in a reserved namespace, `system_catalog` (fixed id 2), replayed first at open.
+Ids went back to 64-bit, handed out by one durable counter in the catalog for
+namespaces and fields alike (8 bytes per WAL record instead of 16). Design:
+`minnal_db/docs/System-Catalog-Design.md`.
+Earlier step (branch `namespace-uuid`, 2026-11-08): Ids are `NamespaceId`
 (random UUID, read from `/dev/urandom`, no new dependency) everywhere, and `next_id` is
 gone. Decided to **keep** the `namespace_registry` file (it now stores UUIDs), so the
 "no central file" half below stays open. Part of the store-lifecycle refactor.
