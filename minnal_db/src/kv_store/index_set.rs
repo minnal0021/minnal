@@ -8,6 +8,7 @@
 //! `KVStore::put_to_storage` and `KVStore::delete_from_storage` to keep
 //! the in-memory index current.
 
+use crate::namespace::NamespaceId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ use crate::field_index::{DynFieldIndex, IndexValue};
 /// signals, rather than knowing how a gap is recorded.
 pub trait IndexGapSink: Send + Sync {
     /// Note that `field_id` in `namespace_id` refused to index `key`.
-    fn note_rejected_update(&self, namespace_id: u32, field_id: FieldId, key: &[u8]);
+    fn note_rejected_update(&self, namespace_id: NamespaceId, field_id: FieldId, key: &[u8]);
 }
 
 /// Write-path requests for an early index checkpoint. Both are O(1), non-blocking

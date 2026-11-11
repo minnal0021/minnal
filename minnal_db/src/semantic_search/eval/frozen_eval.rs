@@ -629,10 +629,10 @@ async fn eval_frozen() {
     let mode = env_or("MINNAL_BENCH_PARTITION", "grow");
     let target: u32 = env_or("MINNAL_BENCH_TARGET", "128").parse().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
+    // The open starts the background workers, as a doc store runs them:
+    // without LSM compaction every flush leaves its L0 files for good and
+    // indexing slows as they pile up.
     let db = Arc::new(AsyncDb::open_with_config(tmp.path().to_owned(), DbConfig::default()).await.unwrap());
-    // The background workers, as a doc store runs them: without LSM compaction
-    // every flush leaves its L0 files for good and indexing slows as they pile up.
-    db.enable_all_workers(&DbConfig::default()).await.unwrap();
     db.namespace(NS.to_string()).await.unwrap();
     match mode.as_str() {
         "file" => {

@@ -9,8 +9,6 @@
 //! PATCH  /stores/{ns}/schema     → amend schema (doc stores only; KV → 409)
 //! ```
 
-use std::sync::Arc;
-
 use axum::{
     Json,
     extract::{Path, State},
@@ -20,7 +18,7 @@ use axum::{
 use minnal_db::doc_store::schema::vector_settings::{MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 use minnal_db::{AttributeType, DocStoreError, DocStoreSchema, KvStoreSchema, SchemaAmendment, SchemaError, StoreType};
 use serde::Deserialize;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{AppState, error::AppError};
 
@@ -61,8 +59,19 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<serde_json::
     }
 }
 
+/// `202 Accepted` with the store's name and its new lifecycle state: the
+/// lifecycle governor finishes the create or drop in the background, and
+/// `GET /stores/{ns}` (or `GET /stores`) shows when it is done.
+fn accepted(namespace: &str, state: minnal_db::NamespaceState) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "namespace": namespace, "state": state.as_str() })),
+    )
+}
+
 /// Core doc-store creation, shared by `POST /stores` and schema import.
-pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) -> Result<StatusCode, AppError> {
+/// Answers once the store is recorded as `creating`; see [`accepted`].
+pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     // Reject semantic-search-enabled stores when the server runs without
     // semantic search: writes would never be embedded.
     if schema.semantic_search_enabled {
@@ -74,28 +83,23 @@ pub(crate) async fn create_doc_schema(state: &AppState, schema: DocStoreSchema) 
     }
     let ns = schema.namespace.clone();
     info!(namespace = %ns, semantic_search = schema.semantic_search_enabled, "creating store");
-    state.store.create(schema).await?;
-    info!(namespace = %ns, "store created");
-    Ok(StatusCode::CREATED)
+    state.store.begin_create(schema).await?;
+    Ok(accepted(&ns, minnal_db::NamespaceState::Creating))
 }
 
+/// `DELETE /stores/{ns}`: answers `202` once the store is `deleting` (it then
+/// refuses every request but the admin views); the lifecycle governor removes
+/// it, and it is gone once `GET /stores/{ns}` answers 404. A store already being
+/// deleted answers 202 again; one still being created cannot be dropped (409).
 pub async fn drop_store(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
     info!(namespace = %ns, "dropping store");
     let store_type = state.store.store_type(&ns).map_err(|e| AppError::from(e).with_ns(&ns))?;
-    // In its own task: axum drops a handler when its client disconnects, and a drop
-    // stopped midway leaves the store half removed until it is retried.
-    let store = Arc::clone(&state.store);
-    let name = ns.clone();
-    tokio::spawn(async move {
-        match store_type {
-            StoreType::Doc => store.remove(&name).await,
-            StoreType::Kv => store.remove_kv(&name).await,
-        }
-    })
-    .await
-    .map_err(|e| AppError::from(DocStoreError::Io(std::io::Error::other(e))))??;
-    info!(namespace = %ns, "store dropped");
-    Ok(StatusCode::NO_CONTENT)
+    match store_type {
+        StoreType::Doc => state.store.begin_remove(&ns),
+        StoreType::Kv => state.store.begin_remove_kv(&ns),
+    }
+    .map_err(|e| AppError::from(e).with_ns(&ns))?;
+    Ok(accepted(&ns, minnal_db::NamespaceState::Deleting))
 }
 
 pub async fn get_schema(State(state): State<AppState>, Path(ns): Path<String>) -> Result<impl IntoResponse, AppError> {
@@ -204,16 +208,13 @@ pub async fn amend_schema(
     // Search defaults apply to doc and KV stores alike.
     if let AmendRequest::UpdateVectorSearch { search, maintenance } = &req {
         state.store.update_vector_search(&ns, search, maintenance.as_ref()).await?;
-        return Ok(StatusCode::NO_CONTENT);
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
     // Enabling the vector index (single- or multi-field) requires semantic
     // search infrastructure, and a model the embedding service serves.
     if matches!(&req, AmendRequest::AddEmbeddingAttribute { .. } | AmendRequest::EnableVectorIndex { .. }) {
         require_semantic_search(&state)?;
-        if state.vec_index_cleanup.lock().contains(&ns) {
-            return Err(DocStoreError::VectorCleanupInProgress { namespace: ns }.into());
-        }
         // Apply to a copy first: the probe needs the resulting settings, and a
         // rejected model must leave the stored schema untouched.
         let mut preview = state.store.get_schema(&ns)?;
@@ -240,36 +241,20 @@ pub async fn amend_schema(
         }
     }
 
-    // For RemoveAttribute we use the dedicated path that returns whether the
-    // last embedding field was removed (triggering background vector cleanup).
+    // Removing the last embedding field turns semantic search off, and the
+    // vector index is removed by a `vector_cleanup` job: 202 with its name.
     if let AmendRequest::RemoveAttribute { name } = &req {
-        // Claimed before semantic search can go off, as the drop routes do. `false`
-        // means a cleanup is already running, and this spawns no other.
-        let claimed = state.vec_index_cleanup.lock().insert(ns.clone());
-        let removed = state.store.remove_attribute(&ns, name);
-        if claimed && !matches!(removed, Ok(true)) {
-            state.vec_index_cleanup.lock().remove(&ns);
-        }
-
-        if removed? && claimed {
-            info!(namespace = %ns, "last embedding field removed — cleaning up vector index data in background");
-            let store = Arc::clone(&state.store);
-            let ops_ref = Arc::clone(&state.vec_index_cleanup);
-            let ns_clone = ns.clone();
-            tokio::spawn(async move {
-                match store.drop_vector_index_data(&ns_clone).await {
-                    Ok(()) => info!(namespace = %ns_clone, "vector index data cleanup complete"),
-                    Err(e) => error!(namespace = %ns_clone, error = %e, "vector index data cleanup failed"),
-                }
-                ops_ref.lock().remove(&ns_clone);
-            });
-        }
-
-        return Ok(StatusCode::NO_CONTENT);
+        return Ok(match state.store.begin_remove_attribute(&ns, name)? {
+            Some(job) => {
+                info!(namespace = %ns, "last embedding field removed — vector index cleanup started");
+                crate::routes::indices::job_accepted(&ns, &job).into_response()
+            }
+            None => StatusCode::NO_CONTENT.into_response(),
+        });
     }
 
     state.store.amend(&ns, req.into()).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Refuse a semantic-search operation when the server runs without semantic
@@ -318,7 +303,8 @@ async fn probe_model(state: &AppState, settings: &VectorIndexSettings) -> Result
 // ── KV store creation (shared core) ─────────────────────────────────────────────
 
 /// Core KV-store creation, shared by `POST /stores` and schema import.
-pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) -> Result<StatusCode, AppError> {
+/// Answers once the store is recorded as `creating`; see [`accepted`].
+pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     if schema.semantic_search_enabled {
         require_semantic_search(state)?;
         if let Ok(settings) = schema.vector_settings() {
@@ -327,7 +313,6 @@ pub(crate) async fn create_kv_schema(state: &AppState, schema: KvStoreSchema) ->
     }
     let ns = schema.namespace.clone();
     info!(namespace = %ns, value_type = ?schema.value_type, "creating KV store");
-    state.store.create_kv(schema).await?;
-    info!(namespace = %ns, "KV store created");
-    Ok(StatusCode::CREATED)
+    state.store.begin_create_kv(schema).await?;
+    Ok(accepted(&ns, minnal_db::NamespaceState::Creating))
 }

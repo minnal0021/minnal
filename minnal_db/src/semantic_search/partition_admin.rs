@@ -1,16 +1,17 @@
 //! Inspecting and rebuilding a namespace's partition: its health, its centres, a
-//! recall check, a probe trace, its history and a background rebuild. All of it runs
+//! recall check, a probe trace, its history and a rebuild. All of it runs
 //! on what the context holds. The store above decides whether a namespace may be
 //! asked about and resolves its settings.
 
+use crate::namespace::NamespaceId;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use crate::AsyncDb;
+use crate::semantic_search::cluster::layout::{PostingOrigin, PostingState};
 use crate::semantic_search::context::{ContextError, NamespaceSemantics, SemanticSearchContext};
 use crate::semantic_search::ivf_split::health::{self, CentreHealth, PartitionHealth, PostingHealth};
 use crate::semantic_search::ivf_split::history::{self, HistoryRecord, RecordKind};
-use crate::semantic_search::ivf_split::rebuild::{self, RebuildParams};
+use crate::semantic_search::ivf_split::rebuild::{self, RebuildParams, RebuildReport, RebuildState, RebuildStatus};
 use crate::semantic_search::ivf_split::recall_check::{self, RecallCheck, RecallCheckParams};
 use crate::semantic_search::service::{self, MAX_TRACE_PROBES, MAX_TRACE_TOP_K, ProbeTrace, SearchBaseline};
 use crate::semantic_search::vector_kv;
@@ -36,7 +37,7 @@ impl SemanticSearchContext {
         &self,
         db: &AsyncDb,
         namespace: &str,
-        ns_id: u32,
+        ns_id: NamespaceId,
         settings: &VectorIndexSettings,
         codes: bool,
     ) -> Result<(PartitionHealth, Vec<PostingHealth>), ContextError> {
@@ -53,7 +54,7 @@ impl SemanticSearchContext {
         &self,
         db: &AsyncDb,
         namespace: &str,
-        ns_id: u32,
+        ns_id: NamespaceId,
         settings: &VectorIndexSettings,
         codes: bool,
     ) -> Result<Vec<CentreHealth>, ContextError> {
@@ -226,46 +227,84 @@ impl SemanticSearchContext {
         Ok(history::read(db, namespace, kind, limit, self.config.partition_history_ttl).await?)
     }
 
-    /// Start rebuilding `namespace`'s partition in the background into `postings`
-    /// postings; its progress and result show in [`rebuild_status`](Self::rebuild_status).
-    pub(crate) fn start_rebuild(
-        self: &Arc<Self>,
-        db: &Arc<AsyncDb>,
+    /// Rebuild `namespace`'s partition into `postings` postings (default: as
+    /// many as are active), and record the outcome in its partition history.
+    /// `None` if `cancelled` stopped it before it changed anything (it is
+    /// asked until the rebuild's plan is recorded; see
+    /// [`rebuild_partition_unless`](rebuild::rebuild_partition_unless)).
+    pub(crate) async fn rebuild(
+        &self,
+        db: &AsyncDb,
         namespace: &str,
-        ns_id: u32,
-        settings: VectorIndexSettings,
+        ns_id: NamespaceId,
+        settings: &VectorIndexSettings,
         postings: Option<usize>,
-    ) -> Result<(), ContextError> {
-        self.claim_rebuild(namespace, postings)?;
-        let (db, ctx, namespace) = (Arc::clone(db), Arc::clone(self), namespace.to_owned());
-        tokio::spawn(async move {
-            let result = async {
-                let ns = ctx.for_namespace(&db, &namespace, ns_id, &settings).await?;
-                let params = RebuildParams {
-                    postings,
-                    threads: ctx.rebuild_threads,
-                };
-                let ops = settings.maintenance.ops();
-                Ok::<_, ContextError>(rebuild::rebuild_partition(&db, &namespace, &ns.partition, &ops, &params).await?)
-            }
-            .await;
-            match &result {
-                Ok(r) => log::info!(
-                    "partition rebuild: namespace='{namespace}' {} chunks, {} -> {} postings ({} fitted, {} iterations, {} moved)",
-                    r.chunks,
-                    r.postings_before,
-                    r.postings_after,
-                    r.postings_fitted,
-                    r.iterations,
-                    r.chunks_moved
-                ),
-                Err(e) => log::warn!("partition rebuild: namespace='{namespace}' failed: {e}"),
-            }
-            ctx.finish_rebuild(&namespace, result.map_err(|e| e.to_string()));
-            if let Some(status) = ctx.rebuild_status(&namespace) {
-                record_history(&db, ctx.config.partition_history_ttl, &namespace, RecordKind::Rebuild, &status).await;
-            }
-        });
-        Ok(())
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Option<RebuildReport>, ContextError> {
+        let started_at_ms = crate::support::now_ms();
+        let ns = self.for_namespace(db, namespace, ns_id, settings).await?;
+        let params = RebuildParams {
+            postings,
+            threads: self.rebuild_threads,
+        };
+        let ops = settings.maintenance.ops();
+        let result = rebuild::rebuild_partition_unless(db, namespace, &ns.partition, &ops, &params, cancelled).await;
+        match &result {
+            Ok(Some(r)) => log::info!(
+                "partition rebuild: namespace='{namespace}' {} chunks, {} -> {} postings ({} fitted, {} iterations, {} moved)",
+                r.chunks,
+                r.postings_before,
+                r.postings_after,
+                r.postings_fitted,
+                r.iterations,
+                r.chunks_moved
+            ),
+            Ok(None) => log::info!("partition rebuild: namespace='{namespace}' cancelled before it changed anything"),
+            Err(e) => log::warn!("partition rebuild: namespace='{namespace}' failed: {e}"),
+        }
+        if !matches!(result, Ok(None)) {
+            let status = RebuildStatus {
+                state: if result.is_ok() { RebuildState::Done } else { RebuildState::Failed },
+                postings_requested: postings,
+                started_at_ms,
+                finished_at_ms: Some(crate::support::now_ms()),
+                report: result.as_ref().ok().copied().flatten(),
+                error: result.as_ref().err().map(ToString::to_string),
+            };
+            record_history(db, self.config.partition_history_ttl, namespace, RecordKind::Rebuild, &status).await;
+        }
+        Ok(result?)
+    }
+
+    /// The highest posting id `namespace`'s partition holds.
+    pub(crate) async fn max_posting_id(
+        &self,
+        db: &AsyncDb,
+        namespace: &str,
+        ns_id: NamespaceId,
+        settings: &VectorIndexSettings,
+    ) -> Result<u32, ContextError> {
+        Ok(self.for_namespace(db, namespace, ns_id, settings).await?.partition.snapshot().max_ids().0)
+    }
+
+    /// Whether `namespace`'s partition holds a posting a rebuild fitted, with
+    /// an id above `above` and not retired: that is, whether a rebuild that
+    /// started when `above` was the highest id got past its publish (and was
+    /// finished, by itself or by journal recovery) rather than being
+    /// abandoned or never recorded. Loading the partition recovers its
+    /// journal first.
+    pub(crate) async fn rebuilt_above(
+        &self,
+        db: &AsyncDb,
+        namespace: &str,
+        ns_id: NamespaceId,
+        settings: &VectorIndexSettings,
+        above: u32,
+    ) -> Result<bool, ContextError> {
+        let ivf = self.for_namespace(db, namespace, ns_id, settings).await?.partition.snapshot();
+        Ok(ivf
+            .posting_infos()
+            .iter()
+            .any(|(&id, info)| id > above && info.origin == PostingOrigin::Rebuild && info.state != PostingState::Retired))
     }
 }

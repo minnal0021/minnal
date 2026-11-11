@@ -116,7 +116,7 @@
 //! is:
 //!
 //! ```text
-//! body: [ns_id u32][seq u64][key_len u32][key][value_len u32][value]
+//! body: [ns_id 16 bytes big-endian][seq u64][key_len u32][key][value_len u32][value]
 //! ```
 //!
 //! A delete is a body whose `value_len` is `u32::MAX` and that has no value
@@ -125,6 +125,7 @@
 //! the bytes written.
 
 use crate::db::wal::segmented_log::{self, LogError, LogFormat, Progress, ProgressFile, SegmentedLog, segment_of};
+use crate::namespace::NamespaceId;
 use crate::support::metrics::Metrics;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -139,15 +140,15 @@ use thiserror::Error;
 /// Default segment size (64 MiB, as the main WAL).
 pub(crate) const DEFAULT_SEGMENT_SIZE: u32 = 64 * 1024 * 1024;
 
-/// This log's segments: magic `MVIW`, version 2 (bump it whenever the body
+/// This log's segments: magic `MVIW`, version 3 (bump it whenever the body
 /// layout changes).
 pub(crate) static FORMAT: LogFormat = LogFormat {
     name: "vector index WAL",
     magic: *b"MVIW",
-    version: 2,
+    version: 3,
 };
 /// The body's fixed fields: `ns_id`, `seq`, `key_len`, `value_len`.
-const BODY_FIXED_LEN: usize = 4 + 8 + 4 + 4;
+const BODY_FIXED_LEN: usize = 16 + 8 + 4 + 4;
 /// The `value_len` of a delete record, which has no value bytes.
 const DELETE_VALUE_LEN: u32 = u32::MAX;
 
@@ -185,7 +186,7 @@ pub type Result<T> = std::result::Result<T, VectorIndexWalError>;
 /// One record read from the log. Borrows the reader's buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordRef<'a> {
-    pub ns_id: u32,
+    pub ns_id: NamespaceId,
     pub seq: u64,
     pub key: &'a [u8],
     /// The value of a put; `None` for a delete.
@@ -204,10 +205,10 @@ fn decode_body(body: &[u8], at: u64) -> Result<RecordRef<'_>> {
     if body.len() < BODY_FIXED_LEN {
         return Err(bad());
     }
-    let ns_id = u32::from_le_bytes(body[0..4].try_into().unwrap());
-    let seq = u64::from_le_bytes(body[4..12].try_into().unwrap());
-    let key_len = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
-    let key_end = 16usize.checked_add(key_len).filter(|&e| e + 4 <= body.len()).ok_or_else(bad)?;
+    let ns_id = NamespaceId::from_bytes(body[0..16].try_into().unwrap());
+    let seq = u64::from_le_bytes(body[16..24].try_into().unwrap());
+    let key_len = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
+    let key_end = 28usize.checked_add(key_len).filter(|&e| e + 4 <= body.len()).ok_or_else(bad)?;
     let value_len = u32::from_le_bytes(body[key_end..key_end + 4].try_into().unwrap());
     let rest = &body[key_end + 4..];
     let value = match value_len {
@@ -218,7 +219,7 @@ fn decode_body(body: &[u8], at: u64) -> Result<RecordRef<'_>> {
     Ok(RecordRef {
         ns_id,
         seq,
-        key: &body[16..key_end],
+        key: &body[28..key_end],
         value,
     })
 }
@@ -341,7 +342,7 @@ pub(crate) struct VectorIndexWal {
     last_seq: AtomicU64,
     /// Appends not yet applied to a memtable: start → namespace. Registered
     /// under the append lock, before the log publishes the tail.
-    in_flight: Mutex<BTreeMap<u64, u32>>,
+    in_flight: Mutex<BTreeMap<u64, NamespaceId>>,
     /// Which namespaces are tracked, their latest records and their seals.
     /// Held briefly, never across I/O.
     tracking: Mutex<Tracking>,
@@ -365,18 +366,18 @@ struct Tracking {
     /// The end of each tracked namespace's latest record. A namespace is
     /// tracked from its first append (at open: from a record at or above where
     /// its replay starts).
-    last_write: HashMap<u32, u64>,
+    last_write: HashMap<NamespaceId, u64>,
     /// `(namespace, memtable version)` → the namespace's ceiling at the seal.
-    seals: BTreeMap<(u32, u64), PendingFlush>,
+    seals: BTreeMap<(NamespaceId, u64), PendingFlush>,
     /// Dropped namespaces. Ids are never reused, so these are never tracked
     /// again: a late append for one would otherwise hold the cut for good.
-    forgotten: HashSet<u32>,
+    forgotten: HashSet<NamespaceId>,
 }
 
 #[derive(Default)]
 struct Retirement {
     /// Every record of the namespace below here is in an SSTable (absent: 0).
-    safe: HashMap<u32, u64>,
+    safe: HashMap<NamespaceId, u64>,
     /// What the marker on disk says now.
     written: Progress,
 }
@@ -410,7 +411,7 @@ impl VectorIndexWal {
 
         let mut last_seq = 0u64;
         // Each namespace's last record end, to rebuild who holds the cut.
-        let mut last_write: HashMap<u32, u64> = HashMap::new();
+        let mut last_write: HashMap<NamespaceId, u64> = HashMap::new();
         let (log, report) = SegmentedLog::open(
             dir,
             &FORMAT,
@@ -431,8 +432,8 @@ impl VectorIndexWal {
         // holds the cut until a flush covers that record. Namespaces the marker
         // lists keep their safe offsets, so they are written again.
         let opened_progress = marker.unwrap_or_default();
-        let mut safe: HashMap<u32, u64> = opened_progress.safe.iter().copied().collect();
-        let mut tracked: HashMap<u32, u64> = HashMap::new();
+        let mut safe: HashMap<NamespaceId, u64> = opened_progress.safe.iter().copied().collect();
+        let mut tracked: HashMap<NamespaceId, u64> = HashMap::new();
         for (ns, end) in last_write {
             let from = opened_progress.replay_from(ns);
             if end > from {
@@ -479,17 +480,17 @@ impl VectorIndexWal {
     ///
     /// Records are in append order, which is not necessarily seq order: seqs
     /// are allocated before the append lock is taken.
-    pub(crate) fn append(&self, ns_id: u32, key: &[u8], value: &[u8], seq: u64) -> Result<LoggedWrite<'_>> {
+    pub(crate) fn append(&self, ns_id: NamespaceId, key: &[u8], value: &[u8], seq: u64) -> Result<LoggedWrite<'_>> {
         self.append_record(ns_id, key, Some(value), seq)
     }
 
     /// Appends a delete of `key`, like [`append`](Self::append).
-    pub(crate) fn append_delete(&self, ns_id: u32, key: &[u8], seq: u64) -> Result<LoggedWrite<'_>> {
+    pub(crate) fn append_delete(&self, ns_id: NamespaceId, key: &[u8], seq: u64) -> Result<LoggedWrite<'_>> {
         self.append_record(ns_id, key, None, seq)
     }
 
-    fn append_record(&self, ns_id: u32, key: &[u8], value: Option<&[u8]>, seq: u64) -> Result<LoggedWrite<'_>> {
-        let ns_bytes = ns_id.to_le_bytes();
+    fn append_record(&self, ns_id: NamespaceId, key: &[u8], value: Option<&[u8]>, seq: u64) -> Result<LoggedWrite<'_>> {
+        let ns_bytes = ns_id.to_bytes();
         let seq_bytes = seq.to_le_bytes();
         let key_len = (key.len() as u32).to_le_bytes();
         let value_len = value.map_or(DELETE_VALUE_LEN, |v| v.len() as u32).to_le_bytes();
@@ -538,7 +539,7 @@ impl VectorIndexWal {
     /// applied, so before this call, and is covered by the namespace's latest
     /// record. No I/O for a namespace that never appended, or whose records are
     /// all durable.
-    pub(crate) fn before_memtable_written(&self, ns: u32) -> Result<()> {
+    pub(crate) fn before_memtable_written(&self, ns: NamespaceId) -> Result<()> {
         let last = self.tracking.lock().last_write.get(&ns).copied();
         match last {
             Some(end) if end > self.log.durable() => {
@@ -596,7 +597,7 @@ impl VectorIndexWal {
     /// first, then `in_flight`: an append registers there before publishing
     /// its tail, so a record below the tail read is either still found in
     /// flight or already applied.
-    fn ceiling(&self, ns: Option<u32>) -> u64 {
+    fn ceiling(&self, ns: Option<NamespaceId>) -> u64 {
         let tail = self.log.tail();
         let in_flight = self.in_flight.lock();
         let oldest = match ns {
@@ -615,7 +616,7 @@ impl VectorIndexWal {
     /// `ns` sealed memtable `version`. Called under that memtable's write
     /// lock, so no record can be applied into the next memtable meanwhile.
     /// Takes only `tracking` and `in_flight`, never a lock held across I/O.
-    pub(crate) fn on_memtable_sealed(&self, ns: u32, version: u64) {
+    pub(crate) fn on_memtable_sealed(&self, ns: NamespaceId, version: u64) {
         let mut t = self.tracking.lock();
         if !t.last_write.contains_key(&ns) {
             return;
@@ -637,7 +638,7 @@ impl VectorIndexWal {
     /// A version with no seal record (the seal came before the namespace's
     /// first append, or before this log observed it) retires nothing but
     /// lets later versions fold past it; a later flush covers its records.
-    pub(crate) fn on_memtable_written(&self, ns: u32, version: u64) -> Result<()> {
+    pub(crate) fn on_memtable_written(&self, ns: NamespaceId, version: u64) -> Result<()> {
         let mut r = self.retirement.lock();
         // Under `retirement`, which serialises written events: nothing else
         // changes this namespace's seals meanwhile, except new seals of later
@@ -697,7 +698,7 @@ impl VectorIndexWal {
     /// recovery replayed them with no observer attached, then flushed those
     /// namespaces to L0 and fsynced their value logs. Writes the marker before
     /// returning; run at open, before anything can merge.
-    pub(crate) fn retire_replayed(&self, namespaces: &[u32]) -> Result<()> {
+    pub(crate) fn retire_replayed(&self, namespaces: &[NamespaceId]) -> Result<()> {
         let mut r = self.retirement.lock();
         // Nothing is in flight at open, so this is the tail.
         let tail = self.ceiling(None);
@@ -710,7 +711,7 @@ impl VectorIndexWal {
 
     /// Stop tracking a dropped namespace: it can never flush again, and replay
     /// skips its records. It is never tracked again.
-    pub(crate) fn forget_namespace(&self, ns: u32) {
+    pub(crate) fn forget_namespace(&self, ns: NamespaceId) {
         let mut r = self.retirement.lock();
         {
             let mut t = self.tracking.lock();
@@ -728,10 +729,10 @@ impl VectorIndexWal {
 
     /// Namespaces the log tracks (every one that has a record above where its
     /// replay starts or has appended since open), plus those the marker lists.
-    pub(crate) fn tracked_namespaces(&self) -> Vec<u32> {
+    pub(crate) fn tracked_namespaces(&self) -> Vec<NamespaceId> {
         let r = self.retirement.lock();
         let t = self.tracking.lock();
-        let mut ns: Vec<u32> = t.last_write.keys().chain(r.safe.keys()).copied().collect();
+        let mut ns: Vec<NamespaceId> = t.last_write.keys().chain(r.safe.keys()).copied().collect();
         ns.sort_unstable();
         ns.dedup();
         ns
@@ -739,8 +740,8 @@ impl VectorIndexWal {
 
     /// Namespaces with records no flush has covered yet, with their safe
     /// offsets.
-    fn holders(r: &Retirement, t: &Tracking) -> Vec<(u32, u64)> {
-        let mut h: Vec<(u32, u64)> = t
+    fn holders(r: &Retirement, t: &Tracking) -> Vec<(NamespaceId, u64)> {
+        let mut h: Vec<(NamespaceId, u64)> = t
             .last_write
             .iter()
             .filter_map(|(&ns, &last)| {
@@ -753,7 +754,7 @@ impl VectorIndexWal {
     }
 
     /// Namespaces with records no flush has covered yet.
-    pub(crate) fn namespaces_holding_cut(&self) -> Vec<u32> {
+    pub(crate) fn namespaces_holding_cut(&self) -> Vec<NamespaceId> {
         let r = self.retirement.lock();
         let t = self.tracking.lock();
         Self::holders(&r, &t).into_iter().map(|(ns, _)| ns).collect()
@@ -771,7 +772,7 @@ impl VectorIndexWal {
             Self::holders(r, &t).into_iter().map(|(_, safe)| safe).min()
         };
         let cut = slowest.map_or(ceiling, |s| s.min(ceiling)).max(self.retired_cut());
-        let mut safe: Vec<(u32, u64)> = r.safe.iter().filter(|(_, s)| **s > cut).map(|(n, s)| (*n, *s)).collect();
+        let mut safe: Vec<(NamespaceId, u64)> = r.safe.iter().filter(|(_, s)| **s > cut).map(|(n, s)| (*n, *s)).collect();
         safe.sort_unstable();
         let next = Progress { cut, safe };
         if next == r.written {
@@ -852,7 +853,7 @@ impl VectorIndexWal {
     }
 
     /// The log's state, naming namespaces with `name_of`.
-    pub(crate) fn stats(&self, name_of: impl Fn(u32) -> String) -> Result<VectorIndexWalStats> {
+    pub(crate) fn stats(&self, name_of: impl Fn(NamespaceId) -> String) -> Result<VectorIndexWalStats> {
         let holders = {
             let r = self.retirement.lock();
             let t = self.tracking.lock();

@@ -206,15 +206,24 @@ fn bench_wal_namespace_overhead(c: &mut Criterion) {
     {
         let value = value.clone();
         group.bench_function("ns_id_0", |b| {
-            b.iter_custom(|iters| time_appends(iters, BATCH, true, || WalEntry::new_upsert_ns(0, b"key_00001".to_vec(), value.clone())));
+            b.iter_custom(|iters| {
+                time_appends(iters, BATCH, true, || {
+                    WalEntry::new_upsert_ns(minnal_db::NamespaceId::DEFAULT, b"key_00001".to_vec(), value.clone())
+                })
+            });
         });
     }
 
-    // Append with a non-default namespace (id=42)
+    // Append with a non-default namespace (a random id, as a created one gets)
     {
         let value = value.clone();
-        group.bench_function("ns_id_42", |b| {
-            b.iter_custom(|iters| time_appends(iters, BATCH, true, || WalEntry::new_upsert_ns(42, b"key_00001".to_vec(), value.clone())));
+        let other = minnal_db::NamespaceId::random().unwrap();
+        group.bench_function("ns_id_other", |b| {
+            b.iter_custom(|iters| {
+                time_appends(iters, BATCH, true, || {
+                    WalEntry::new_upsert_ns(other, b"key_00001".to_vec(), value.clone())
+                })
+            });
         });
     }
 

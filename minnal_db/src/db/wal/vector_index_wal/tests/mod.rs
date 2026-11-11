@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::db::wal::segmented_log::{END_MARKER, END_MARKER_LEN, FRAME_HEADER_LEN, SEGMENT_HEADER_LEN, position, prep_path, segment_path, split};
+use crate::namespace::NamespaceId;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::Ordering::Relaxed;
@@ -15,7 +16,7 @@ fn header_bytes(segment_id: u64) -> [u8; SEGMENT_HEADER_LEN as usize] {
     segmented_log::header_bytes(&FORMAT, segment_id)
 }
 
-type Row = (u64, u32, u64, Vec<u8>, Option<Vec<u8>>);
+type Row = (u64, u128, u64, Vec<u8>, Option<Vec<u8>>);
 
 fn open_at(dir: &Path, segment_size: u32) -> (VectorIndexWal, OpenReport) {
     VectorIndexWal::open(dir, segment_size, Arc::new(Metrics::default())).unwrap()
@@ -24,7 +25,7 @@ fn open_at(dir: &Path, segment_size: u32) -> (VectorIndexWal, OpenReport) {
 fn rows_from(wal: &VectorIndexWal, start: u64) -> Vec<Row> {
     let mut rows = Vec::new();
     wal.for_each_from(start, |at, r| -> Result<()> {
-        rows.push((at, r.ns_id, r.seq, r.key.to_vec(), r.value.map(<[u8]>::to_vec)));
+        rows.push((at, r.ns_id.as_u128(), r.seq, r.key.to_vec(), r.value.map(<[u8]>::to_vec)));
         Ok(())
     })
     .unwrap();
@@ -42,13 +43,17 @@ fn value(i: u64) -> Vec<u8> {
 /// Appends records 0..n (ns `i % 3`, seq `i + 1`) and returns where each landed.
 fn append_n(wal: &VectorIndexWal, n: u64) -> Vec<Appended> {
     (0..n)
-        .map(|i| wal.append((i % 3) as u32, &key(i), &value(i), i + 1).unwrap().appended())
+        .map(|i| {
+            wal.append(NamespaceId::from_u128(u128::from(i % 3)), &key(i), &value(i), i + 1)
+                .unwrap()
+                .appended()
+        })
         .collect()
 }
 
 fn expected(appended: &[Appended], range: std::ops::Range<u64>) -> Vec<Row> {
     range
-        .map(|i| (appended[i as usize].start, (i % 3) as u32, i + 1, key(i), Some(value(i))))
+        .map(|i| (appended[i as usize].start, u128::from(i % 3), i + 1, key(i), Some(value(i))))
         .collect()
 }
 
@@ -83,6 +88,10 @@ fn reopen(dir: &Path, segment_size: u32) -> Result<(VectorIndexWal, OpenReport)>
 
 /// Frame length of the records `append_n` writes.
 const FRAME: u32 = FRAME_HEADER_LEN + BODY_FIXED_LEN as u32 + 8 + 40;
+
+/// A segment that holds exactly three of `append_n`'s records (and its end
+/// marker), so a few appends span several segments.
+const SMALL_SEGMENT: u32 = segmented_log::SEGMENT_HEADER_LEN + 3 * FRAME + segmented_log::END_MARKER_LEN;
 
 mod database;
 mod log;

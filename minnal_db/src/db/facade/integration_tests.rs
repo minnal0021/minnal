@@ -1,4 +1,5 @@
-//! Integration tests for the `Db` / `AsyncDb` facade.
+//! Integration tests for the `AsyncDb` facade, and for `Db`, the engine
+//! handle it wraps.
 //!
 //! Lives here rather than in `tests/` because it reaches internal configuration
 //! types.
@@ -321,24 +322,53 @@ mod tests {
         Ok(())
     }
 
-    /// A `Namespace` merge must stay inside its own keyspace.
-    #[test]
-    fn merge_is_scoped_to_its_namespace() -> Result<()> {
+    /// A namespace's merge must stay inside its own keyspace.
+    #[tokio::test]
+    async fn merge_is_scoped_to_its_namespace() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
 
-        db.put(b"k", b"default-value")?;
-        let orders = db.namespace("orders")?;
-        let written = orders.merge(b"k", b"ns-value", |existing, operand| {
-            assert_eq!(existing, None, "the namespace saw the default namespace's value");
-            Ok(Some(operand.to_vec()))
-        })?;
+        db.put(b"k".to_vec(), b"default-value".to_vec()).await?;
+        let orders = db.namespace("orders".to_string()).await?;
+        let written = orders
+            .merge(b"k".to_vec(), b"ns-value".to_vec(), |existing, operand| {
+                assert_eq!(existing, None, "the namespace saw the default namespace's value");
+                Ok(Some(operand.to_vec()))
+            })
+            .await?;
 
         assert_eq!(written, Some(b"ns-value".to_vec()));
-        assert_eq!(orders.get(b"k")?, Some(b"ns-value".to_vec()));
-        assert_eq!(db.get(b"k")?, Some(b"default-value".to_vec()));
+        assert_eq!(orders.get(b"k".to_vec()).await?, Some(b"ns-value".to_vec()));
+        assert_eq!(db.get(b"k".to_vec()).await?, Some(b"default-value".to_vec()));
 
-        db.shutdown()?;
+        db.shutdown().await?;
+        Ok(())
+    }
+
+    /// A namespace's no-WAL writes, `get_multiple` and `scan_prefixes_batch`.
+    #[tokio::test]
+    async fn a_namespace_has_batch_and_no_wal_operations() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
+        let ns = db.namespace("mirror".to_string()).await?;
+        let key = |prefix: u32, n: u8| {
+            let mut k = prefix.to_be_bytes().to_vec();
+            k.push(n);
+            k
+        };
+        ns.put_no_wal(key(7, 1), b"a".to_vec()).await?;
+        ns.put(key(7, 2), b"b".to_vec()).await?;
+        ns.put(key(9, 1), b"c".to_vec()).await?;
+        assert_eq!(
+            ns.get_multiple(vec![key(7, 1), key(8, 1), key(7, 1)]).await?,
+            vec![Some(b"a".to_vec()), None, Some(b"a".to_vec())]
+        );
+        let by_prefix = ns.scan_prefixes_batch(vec![7, 8]).await?;
+        assert_eq!(by_prefix.iter().filter(|(p, _, _)| *p == 7).count(), 2);
+        assert!(by_prefix.iter().all(|(p, _, _)| p == 7));
+        ns.delete_no_wal(key(7, 1)).await?;
+        assert_eq!(ns.get(key(7, 1)).await?, None);
+        db.shutdown().await?;
         Ok(())
     }
 
@@ -346,44 +376,16 @@ mod tests {
     /// be an archive of the requested type. It used unchecked access, so reading
     /// raw or differently-typed bytes followed archived pointers out of bounds —
     /// undefined behaviour from a safe function. Now it is an error.
-    /// The sync `Namespace` offers the same operations as `AsyncNamespace`
-    /// (it lacked the no-WAL writes, `get_multiple` and `scan_prefixes_batch`).
-    #[test]
-    fn sync_namespace_mirrors_the_async_batch_and_no_wal_operations() -> Result<()> {
+    #[tokio::test]
+    async fn get_typed_rejects_bytes_that_are_not_an_archive_of_that_type() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-        let ns = db.namespace("mirror")?;
-        let key = |prefix: u32, n: u8| {
-            let mut k = prefix.to_be_bytes().to_vec();
-            k.push(n);
-            k
-        };
-        ns.put_no_wal(&key(7, 1), b"a")?;
-        ns.put(&key(7, 2), b"b")?;
-        ns.put(&key(9, 1), b"c")?;
-        assert_eq!(
-            ns.get_multiple(&[key(7, 1), key(8, 1), key(7, 1)])?,
-            vec![Some(b"a".to_vec()), None, Some(b"a".to_vec())]
-        );
-        let by_prefix = ns.scan_prefixes_batch(&[7, 8])?;
-        assert_eq!(by_prefix.iter().filter(|(p, _, _)| *p == 7).count(), 2);
-        assert!(by_prefix.iter().all(|(p, _, _)| p == 7));
-        ns.delete_no_wal(&key(7, 1))?;
-        assert_eq!(ns.get(&key(7, 1))?, None);
-        db.shutdown()?;
-        Ok(())
-    }
-
-    #[test]
-    fn get_typed_rejects_bytes_that_are_not_an_archive_of_that_type() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
 
         // Too short to hold a `Tally`: unchecked access read past the buffer.
         let short_key = rkyv::to_bytes::<rkyv::rancor::Error>(&"short".to_string()).unwrap().to_vec();
-        db.put(&short_key, &[0x01, 0x02, 0x03])?;
+        db.put(short_key, vec![0x01, 0x02, 0x03]).await?;
         assert!(matches!(
-            db.get_typed::<String, Tally>(&"short".to_string()),
+            db.get_typed::<String, Tally>(&"short".to_string()).await,
             Err(KVError::Serialization(_))
         ));
 
@@ -397,83 +399,91 @@ mod tests {
         let at = bytes.windows(7).position(|w| w == b"a label").expect("label bytes in the archive");
         bytes[at] = 0xFF;
         let corrupt_key = rkyv::to_bytes::<rkyv::rancor::Error>(&"corrupt".to_string()).unwrap().to_vec();
-        db.put(&corrupt_key, &bytes)?;
+        db.put(corrupt_key, bytes).await?;
         assert!(matches!(
-            db.get_typed::<String, Tally>(&"corrupt".to_string()),
+            db.get_typed::<String, Tally>(&"corrupt".to_string()).await,
             Err(KVError::Serialization(_))
         ));
 
         // A value stored as one type, read back as another.
-        db.put_typed(&"n".to_string(), &7u8)?;
-        assert!(matches!(db.get_typed::<String, Tally>(&"n".to_string()), Err(KVError::Serialization(_))));
+        db.put_typed(&"n".to_string(), &7u8).await?;
+        assert!(matches!(
+            db.get_typed::<String, Tally>(&"n".to_string()).await,
+            Err(KVError::Serialization(_))
+        ));
 
         // A correctly typed value still round-trips.
         let tally = Tally {
             count: 3,
             label: "ok".to_string(),
         };
-        db.put_typed(&"t".to_string(), &tally)?;
-        assert_eq!(db.get_typed::<String, Tally>(&"t".to_string())?, Some(tally));
-        db.shutdown()?;
+        db.put_typed(&"t".to_string(), &tally).await?;
+        assert_eq!(db.get_typed::<String, Tally>(&"t".to_string()).await?, Some(tally));
+        db.shutdown().await?;
         Ok(())
     }
 
-    #[test]
-    fn merge_typed_accumulates_a_typed_value() -> Result<()> {
+    #[tokio::test]
+    async fn merge_typed_accumulates_a_typed_value() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
 
         let step = Tally {
             count: 4,
             label: "clicks".to_string(),
         };
-        let first: Option<Tally> = db.merge_typed(&"stats".to_string(), &step, |current, operand| {
-            assert!(current.is_none());
-            Ok(Some(operand))
-        })?;
+        let first: Option<Tally> = db
+            .merge_typed(&"stats".to_string(), &step, |current, operand| {
+                assert!(current.is_none());
+                Ok(Some(operand))
+            })
+            .await?;
         assert_eq!(first.unwrap().count, 4);
 
-        let second: Option<Tally> = db.merge_typed(&"stats".to_string(), &step, |current, operand| {
-            let current = current.expect("the stored tally should be visible");
-            Ok(Some(Tally {
-                count: current.count + operand.count,
-                label: current.label,
-            }))
-        })?;
+        let second: Option<Tally> = db
+            .merge_typed(&"stats".to_string(), &step, |current, operand| {
+                let current = current.expect("the stored tally should be visible");
+                Ok(Some(Tally {
+                    count: current.count + operand.count,
+                    label: current.label,
+                }))
+            })
+            .await?;
         let second = second.expect("merge_typed returns the new value");
         assert_eq!(second.count, 8);
         assert_eq!(second.label, "clicks");
 
         // And it is what actually landed in storage.
-        let stored: Option<Tally> = db.get_typed(&"stats".to_string())?;
+        let stored: Option<Tally> = db.get_typed(&"stats".to_string()).await?;
         assert_eq!(stored.unwrap().count, 8);
 
-        db.shutdown()?;
+        db.shutdown().await?;
         Ok(())
     }
 
-    #[test]
-    fn merge_typed_aborts_without_touching_the_stored_value() -> Result<()> {
+    #[tokio::test]
+    async fn merge_typed_aborts_without_touching_the_stored_value() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
+        let db = AsyncDb::open_with_config(temp_dir.path().to_path_buf(), create_db_config()).await?;
 
         let tally = Tally {
             count: 1,
             label: "clicks".to_string(),
         };
-        db.put_typed(&"stats".to_string(), &tally)?;
+        db.put_typed(&"stats".to_string(), &tally).await?;
 
         let err = db
             .merge_typed(&"stats".to_string(), &tally, |_current, _operand| -> Result<Option<Tally>> {
                 Err(KVError::MergeAborted("declined".into()))
             })
+            .await
             .unwrap_err();
         assert!(matches!(err, KVError::MergeAborted(_)), "unexpected error: {err:?}");
 
-        let stored: Option<Tally> = db.get_typed(&"stats".to_string())?;
+        let stored: Option<Tally> = db.get_typed(&"stats".to_string()).await?;
         assert_eq!(stored.unwrap().count, 1);
 
-        db.shutdown()?;
+        db.shutdown().await?;
         Ok(())
     }
 
@@ -559,428 +569,6 @@ mod tests {
         db.remove_namespace("ns".to_owned()).await.unwrap();
         assert!(db.existing_namespace("ns".to_owned()).await.unwrap().is_none());
         assert!(!registered(&db), "the lookup brought the namespace back");
-        db.shutdown().await.unwrap();
-
-        let temp_dir = TempDir::new().unwrap();
-        let db = Db::open_with_config(temp_dir.path(), create_db_config()).unwrap();
-        assert!(db.existing_namespace("ns").is_none());
-        db.namespace("ns").unwrap();
-        assert!(db.existing_namespace("ns").is_some());
-        db.remove_namespace("ns").unwrap();
-        assert!(db.existing_namespace("ns").is_none());
-    }
-}
-
-#[cfg(test)]
-mod iterator_tests {
-    use super::*;
-    use crate::db::facade::Db;
-    use tempfile::TempDir;
-
-    fn create_db_config() -> DbConfig {
-        let gc_interval = Duration::from_secs(5);
-        let wal_gc_interval = Duration::from_secs(5);
-        let lsm_compaction_interval = Duration::from_secs(5);
-
-        let sync_config = SyncConfig::default();
-        let threshold_config = ThresholdConfig::new(2.5);
-        let scheduled_task_config = ScheduledTaskConfig::new(gc_interval, wal_gc_interval, lsm_compaction_interval);
-        let lsm_config = LSMConfig::default();
-        let mut config = DbConfig::new(threshold_config, scheduled_task_config, sync_config, lsm_config);
-        config.num_buckets = crate::support::TEST_NUM_BUCKETS;
-        config
-    }
-
-    #[test]
-    fn test_iter_all() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        for i in 0..10 {
-            let key = format!("key{:02}", i).into_bytes();
-            let value = format!("value{}", i).into_bytes();
-            db.put(&key, &value)?;
-        }
-
-        assert_eq!(db.iter()?.len(), 10);
-        Ok(())
-    }
-
-    #[test]
-    fn test_prefix_scan() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"user:1", b"Alice")?;
-        db.put(b"user:2", b"Bob")?;
-        db.put(b"product:1", b"Laptop")?;
-
-        assert_eq!(db.scan_prefix(b"user:")?.len(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn shutdown_marks_db_as_closed() {
-        let temp_dir = TempDir::new().expect("failed to create temp dir");
-        let db = Db::open_with_config(temp_dir.path(), create_db_config()).expect("failed to open db");
-
-        db.put(b"key1", b"value1").expect("failed to put key1");
-        assert_eq!(db.get(b"key1").expect("Failed to get key1"), Some(b"value1".to_vec()));
-
-        db.shutdown().expect("Failed to close database");
-        assert!(db.is_closed());
-    }
-
-    #[test]
-    fn test_reopen_after_close() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().to_path_buf();
-
-        {
-            let db = Db::open_with_config(&path, create_db_config())?;
-            db.put(b"key1", b"value1")?;
-            db.put(b"key2", b"value2")?;
-            db.shutdown()?;
-        }
-
-        {
-            let db = Db::open_with_config(&path, create_db_config())?;
-            assert_eq!(db.get(b"key1")?, Some(b"value1".to_vec()));
-            assert_eq!(db.get(b"key2")?, Some(b"value2".to_vec()));
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_auto_close_on_drop() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let path = temp_dir.path().to_path_buf();
-
-        {
-            let db = Db::open_with_config(&path, create_db_config())?;
-            db.put(b"key1", b"value1")?;
-            db.shutdown()?;
-        }
-
-        let db = Db::open_with_config(&path, create_db_config())?;
-        assert_eq!(db.get(b"key1")?, Some(b"value1".to_vec()));
-
-        Ok(())
-    }
-
-    /// Regression: skip list used to reject u128 value 0 (encoding of
-    /// ShardedValuePointer { bucket: 0, page_offset: 0, segment_id: 0 }).
-    #[test]
-    fn test_zero_byte_values_roundtrip() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"key_zero", b"\x00")?;
-        assert_eq!(db.get(b"key_zero")?, Some(b"\x00".to_vec()));
-
-        db.put(b"key_leading_zero", b"\x00\x01\x02")?;
-        assert_eq!(db.get(b"key_leading_zero")?, Some(b"\x00\x01\x02".to_vec()));
-
-        db.put(b"key_all_zeros", b"\x00\x00\x00\x00")?;
-        assert_eq!(db.get(b"key_all_zeros")?, Some(b"\x00\x00\x00\x00".to_vec()));
-
-        db.put(b"ke\x00y", b"value_with_zero_key")?;
-        assert_eq!(db.get(b"ke\x00y")?, Some(b"value_with_zero_key".to_vec()));
-
-        db.put(b"key_zero", b"\x00\xff")?;
-        assert_eq!(db.get(b"key_zero")?, Some(b"\x00\xff".to_vec()));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_iter_returns_all_pairs_in_order() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"c", b"3")?;
-        db.put(b"a", b"1")?;
-        db.put(b"b", b"2")?;
-
-        let pairs = db.iter()?;
-        assert_eq!(pairs.len(), 3);
-        assert_eq!(pairs[0], (b"a".to_vec(), b"1".to_vec()));
-        assert_eq!(pairs[1], (b"b".to_vec(), b"2".to_vec()));
-        assert_eq!(pairs[2], (b"c".to_vec(), b"3".to_vec()));
-        Ok(())
-    }
-
-    #[test]
-    fn test_keys_iter_no_value_log_access() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"x", b"v1")?;
-        db.put(b"y", b"v2")?;
-        db.delete(b"x")?;
-
-        assert_eq!(db.keys()?, vec![b"y".to_vec()]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_values_iter() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"a", b"apple")?;
-        db.put(b"b", b"banana")?;
-
-        let vals: Vec<Vec<u8>> = db.iter()?.into_iter().map(|(_, v)| v).collect();
-        assert_eq!(vals.len(), 2);
-        assert!(vals.contains(&b"apple".to_vec()));
-        assert!(vals.contains(&b"banana".to_vec()));
-        Ok(())
-    }
-
-    #[test]
-    fn test_range_inclusive_start_exclusive_end() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        for ch in b'a'..=b'e' {
-            db.put(&[ch], &[ch])?;
-        }
-
-        let pairs = db.range(b"b", Some(b"d" as &[u8]))?;
-        let keys: Vec<_> = pairs.iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_range_no_upper_bound() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"a", b"1")?;
-        db.put(b"b", b"2")?;
-        db.put(b"c", b"3")?;
-
-        let pairs = db.range(b"b", None)?;
-        let keys: Vec<_> = pairs.iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
-        Ok(())
-    }
-
-    #[test]
-    fn test_scan_prefix_returns_only_matching_keys() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"user:alice", b"1")?;
-        db.put(b"user:bob", b"2")?;
-        db.put(b"order:1", b"3")?;
-
-        let pairs = db.scan_prefix(b"user:")?;
-        assert_eq!(pairs.len(), 2);
-        assert!(pairs.iter().all(|(k, _)| k.starts_with(b"user:")));
-        Ok(())
-    }
-
-    #[test]
-    fn test_scan_prefix_after_delete() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"doc:1", b"alpha")?;
-        db.put(b"doc:2", b"beta")?;
-        db.put(b"doc:3", b"gamma")?;
-        db.put(b"doc:4", b"delta")?;
-        db.put(b"other:1", b"unrelated")?;
-
-        let before = db.scan_prefix(b"doc:")?;
-        assert_eq!(before.len(), 4, "expected 4 doc: records before delete");
-        let keys_before: Vec<Vec<u8>> = before.iter().map(|(k, _)| k.clone()).collect();
-        assert!(keys_before.contains(&b"doc:1".to_vec()));
-        assert!(keys_before.contains(&b"doc:2".to_vec()));
-        assert!(keys_before.contains(&b"doc:3".to_vec()));
-        assert!(keys_before.contains(&b"doc:4".to_vec()));
-
-        db.delete(b"doc:2")?;
-
-        assert_eq!(db.get(b"doc:2")?, None);
-
-        let after = db.scan_prefix(b"doc:")?;
-        assert_eq!(after.len(), 3, "expected 3 doc: records after deleting doc:2, got {}", after.len());
-        let keys_after: Vec<Vec<u8>> = after.iter().map(|(k, _)| k.clone()).collect();
-        assert!(!keys_after.contains(&b"doc:2".to_vec()), "doc:2 should not appear after deletion");
-        assert!(keys_after.contains(&b"doc:1".to_vec()));
-        assert!(keys_after.contains(&b"doc:3".to_vec()));
-        assert!(keys_after.contains(&b"doc:4".to_vec()));
-
-        let val_1 = after.iter().find(|(k, _)| k == b"doc:1").map(|(_, v)| v.clone());
-        assert_eq!(val_1, Some(b"alpha".to_vec()));
-
-        assert_eq!(db.scan_prefix(b"other:")?.len(), 1);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_range_after_delete_excludes_deleted_keys() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        for ch in b'a'..=b'f' {
-            db.put(&[ch], &[ch])?;
-        }
-
-        db.delete(b"c")?;
-        db.delete(b"e")?;
-
-        let pairs = db.range(b"b", Some(b"f" as &[u8]))?;
-        let keys: Vec<_> = pairs.iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(keys, vec![b"b".to_vec(), b"d".to_vec()]);
-
-        let pairs2 = db.range(b"c", None)?;
-        let keys2: Vec<_> = pairs2.iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(keys2, vec![b"d".to_vec(), b"f".to_vec()]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_iter_after_delete_excludes_deleted_keys() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        db.put(b"keep", b"yes")?;
-        db.put(b"drop", b"no")?;
-        db.delete(b"drop")?;
-
-        let pairs = db.iter()?;
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].0, b"keep".to_vec());
-        Ok(())
-    }
-
-    #[test]
-    fn test_iter_empty_store() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
-
-        assert_eq!(db.iter()?.len(), 0);
-        assert_eq!(db.keys()?.len(), 0);
-        assert_eq!(db.range(b"a", Some(b"z" as &[u8]))?.len(), 0);
-        assert_eq!(db.scan_prefix(b"x")?.len(), 0);
-        Ok(())
-    }
-
-    /// A no-WAL write takes a sequence the WAL never records. After a crash the
-    /// counter recovered from the WAL alone restarted below a no-WAL value
-    /// already flushed to an SSTable, so every later write to that key lost to
-    /// the stale value under highest-sequence-wins. `KVStore::set_seq_counter`
-    /// now raises the counter above every stored sequence at open.
-    #[tokio::test]
-    async fn a_write_after_a_crash_beats_a_flushed_no_wal_value() {
-        let dir = TempDir::new().unwrap();
-        let open = || crate::db::facade::AsyncDb::open_with_config(dir.path().to_owned(), create_db_config());
-        let db = open().await.unwrap();
-        let ns = db.namespace("n".to_string()).await.unwrap();
-        ns.put(b"k".to_vec(), b"wal".to_vec()).await.unwrap();
-        // Push the sequence well past what the WAL has seen, without the WAL.
-        for i in 0..100u32 {
-            ns.put_no_wal(i.to_be_bytes().to_vec(), b"x".to_vec()).await.unwrap();
-        }
-        ns.put_no_wal(b"k".to_vec(), b"no-wal".to_vec()).await.unwrap();
-        db.flush_namespaces(vec!["n".to_string()]).await.unwrap();
-        drop(ns);
-        db.crash().await;
-
-        let db = open().await.unwrap();
-        let ns = db.namespace("n".to_string()).await.unwrap();
-        assert_eq!(ns.get(b"k".to_vec()).await.unwrap().as_deref(), Some(&b"no-wal"[..]));
-        ns.put(b"k".to_vec(), b"after".to_vec()).await.unwrap();
-        assert_eq!(
-            ns.get(b"k".to_vec()).await.unwrap().as_deref(),
-            Some(&b"after"[..]),
-            "a WAL put lost to the stale value"
-        );
-        ns.put_no_wal(b"k".to_vec(), b"after2".to_vec()).await.unwrap();
-        assert_eq!(ns.get(b"k".to_vec()).await.unwrap().as_deref(), Some(&b"after2"[..]));
-        ns.delete(b"k".to_vec()).await.unwrap();
-        assert_eq!(ns.get(b"k".to_vec()).await.unwrap(), None, "a delete lost to the stale value");
-        db.shutdown().await.unwrap();
-    }
-
-    /// The crash tests' simulated crash loses what a process kill loses: a
-    /// no-WAL write still in the memtable is gone, a WAL-backed one replays, and
-    /// a flushed no-WAL one stays. `KVStore`'s `Drop` used to flush every
-    /// memtable even after `crash()`, so no-WAL writes always survived and no
-    /// crash test could catch a missing barrier flush.
-    #[tokio::test]
-    async fn a_simulated_crash_loses_unflushed_no_wal_writes() {
-        let dir = TempDir::new().unwrap();
-        let open = || crate::db::facade::AsyncDb::open_with_config(dir.path().to_owned(), create_db_config());
-        let db = open().await.unwrap();
-        let ns = db.namespace("n".to_string()).await.unwrap();
-        ns.put_no_wal(b"flushed".to_vec(), b"1".to_vec()).await.unwrap();
-        db.flush_namespaces(vec!["n".to_string()]).await.unwrap();
-        ns.put(b"wal".to_vec(), b"1".to_vec()).await.unwrap();
-        ns.put_no_wal(b"memtable".to_vec(), b"1".to_vec()).await.unwrap();
-        drop(ns);
-        db.crash().await;
-
-        let db = open().await.unwrap();
-        let ns = db.namespace("n".to_string()).await.unwrap();
-        assert!(ns.get(b"flushed".to_vec()).await.unwrap().is_some());
-        assert!(ns.get(b"wal".to_vec()).await.unwrap().is_some());
-        assert_eq!(ns.get(b"memtable".to_vec()).await.unwrap(), None, "an unflushed no-WAL write survived");
-        db.shutdown().await.unwrap();
-    }
-
-    /// A database with its workers running, holding one written namespace.
-    #[cfg(target_os = "linux")]
-    async fn open_with_workers(dir: &std::path::Path) -> crate::db::facade::AsyncDb {
-        let config = create_db_config();
-        let db = crate::db::facade::AsyncDb::open_with_config(dir.to_owned(), config.clone())
-            .await
-            .unwrap();
-        db.enable_all_workers(&config).await.unwrap();
-        let ns = db.namespace("n".to_string()).await.unwrap();
-        ns.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
-        db.flush_namespaces(vec!["n".to_string()]).await.unwrap();
-        assert!(!crate::support::open_files_under(dir).is_empty(), "set-up: the database holds files");
-        db
-    }
-
-    /// However a database goes away, it closes every file. A leak here is what
-    /// runs a long-lived process, or a test binary, out of descriptors.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_database_closes_every_file_when_it_goes() {
-        let dir = TempDir::new().unwrap();
-        let db = open_with_workers(dir.path()).await;
-        db.shutdown().await.unwrap();
-        drop(db);
-        crate::support::assert_no_open_files_under(dir.path(), "after shutdown").await;
-
-        let dir = TempDir::new().unwrap();
-        drop(open_with_workers(dir.path()).await);
-        crate::support::assert_no_open_files_under(dir.path(), "dropped without shutdown").await;
-
-        let dir = TempDir::new().unwrap();
-        open_with_workers(dir.path()).await.crash().await;
-        crate::support::assert_no_open_files_under(dir.path(), "after a simulated crash").await;
-    }
-
-    /// Removing a namespace closes its files while the database stays open.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn removing_a_namespace_closes_its_files() {
-        let dir = TempDir::new().unwrap();
-        let db = open_with_workers(dir.path()).await;
-        let files = dir.path().join("ns_n");
-        assert!(!crate::support::open_files_under(&files).is_empty(), "set-up: the namespace holds files");
-        db.remove_namespace("n".to_string()).await.unwrap();
-        crate::support::assert_no_open_files_under(&files, "after remove_namespace").await;
         db.shutdown().await.unwrap();
     }
 }

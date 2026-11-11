@@ -2,6 +2,7 @@
 //! unflushed entries and moves the cut; `LsmFlushObserverHub` fans the events out.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 pub(super) struct WalFlushState {
     tail: u64,
@@ -47,13 +48,13 @@ pub(crate) struct WalPersistObserver {
     /// version 7 and namespace B's version 7 the same entry — A's flush would
     /// then satisfy B's pending record and advance the cut past B's
     /// un-flushed writes.
-    pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
+    pending: Arc<RwLock<BTreeMap<(NamespaceId, u64), WalFlushState>>>,
     /// The database's sequence counter, whose high-water mark every metadata
     /// save records: open reads the log only from the cut, and this covers the
     /// sequences below it.
     next_seq: Arc<AtomicU64>,
     /// Per-namespace flush progress — the input to the cut.
-    pub(super) ns_progress: RwLock<std::collections::HashMap<u32, NsFlushProgress>>,
+    pub(super) ns_progress: RwLock<std::collections::HashMap<NamespaceId, NsFlushProgress>>,
     /// Serialises every change to the saved progress and every save of the WAL
     /// metadata file, so two saves cannot land in the opposite order (older
     /// progress overwriting newer). Held across the file write; never taken
@@ -70,7 +71,7 @@ pub(crate) struct WalPersistObserver {
     /// replay, so an empty one holds nothing). Kept current by
     /// [`Self::fields_checkpointed`]; a field is added when it is activated and
     /// removed when it is deactivated or dropped, or its namespace is.
-    field_consumers: RwLock<BTreeMap<(u32, FieldId), Option<u64>>>,
+    field_consumers: RwLock<BTreeMap<(NamespaceId, FieldId), Option<u64>>>,
     /// Test hook: outcomes for the next metadata saves, `true` = fail.
     #[cfg(test)]
     save_failures: Mutex<std::collections::VecDeque<bool>>,
@@ -137,7 +138,7 @@ impl WalPersistObserver {
         wal: Arc<Wal>,
         wal_metadata: Arc<RwLock<WalMetadata>>,
         wal_metadata_path: PathBuf,
-        pending: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
+        pending: Arc<RwLock<BTreeMap<(NamespaceId, u64), WalFlushState>>>,
         next_seq: Arc<AtomicU64>,
     ) -> Self {
         Self {
@@ -214,7 +215,7 @@ impl WalPersistObserver {
     /// These are what hold the global watermark — and therefore WAL GC — back.
     /// A namespace that writes a little and then goes idle would pin the WAL
     /// indefinitely, so the WAL GC worker flushes them on its tick.
-    pub(crate) fn namespaces_with_unflushed(&self) -> Vec<u32> {
+    pub(crate) fn namespaces_with_unflushed(&self) -> Vec<NamespaceId> {
         self.ns_progress
             .read()
             .iter()
@@ -228,7 +229,7 @@ impl WalPersistObserver {
     /// This is what lets the watermark tell "namespace has nothing outstanding"
     /// apart from "namespace has not flushed yet": a namespace that never writes
     /// must not hold the watermark — and therefore WAL GC — back forever.
-    pub(crate) fn note_write(&self, namespace_id: u32, tail: u64) {
+    pub(crate) fn note_write(&self, namespace_id: NamespaceId, tail: u64) {
         let mut progress = self.ns_progress.write();
         let entry = progress.entry(namespace_id).or_default();
         entry.last_write_offset = entry.last_write_offset.max(tail);
@@ -236,12 +237,12 @@ impl WalPersistObserver {
 
     /// Field `(namespace_id, field_id)` is active and needs the WAL from
     /// `position` (see `field_consumers`).
-    pub(crate) fn add_field_consumer(&self, namespace_id: u32, field_id: FieldId, position: Option<u64>) {
+    pub(crate) fn add_field_consumer(&self, namespace_id: NamespaceId, field_id: FieldId, position: Option<u64>) {
         self.field_consumers.write().insert((namespace_id, field_id), position);
     }
 
     /// The field is no longer active: it stops holding the WAL.
-    pub(crate) fn remove_field_consumer(&self, namespace_id: u32, field_id: FieldId) {
+    pub(crate) fn remove_field_consumer(&self, namespace_id: NamespaceId, field_id: FieldId) {
         self.field_consumers.write().remove(&(namespace_id, field_id));
     }
 
@@ -249,7 +250,7 @@ impl WalPersistObserver {
     /// checkpoint marker at `position`. Reported only after the markers are on
     /// disk; reported early, WAL GC could delete a segment a crash would send
     /// the field back to. A field no longer active is not re-added.
-    pub(crate) fn fields_checkpointed(&self, fields: &[(u32, FieldId)], position: u64) {
+    pub(crate) fn fields_checkpointed(&self, fields: &[(NamespaceId, FieldId)], position: u64) {
         let mut consumers = self.field_consumers.write();
         for key in fields {
             if let Some(p) = consumers.get_mut(key) {
@@ -259,7 +260,7 @@ impl WalPersistObserver {
     }
 
     /// Every field consumer and its position.
-    pub(crate) fn field_consumers(&self) -> Vec<((u32, FieldId), Option<u64>)> {
+    pub(crate) fn field_consumers(&self) -> Vec<((NamespaceId, FieldId), Option<u64>)> {
         self.field_consumers.read().iter().map(|(&k, &v)| (k, v)).collect()
     }
 
@@ -277,7 +278,7 @@ impl WalPersistObserver {
     /// missing from the registry, which `remove_namespace` has already updated.
     /// The new cut is saved; a failed save only leaves the saved cut behind,
     /// which costs replay, not data.
-    pub(crate) fn forget_namespace(&self, namespace_id: u32) {
+    pub(crate) fn forget_namespace(&self, namespace_id: NamespaceId) {
         self.field_consumers.write().retain(|(ns, _), _| *ns != namespace_id);
         let _persist = self.persist_lock.lock();
         self.ns_progress.write().remove(&namespace_id);
@@ -309,7 +310,7 @@ impl WalPersistObserver {
     /// instant it removes a namespace, which is precisely when the set of
     /// namespaces reporting un-flushed writes can go empty while other
     /// namespaces are mid-write.
-    fn compute_cut(&self, progress: &std::collections::HashMap<u32, NsFlushProgress>) -> u64 {
+    fn compute_cut(&self, progress: &std::collections::HashMap<NamespaceId, NsFlushProgress>) -> u64 {
         let slowest = progress.values().filter(|p| p.has_unflushed()).map(|p| p.safe_offset).min();
         let ceiling = self.wal_cut_ceiling();
         let cut = match slowest {
@@ -321,9 +322,9 @@ impl WalPersistObserver {
 
     /// The metadata `progress` implies: the current metadata with its cut and
     /// per-namespace offsets replaced.
-    fn progress_snapshot(&self, progress: &std::collections::HashMap<u32, NsFlushProgress>) -> WalMetadata {
+    fn progress_snapshot(&self, progress: &std::collections::HashMap<NamespaceId, NsFlushProgress>) -> WalMetadata {
         let cut = self.compute_cut(progress);
-        let mut safe: Vec<(u32, u64)> = progress
+        let mut safe: Vec<(NamespaceId, u64)> = progress
             .iter()
             .filter(|(_, p)| p.safe_offset > cut)
             .map(|(&ns, p)| (ns, p.safe_offset))
@@ -346,7 +347,7 @@ impl WalPersistObserver {
     /// `persist_lock`. On a failed save nothing changes in memory: recovery and
     /// WAL GC read the in-memory `cut` / `safe`, and they must never act on
     /// progress that a crash could undo.
-    fn commit_progress(&self, progress: &std::collections::HashMap<u32, NsFlushProgress>) -> std::io::Result<()> {
+    fn commit_progress(&self, progress: &std::collections::HashMap<NamespaceId, NsFlushProgress>) -> std::io::Result<()> {
         let snapshot = self.progress_snapshot(progress);
         self.write_metadata(&snapshot)?;
         self.apply_progress(&snapshot);
@@ -401,7 +402,7 @@ impl WalPersistObserver {
         Ok(())
     }
 
-    pub(super) fn on_memtable_sealed_ns(&self, namespace_id: u32, version: u64) {
+    pub(super) fn on_memtable_sealed_ns(&self, namespace_id: NamespaceId, version: u64) {
         // The ceiling, not the raw tail. This record means "every WAL entry below
         // `tail` is in the memtable being sealed", and that is false for a write
         // whose apply has not landed yet: its apply will go into the *next*
@@ -428,7 +429,7 @@ impl WalPersistObserver {
     ///
     /// An error means the save failed: nothing changed, and the LSM undoes the
     /// flush (nothing registered, the memtable kept for a retry).
-    pub(super) fn prepare_written(&self, namespace_id: u32, version: u64) -> std::io::Result<PreparedProgress<'_>> {
+    pub(super) fn prepare_written(&self, namespace_id: NamespaceId, version: u64) -> std::io::Result<PreparedProgress<'_>> {
         // Same reasoning as the seal path, for a flush observed without a
         // preceding seal record.
         let ceiling = self.wal_cut_ceiling();
@@ -489,12 +490,12 @@ impl WalPersistObserver {
 pub(crate) struct PreparedProgress<'a> {
     observer: &'a WalPersistObserver,
     _guard: parking_lot::MutexGuard<'a, ()>,
-    namespace_id: u32,
+    namespace_id: NamespaceId,
     version: u64,
     /// The flush had no seal record before this event.
     fresh: bool,
     /// Pending seal records this flush completes, in version order.
-    folded: Vec<(u32, u64)>,
+    folded: Vec<(NamespaceId, u64)>,
     new_safe: u64,
     /// The metadata before this flush, re-saved by [`Self::abort`].
     previous: WalMetadata,
@@ -566,7 +567,7 @@ pub(super) fn wal_write_error(e: WalError) -> KVError {
 /// memtable versions, and those are allocated per store. Every namespace's hub
 /// reports to the vector index WAL; it ignores namespaces that never appended.
 pub(in crate::db) struct LsmFlushObserverHub {
-    namespace_id: u32,
+    namespace_id: NamespaceId,
     wal_observer: Arc<WalPersistObserver>,
     vector_index_wal: Arc<VectorIndexWal>,
     compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,
@@ -574,7 +575,7 @@ pub(in crate::db) struct LsmFlushObserverHub {
 
 impl LsmFlushObserverHub {
     pub(in crate::db) fn new(
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         wal_observer: Arc<WalPersistObserver>,
         vector_index_wal: Arc<VectorIndexWal>,
         compaction_trigger: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<LsmCompactionCommand>>>>,

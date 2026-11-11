@@ -509,30 +509,34 @@ data is no longer needed.
 To embed minnal in a Rust process, add the `minnal_db` crate and call it
 in-process — no server, no daemon. Capabilities are selected by cargo feature
 (`kv-store` default, `doc-store`, `semantic-search`), so you compile only what
-you use and the lean default pulls no vector dependencies.
+you use and the lean default pulls no vector dependencies. The API is async, on
+tokio, and opening a database starts its background workers (compaction, GC of
+the value log and both write-ahead logs, index checkpoints, TTL expiry).
 
 ```rust
-use minnal_db::Db;
+use minnal_db::AsyncDb;
 
-let db = Db::open("/tmp/mydb")?;
+let db = AsyncDb::open("/tmp/mydb").await?;
 
-db.put(b"hello", b"world")?;
-let val = db.get(b"hello")?;              // Some(b"world")
+db.put(b"hello".to_vec(), b"world".to_vec()).await?;
+let val = db.get(b"hello".to_vec()).await?;              // Some(b"world")
 
 // `merge` is the atomic read-modify-write `get` + `put` cannot give you:
 // it reads the key, runs your closure over (existing, operand), and writes
-// the result back as one step. Safe from any number of threads.
-let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
-    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-    let step = u64::from_le_bytes(operand.try_into().unwrap());
-    Ok(Some((current + step).to_le_bytes().to_vec()))
-})?;
+// the result back as one step. Safe from any number of tasks.
+let total = db
+    .merge(b"visits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
+        let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        let step = u64::from_le_bytes(operand.try_into().unwrap());
+        Ok(Some((current + step).to_le_bytes().to_vec()))
+    })
+    .await?;
 
 // Namespaces — each an isolated keyspace inside the same database
-let orders = db.namespace("orders")?;
-orders.put(b"o1", b"shipped")?;
+let orders = db.namespace("orders".to_string()).await?;
+orders.put(b"o1".to_vec(), b"shipped".to_vec()).await?;
 
-db.shutdown()?;
+db.shutdown().await?;
 ```
 
 The closure returns `Ok(Some(v))` to write, `Ok(None)` to delete the key, or

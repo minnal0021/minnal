@@ -36,7 +36,7 @@ Provides per-field bitmap indexes over document key-spaces and a predicate query
 
 ```
 INGEST (synchronous, on the write path)                    [minnal_doc_store → minnal_db]
-  Db::put(ns, key, value)
+  AsyncDb::put(ns, key, value)
     └─ KVStore::put_to_storage_inner                       (kv_store/writes.rs)
          1. WAL append + fsync          ← durability barrier (the DOC is durable here)
          2. value-log write → pointer; memtable insert
@@ -55,7 +55,7 @@ INGEST (synchronous, on the write path)                    [minnal_doc_store →
          (nothing touches the index files here unless the hard limit is crossed;
           after a crash the overlay is rebuilt by WAL replay from the checkpoint offset)
 
-CHECKPOINT (background, every 1.75 s by default / soft limit / backpressure / shutdown / Db::checkpoint_index)
+CHECKPOINT (background, every 1.75 s by default / soft limit / backpressure / shutdown / AsyncDb::checkpoint_index)
   IndexCheckpointWorker → Database::run_index_checkpoint   (database/)
     wal_tail = wal_cut_ceiling()           (below any in-flight write)
     flush every row map first (its marker before any field's)
@@ -132,7 +132,7 @@ The budget (`thresholds.index_overlay_soft_bytes` 32 MiB / `index_overlay_hard_b
 
 **Format version.** `BlobStore` `VERSION` is 2 (directory layout). A version-1 store fails `validate_open` with `InvalidData` and the field cannot activate — greenfield: delete the database (or the field's directory) and rebuild. There is no migration.
 
-`BlobStore::compact()` rebuilds the value region from live slots only, clears tombstones, and shrinks the file. `BlobStore::waste_ratio()` reports the reclaimable fraction (alignment padding counts as live). The checkpoint calls `DynFieldIndex::maybe_compact` per field when waste crosses `ThresholdConfig::index_blob_waste_threshold` (percent, default 50). `Db::checkpoint_index()` forces a flush+compaction on demand.
+`BlobStore::compact()` rebuilds the value region from live slots only, clears tombstones, and shrinks the file. `BlobStore::waste_ratio()` reports the reclaimable fraction (alignment padding counts as live). The checkpoint calls `DynFieldIndex::maybe_compact` per field when waste crosses `ThresholdConfig::index_blob_waste_threshold` (percent, default 50). `AsyncDb::checkpoint_index()` forces a flush+compaction on demand.
 
 **Backpressure is now a secondary valve.** The write path also reads `BlobStore::dead_bytes()` — an **O(1)** running count of reclaimable bytes (incremented by `set_slot`-replace / `remove_key`, reset by `compact`, seeded from `logical - live` at `open`), surfaced as `DynFieldIndex::reclaimable_dead_bytes()` — and fires `request_if_over_cap` at `thresholds.index_blob_backpressure_bytes` (default 64 MiB, 0 disables). Dead space now grows per spill, not per write, so this fires only when hard-limit spills pile up between checkpoints. Keep it an absolute **byte** cap, not a ratio: a field with one large, often-rewritten bitmap sits near 100% waste after a few spills, so a ratio trigger would fire nearly every write. **WAL replay at open** compacts inline on the same cap (and on the default cap when it is 0), because the checkpoint worker is not running yet and an unbounded replay can leave the database unopenable. See `db/workers/index_checkpoint.rs`.
 

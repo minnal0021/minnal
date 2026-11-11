@@ -46,7 +46,7 @@ impl DocStore {
     /// document holds.
     pub async fn put(&self, namespace: &str, id: DocId, doc: serde_json::Value) -> Result<(), DocStoreError> {
         debug!("put namespace='{}' id={:?}", namespace, id);
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let schema = self.load_schema(namespace)?;
         check_id_type(namespace, id, &schema)?;
         schema.validate_doc(&doc)?;
@@ -86,7 +86,7 @@ impl DocStore {
     /// indexes what the store holds: the document if it survived the no-WAL
     /// write, nothing if it did not.
     pub async fn put_no_wal(&self, namespace: &str, id: DocId, doc: serde_json::Value) -> Result<(), DocStoreError> {
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let schema = self.load_schema(namespace)?;
         check_id_type(namespace, id, &schema)?;
         schema.validate_doc(&doc)?;
@@ -126,7 +126,7 @@ impl DocStore {
     /// tombstone with the document, finds it still there, and re-embeds it.
     pub async fn delete(&self, namespace: &str, id: DocId) -> Result<(), DocStoreError> {
         debug!("delete namespace='{}' id={:?}", namespace, id);
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let key = id.to_bytes();
 
         #[cfg(feature = "semantic-search")]

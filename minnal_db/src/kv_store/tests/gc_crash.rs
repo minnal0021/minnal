@@ -1,6 +1,7 @@
 //! A crash at each step of GC, and value-log accounting after one.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 // ── GC race regression tests ──────────────────────────────────────────────
 //
@@ -35,7 +36,17 @@ fn stale_value_log_metadata_is_rebuilt_from_the_lsm_at_open() {
     cfg.num_buckets = 1;
     let value = vec![0x5Au8; 1024];
     let rec = crate::storage::value_log::ValueRecordHeader::record_len(b"k0".len(), value.len());
-    let open = || KVStore::open(0, "default", dir.path(), cfg.clone(), SyncConfig::default(), 1024 * 1024).unwrap();
+    let open = || {
+        KVStore::open(
+            NamespaceId::from_u128(0),
+            "default",
+            dir.path(),
+            cfg.clone(),
+            SyncConfig::default(),
+            1024 * 1024,
+        )
+        .unwrap()
+    };
 
     let metadata = dir.path().join("value_logs").join("value_log_0.metadata");
     let saved = {
@@ -78,7 +89,15 @@ fn test_gc_crash_between_repoint_and_unlink_loses_nothing() {
     let value = vec![0xC3u8; 8 * 1024];
 
     let pending = {
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        let store = KVStore::open(
+            NamespaceId::from_u128(0),
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            segment_size,
+        )
+        .unwrap();
         for i in 0..12 {
             store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
         }
@@ -118,7 +137,15 @@ fn test_gc_crash_between_repoint_and_unlink_loses_nothing() {
     // Reopen. The re-point may have been lost with the memtable, in which case the
     // keys still point at the OLD segments — which is exactly why they must not have
     // been unlinked. Either way every value must still read back.
-    let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u128(0),
+        "default",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        segment_size,
+    )
+    .unwrap();
     for i in 0..12 {
         assert_eq!(
             store.get(format!("k{i}").as_bytes()).unwrap(),
@@ -145,7 +172,15 @@ fn test_gc_crash_the_instant_segments_are_unlinked_loses_nothing() {
     let value = vec![0xE5u8; 8 * 1024];
 
     {
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        let store = KVStore::open(
+            NamespaceId::from_u128(0),
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            segment_size,
+        )
+        .unwrap();
         for i in 0..12 {
             store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
         }
@@ -162,7 +197,15 @@ fn test_gc_crash_the_instant_segments_are_unlinked_loses_nothing() {
         store.crash();
     }
 
-    let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u128(0),
+        "default",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        segment_size,
+    )
+    .unwrap();
     for i in 0..12 {
         assert_eq!(
             store.get(format!("k{i}").as_bytes()).unwrap(),
@@ -183,7 +226,15 @@ fn test_gc_survives_a_crash_immediately_after_the_pass() {
     let value = vec![0xD4u8; 8 * 1024];
 
     {
-        let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+        let store = KVStore::open(
+            NamespaceId::from_u128(0),
+            "default",
+            dir.path(),
+            default_lsm_config(),
+            SyncConfig::default(),
+            segment_size,
+        )
+        .unwrap();
         for i in 0..12 {
             store.put_to_storage(format!("k{i}").as_bytes(), &value).unwrap();
         }
@@ -197,7 +248,15 @@ fn test_gc_survives_a_crash_immediately_after_the_pass() {
         store.crash();
     }
 
-    let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::default(), segment_size).unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u128(0),
+        "default",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        segment_size,
+    )
+    .unwrap();
     for i in 0..12 {
         assert_eq!(
             store.get(format!("k{i}").as_bytes()).unwrap(),
@@ -215,7 +274,15 @@ fn test_gc_survives_a_crash_immediately_after_the_pass() {
 #[test]
 fn test_gc_makes_its_relocated_copies_durable() {
     let dir = TempDir::new().unwrap();
-    let store = KVStore::open(0, "default", dir.path(), default_lsm_config(), SyncConfig::new(0), 64 * 1024).unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u128(0),
+        "default",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::new(0),
+        64 * 1024,
+    )
+    .unwrap();
     for round in 0..4u8 {
         for i in 0u32..200 {
             store.put_to_storage(&format!("key:{i:04}").into_bytes(), &[round; 300]).unwrap();

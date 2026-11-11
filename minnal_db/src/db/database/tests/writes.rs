@@ -1,6 +1,7 @@
 //! Writes and their bookkeeping: size limits, sequences, retries, value-log accounting and stats.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 #[test]
 fn check_total_len_rejects_over_limit() {
@@ -288,7 +289,7 @@ fn test_apply_with_retry_succeeds_after_transient_failure() {
     use std::cell::Cell;
 
     let attempts = Cell::new(0);
-    Database::apply_with_retry("put", 0, b"k", 1, || {
+    Database::apply_with_retry("put", NamespaceId::from_u128(0), b"k", 1, || {
         attempts.set(attempts.get() + 1);
         // Fail on the first attempt, succeed on the second.
         if attempts.get() < 2 { Err(KVError::KeyNotFound) } else { Ok(()) }
@@ -303,7 +304,7 @@ fn test_apply_with_retry_gives_up_after_max_attempts() {
     use std::cell::Cell;
 
     let attempts = Cell::new(0);
-    Database::apply_with_retry("put", 0, b"k", 1, || {
+    Database::apply_with_retry("put", NamespaceId::from_u128(0), b"k", 1, || {
         attempts.set(attempts.get() + 1);
         Err(KVError::KeyNotFound)
     });

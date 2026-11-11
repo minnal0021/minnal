@@ -34,7 +34,7 @@ impl DocStore {
     /// [`kv_put_no_wal`](Self::kv_put_no_wal); `skip_wal` selects the value-write
     /// durability path.
     async fn kv_put_inner(&self, namespace: &str, key: &serde_json::Value, value: &serde_json::Value, skip_wal: bool) -> Result<(), DocStoreError> {
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let schema = self.load_kv_schema(namespace)?;
         let key_bytes = schema.key_type.serialize_key(key)?;
         let value_bytes = schema.value_type.serialize_value(value)?;
@@ -106,7 +106,7 @@ impl DocStore {
     /// tombstone, never an orphaned vector. The worker compares the tombstone with
     /// the store, finds the value still there, and re-embeds it.
     pub async fn kv_delete(&self, namespace: &str, raw_key: &str) -> Result<(), DocStoreError> {
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let schema = self.load_kv_schema(namespace)?;
         let key_bytes = schema.key_type.serialize_key_from_str(raw_key)?;
 

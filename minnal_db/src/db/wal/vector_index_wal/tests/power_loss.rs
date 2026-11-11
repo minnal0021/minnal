@@ -1,6 +1,7 @@
 //! Power loss: what an fsync covered survives, and nothing else counts.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 /// `lose_unsynced` and the power-loss image cut each segment at what an
 /// fsync covered, not at the durable tail: an append that no sync covered
@@ -8,17 +9,17 @@ use super::*;
 #[test]
 fn a_power_loss_keeps_exactly_what_an_fsync_covered() {
     let dir = TempDir::new().unwrap();
-    let (wal, _) = open_at(dir.path(), 256);
+    let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
     let appended = append_n(&wal, 4); // segment 0 sealed (fsynced) with 3
     wal.sync().unwrap();
-    let lost = wal.append(1, &key(50), &value(50), 51).unwrap().appended();
+    let lost = wal.append(NamespaceId::from_u128(1), &key(50), &value(50), 51).unwrap().appended();
     assert!(!wal.covered(lost.end));
     wal.lose_unsynced();
     drop(wal);
-    let (wal, report) = reopen(dir.path(), 256).unwrap();
+    let (wal, report) = reopen(dir.path(), SMALL_SEGMENT).unwrap();
     assert_eq!(report.tail, lost.start);
     assert_eq!(rows_from(&wal, 0), expected(&appended, 0..4));
-    assert!(wal.segments().unwrap().iter().all(|&(_, len)| len == 256));
+    assert!(wal.segments().unwrap().iter().all(|&(_, len)| len == u64::from(SMALL_SEGMENT)));
 }
 
 /// Writers append same-size records and sync from several threads, on
@@ -49,7 +50,7 @@ fn vector_wal_power_loss_round(seed: u64) {
 
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), SEGMENT);
-    let appended: Mutex<BTreeMap<u64, (u32, u64)>> = Mutex::new(BTreeMap::new());
+    let appended: Mutex<BTreeMap<u64, (NamespaceId, u64)>> = Mutex::new(BTreeMap::new());
     let synced: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     let synced_at_loss: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     let next_seq = AtomicU64::new(1);
@@ -66,8 +67,10 @@ fn vector_wal_power_loss_round(seed: u64) {
                     let mut mine = Vec::new();
                     for _ in 0..1 + rng.below(12) {
                         let seq = next_seq.fetch_add(1, Ordering::SeqCst);
-                        let at = wal.append(w as u32, &rec_key(seq), &rec_value(seq), seq).unwrap();
-                        appended.lock().insert(at.start, (w as u32, seq));
+                        let at = wal
+                            .append(NamespaceId::from_u128(u128::from(w as u32)), &rec_key(seq), &rec_value(seq), seq)
+                            .unwrap();
+                        appended.lock().insert(at.start, (NamespaceId::from_u128(w as u128), seq));
                         mine.push(at.start);
                     }
                     wal.sync().unwrap();
@@ -125,7 +128,7 @@ fn vector_wal_power_loss_round(seed: u64) {
     for (at, ns, seq, key, value) in &rows {
         assert_eq!(
             appended.get(at),
-            Some(&(*ns, *seq)),
+            Some(&(NamespaceId::from_u128(*ns), *seq)),
             "seed {seed}: a record at {at:#x} that was never appended there"
         );
         assert_eq!(
@@ -144,7 +147,10 @@ fn vector_wal_power_loss_round(seed: u64) {
     let first = appended.values().map(|v| v.1).max().unwrap_or(0) + 1;
     let mut want = rows;
     for seq in first..first + 1 + rng.below(200) {
-        let at = wal.append(7, &rec_key(seq), &rec_value(seq), seq).unwrap().appended();
+        let at = wal
+            .append(NamespaceId::from_u128(7), &rec_key(seq), &rec_value(seq), seq)
+            .unwrap()
+            .appended();
         want.push((at.start, 7, seq, rec_key(seq), Some(rec_value(seq))));
     }
     wal.sync().unwrap();
@@ -184,7 +190,8 @@ fn measure_batch_sync_latency() {
     let mut batch = |wal: &VectorIndexWal| {
         for _ in 0..8 {
             seq += 1;
-            wal.append(1, format!("k{seq:09}").as_bytes(), &value, seq).unwrap();
+            wal.append(NamespaceId::from_u128(1), format!("k{seq:09}").as_bytes(), &value, seq)
+                .unwrap();
         }
         wal.sync().unwrap();
     };

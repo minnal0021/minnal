@@ -2,7 +2,8 @@
 //!
 //! Every schema the doc store reads comes from `SchemaStore`, and nothing else
 //! touches `system_schema`. The key is the store's name and the value its schema
-//! as JSON (the same JSON export and import use).
+//! as JSON (the same JSON export and import use), plus the store's lifecycle
+//! state under a `"state"` key ([`NamespaceState`]).
 //!
 //! **Writes are write-through and serialised.** Each write takes `writer`,
 //! persists the schema (a WAL-backed put or delete, durable on return), then
@@ -12,6 +13,7 @@
 //! concurrent update. Readers clone an `Arc` under the read lock and never wait
 //! for an fsync. `writer` is never held across an `.await`.
 
+use crate::namespace::NamespaceId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,6 +23,8 @@ use crate::doc_store::error::{DocStoreError, SchemaError};
 #[cfg(feature = "semantic-search")]
 use crate::doc_store::schema::vector_settings::VectorIndexSettings;
 use crate::doc_store::schema::{DocStoreSchema, KvStoreSchema, StoreType, peek_store_type};
+use crate::doc_store::{StoreWrites, WriteGuard};
+use crate::namespace_lifecycle::NamespaceState;
 use crate::{AsyncDb, AsyncNamespace};
 
 /// The system namespace that holds every store's schema.
@@ -53,7 +57,7 @@ impl StoredSchema {
     }
 
     /// The store's namespace id, once it has one.
-    pub fn ns_id(&self) -> Option<u32> {
+    pub fn ns_id(&self) -> Option<NamespaceId> {
         match self {
             Self::Doc(s) => s.ns_id,
             Self::Kv(s) => s.ns_id,
@@ -76,20 +80,37 @@ impl StoredSchema {
         }
     }
 
-    fn to_json(&self) -> Result<Vec<u8>, SchemaError> {
+    /// The schema as JSON.
+    pub(crate) fn to_value(&self) -> Result<serde_json::Value, SchemaError> {
         Ok(match self {
-            Self::Doc(s) => serde_json::to_vec_pretty(&**s)?,
-            Self::Kv(s) => serde_json::to_vec_pretty(&**s)?,
+            Self::Doc(s) => serde_json::to_value(&**s)?,
+            Self::Kv(s) => serde_json::to_value(&**s)?,
         })
     }
 
-    /// Parse a stored schema; `store_type` says which kind it is.
-    fn from_json(bytes: &[u8]) -> Result<Self, SchemaError> {
+    /// The stored record: the schema's JSON with the store's state beside it.
+    fn to_record(&self, state: NamespaceState) -> Result<Vec<u8>, SchemaError> {
+        let mut value = self.to_value()?;
+        if let serde_json::Value::Object(map) = &mut value {
+            map.insert(NamespaceState::KEY.to_owned(), serde_json::to_value(state)?);
+        }
+        Ok(serde_json::to_vec_pretty(&value)?)
+    }
+
+    /// Parse a stored record; `store_type` says which kind it is. A record
+    /// without a state is a created store.
+    fn from_record(bytes: &[u8]) -> Result<(Self, NamespaceState), SchemaError> {
         let json = String::from_utf8_lossy(bytes);
-        Ok(match peek_store_type(&json) {
-            Some(StoreType::Kv) => Self::Kv(Arc::new(serde_json::from_str(&json)?)),
-            _ => Self::Doc(Arc::new(serde_json::from_str(&json)?)),
-        })
+        let mut value: serde_json::Value = serde_json::from_str(&json)?;
+        let state = match value.as_object_mut().and_then(|m| m.remove(NamespaceState::KEY)) {
+            Some(s) => serde_json::from_value(s)?,
+            None => NamespaceState::Created,
+        };
+        let schema = match peek_store_type(&json) {
+            Some(StoreType::Kv) => Self::Kv(Arc::new(serde_json::from_value(value)?)),
+            _ => Self::Doc(Arc::new(serde_json::from_value(value)?)),
+        };
+        Ok((schema, state))
     }
 }
 
@@ -99,16 +120,22 @@ impl StoredSchema {
 #[derive(Debug)]
 struct Entry {
     schema: StoredSchema,
+    state: NamespaceState,
+    /// The store's writes in progress: one for the store's lifetime, carried
+    /// from entry to entry (see `write_gate`).
+    writes: Arc<StoreWrites>,
     #[cfg(feature = "semantic-search")]
     vector: Option<VectorIndexSettings>,
 }
 
 impl Entry {
-    fn new(schema: StoredSchema) -> Arc<Self> {
+    fn new(schema: StoredSchema, state: NamespaceState, writes: Arc<StoreWrites>) -> Arc<Self> {
         Arc::new(Self {
             #[cfg(feature = "semantic-search")]
             vector: schema.vector_settings().ok(),
             schema,
+            state,
+            writes,
         })
     }
 }
@@ -130,13 +157,13 @@ impl SchemaStore {
         let mut map = HashMap::new();
         for (key, value) in ns.scan_prefix(Vec::new()).await? {
             let name = String::from_utf8_lossy(&key).into_owned();
-            let schema = StoredSchema::from_json(&value).map_err(|e| {
+            let (schema, state) = StoredSchema::from_record(&value).map_err(|e| {
                 DocStoreError::Schema(SchemaError::Corrupt {
                     namespace: name.clone(),
                     reason: e.to_string(),
                 })
             })?;
-            map.insert(name, Entry::new(schema));
+            map.insert(name, Entry::new(schema, state, Arc::default()));
         }
         Ok(Self {
             ns,
@@ -188,6 +215,50 @@ impl SchemaStore {
         }
     }
 
+    /// A store's lifecycle state; `None` if there is no such store.
+    pub(crate) fn state(&self, namespace: &str) -> Option<NamespaceState> {
+        self.entry(namespace).map(|e| e.state)
+    }
+
+    /// `Ok` if the store exists and takes requests (it is created); otherwise
+    /// `NotFound`, `StoreCreating` or `StoreDeleting`.
+    pub(crate) fn admit(&self, namespace: &str) -> Result<(), DocStoreError> {
+        self.state(namespace)
+            .ok_or_else(|| Self::not_found(namespace))?
+            .admit(namespace)
+            .map_err(Into::into)
+    }
+
+    /// Start a write to `namespace`, counted until the guard drops: refused
+    /// unless the store takes requests (`NotFound`, `StoreCreating`,
+    /// `StoreDeleting`). Counted first, then the state checked, so a drop
+    /// that moves the store on sees the write or the write sees the drop
+    /// (see `write_gate`).
+    pub(crate) fn enter_write(&self, namespace: &str) -> Result<WriteGuard, DocStoreError> {
+        let entry = self.entry(namespace).ok_or_else(|| Self::not_found(namespace))?;
+        let guard = entry.writes.enter();
+        match self.entry(namespace) {
+            // The same store (not one dropped and created again meanwhile).
+            Some(now) if Arc::ptr_eq(&now.writes, &entry.writes) => {
+                now.state.admit(namespace)?;
+                Ok(guard)
+            }
+            _ => Err(Self::not_found(namespace)),
+        }
+    }
+
+    /// `namespace`'s writes in progress, for a drop to wait out.
+    pub(crate) fn writes(&self, namespace: &str) -> Option<Arc<StoreWrites>> {
+        self.entry(namespace).map(|e| Arc::clone(&e.writes))
+    }
+
+    /// Every store's name and state, sorted by name.
+    pub(crate) fn states(&self) -> Vec<(String, NamespaceState)> {
+        let mut all: Vec<(String, NamespaceState)> = self.map.read().iter().map(|(n, e)| (n.clone(), e.state)).collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
+
     /// Whether a store of this name exists.
     pub(crate) fn contains(&self, namespace: &str) -> bool {
         self.map.read().contains_key(namespace)
@@ -225,7 +296,7 @@ impl SchemaStore {
     /// A store's resolved vector-index settings and namespace id, whichever kind
     /// of store it is.
     #[cfg(feature = "semantic-search")]
-    pub(crate) fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, u32), DocStoreError> {
+    pub(crate) fn vector_settings(&self, namespace: &str) -> Result<(VectorIndexSettings, NamespaceId), DocStoreError> {
         let entry = self.entry(namespace).ok_or_else(|| {
             DocStoreError::Schema(SchemaError::NotFound {
                 namespace: namespace.to_owned(),
@@ -255,24 +326,48 @@ impl SchemaStore {
         }
     }
 
-    /// Persist `schema` under its name and cache it. Caller holds `writer`.
-    fn persist(&self, schema: StoredSchema) -> Result<(), DocStoreError> {
+    /// Persist `schema` under its name in `state` and cache it. Caller holds
+    /// `writer`.
+    fn persist(&self, schema: StoredSchema, state: NamespaceState) -> Result<(), DocStoreError> {
         let name = schema.namespace().to_owned();
-        let json = schema.to_json()?;
+        let json = schema.to_record(state)?;
         crate::support::run_blocking_pass(|| self.ns.put_blocking(name.as_bytes(), &json))?;
-        self.map.write().insert(name, Entry::new(schema));
+        let writes = self.entry(&name).map_or_else(Arc::default, |e| Arc::clone(&e.writes));
+        self.map.write().insert(name, Entry::new(schema, state, writes));
         Ok(())
     }
 
-    /// Save a new store's schema. `AlreadyExists` if the name is taken.
-    pub(crate) fn insert(&self, schema: StoredSchema) -> Result<(), DocStoreError> {
+    /// Save a new store's schema in `state`. `AlreadyExists` if the name is
+    /// taken, whatever state its store is in.
+    pub(crate) fn insert(&self, schema: StoredSchema, state: NamespaceState) -> Result<(), DocStoreError> {
         let _w = self.writer.lock();
-        if self.contains(schema.namespace()) {
-            return Err(DocStoreError::AlreadyExists {
-                namespace: schema.namespace().to_owned(),
+        if let Some(current) = self.state(schema.namespace()) {
+            let namespace = schema.namespace().to_owned();
+            return Err(match current {
+                NamespaceState::Deleting => DocStoreError::StoreDeleting { namespace },
+                _ => DocStoreError::AlreadyExists { namespace },
             });
         }
-        self.persist(schema)
+        self.persist(schema, state)
+    }
+
+    /// Move a store from one of `from` to `to`, durably. Under the writer lock,
+    /// so two callers cannot both make the same move (two drops of one store:
+    /// the second finds it `Deleting`). A store in another state gets the
+    /// refusal of that state (`StoreCreating`, `StoreDeleting`, and
+    /// `StoreInMaintenance` for a drop of a store with jobs running), else
+    /// `InvalidTransition`; `NotFound` if there is none. Returns the state it
+    /// was in; a move to the state it is in writes nothing.
+    pub(crate) fn transition(&self, namespace: &str, from: &[NamespaceState], to: NamespaceState) -> Result<NamespaceState, DocStoreError> {
+        let _w = self.writer.lock();
+        let entry = self.entry(namespace).ok_or_else(|| Self::not_found(namespace))?;
+        if !from.contains(&entry.state) {
+            return Err(entry.state.refusal(namespace, to).into());
+        }
+        if entry.state != to {
+            self.persist(entry.schema.clone(), to)?;
+        }
+        Ok(entry.state)
     }
 
     /// Change a document store's schema with `f`, atomically with respect to
@@ -280,9 +375,10 @@ impl SchemaStore {
     pub(crate) fn update_doc<R>(&self, namespace: &str, f: impl FnOnce(&mut DocStoreSchema) -> Result<R, DocStoreError>) -> Result<R, DocStoreError> {
         let _w = self.writer.lock();
         let current = self.doc(namespace)?;
+        let state = self.state(namespace).unwrap_or(NamespaceState::Created);
         let mut schema = DocStoreSchema::clone(&current);
         let out = f(&mut schema)?;
-        self.persist(StoredSchema::Doc(Arc::new(schema)))?;
+        self.persist(StoredSchema::Doc(Arc::new(schema)), state)?;
         Ok(out)
     }
 
@@ -290,9 +386,10 @@ impl SchemaStore {
     pub(crate) fn update_kv<R>(&self, namespace: &str, f: impl FnOnce(&mut KvStoreSchema) -> Result<R, DocStoreError>) -> Result<R, DocStoreError> {
         let _w = self.writer.lock();
         let current = self.kv(namespace)?;
+        let state = self.state(namespace).unwrap_or(NamespaceState::Created);
         let mut schema = KvStoreSchema::clone(&current);
         let out = f(&mut schema)?;
-        self.persist(StoredSchema::Kv(Arc::new(schema)))?;
+        self.persist(StoredSchema::Kv(Arc::new(schema)), state)?;
         Ok(out)
     }
 
@@ -315,7 +412,7 @@ mod tests {
         StoredSchema::Doc(Arc::new(DocStoreSchema {
             store_type: StoreType::Doc,
             namespace: name.to_owned(),
-            ns_id: Some(7),
+            ns_id: Some(NamespaceId::from_u128(7)),
             key_type: KeyType::U64,
             indices: vec![],
             attributes: vec![],
@@ -329,7 +426,7 @@ mod tests {
         StoredSchema::Kv(Arc::new(KvStoreSchema {
             store_type: StoreType::Kv,
             namespace: name.to_owned(),
-            ns_id: Some(8),
+            ns_id: Some(NamespaceId::from_u128(8)),
             key_type: KvKeyType::Str,
             value_type: KvValueType::Str,
             semantic_search_enabled: false,
@@ -351,9 +448,9 @@ mod tests {
         {
             let db = open_db(dir.path()).await;
             let schemas = SchemaStore::open(&db).await.unwrap();
-            schemas.insert(doc("docs")).unwrap();
-            schemas.insert(kv("tokens")).unwrap();
-            schemas.insert(doc("gone")).unwrap();
+            schemas.insert(doc("docs"), NamespaceState::Created).unwrap();
+            schemas.insert(kv("tokens"), NamespaceState::Created).unwrap();
+            schemas.insert(doc("gone"), NamespaceState::Created).unwrap();
             schemas
                 .update_doc("docs", |s| {
                     s.embedding_fields.push("text".into());
@@ -373,14 +470,104 @@ mod tests {
         db.shutdown().await.unwrap();
     }
 
+    /// A write is admitted only while its store takes requests, is counted
+    /// across schema changes, and a store dropped and created again under its
+    /// name starts a count of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writes_are_counted_per_store_and_refused_once_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path()).await;
+        let schemas = SchemaStore::open(&db).await.unwrap();
+        schemas.insert(doc("docs"), NamespaceState::Created).unwrap();
+        let old = schemas.writes("docs").unwrap();
+        let write = schemas.enter_write("docs").unwrap();
+        schemas.update_doc("docs", |_| Ok(())).unwrap();
+        assert!(Arc::ptr_eq(&old, &schemas.writes("docs").unwrap()), "kept across a schema change");
+        schemas.transition("docs", &[NamespaceState::Created], NamespaceState::Deleting).unwrap();
+        assert!(matches!(schemas.enter_write("docs"), Err(DocStoreError::StoreDeleting { .. })));
+        schemas.remove("docs").unwrap();
+        schemas.insert(doc("docs"), NamespaceState::Created).unwrap();
+        assert!(!Arc::ptr_eq(&old, &schemas.writes("docs").unwrap()), "a new store, a new count");
+        drop(write);
+        old.drain().await;
+        db.shutdown().await.unwrap();
+    }
+
+    /// A store's state is saved with its record, survives a crash, and an
+    /// update of its schema keeps it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_state_survives_a_crash_and_an_update_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = open_db(dir.path()).await;
+            let schemas = SchemaStore::open(&db).await.unwrap();
+            schemas.insert(doc("new"), NamespaceState::Creating).unwrap();
+            schemas.insert(doc("old"), NamespaceState::Created).unwrap();
+            schemas.transition("old", &[NamespaceState::Created], NamespaceState::Deleting).unwrap();
+            schemas
+                .update_doc("old", |s| {
+                    s.embedding_fields.push("text".into());
+                    Ok(())
+                })
+                .unwrap();
+            drop(schemas);
+            db.crash().await;
+        }
+        let db = open_db(dir.path()).await;
+        let schemas = SchemaStore::open(&db).await.unwrap();
+        assert_eq!(schemas.state("new"), Some(NamespaceState::Creating));
+        assert_eq!(schemas.state("old"), Some(NamespaceState::Deleting));
+        assert_eq!(schemas.state("none"), None);
+        assert_eq!(
+            schemas.states(),
+            vec![("new".to_owned(), NamespaceState::Creating), ("old".to_owned(), NamespaceState::Deleting)]
+        );
+        db.shutdown().await.unwrap();
+    }
+
+    /// A transition is a compare-and-set: of two drops of one store, the
+    /// second finds it `Deleting`. A store in another state gets the error a
+    /// request to it would, and a name being dropped cannot be taken again.
+    #[tokio::test]
+    async fn a_transition_moves_only_from_the_states_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path()).await;
+        let schemas = SchemaStore::open(&db).await.unwrap();
+        schemas.insert(doc("s"), NamespaceState::Creating).unwrap();
+        assert!(matches!(
+            schemas.transition("s", &[NamespaceState::Created], NamespaceState::Deleting),
+            Err(DocStoreError::StoreCreating { .. })
+        ));
+        assert!(matches!(schemas.admit("s"), Err(DocStoreError::StoreCreating { .. })));
+        assert_eq!(
+            schemas.transition("s", &[NamespaceState::Creating], NamespaceState::Created).unwrap(),
+            NamespaceState::Creating
+        );
+        schemas.admit("s").unwrap();
+        schemas.transition("s", &[NamespaceState::Created], NamespaceState::Deleting).unwrap();
+        assert!(matches!(
+            schemas.transition("s", &[NamespaceState::Created], NamespaceState::Deleting),
+            Err(DocStoreError::StoreDeleting { .. })
+        ));
+        assert!(matches!(
+            schemas.insert(doc("s"), NamespaceState::Creating),
+            Err(DocStoreError::StoreDeleting { .. })
+        ));
+        assert!(matches!(schemas.admit("missing"), Err(DocStoreError::NotFound { .. })));
+        db.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn reads_check_the_kind_and_a_failed_update_saves_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(dir.path()).await;
         let schemas = SchemaStore::open(&db).await.unwrap();
-        schemas.insert(doc("docs")).unwrap();
-        schemas.insert(kv("tokens")).unwrap();
-        assert!(matches!(schemas.insert(kv("docs")), Err(DocStoreError::AlreadyExists { .. })));
+        schemas.insert(doc("docs"), NamespaceState::Created).unwrap();
+        schemas.insert(kv("tokens"), NamespaceState::Created).unwrap();
+        assert!(matches!(
+            schemas.insert(kv("docs"), NamespaceState::Created),
+            Err(DocStoreError::AlreadyExists { .. })
+        ));
         assert!(matches!(
             schemas.kv("docs"),
             Err(DocStoreError::Schema(SchemaError::WrongStoreType {

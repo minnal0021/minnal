@@ -125,12 +125,14 @@ writing anything.
 
 ```rust
 // Increment a counter by the operand, creating it at zero. Safe from any
-// number of threads.
-let total = db.merge(b"visits", &1u64.to_le_bytes(), |existing, operand| {
-    let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-    let step = u64::from_le_bytes(operand.try_into().unwrap());
-    Ok(Some((current + step).to_le_bytes().to_vec()))
-})?;
+// number of tasks.
+let total = db
+    .merge(b"visits".to_vec(), 1u64.to_le_bytes().to_vec(), |existing, operand| {
+        let current = existing.map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        let step = u64::from_le_bytes(operand.try_into().unwrap());
+        Ok(Some((current + step).to_le_bytes().to_vec()))
+    })
+    .await?;
 ```
 
 Atomicity comes from a striped per-key lock that sits above the WAL lock and is
@@ -138,15 +140,15 @@ held across the read, the closure, the WAL append and the in-memory apply. Every
 write path takes it, so a blind `put` cannot land in the middle of a merge
 either. The WAL records only the *result*, as an ordinary upsert or delete — so
 crash recovery is completely unchanged, and nothing re-runs your closure at
-replay. `merge` and its rkyv twin `merge_typed` are on `Db`, `Namespace`,
-`AsyncDb` and `AsyncNamespace`.
+replay. `merge` and its rkyv twin `merge_typed` are on `AsyncDb` and
+`AsyncNamespace`.
 
 The guarantee is **per key** — it is not a transaction, and minnal still has no
 multi-key transaction primitive.
 
 #### Prefix scan with SIMD acceleration
 
-`scan_prefix` returns all live key-value pairs whose keys start with a given byte prefix. It merges results across all storage layers — active memtable, read-only memtable, L0 SSTables, and the L1 SSTable — deduplicating by key and honouring tombstones. The full API is available on `Db`, `Namespace`, `AsyncDb`, and `AsyncNamespace`, including a typed variant for callers who store typed values.
+`scan_prefix` returns all live key-value pairs whose keys start with a given byte prefix. It merges results across all storage layers — active memtable, read-only memtable, L0 SSTables, and the L1 SSTable — deduplicating by key and honouring tombstones. It is available on `AsyncDb` and `AsyncNamespace`, including a typed variant for callers who store typed values.
 
 Three layers of acceleration keep prefix scans fast even as data accumulates across layers:
 
@@ -282,7 +284,7 @@ KV stores have no field indices; field-index predicate queries belong to documen
 
 **Index builds**
 
-Adding an index to a namespace that already has documents triggers a background rebuild. Progress is tracked in a `build_progress.json` checkpoint file. If the server is stopped mid-build, it automatically detects the incomplete state on the next startup and resumes from the last checkpoint — no data is lost.
+Adding an index to a namespace that already has documents triggers a background rebuild. Progress is saved in a record in the `system_namespace_maintenance` namespace, written through the WAL. If the server is stopped mid-build, it finds the unfinished build on the next startup and resumes from the last saved point — no data is lost.
 
 **Semantic search integration — async vector indexing**
 
@@ -358,7 +360,7 @@ minnal/
 │       ├── kv_store/       ← one namespace's storage and live field indexes
 │       ├── namespace/      ← the saved list of namespaces and their schemas
 │       ├── field_index/    ← RoaringBitmap field indexing (part of kv-store)
-│       ├── db/             ← the engine: Db / AsyncDb, the coordinator, both WALs, workers
+│       ├── db/             ← the engine: AsyncDb, the coordinator, both WALs, workers
 │       ├── vector_index/   ← each store's vector-index settings (doc-store)
 │       ├── semantic_search/← IVF clustering, RaBitQ quantisation, vector↔KV bridge (semantic-search)
 │       └── doc_store/      ← JSON document and typed KV stores (doc-store)

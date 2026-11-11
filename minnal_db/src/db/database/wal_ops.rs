@@ -1,6 +1,7 @@
 //! Size checks, flushes that move the WAL's cut, and vector index WAL upkeep.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 impl Database {
     pub(in crate::db) fn check_closed(&self) -> Result<()> {
@@ -169,7 +170,7 @@ impl Database {
         }
         // Cloned so no flush (and its fsyncs) holds the store map, which
         // creating or dropping a namespace needs.
-        let stores: Vec<(u32, Arc<KVStore>)> = {
+        let stores: Vec<(NamespaceId, Arc<KVStore>)> = {
             let stores = self.stores.read();
             holding.iter().filter_map(|ns| stores.get(ns).map(|s| (*ns, Arc::clone(s)))).collect()
         };

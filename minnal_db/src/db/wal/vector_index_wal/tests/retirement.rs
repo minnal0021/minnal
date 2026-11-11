@@ -1,13 +1,14 @@
 //! Retirement and GC: the cut, its marker and what holds it back.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 /// Appends `n` records for `ns` and lets them count as applied.
-fn applied(wal: &VectorIndexWal, ns: u32, n: u64) -> Vec<Appended> {
+fn applied(wal: &VectorIndexWal, ns: NamespaceId, n: u64) -> Vec<Appended> {
     (0..n).map(|i| wal.append(ns, &key(i), &value(i), i + 1).unwrap().appended()).collect()
 }
 
-fn seal_and_flush(wal: &VectorIndexWal, ns: u32, version: u64) {
+fn seal_and_flush(wal: &VectorIndexWal, ns: NamespaceId, version: u64) {
     wal.on_memtable_sealed(ns, version);
     wal.on_memtable_written(ns, version).unwrap();
 }
@@ -16,10 +17,10 @@ fn seal_and_flush(wal: &VectorIndexWal, ns: u32, version: u64) {
 fn a_flush_retires_its_memtables_records_and_the_cut_survives_reopen() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 3);
+    applied(&wal, NamespaceId::from_u128(1), 3);
     assert_eq!(wal.retired_cut(), 0);
     assert_eq!(wal.namespaces_holding_cut(), vec![1]);
-    seal_and_flush(&wal, 1, 0);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     assert_eq!(wal.retired_cut(), wal.tail());
     assert!(wal.namespaces_holding_cut().is_empty());
     let cut = wal.retired_cut();
@@ -33,13 +34,13 @@ fn a_flush_retires_its_memtables_records_and_the_cut_survives_reopen() {
 fn memtables_retire_in_version_order_only() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 1);
-    wal.on_memtable_sealed(1, 0);
-    applied(&wal, 1, 1);
-    wal.on_memtable_sealed(1, 1);
-    wal.on_memtable_written(1, 1).unwrap();
+    applied(&wal, NamespaceId::from_u128(1), 1);
+    wal.on_memtable_sealed(NamespaceId::from_u128(1), 0);
+    applied(&wal, NamespaceId::from_u128(1), 1);
+    wal.on_memtable_sealed(NamespaceId::from_u128(1), 1);
+    wal.on_memtable_written(NamespaceId::from_u128(1), 1).unwrap();
     assert_eq!(wal.retired_cut(), 0, "version 0 is not flushed yet");
-    wal.on_memtable_written(1, 0).unwrap();
+    wal.on_memtable_written(NamespaceId::from_u128(1), 0).unwrap();
     assert_eq!(wal.retired_cut(), wal.tail());
 }
 
@@ -47,14 +48,14 @@ fn memtables_retire_in_version_order_only() {
 fn a_record_not_yet_applied_holds_the_cut() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 2);
-    let in_flight = wal.append(1, b"late", b"v", 9).unwrap();
+    applied(&wal, NamespaceId::from_u128(1), 2);
+    let in_flight = wal.append(NamespaceId::from_u128(1), b"late", b"v", 9).unwrap();
     // Its apply will land in the next memtable, so this seal must not claim it.
-    seal_and_flush(&wal, 1, 0);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     assert_eq!(wal.retired_cut(), in_flight.start);
     assert_eq!(wal.namespaces_holding_cut(), vec![1]);
     drop(in_flight);
-    seal_and_flush(&wal, 1, 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 1);
     assert_eq!(wal.retired_cut(), wal.tail());
 }
 
@@ -62,15 +63,15 @@ fn a_record_not_yet_applied_holds_the_cut() {
 fn another_namespaces_record_in_flight_does_not_hold_a_flushed_namespace() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 2);
-    let other = wal.append(2, b"k", b"v", 9).unwrap();
-    applied(&wal, 1, 1);
-    seal_and_flush(&wal, 1, 0);
+    applied(&wal, NamespaceId::from_u128(1), 2);
+    let other = wal.append(NamespaceId::from_u128(2), b"k", b"v", 9).unwrap();
+    applied(&wal, NamespaceId::from_u128(1), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     // Namespace 1 flushed everything it wrote; only 2 holds the cut.
     assert_eq!(wal.namespaces_holding_cut(), vec![2]);
     assert_eq!(wal.retired_cut(), 0);
     drop(other);
-    seal_and_flush(&wal, 2, 0);
+    seal_and_flush(&wal, NamespaceId::from_u128(2), 0);
     assert_eq!(wal.retired_cut(), wal.tail());
     assert!(wal.namespaces_holding_cut().is_empty());
 }
@@ -79,16 +80,16 @@ fn another_namespaces_record_in_flight_does_not_hold_a_flushed_namespace() {
 fn the_cut_is_the_slowest_unflushed_namespace() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 2, 1);
-    seal_and_flush(&wal, 2, 0);
+    applied(&wal, NamespaceId::from_u128(2), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(2), 0);
     let after_two = wal.retired_cut();
     assert_eq!(after_two, wal.tail());
-    applied(&wal, 1, 2);
-    applied(&wal, 2, 1);
-    seal_and_flush(&wal, 1, 0);
+    applied(&wal, NamespaceId::from_u128(1), 2);
+    applied(&wal, NamespaceId::from_u128(2), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     assert_eq!(wal.namespaces_holding_cut(), vec![2]);
     assert_eq!(wal.retired_cut(), after_two, "namespace 2's safe offset");
-    seal_and_flush(&wal, 2, 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(2), 1);
     assert_eq!(wal.retired_cut(), wal.tail());
 }
 
@@ -96,11 +97,11 @@ fn the_cut_is_the_slowest_unflushed_namespace() {
 fn a_flush_without_a_seal_record_retires_nothing() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 2);
-    wal.on_memtable_written(1, 0).unwrap();
+    applied(&wal, NamespaceId::from_u128(1), 2);
+    wal.on_memtable_written(NamespaceId::from_u128(1), 0).unwrap();
     assert_eq!(wal.retired_cut(), 0);
     assert_eq!(wal.namespaces_holding_cut(), vec![1]);
-    seal_and_flush(&wal, 1, 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 1);
     assert_eq!(wal.retired_cut(), wal.tail());
 }
 
@@ -108,9 +109,9 @@ fn a_flush_without_a_seal_record_retires_nothing() {
 fn events_for_a_namespace_that_never_appended_are_ignored() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    seal_and_flush(&wal, 7, 0);
-    applied(&wal, 1, 1);
-    seal_and_flush(&wal, 7, 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(7), 0);
+    applied(&wal, NamespaceId::from_u128(1), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(7), 1);
     assert_eq!(wal.retired_cut(), 0);
     assert_eq!(wal.namespaces_holding_cut(), vec![1]);
 }
@@ -119,11 +120,11 @@ fn events_for_a_namespace_that_never_appended_are_ignored() {
 fn forgetting_a_namespace_releases_the_cut() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 1);
-    applied(&wal, 2, 1);
-    seal_and_flush(&wal, 1, 0);
+    applied(&wal, NamespaceId::from_u128(1), 1);
+    applied(&wal, NamespaceId::from_u128(2), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     assert_eq!(wal.retired_cut(), 0);
-    wal.forget_namespace(2);
+    wal.forget_namespace(NamespaceId::from_u128(2));
     assert_eq!(wal.retired_cut(), wal.tail());
     assert!(wal.namespaces_holding_cut().is_empty());
 }
@@ -132,24 +133,24 @@ fn forgetting_a_namespace_releases_the_cut() {
 fn gc_deletes_only_segments_wholly_below_the_cut() {
     let dir = TempDir::new().unwrap();
     let metrics = Arc::new(Metrics::default());
-    let (wal, _) = VectorIndexWal::open(dir.path(), 256, Arc::clone(&metrics)).unwrap();
-    applied(&wal, 1, 8); // segments 0, 1, 2
+    let (wal, _) = VectorIndexWal::open(dir.path(), SMALL_SEGMENT, Arc::clone(&metrics)).unwrap();
+    applied(&wal, NamespaceId::from_u128(1), 8); // segments 0, 1, 2
     assert!(!wal.has_deletable_segments().unwrap());
     assert_eq!(wal.garbage_collect().unwrap(), (0, 0));
-    seal_and_flush(&wal, 1, 0);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     assert_eq!(split(wal.retired_cut()).0, 2);
     assert!(wal.has_deletable_segments().unwrap());
     // Segment files are their full size.
-    assert_eq!(wal.garbage_collect().unwrap(), (2, 2 * 256));
+    assert_eq!(wal.garbage_collect().unwrap(), (2, 2 * u64::from(SMALL_SEGMENT)));
     assert_eq!(wal.segments().unwrap().iter().map(|s| s.0).collect::<Vec<_>>(), vec![2]);
     assert!(!wal.has_deletable_segments().unwrap());
     let s = metrics.snapshot();
     assert_eq!((s.vector_wal_gc_runs, s.vector_wal_segments_deleted), (2, 2));
 
-    let more = applied(&wal, 1, 2);
+    let more = applied(&wal, NamespaceId::from_u128(1), 2);
     let cut = wal.retired_cut();
     drop(wal);
-    let (wal, _) = open_at(dir.path(), 256);
+    let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
     assert_eq!(wal.retired_cut(), cut);
     let rows = rows_from(&wal, cut);
     assert_eq!(
@@ -162,9 +163,9 @@ fn gc_deletes_only_segments_wholly_below_the_cut() {
 fn a_bad_retired_cut_marker_fails_the_open() {
     let fresh = || {
         let dir = TempDir::new().unwrap();
-        let (wal, _) = open_at(dir.path(), 256);
-        applied(&wal, 1, 8);
-        seal_and_flush(&wal, 1, 0);
+        let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
+        applied(&wal, NamespaceId::from_u128(1), 8);
+        seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
         wal.garbage_collect().unwrap();
         dir
     };
@@ -179,7 +180,7 @@ fn a_bad_retired_cut_marker_fails_the_open() {
         }),
     )
     .unwrap();
-    assert!(corruption(reopen(dir.path(), 256)).contains("past the last segment"));
+    assert!(corruption(reopen(dir.path(), SMALL_SEGMENT)).contains("past the last segment"));
 
     let dir = fresh();
     let cut = read_progress(dir.path()).unwrap().unwrap().cut;
@@ -187,11 +188,11 @@ fn a_bad_retired_cut_marker_fails_the_open() {
         marker(&dir),
         progress_bytes(&Progress {
             cut,
-            safe: vec![(1, cut - 1)],
+            safe: vec![(NamespaceId::from_u128(1), cut - 1)],
         }),
     )
     .unwrap();
-    assert!(corruption(reopen(dir.path(), 256)).contains("below the cut"));
+    assert!(corruption(reopen(dir.path(), SMALL_SEGMENT)).contains("below the cut"));
 
     let dir = fresh();
     std::fs::write(
@@ -202,30 +203,30 @@ fn a_bad_retired_cut_marker_fails_the_open() {
         }),
     )
     .unwrap();
-    assert!(corruption(reopen(dir.path(), 256)).contains("below the oldest segment"));
+    assert!(corruption(reopen(dir.path(), SMALL_SEGMENT)).contains("below the oldest segment"));
 
     let dir = fresh();
     std::fs::remove_file(marker(&dir)).unwrap();
-    assert!(corruption(reopen(dir.path(), 256)).contains("no progress was saved"));
+    assert!(corruption(reopen(dir.path(), SMALL_SEGMENT)).contains("no progress was saved"));
 
     let dir = fresh();
     let mut bytes = std::fs::read(marker(&dir)).unwrap();
     bytes[5] ^= 0xff;
     std::fs::write(marker(&dir), bytes).unwrap();
-    assert!(corruption(reopen(dir.path(), 256)).contains("damaged"));
+    assert!(corruption(reopen(dir.path(), SMALL_SEGMENT)).contains("damaged"));
 }
 
 #[test]
 fn the_cut_never_moves_back() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 2);
-    seal_and_flush(&wal, 1, 0);
+    applied(&wal, NamespaceId::from_u128(1), 2);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     let cut = wal.retired_cut();
     // A namespace that starts writing now has a safe offset of 0 until it
     // flushes; that must not drag the cut back.
-    applied(&wal, 2, 1);
-    wal.forget_namespace(3);
+    applied(&wal, NamespaceId::from_u128(2), 1);
+    wal.forget_namespace(NamespaceId::from_u128(3));
     assert_eq!(wal.retired_cut(), cut);
     drop(wal);
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
@@ -235,10 +236,10 @@ fn the_cut_never_moves_back() {
 #[test]
 fn stats_report_positions_unretired_bytes_and_holders() {
     let dir = TempDir::new().unwrap();
-    let (wal, _) = open_at(dir.path(), 256);
-    applied(&wal, 1, 4); // segment 0 sealed with 3, segment 1 holds 1
-    applied(&wal, 2, 1);
-    let name = |ns: u32| format!("ns{ns}");
+    let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
+    applied(&wal, NamespaceId::from_u128(1), 4); // segment 0 sealed with 3, segment 1 holds 1
+    applied(&wal, NamespaceId::from_u128(2), 1);
+    let name = |ns: NamespaceId| format!("ns{}", ns.as_u128());
     let s = wal.stats(name).unwrap();
     assert_eq!(s.segment_count, 2);
     assert_eq!(
@@ -253,8 +254,8 @@ fn stats_report_positions_unretired_bytes_and_holders() {
     assert_eq!(s.last_sequence, 4);
     assert_eq!(s.holding_cut.iter().map(|h| h.namespace.as_str()).collect::<Vec<_>>(), vec!["ns1", "ns2"]);
 
-    seal_and_flush(&wal, 1, 0);
-    seal_and_flush(&wal, 2, 0);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
+    seal_and_flush(&wal, NamespaceId::from_u128(2), 0);
     let s = wal.stats(name).unwrap();
     assert_eq!(s.retired_cut, s.tail);
     assert_eq!(s.unretired_bytes, 0);
@@ -273,10 +274,10 @@ fn stats_report_positions_unretired_bytes_and_holders() {
 fn a_reopened_log_holds_the_cut_for_records_nobody_flushed() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 3, 1);
-    seal_and_flush(&wal, 3, 0);
+    applied(&wal, NamespaceId::from_u128(3), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(3), 0);
     let cut = wal.retired_cut();
-    let unflushed = applied(&wal, 1, 2);
+    let unflushed = applied(&wal, NamespaceId::from_u128(1), 2);
     drop(wal); // a crash: the in-memory state is gone, the records are not
 
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
@@ -284,12 +285,12 @@ fn a_reopened_log_holds_the_cut_for_records_nobody_flushed() {
     assert_eq!(wal.namespaces_holding_cut(), vec![1]);
     assert_eq!(wal.tracked_namespaces(), vec![1]);
     // Another namespace's flush must not carry the cut past 1's records.
-    applied(&wal, 2, 1);
-    seal_and_flush(&wal, 2, 0);
+    applied(&wal, NamespaceId::from_u128(2), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(2), 0);
     assert_eq!(wal.retired_cut(), cut);
     assert!(wal.retired_cut() <= unflushed[0].start);
     // Only 1's own flush releases it.
-    seal_and_flush(&wal, 1, 0);
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     assert_eq!(wal.retired_cut(), wal.tail());
 }
 
@@ -297,14 +298,18 @@ fn a_reopened_log_holds_the_cut_for_records_nobody_flushed() {
 fn the_marker_round_trips_with_per_namespace_offsets() {
     let p = Progress {
         cut: position(1, 40),
-        safe: vec![(2, position(1, 90)), (7, position(2, 16))],
+        safe: vec![(NamespaceId::from_u128(2), position(1, 90)), (NamespaceId::from_u128(7), position(2, 16))],
     };
     let dir = TempDir::new().unwrap();
     crate::support::write_atomic_durable(&dir.path().join(RETIRED_CUT_FILE), &progress_bytes(&p)).unwrap();
     assert_eq!(read_progress(dir.path()).unwrap(), Some(p.clone()));
-    assert_eq!(p.replay_from(2), position(1, 90));
-    assert_eq!(p.replay_from(7), position(2, 16));
-    assert_eq!(p.replay_from(3), position(1, 40), "an unlisted namespace replays from the cut");
+    assert_eq!(p.replay_from(NamespaceId::from_u128(2)), position(1, 90));
+    assert_eq!(p.replay_from(NamespaceId::from_u128(7)), position(2, 16));
+    assert_eq!(
+        p.replay_from(NamespaceId::from_u128(3)),
+        position(1, 40),
+        "an unlisted namespace replays from the cut"
+    );
     let mut bytes = progress_bytes(&p);
     bytes.truncate(bytes.len() - 5);
     std::fs::write(dir.path().join(RETIRED_CUT_FILE), &bytes).unwrap();
@@ -315,11 +320,11 @@ fn the_marker_round_trips_with_per_namespace_offsets() {
 fn replay_skips_each_namespaces_records_below_its_own_safe_offset() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    let flushed = applied(&wal, 1, 2);
-    let held = applied(&wal, 2, 1);
-    let after = applied(&wal, 1, 1);
-    wal.on_memtable_sealed(1, 0); // covers all of namespace 1's records so far
-    wal.on_memtable_written(1, 0).unwrap();
+    let flushed = applied(&wal, NamespaceId::from_u128(1), 2);
+    let held = applied(&wal, NamespaceId::from_u128(2), 1);
+    let after = applied(&wal, NamespaceId::from_u128(1), 1);
+    wal.on_memtable_sealed(NamespaceId::from_u128(1), 0); // covers all of namespace 1's records so far
+    wal.on_memtable_written(NamespaceId::from_u128(1), 0).unwrap();
     assert_eq!(wal.retired_cut(), 0, "namespace 2 holds the global cut");
     drop(wal);
 
@@ -332,7 +337,7 @@ fn replay_skips_each_namespaces_records_below_its_own_safe_offset() {
     .unwrap();
     // Only namespace 2's record: namespace 1's are below its own offset,
     // although they are above the global cut.
-    assert_eq!(replayed, vec![(2, 1)]);
+    assert_eq!(replayed, vec![(NamespaceId::from_u128(2), 1)]);
     let _ = (flushed, held, after);
 }
 
@@ -340,8 +345,8 @@ fn replay_skips_each_namespaces_records_below_its_own_safe_offset() {
 fn a_marker_past_the_durable_tail_starts_a_new_segment() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 3); // never synced
-    seal_and_flush(&wal, 1, 0); // but written to L0: the marker names the tail
+    applied(&wal, NamespaceId::from_u128(1), 3); // never synced
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0); // but written to L0: the marker names the tail
     let marked = wal.retired_cut();
     wal.lose_unsynced(); // power loss
     drop(wal);
@@ -349,7 +354,7 @@ fn a_marker_past_the_durable_tail_starts_a_new_segment() {
     let (wal, report) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
     assert_eq!(report.tail, position(1, SEGMENT_HEADER_LEN));
     assert!(wal.tail() > marked, "new appends land above every position the marker names");
-    let fresh = wal.append(1, b"new", b"v", 9).unwrap().appended();
+    let fresh = wal.append(NamespaceId::from_u128(1), b"new", b"v", 9).unwrap().appended();
     drop(wal);
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
     let mut replayed = Vec::new();
@@ -368,24 +373,24 @@ fn a_marker_past_the_durable_tail_starts_a_new_segment() {
 fn a_failed_marker_write_changes_nothing_and_the_retry_retires() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    let ns1 = applied(&wal, 1, 3);
-    wal.on_memtable_sealed(1, 0);
+    let ns1 = applied(&wal, NamespaceId::from_u128(1), 3);
+    wal.on_memtable_sealed(NamespaceId::from_u128(1), 0);
     let marker_before = read_progress(dir.path()).unwrap();
     wal.fail_next_marker_write();
-    assert!(wal.on_memtable_written(1, 0).is_err());
+    assert!(wal.on_memtable_written(NamespaceId::from_u128(1), 0).is_err());
     assert_eq!(wal.retired_cut(), 0);
     assert_eq!(wal.namespaces_holding_cut(), vec![1]);
     assert_eq!(read_progress(dir.path()).unwrap(), marker_before);
 
     // Another namespace's flush writes a marker: it must not carry 1's.
-    applied(&wal, 2, 1);
-    seal_and_flush(&wal, 2, 0);
+    applied(&wal, NamespaceId::from_u128(2), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(2), 0);
     assert!(wal.retired_cut() <= ns1[0].start, "1's records are not retired");
     let marker = read_progress(dir.path()).unwrap().unwrap();
-    assert!(marker.replay_from(1) <= ns1[0].start);
+    assert!(marker.replay_from(NamespaceId::from_u128(1)) <= ns1[0].start);
 
     // The LSM retries the same memtable version.
-    wal.on_memtable_written(1, 0).unwrap();
+    wal.on_memtable_written(NamespaceId::from_u128(1), 0).unwrap();
     assert!(wal.namespaces_holding_cut().is_empty());
     assert_eq!(wal.retired_cut(), wal.tail());
 }
@@ -396,14 +401,14 @@ fn a_failed_marker_write_changes_nothing_and_the_retry_retires() {
 fn an_append_after_a_namespace_is_forgotten_does_not_hold_the_cut() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 1);
-    wal.forget_namespace(1);
-    applied(&wal, 1, 1); // a late write that raced the drop
+    applied(&wal, NamespaceId::from_u128(1), 1);
+    wal.forget_namespace(NamespaceId::from_u128(1));
+    applied(&wal, NamespaceId::from_u128(1), 1); // a late write that raced the drop
     assert!(wal.namespaces_holding_cut().is_empty());
-    wal.on_memtable_sealed(1, 0);
-    wal.on_memtable_written(1, 0).unwrap();
-    applied(&wal, 2, 1);
-    seal_and_flush(&wal, 2, 0);
+    wal.on_memtable_sealed(NamespaceId::from_u128(1), 0);
+    wal.on_memtable_written(NamespaceId::from_u128(1), 0).unwrap();
+    applied(&wal, NamespaceId::from_u128(2), 1);
+    seal_and_flush(&wal, NamespaceId::from_u128(2), 0);
     assert_eq!(wal.retired_cut(), wal.tail(), "nothing holds the cut");
 }
 
@@ -413,11 +418,11 @@ fn an_append_after_a_namespace_is_forgotten_does_not_hold_the_cut() {
 fn a_failed_fsync_stops_the_log_until_it_is_reopened() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 1);
+    applied(&wal, NamespaceId::from_u128(1), 1);
     wal.fail_next_sync();
     assert!(matches!(wal.sync(), Err(VectorIndexWalError::Log(LogError::Poisoned(_)))));
     assert!(matches!(
-        wal.append(1, b"k", b"v", 9),
+        wal.append(NamespaceId::from_u128(1), b"k", b"v", 9),
         Err(VectorIndexWalError::Log(LogError::Poisoned(_)))
     ));
     assert!(
@@ -427,7 +432,7 @@ fn a_failed_fsync_stops_the_log_until_it_is_reopened() {
     assert!(wal.stats(|n| n.to_string()).unwrap().stopped.is_some());
     drop(wal);
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    wal.append(1, b"k", b"v", 9).unwrap();
+    wal.append(NamespaceId::from_u128(1), b"k", b"v", 9).unwrap();
     wal.sync().unwrap();
     assert!(wal.stats(|n| n.to_string()).unwrap().stopped.is_none());
 }
@@ -446,7 +451,12 @@ fn concurrent_syncs_share_fsyncs() {
             s.spawn(move || {
                 for i in 0..50u32 {
                     let write = wal
-                        .append(t, format!("k{i}").as_bytes(), b"v", seq.fetch_add(1, Ordering::SeqCst))
+                        .append(
+                            NamespaceId::from_u128(u128::from(t)),
+                            format!("k{i}").as_bytes(),
+                            b"v",
+                            seq.fetch_add(1, Ordering::SeqCst),
+                        )
                         .unwrap();
                     let end = write.end;
                     drop(write);
@@ -478,7 +488,7 @@ fn syncs_waiting_together_share_one_fsync() {
             .map(|t| {
                 let wal = &wal;
                 s.spawn(move || {
-                    drop(wal.append(t, b"k", b"v", u64::from(t) + 1).unwrap());
+                    drop(wal.append(NamespaceId::from_u128(u128::from(t)), b"k", b"v", u64::from(t) + 1).unwrap());
                     wal.sync()
                 })
             })
@@ -512,7 +522,7 @@ fn a_failed_round_fails_every_waiting_sync() {
             .map(|t| {
                 let wal = &wal;
                 s.spawn(move || {
-                    drop(wal.append(t, b"k", b"v", u64::from(t) + 1).unwrap());
+                    drop(wal.append(NamespaceId::from_u128(u128::from(t)), b"k", b"v", u64::from(t) + 1).unwrap());
                     wal.sync()
                 })
             })
@@ -537,14 +547,14 @@ fn a_failed_round_fails_every_waiting_sync() {
 #[test]
 fn open_does_not_read_segments_below_the_cut() {
     let dir = TempDir::new().unwrap();
-    let (wal, _) = open_at(dir.path(), 256);
-    let records = applied(&wal, 1, 8); // segments 0, 1, 2
-    seal_and_flush(&wal, 1, 0);
+    let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
+    let records = applied(&wal, NamespaceId::from_u128(1), 8); // segments 0, 1, 2
+    seal_and_flush(&wal, NamespaceId::from_u128(1), 0);
     assert_eq!(split(wal.retired_cut()).0, 2);
     let last_seq = wal.last_seq();
     drop(wal);
     flip(dir.path(), 0, u64::from(SEGMENT_HEADER_LEN + FRAME_HEADER_LEN + 2));
-    let (wal, report) = open_at(dir.path(), 256);
+    let (wal, report) = open_at(dir.path(), SMALL_SEGMENT);
     assert_eq!(report.tail, records.last().unwrap().end);
     assert!(wal.namespaces_holding_cut().is_empty());
     // Nothing at or above the cut, so no seq to report from the log.
@@ -558,14 +568,14 @@ fn open_does_not_read_segments_below_the_cut() {
 fn a_seal_never_waits_for_a_marker_write() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    applied(&wal, 1, 1);
+    applied(&wal, NamespaceId::from_u128(1), 1);
     let held = wal.retirement.lock(); // as during a marker write
     std::thread::scope(|s| {
         let (tx, rx) = std::sync::mpsc::channel();
         let wal = &wal;
         s.spawn(move || {
-            wal.on_memtable_sealed(1, 0); // tracked
-            wal.on_memtable_sealed(7, 0); // untracked
+            wal.on_memtable_sealed(NamespaceId::from_u128(1), 0); // tracked
+            wal.on_memtable_sealed(NamespaceId::from_u128(7), 0); // untracked
             tx.send(()).unwrap();
         });
         let done = rx.recv_timeout(std::time::Duration::from_secs(5));

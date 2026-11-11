@@ -58,7 +58,7 @@ impl Default for RebuildParams {
 }
 
 /// What a rebuild did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RebuildReport {
     /// Active postings before.
     pub postings_before: usize,
@@ -85,9 +85,11 @@ pub enum RebuildState {
     /// Stopped by an error (a journalled rebuild is finished by recovery at
     /// the next start).
     Failed,
+    /// Stopped by a cancel before it changed anything.
+    Cancelled,
 }
 
-/// A namespace's last rebuild since the server started.
+/// A namespace's last rebuild (its `partition_rebuild` job).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RebuildStatus {
     /// Running, done or failed.
@@ -116,17 +118,38 @@ pub async fn rebuild_partition(
     ops: &MaintenanceOps,
     params: &RebuildParams,
 ) -> Result<RebuildReport, crate::KVError> {
+    Ok(rebuild_partition_unless(db, namespace, handle, ops, params, &|| false)
+        .await?
+        .expect("never cancelled"))
+}
+
+/// [`rebuild_partition`], unless `cancelled` says stop before the plan is
+/// recorded (it is asked before the codes are read and again after k-means):
+/// then nothing has changed and `None` is returned. Once the plan is
+/// recorded the rebuild runs to its end.
+pub async fn rebuild_partition_unless(
+    db: &AsyncDb,
+    namespace: &str,
+    handle: &PartitionHandle,
+    ops: &MaintenanceOps,
+    params: &RebuildParams,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<RebuildReport>, crate::KVError> {
     let mut report = {
         let _maintenance = handle.lock_maintenance().await;
         prepare(db, namespace, handle, ops).await?;
-        rebuild_locked(db, namespace, handle, ops, params)
+        match rebuild_locked(db, namespace, handle, ops, params, cancelled)
             .await
             .inspect_err(|_| handle.set_needs_recovery(true))?
+        {
+            Some(report) => report,
+            None => return Ok(None),
+        }
     };
     maintain_partition(db, namespace, handle, ops).await?;
     let ivf = handle.snapshot();
     report.postings_after = ivf.posting_infos().values().filter(|i| i.state == PostingState::Active).count();
-    Ok(report)
+    Ok(Some(report))
 }
 
 async fn rebuild_locked(
@@ -135,7 +158,8 @@ async fn rebuild_locked(
     handle: &PartitionHandle,
     ops: &MaintenanceOps,
     params: &RebuildParams,
-) -> Result<RebuildReport, crate::KVError> {
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<RebuildReport>, crate::KVError> {
     let ivf = handle.snapshot();
     let mut active: Vec<u32> = ivf
         .posting_infos()
@@ -149,7 +173,10 @@ async fn rebuild_locked(
         ..RebuildReport::default()
     };
     if active.is_empty() {
-        return Ok(report);
+        return Ok(Some(report));
+    }
+    if cancelled() {
+        return Ok(None);
     }
 
     // 1. Plan: every code that can be reconstructed, clustered.
@@ -164,7 +191,7 @@ async fn rebuild_locked(
         .collect();
     report.chunks = codes.len() as u64;
     if codes.is_empty() {
-        return Ok(report);
+        return Ok(Some(report));
     }
     let op = next_op_id(db, namespace).await?;
     let k = params.postings.unwrap_or(active.len()).max(1);
@@ -194,7 +221,10 @@ async fn rebuild_locked(
         .await
         .map_err(|e| crate::KVError::Io(std::io::Error::other(e)))??
     };
-    let Some(fit) = fit else { return Ok(report) };
+    let Some(fit) = fit else { return Ok(Some(report)) };
+    if cancelled() {
+        return Ok(None);
+    }
     report.iterations = fit.iterations;
     // A centre no chunk is nearest would be an empty posting.
     let centres: Vec<Vec<f32>> = fit
@@ -249,7 +279,7 @@ async fn rebuild_locked(
     let before = handle.counters().read().rebuild_moves;
     finish(db, namespace, handle, ops, op, record.with_state(JournalState::Published)).await?;
     report.chunks_moved = handle.counters().read().rebuild_moves - before;
-    Ok(report)
+    Ok(Some(report))
 }
 
 /// Steps 4–7 of a published rebuild (also what recovery runs).

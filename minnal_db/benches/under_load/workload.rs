@@ -336,7 +336,7 @@ pub enum Outcome {
 pub struct Target {
     pub store: Arc<DocStore>,
     pub ns: String,
-    pub ns_id: u32,
+    pub ns_id: minnal_db::NamespaceId,
     pub key_type: KeyType,
 }
 

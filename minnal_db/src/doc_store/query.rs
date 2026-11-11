@@ -2,6 +2,7 @@
 //! queries, and semantic search.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 impl DocStore {
     // ── Query ─────────────────────────────────────────────────────────────
@@ -13,7 +14,7 @@ impl DocStore {
     pub(super) async fn namespace_semantics(
         &self,
         namespace: &str,
-        ns_id: Option<u32>,
+        ns_id: Option<crate::namespace::NamespaceId>,
         settings: &crate::doc_store::schema::vector_settings::VectorIndexSettings,
         overrides: &SearchSpec,
     ) -> Result<NamespaceSemantics, DocStoreError> {
@@ -285,7 +286,7 @@ impl DocStore {
         namespace: &str,
         predicate: &str,
         pagination: Pagination,
-        ns_id: u32,
+        ns_id: NamespaceId,
         key_type: KeyType,
     ) -> Result<Page<(DocId, serde_json::Value)>, DocStoreError> {
         // Use the paginated variant so only the page window of keys is resolved
@@ -321,19 +322,33 @@ impl DocStore {
     }
 
     /// The fields a query's results may be incomplete for, by name: those with
-    /// an outstanding gap record (from the engine), and those whose index build
-    /// is still running or failed — a building index holds only the documents
-    /// it has reached so far. Only fields the predicate touched are considered.
+    /// an outstanding gap record (from the engine), and those whose index is
+    /// still being built or failed to build (a `field_build` job not complete,
+    /// or a `reindex-all` that has not reached the field) — a building index
+    /// holds only the documents it has reached so far. Only fields the
+    /// predicate touched are considered.
     ///
     /// An id with no matching registered field falls back to its numeric form
     /// rather than being dropped — losing a degradation signal because a name
     /// could not be resolved would be exactly the wrong failure mode.
-    fn degraded_field_names(&self, ns_id: u32, outcome: &crate::QueryOutcome) -> Vec<String> {
+    fn degraded_field_names(&self, ns_id: NamespaceId, outcome: &crate::QueryOutcome) -> Vec<String> {
+        use crate::namespace_lifecycle::BuildStatus;
         let mut degraded = outcome.degraded_fields.clone();
+        let fields = self.db.list_index_fields(ns_id);
+        // A record that cannot be read counts as degraded: losing the signal
+        // is the wrong way to fail.
+        let reindexing = self.fields_reindexing(ns_id);
         for &fid in &outcome.touched_fields {
-            let building = read_disk_progress(&build_progress_path(&self.db_path, ns_id, fid))
-                .is_some_and(|p| p.status == "in_progress" || p.status == "failed");
-            if building && !degraded.contains(&fid) {
+            let name = fields.iter().find(|f| f.field_id == fid).map(|f| f.field_name.as_str());
+            let building = match self.jobs.status(crate::doc_store::JobKey::field_build(ns_id, fid)) {
+                Ok(status) => status.is_some_and(|s| !matches!(s, BuildStatus::Complete | BuildStatus::Cancelled)),
+                Err(_) => true,
+            };
+            let rebuilding = match &reindexing {
+                Ok(unbuilt) => name.is_some_and(|n| unbuilt.iter().any(|u| u == n)),
+                Err(_) => true,
+            };
+            if (building || rebuilding) && !degraded.contains(&fid) {
                 degraded.push(fid);
             }
         }
@@ -341,7 +356,6 @@ impl DocStore {
             return Vec::new();
         }
         degraded.sort_unstable();
-        let fields = self.db.list_index_fields(ns_id);
         degraded
             .iter()
             .map(|&fid| {
@@ -417,10 +431,8 @@ mod tests {
 
     /// Same scenario but with `semantic_search_enabled = true`, which makes
     /// `delete()` take the semantic-search path (cancel pending embed + delete
-    /// vector + delete doc).  No actual embedding service is needed because
-    /// writes without `with_semantic_search()` attached fall back to the
-    /// regular `ns.put()` path, while deletes always go through the
-    /// semantic-search path when the schema flag is set.
+    /// vector + delete doc). No embedding service is needed: a write only
+    /// queues its embed, and the test store points at no service.
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn test_scan_by_prefix_after_delete_semantic_search_enabled() {
@@ -722,11 +734,8 @@ mod tests {
     #[cfg(feature = "semantic-search")]
     #[tokio::test]
     async fn semantic_search_on_a_store_without_it_reports_not_enabled() {
-        use crate::semantic_search::service::SemanticSearchConfig;
-
         let db_dir = TempDir::new().unwrap();
-        let mut store = open_fresh(db_dir.path()).await;
-        store.semantic_ctx = Some(Arc::new(SemanticSearchContext::new(SemanticSearchConfig::default())));
+        let store = open_fresh(db_dir.path()).await;
         store.create(make_schema("plain", vec![])).await.unwrap();
         store
             .create_kv(make_kv_schema("plain_kv", KvKeyType::Str, KvValueType::Str))

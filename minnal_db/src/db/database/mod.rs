@@ -3,6 +3,7 @@
 //! Manages a shared WAL, namespace registry, and multiple KVStore instances.
 //! Each namespace has independent LSM + value log storage.
 
+use crate::namespace::NamespaceId;
 mod flush_observers;
 pub(crate) mod key_locks;
 mod open;
@@ -75,7 +76,7 @@ pub(crate) struct WriteOutcome {
 /// What [`Database::lookup_open_store`] found for a namespace name.
 pub(crate) enum OpenStoreLookup {
     /// Registered, and its store is open.
-    Open(u32, Arc<KVStore>),
+    Open(NamespaceId, Arc<KVStore>),
     /// No namespace has this name.
     Absent,
     /// Registered, but its store is not in the store map: being opened by
@@ -98,7 +99,7 @@ pub struct Database {
     pub(crate) wal_metadata: Arc<RwLock<WalMetadata>>,
     pub(crate) wal_flush_observer: Arc<WalPersistObserver>,
     #[allow(dead_code)]
-    pending_wal_flushes: Arc<RwLock<BTreeMap<(u32, u64), WalFlushState>>>,
+    pending_wal_flushes: Arc<RwLock<BTreeMap<(NamespaceId, u64), WalFlushState>>>,
     pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
 
     /// The vector index WAL: the vector worker's payload writes, one per
@@ -149,7 +150,7 @@ pub struct Database {
     pub(in crate::db) index_activate_lock: Mutex<()>,
 
     // Per-namespace stores: namespace_id -> KVStore
-    pub(crate) stores: RwLock<HashMap<u32, Arc<KVStore>>>,
+    pub(crate) stores: RwLock<HashMap<NamespaceId, Arc<KVStore>>>,
 
     // Database-level flags
     closed: Arc<AtomicBool>,
@@ -174,7 +175,7 @@ pub struct Database {
     pub(crate) rejected_index_updates: Arc<crate::db::indexing::manager::RejectedUpdateBuffer>,
     /// Namespaces whose durable "no-WAL writes outstanding" marker is set.
     /// Debounces the marker write to once per checkpoint interval.
-    pub(crate) no_wal_pending: parking_lot::Mutex<std::collections::HashSet<u32>>,
+    pub(crate) no_wal_pending: parking_lot::Mutex<std::collections::HashSet<NamespaceId>>,
 
     // Single global TTL worker — one task that scans every TTL-enabled namespace
     // on each tick (mirrors `value_log_gc_worker`). `None` until the first TTL
@@ -224,7 +225,7 @@ impl Database {
     /// does — can arrive while the store is still being opened. If the registry
     /// knows the id, a creation is or was in flight: wait on the creation lock
     /// and look once more. Ids the registry does not know fail straight away.
-    pub(crate) fn get_store(&self, namespace_id: u32) -> Result<Arc<KVStore>> {
+    pub(crate) fn get_store(&self, namespace_id: NamespaceId) -> Result<Arc<KVStore>> {
         if let Some(store) = self.stores.read().get(&namespace_id).cloned() {
             return Ok(store);
         }

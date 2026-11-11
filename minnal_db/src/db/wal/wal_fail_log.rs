@@ -6,6 +6,7 @@
 //! Customers can inspect these files to understand what data was not applied
 //! and take corrective action (replay, delete, or ignore).
 
+use crate::namespace::NamespaceId;
 use std::path::{Path, PathBuf};
 
 use log::error;
@@ -26,7 +27,7 @@ pub struct FailLog {
 pub struct FailLogOperation {
     pub name: String,
     pub operation: &'static str,
-    pub namespace_id: u32,
+    pub namespace_id: NamespaceId,
     pub key: serde_json::Value,
     pub value: serde_json::Value,
     pub error: String,

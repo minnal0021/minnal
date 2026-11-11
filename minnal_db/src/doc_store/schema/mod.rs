@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 pub mod kv;
 pub mod store;
 pub use crate::vector_index::vector_settings;
@@ -149,7 +150,7 @@ pub struct IndexSpec {
 /// Only **non-indexed** attributes may be amended.  Attempting to remove or
 /// update an attribute that is currently indexed returns
 /// `DocStoreError::AttributeIsIndexed`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SchemaAmendment {
     /// Add a new non-indexed attribute.  Fails if the name already exists in
     /// `attributes` or `indices`.
@@ -223,7 +224,7 @@ pub struct DocStoreSchema {
     pub store_type: StoreType,
     /// The minnal_db internal namespace ID — set after creation.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ns_id: Option<u32>,
+    pub ns_id: Option<NamespaceId>,
     /// The type used as the document key.
     pub key_type: KeyType,
     /// Non-indexed attribute declarations (documentation / future validation).

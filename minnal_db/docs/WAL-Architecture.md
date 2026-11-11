@@ -54,14 +54,14 @@ frame can have; its four bytes are reserved in every segment.
 | Log | Magic | Body |
 |---|---|---|
 | Main WAL | `MWAL` | an rkyv `WalEntry`: operation, namespace, sequence, op name, key, value |
-| Vector index WAL | `MVIW` | `[ns_id u32][seq u64][key_len u32][key][value_len u32][value]`; a delete has `value_len = u32::MAX` and no value |
+| Vector index WAL | `MVIW` | `[ns_id 16B][seq u64][key_len u32][key][value_len u32][value]`; a delete has `value_len = u32::MAX` and no value |
 
 Each log also keeps a **progress file** (`segmented_log::ProgressFile`) in its
 directory: the cut and every safe offset above it, plus the log's own extra
 bytes, checksummed and written atomically.
 
 ```text
-[magic 4B][version u32][cut u64][count u32][count × (ns_id u32, safe u64)]
+[magic 4B][version u32][cut u64][count u32][count × (ns_id 16B, safe u64)]
 [extra_len u32][extra][crc32 of everything before it]
 ```
 

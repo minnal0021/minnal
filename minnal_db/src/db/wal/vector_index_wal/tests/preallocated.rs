@@ -1,6 +1,7 @@
 //! Preallocated segments (design note §18).
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 /// The bytes of segment `segment_id` from `from` to `to`.
 fn bytes_of(dir: &Path, segment_id: u64, from: u64, to: u64) -> Vec<u8> {
@@ -36,12 +37,12 @@ fn a_preallocated_segment_reopens_at_the_same_tail() {
 #[test]
 fn unwritten_space_in_an_earlier_segment_is_corruption() {
     let dir = TempDir::new().unwrap();
-    let (wal, _) = open_at(dir.path(), 256);
+    let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
     append_n(&wal, 4); // segment 0 sealed with 3
     drop(wal);
     let marker = u64::from(SEGMENT_HEADER_LEN + 3 * FRAME);
     zero(dir.path(), 0, marker, marker + 4);
-    let msg = corruption(reopen(dir.path(), 256));
+    let msg = corruption(reopen(dir.path(), SMALL_SEGMENT));
     assert!(msg.contains("segment 0 is not sealed"), "{msg}");
 }
 
@@ -51,12 +52,12 @@ fn unwritten_space_in_an_earlier_segment_is_corruption() {
 #[test]
 fn a_last_segment_with_a_blank_header_is_created_again() {
     let dir = TempDir::new().unwrap();
-    let (wal, _) = open_at(dir.path(), 256);
+    let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
     let appended = append_n(&wal, 3);
-    wal.append(0, b"k", b"v", 99).unwrap(); // starts segment 1
+    wal.append(NamespaceId::from_u128(0), b"k", b"v", 99).unwrap(); // starts segment 1
     drop(wal);
-    zero(dir.path(), 1, 0, 256);
-    let (wal, report) = reopen(dir.path(), 256).unwrap();
+    zero(dir.path(), 1, 0, u64::from(SMALL_SEGMENT));
+    let (wal, report) = reopen(dir.path(), SMALL_SEGMENT).unwrap();
     assert_eq!(report.tail, position(1, SEGMENT_HEADER_LEN));
     assert_eq!(rows_from(&wal, 0), expected(&appended, 0..3));
     let f = File::open(segment_path(dir.path(), 1)).unwrap();
@@ -64,22 +65,22 @@ fn a_last_segment_with_a_blank_header_is_created_again() {
     drop(wal);
 
     flip(dir.path(), 1, 2);
-    let msg = corruption(reopen(dir.path(), 256));
+    let msg = corruption(reopen(dir.path(), SMALL_SEGMENT));
     assert!(msg.contains("no vector index WAL header"), "{msg}");
 }
 
 /// A segment of the earlier format (end marker 0) fails the open: no
 /// conversion.
 #[test]
-fn a_version_1_segment_fails_the_open() {
+fn a_segment_of_an_older_version_fails_the_open() {
     let dir = TempDir::new().unwrap();
-    let (wal, _) = open_at(dir.path(), 256);
+    let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
     append_n(&wal, 2);
     drop(wal);
     let f = OpenOptions::new().write(true).open(segment_path(dir.path(), 0)).unwrap();
     f.write_all_at(&1u32.to_le_bytes(), 4).unwrap();
-    let msg = corruption(reopen(dir.path(), 256));
-    assert!(msg.contains("format version 1, expected 2"), "{msg}");
+    let msg = corruption(reopen(dir.path(), SMALL_SEGMENT));
+    assert!(msg.contains(&format!("format version 1, expected {}", FORMAT.version)), "{msg}");
 }
 
 /// Past half of the active segment the next one is zero-filled ahead,
@@ -100,7 +101,11 @@ fn the_next_segment_is_prepared_ahead_and_installed() {
     let prep = prep_path(dir.path(), 1);
     assert!(prep.exists() && !segment_path(dir.path(), 1).exists());
     let before = appended.len() as u64;
-    appended.extend((before..per_segment + 2).map(|i| wal.append((i % 3) as u32, &key(i), &value(i), i + 1).unwrap().appended()));
+    appended.extend((before..per_segment + 2).map(|i| {
+        wal.append(NamespaceId::from_u128(u128::from((i % 3) as u32)), &key(i), &value(i), i + 1)
+            .unwrap()
+            .appended()
+    }));
     assert!(!prep.exists(), "the prepared file was moved into place");
     let m = std::fs::metadata(segment_path(dir.path(), 1)).unwrap();
     assert_eq!(m.len(), 64 * 1024);
@@ -116,12 +121,12 @@ fn the_next_segment_is_prepared_ahead_and_installed() {
 #[test]
 fn a_leftover_prepared_segment_is_removed_at_open() {
     let dir = TempDir::new().unwrap();
-    let (wal, _) = open_at(dir.path(), 256);
+    let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
     let appended = append_n(&wal, 2);
     drop(wal);
     let prep = prep_path(dir.path(), 1);
     std::fs::write(&prep, header_bytes(1)).unwrap();
-    let (wal, report) = reopen(dir.path(), 256).unwrap();
+    let (wal, report) = reopen(dir.path(), SMALL_SEGMENT).unwrap();
     assert!(!prep.exists());
     assert_eq!(split(report.tail).0, 0);
     assert_eq!(rows_from(&wal, 0), expected(&appended, 0..2));
@@ -145,7 +150,10 @@ fn records_past_a_lost_one_never_rejoin_the_log() {
     assert_eq!(report.tail, appended[10].start);
     let past = bytes_of(dir.path(), 0, u64::from(lost), 64 * 1024);
     assert!(past.iter().all(|&b| b == 0), "open zeroes every byte past the tail");
-    let new = wal.append(0, &key(9_000), &value(9_000), 9_001).unwrap().appended();
+    let new = wal
+        .append(NamespaceId::from_u128(0), &key(9_000), &value(9_000), 9_001)
+        .unwrap()
+        .appended();
     assert_eq!(new.end, appended[11].start, "a same-size record ends where an old one started");
     wal.sync().unwrap();
     drop(wal);

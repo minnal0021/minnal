@@ -27,7 +27,7 @@ async fn async_db_basic_round_trip() {
 #[tokio::test]
 async fn async_db_wal_gc_worker_reclaims_and_stops() {
     let dir = TempDir::new().unwrap();
-    let db = crate::db::facade::AsyncDb::open_with_config(dir.path().to_path_buf(), create_db_config())
+    let db = crate::db::facade::AsyncDb::open_without_workers(dir.path().to_path_buf(), create_db_config())
         .await
         .unwrap();
     db.enable_wal_gc_worker(Duration::from_millis(50)).await.unwrap();
@@ -61,7 +61,7 @@ async fn async_db_wal_gc_worker_reclaims_and_stops() {
 #[tokio::test]
 async fn async_db_shutdown_stops_the_index_checkpoint_worker() {
     let dir = TempDir::new().unwrap();
-    let db = crate::db::facade::AsyncDb::open_with_config(dir.path().to_path_buf(), create_db_config())
+    let db = crate::db::facade::AsyncDb::open_without_workers(dir.path().to_path_buf(), create_db_config())
         .await
         .unwrap();
     // A short interval so a surviving worker would keep firing.
@@ -79,19 +79,24 @@ async fn async_db_shutdown_stops_the_index_checkpoint_worker() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
+/// An open starts every worker, and a shutdown stops them all.
 #[tokio::test]
-async fn async_db_enable_all_workers_then_shut_down() {
+async fn an_open_starts_every_worker_and_a_shutdown_stops_them() {
     let dir = TempDir::new().unwrap();
-    let cfg = create_db_config();
-    let db = crate::db::facade::AsyncDb::open_with_config(dir.path().to_path_buf(), cfg.clone())
+    let db = crate::db::facade::AsyncDb::open_with_config(dir.path().to_path_buf(), create_db_config())
         .await
         .unwrap();
-    db.enable_all_workers(&cfg).await.unwrap();
+    assert_eq!(
+        db.running_workers().await,
+        ["wal_gc", "lsm_compaction", "value_log_gc", "index_checkpoint"],
+        "every worker runs from the open"
+    );
 
     db.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
     assert_eq!(db.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
 
     db.shutdown().await.unwrap();
+    assert!(db.running_workers().await.is_empty(), "the shutdown stopped them all");
 }
 
 #[tokio::test]

@@ -65,7 +65,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ Public API                                                               │
 │                                                                          │
-│ Db / AsyncDb                  Namespace / AsyncNamespace                 │
+│ AsyncDb                       AsyncNamespace                             │
 │   the default namespace, plus   one named namespace                      │
 │   engine-wide operations                                                 │
 │                                                                          │
@@ -271,7 +271,7 @@ frame:   [size: 4B] [crc32(body): 4B] [body: rkyv-serialized WalEntry]
 
 WalEntry {
   operation:    Upsert | Delete
-  namespace_id: u32
+  namespace_id: NamespaceId — 16 bytes, see below
   sequence:     u64   — global monotonic counter
   op_name:      String — caller-supplied label, used in fail-log output
   key:          Vec<u8>
@@ -466,7 +466,7 @@ A namespace is a fully isolated keyspace inside a single database instance — t
 
 **Each namespace is self-contained.** It has its own LSM tree (skip list, L0 files, L1 SSTables), its own sharded value log (`num_buckets` shards), and its own on-disk directory at `<db_path>/ns_<name>/`. Keys in one namespace are invisible to another. (Maintenance — GC, LSM compaction, and TTL expiry — is run by single global workers that fan out over the namespaces, not one worker per namespace; see [Background Workers](#background-workers).)
 
-**Two things are shared across all namespaces:** the single global WAL (each entry tagged with its `namespace_id`), and the namespace registry — a persistent file that maps names to numeric IDs. The registry makes two guarantees worth relying on: the default namespace is always ID `0`, and IDs are assigned monotonically and **never reused**, even after a namespace is deleted. The registry also stores each TTL-enabled namespace's TTL configuration (`ttl` + `max_deletes_per_run`), so TTL expiry is restored automatically on restart rather than having to be re-declared.
+**Two things are shared across all namespaces:** the single global WAL (each entry tagged with its `namespace_id`), and the namespace registry — a persistent file that maps names to ids. A namespace id (`NamespaceId`) is a random 128-bit UUID drawn when the namespace is created, so an id is **never reused**: a name dropped and created again gets a new id, and the old namespace's WAL records and field-index files can never be taken for the new one's. The `default` and `system` namespaces have fixed ids (`NamespaceId::DEFAULT`, `NamespaceId::SYSTEM`). The registry also stores each TTL-enabled namespace's TTL configuration (`ttl` + `max_deletes_per_run`), so TTL expiry is restored automatically on restart rather than having to be re-declared.
 
 **Dropping a namespace** (`remove_namespace`) reclaims its storage and is carefully ordered so that it is crash-safe:
 
@@ -478,6 +478,13 @@ A namespace is a fully isolated keyspace inside a single database instance — t
 The reason this order matters is recovery. The cleanup touches only the namespace's own files — **never the shared WAL or its metadata** — so recovery for surviving namespaces is unaffected. And because the registry deletion is made durable *before* any file is removed, a crash partway through cleanup simply leaves some unreferenced files behind (a harmless disk leak): on the next startup, recovery **skips any WAL entry whose namespace is absent from the registry**, so a dropped namespace can never be resurrected. The never-reused-ID guarantee is what makes this unambiguous — a leftover WAL entry pointing at a missing namespace can only mean that namespace was deleted, never that its ID was handed to something else.
 
 **The WAL leak self-heals — it never becomes permanent.** A crash before step 3 leaves the dropped namespace's entries above the saved cut. That is not a standing leak: the next startup runs WAL recovery, which skips them (their namespace is gone) and then retires the whole log, moving the cut to the tail. WAL GC reclaims those segments on its next cycle.
+
+**A store has a lifecycle of its own on top of this.** A document or KV store of
+the doc store is one namespace plus its record, and moves through states
+(`creating`, `created`, `index_maintenance`, `deleting`) as it is created in the
+background, changed by index jobs and dropped, with one supervised governor
+running every step and resuming it after a crash: see
+[`docs/Namespace-Lifecycle.md`](docs/Namespace-Lifecycle.md).
 
 ### Background Workers
 
@@ -502,7 +509,7 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 
 ```
 <db_path>/
-├── namespace_registry          # Namespace name → ID map, plus TTL settings (rkyv)
+├── namespace_registry          # Namespace name → id (UUID) map, plus TTL settings (rkyv)
 │
 ├── wal/                        # The main WAL
 │   ├── 0000000000.log          # Segments, 64 MB each, created at full size; reclaimed
@@ -703,7 +710,7 @@ There is deliberately **no value-log GC recovery step**. GC unlinks a segment on
 
 ## MinnalDB as an Embedded Store
 
-MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `Db::open` (or `AsyncDb::open`) on a directory path, and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, WAL GC, TTL) running inside your process.
+MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `AsyncDb::open` on a directory path (the API is async, on tokio), and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, GC of both write-ahead logs, field-index checkpoints, TTL) running inside your process, started by the open.
 
 `minnal_db` is a **single crate**; the document and semantic-search layers are
 provided as cargo features (`doc-store`, `semantic-search`) that you opt into.

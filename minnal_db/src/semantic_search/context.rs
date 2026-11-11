@@ -2,6 +2,7 @@
 //! configuration, each namespace's loaded partition, and what a drop or a rebuild
 //! coordinates through.
 
+use crate::namespace::NamespaceId;
 use std::sync::Arc;
 
 use crate::semantic_search::PartitionHandle;
@@ -30,10 +31,6 @@ pub enum ContextError {
     #[error("semantic search is not enabled for namespace '{namespace}'")]
     SemanticSearchNotEnabled { namespace: String },
 
-    /// A partition rebuild of the namespace is already running.
-    #[error("a partition rebuild for namespace '{namespace}' is already running")]
-    VecRebuildInProgress { namespace: String },
-
     /// The embedding service could not embed a query, or a query's stores could
     /// not be opened.
     #[error("embedding failed: {0}")]
@@ -60,8 +57,8 @@ pub enum ContextError {
 /// asynchronously, making the write path independent of embedding service
 /// availability.
 ///
-/// Construct once at startup and attach via
-/// [`DocStore::with_semantic_search`](crate::doc_store::DocStore::with_semantic_search).
+/// Construct once at startup and pass it to the store's builder,
+/// [`DocStoreBuilder::semantic_search`](crate::doc_store::DocStoreBuilder::semantic_search).
 ///
 /// It holds what is engine-wide: the embedding service settings, the defaults
 /// a namespace's vector-index settings start from, and optionally the models
@@ -92,14 +89,12 @@ pub struct SemanticSearchContext {
     /// Threads a partition rebuild's k-means uses (at most
     /// [`MAX_REBUILD_THREADS`](crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS)).
     pub rebuild_threads: usize,
-    /// Each namespace's last rebuild since start.
-    rebuilds: parking_lot::Mutex<std::collections::HashMap<String, crate::semantic_search::ivf_split::rebuild::RebuildStatus>>,
     /// Reaches the partition maintenance task, once it runs.
     maintenance_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Each namespace's partition, loaded once from its stores. Keyed by name and
     /// `ns_id`, so a namespace dropped and recreated under the same name never
     /// reuses the old one.
-    ivfs: parking_lot::RwLock<std::collections::HashMap<(String, u32), Arc<PartitionHandle>>>,
+    ivfs: parking_lot::RwLock<std::collections::HashMap<(String, NamespaceId), Arc<PartitionHandle>>>,
     /// Namespaces whose vector index is being dropped: no partition of theirs
     /// is loaded or handed out until the drop ends ([`begin_drop`](Self::begin_drop)).
     dropping: parking_lot::Mutex<std::collections::HashSet<String>>,
@@ -135,7 +130,6 @@ impl SemanticSearchContext {
             index_defaults: crate::vector_index::vector_settings::IndexDefaults::default(),
             maintenance_threads: crate::semantic_search::workers::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
             rebuild_threads: crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS,
-            rebuilds: parking_lot::Mutex::new(std::collections::HashMap::new()),
             maintenance_tx: std::sync::OnceLock::new(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
             dropping: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -160,52 +154,6 @@ impl SemanticSearchContext {
     pub fn with_rebuild_threads(mut self, threads: usize) -> Self {
         self.rebuild_threads = threads.clamp(1, crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS);
         self
-    }
-
-    /// Mark a rebuild of `namespace` as running, unless one already is.
-    pub(crate) fn claim_rebuild(&self, namespace: &str, postings: Option<usize>) -> Result<(), ContextError> {
-        use crate::semantic_search::ivf_split::rebuild::{RebuildState, RebuildStatus};
-        let mut rebuilds = self.rebuilds.lock();
-        if rebuilds.get(namespace).is_some_and(|s| s.state == RebuildState::Running) {
-            return Err(ContextError::VecRebuildInProgress {
-                namespace: namespace.to_owned(),
-            });
-        }
-        rebuilds.insert(
-            namespace.to_owned(),
-            RebuildStatus {
-                state: RebuildState::Running,
-                postings_requested: postings,
-                started_at_ms: crate::support::now_ms(),
-                finished_at_ms: None,
-                report: None,
-                error: None,
-            },
-        );
-        Ok(())
-    }
-
-    /// Record how `namespace`'s running rebuild ended.
-    pub(crate) fn finish_rebuild(&self, namespace: &str, result: Result<crate::semantic_search::ivf_split::rebuild::RebuildReport, String>) {
-        use crate::semantic_search::ivf_split::rebuild::RebuildState;
-        if let Some(status) = self.rebuilds.lock().get_mut(namespace) {
-            status.finished_at_ms = Some(crate::support::now_ms());
-            match result {
-                Ok(report) => {
-                    status.state = RebuildState::Done;
-                    status.report = Some(report);
-                }
-                Err(e) => {
-                    status.state = RebuildState::Failed;
-                    status.error = Some(e);
-                }
-            }
-        }
-    }
-
-    /// `namespace`'s last rebuild since start, if any.
-    pub fn rebuild_status(&self, namespace: &str) -> Option<crate::semantic_search::ivf_split::rebuild::RebuildStatus> {
-        self.rebuilds.lock().get(namespace).cloned()
     }
 
     pub(crate) fn set_maintenance_sender(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
@@ -346,7 +294,7 @@ impl SemanticSearchContext {
         &self,
         db: &crate::AsyncDb,
         namespace: &str,
-        ns_id: u32,
+        ns_id: NamespaceId,
         settings: &VectorIndexSettings,
     ) -> Result<NamespaceSemantics, ContextError> {
         let key = (namespace.to_owned(), ns_id);

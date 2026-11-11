@@ -1,8 +1,21 @@
-//! A store's vector index over its lifetime: changing its search settings, seeding
-//! its partition, turning semantic search off, and dropping its data, including
-//! finishing a drop that a crash interrupted.
+//! A store's vector index over its lifetime: changing its search settings,
+//! turning semantic search on (a `vector_enable` job: seed the partition, then
+//! save the schema) and off (a `vector_cleanup` job: save the schema, then
+//! remove the vector data).
+//!
+//! The two jobs conflict with each other and with every other vector job of
+//! the store, so an enable can never land while a cleanup runs (FR-010: the
+//! writes between them lost their queue entries).
 
 use crate::doc_store::*;
+use crate::namespace_lifecycle::{JobKind, JobRecord};
+
+/// The progress of a `vector_enable` job: the amendment that turns semantic
+/// search on, its settings settled.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EnableProgress {
+    amendment: SchemaAmendment,
+}
 
 impl DocStore {
     /// Change a store's search settings (`min_probes`, `max_probes`,
@@ -29,9 +42,12 @@ impl DocStore {
                 )
                 .await
             }
-            StoreType::Kv => self
-                .schemas
-                .update_kv(namespace, |schema| Ok(schema.update_vector_search(search, maintenance)?)),
+            // The state checked under the schema writer, so no drop moves the
+            // store on between the check and the change.
+            StoreType::Kv => self.schemas.update_kv(namespace, |schema| {
+                self.schemas.admit(namespace)?;
+                Ok(schema.update_vector_search(search, maintenance)?)
+            }),
         }
     }
 
@@ -75,14 +91,10 @@ impl DocStore {
         crate::doc_store::schema::vector_settings::IndexDefaults::default()
     }
 
-    /// Disable semantic search for a document or KV store: `semantic_search_enabled`
-    /// goes to `false`, and a document store's `embedding_fields` are cleared. A
-    /// document store can enable it again by amending its schema; a KV store chooses
-    /// it only when it is created.
-    ///
-    /// Returns `Err(SemanticSearchNotEnabled)` when the namespace does not have
-    /// semantic search configured, so callers can surface a proper 422.
-    pub fn disable_semantic_search(&self, namespace: &str) -> Result<(), DocStoreError> {
+    /// Turn semantic search off in a document or KV store's schema:
+    /// `semantic_search_enabled` goes to `false`, and a document store's
+    /// `embedding_fields` are cleared. `SemanticSearchNotEnabled` when it is off.
+    pub(in crate::doc_store) fn turn_semantic_search_off(&self, namespace: &str) -> Result<(), DocStoreError> {
         let not_enabled = || DocStoreError::SemanticSearchNotEnabled {
             namespace: namespace.to_owned(),
         };
@@ -105,56 +117,10 @@ impl DocStore {
         }
     }
 
-    /// Finish every vector-index drop a crash interrupted; returns how many.
-    ///
-    /// Dropping a vector index saves the schema with semantic search off first
-    /// (so new writes stop enqueueing), then clears the queue and removes the
-    /// vector namespaces in the background ([`drop_vector_index_data`]). A crash
-    /// in between left the vectors and the queue entries for good, and the worker
-    /// would even process those entries, recreating the vector namespaces of a
-    /// store without semantic search. Dropping a whole store has the same shape.
-    /// So at open, before any worker starts, every namespace that has vector data
-    /// or queue entries but no semantic-search schema gets the cleanup finished.
-    ///
-    /// [`drop_vector_index_data`]: DocStore::drop_vector_index_data
-    #[cfg(feature = "semantic-search")]
-    pub(in crate::doc_store) async fn finish_interrupted_vector_index_drops(&self) -> Result<usize, DocStoreError> {
-        let mut semantic: std::collections::HashSet<String> = self
-            .load_all_schemas()?
-            .into_iter()
-            .filter(|s| s.is_semantic_search_enabled())
-            .map(|s| s.namespace.clone())
-            .collect();
-        semantic.extend(
-            self.load_all_kv_schemas()?
-                .into_iter()
-                .filter(|s| s.is_semantic_search_enabled())
-                .map(|s| s.namespace.clone()),
-        );
-        let mut leftover: std::collections::BTreeSet<String> = self
-            .db
-            .list_namespaces()
-            .into_iter()
-            // A store saved under such a name is not a companion, even though
-            // its name is no longer accepted.
-            .filter(|(name, _)| !self.schemas.contains(name))
-            .filter_map(|(name, _)| vector_kv::vector_data_base(&name).map(str::to_owned))
-            .collect();
-        leftover.extend(vector_kv::queued_namespaces(&self.db).await?);
-        leftover.retain(|ns| !semantic.contains(ns));
-        for namespace in &leftover {
-            warn!("finishing an interrupted vector-index drop for namespace='{namespace}'");
-            self.drop_vector_index_data(namespace).await?;
-        }
-        Ok(leftover.len())
-    }
-
     /// Give every semantic-search store whatever it lacks of its vector namespaces
-    /// and starting partition. Writers never create them, and a crash after a drop
-    /// removed them and before it re-seeded (semantic search was enabled again
-    /// meanwhile) leaves a schema that promises a partition with none there; the
-    /// enable route refuses such a store, as it already has a vector index. Called
-    /// at open, before any drop can run.
+    /// and starting partition: a schema that promises a partition must have
+    /// one, and writers never create it. Cheap and idempotent; called at open,
+    /// before any job runs.
     #[cfg(feature = "semantic-search")]
     pub(in crate::doc_store) async fn ensure_vector_indexes(&self) -> Result<(), DocStoreError> {
         let docs = self
@@ -178,46 +144,152 @@ impl DocStore {
         Ok(())
     }
 
-    /// Delete all vector-index backing data for a namespace.
-    ///
-    /// Clears:
-    /// - Every entry in the global embedding queue that belongs to `namespace`.
-    /// - All entries in the `{namespace}_sparse_vector_meta` companion namespace.
-    /// - All entries in the `{namespace}_sparse_vector` companion namespace.
-    /// - All entries in the `{namespace}_dense_vector` companion namespace.
-    /// - The `vector_reindex.json` progress file (if present).
-    ///
-    /// This does **not** update the schema — the caller must call
-    /// [`disable_semantic_search`] (or equivalent) before spawning this as a
-    /// background task, so that new writes do not re-enqueue embeddings during
-    /// cleanup.
-    ///
-    /// [`disable_semantic_search`]: DocStore::disable_semantic_search
-    #[cfg(feature = "semantic-search")]
-    pub async fn drop_vector_index_data(&self, namespace: &str) -> Result<(), DocStoreError> {
-        self.without_partition_maintenance(namespace, async {
-            self.drop_vector_index_data_now(namespace).await?;
-            // Semantic search was turned back on before this drop ran, and the
-            // partition its seeding kept is gone with the rest. The schema
-            // promises one.
-            let enabled = self.schemas.get(namespace).is_some_and(|s| s.is_semantic_search_enabled());
-            if enabled {
-                // No model check: the enable made it, and with the old partition
-                // already gone, failing here would leave none.
-                let (settings, _) = self.schemas.vector_settings(namespace)?;
-                vector_kv::init_ivf(&self.db, namespace, settings.embedding_dim as usize).await?;
-            }
-            Ok(())
+    // ── Enable: a `vector_enable` job ─────────────────────────────────────
+
+    /// Turn semantic search on for document store `namespace` with
+    /// `amendment` (one that does, its settings settled and its model
+    /// checked), as a `vector_enable` job; returns once the schema says so.
+    pub(in crate::doc_store) async fn enable_semantic_search(&self, namespace: &str, amendment: SchemaAmendment) -> Result<(), DocStoreError> {
+        let key = self.start_vector_enable(namespace, amendment)?;
+        self.run_job(namespace, key).await
+    }
+
+    /// Record the `vector_enable` job of [`enable_semantic_search`](Self::enable_semantic_search).
+    pub(in crate::doc_store) fn start_vector_enable(&self, namespace: &str, amendment: SchemaAmendment) -> Result<JobKey, DocStoreError> {
+        self.job_runner_ready()?;
+        let ns_id = self.load_schema(namespace)?.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        let key = JobKey::new(ns_id, JobKind::VectorEnable);
+        self.start_job(namespace, key, "semantic search", &EnableProgress { amendment })?;
+        Ok(key)
+    }
+
+    /// The body of a `vector_enable` job: seed the store's vector namespaces
+    /// and partition, then save the schema with semantic search on. On a
+    /// cancel, what the seeding made is removed again.
+    pub(in crate::doc_store) async fn vector_enable_job(&self, namespace: &str, key: JobKey) -> Result<(), DocStoreError> {
+        use crate::doc_store::indexing::record_error;
+        let Some(record) = self.jobs.get(key)?.filter(JobRecord::is_live) else {
+            return Ok(());
+        };
+        let progress: EnableProgress = record.progress().ok_or_else(|| record_error(key, "no amendment"))?;
+        let current = self.load_schema(namespace)?;
+        if current.semantic_search_enabled {
+            return Ok(());
+        }
+        let cancelled = || self.jobs.is_cancelling(key);
+        if cancelled() {
+            return self.remove_vector_data(namespace).await;
+        }
+        let mut trial = DocStoreSchema::clone(&current);
+        crate::doc_store::lifecycle::apply_amendment(namespace, &mut trial, progress.amendment.clone())?;
+        let settings = trial.vector_settings()?;
+        // Idempotent: a namespace that already has a partition keeps it.
+        self.seed_vector_index(namespace, &settings, &mut trial.vector_index).await?;
+        if cancelled() {
+            return self.remove_vector_data(namespace).await;
+        }
+        // Applied to the schema as it is now, atomically with every other
+        // schema write: a concurrent amendment cannot be lost.
+        self.schemas.update_doc(namespace, |schema| {
+            crate::doc_store::lifecycle::apply_amendment(namespace, schema, progress.amendment.clone())
         })
-        .await
+    }
+
+    // ── Cleanup: a `vector_cleanup` job ───────────────────────────────────
+
+    /// Turn semantic search off for a document or KV store and remove its
+    /// vector index — its embedding queue entries and vector namespaces, the
+    /// partition with them — as a `vector_cleanup` job; returns once it is
+    /// gone. A document store's embedding fields stay as plain attributes,
+    /// and its vector-index settings are kept for a later enable.
+    ///
+    /// Refused with [`DocStoreError::SemanticSearchNotEnabled`] for a store
+    /// without semantic search, and [`DocStoreError::JobConflict`] while
+    /// another vector job of it runs. It cannot be cancelled: a half-removed
+    /// vector index serves neither searches nor a new enable.
+    pub async fn drop_vector_index(&self, namespace: &str) -> Result<(), DocStoreError> {
+        let key = self.start_vector_cleanup(namespace, || self.turn_semantic_search_off(namespace))?;
+        self.run_job(namespace, key).await
+    }
+
+    /// [`drop_vector_index`](Self::drop_vector_index), returning the job's
+    /// name once semantic search is off and the removal is handed to the
+    /// governor.
+    pub fn begin_drop_vector_index(&self, namespace: &str) -> Result<String, DocStoreError> {
+        self.running_governor()?;
+        let key = self.start_vector_cleanup(namespace, || self.turn_semantic_search_off(namespace))?;
+        self.submit_job(namespace, key)?;
+        Ok(key.kind.name().to_owned())
+    }
+
+    /// Start a `vector_cleanup` job of `namespace`, then `turn_off` its
+    /// semantic search in the schema, before the job is handed on: writes stop
+    /// enqueueing at once.
+    pub(in crate::doc_store) fn start_vector_cleanup(
+        &self,
+        namespace: &str,
+        turn_off: impl FnOnce() -> Result<(), DocStoreError>,
+    ) -> Result<JobKey, DocStoreError> {
+        self.job_runner_ready()?;
+        self.schemas.admit(namespace)?;
+        let schema = self.schemas.get(namespace).ok_or_else(|| DocStoreError::NotFound {
+            namespace: namespace.to_owned(),
+        })?;
+        if !schema.is_semantic_search_enabled() {
+            return Err(DocStoreError::SemanticSearchNotEnabled {
+                namespace: namespace.to_owned(),
+            });
+        }
+        let ns_id = schema.ns_id().ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        let key = JobKey::new(ns_id, JobKind::VectorCleanup);
+        self.start_job(namespace, key, "vector index", &serde_json::Value::Null)?;
+        if let Err(e) = turn_off() {
+            // Refused before any of the job's work: take the job back rather
+            // than leave a failed one on record.
+            self.jobs.withdraw(self, namespace, key, &e.to_string())?;
+            return Err(e);
+        }
+        Ok(key)
+    }
+
+    /// The body of a `vector_cleanup` job: semantic search off (a crash can
+    /// have come before the start turned it off), then the vector data
+    /// removed.
+    pub(in crate::doc_store) async fn vector_cleanup_job(&self, namespace: &str, key: JobKey) -> Result<(), DocStoreError> {
+        if !self.jobs.get(key)?.is_some_and(|r| r.is_live()) {
+            return Ok(());
+        }
+        match self.turn_semantic_search_off(namespace) {
+            Ok(()) | Err(DocStoreError::SemanticSearchNotEnabled { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        self.remove_vector_data(namespace).await
+    }
+
+    /// Remove `namespace`'s vector data, with its partition's maintenance
+    /// stopped first. Idempotent.
+    async fn remove_vector_data(&self, namespace: &str) -> Result<(), DocStoreError> {
+        #[cfg(feature = "semantic-search")]
+        return self
+            .without_partition_maintenance(namespace, self.drop_vector_index_data_now(namespace))
+            .await;
+        #[cfg(not(feature = "semantic-search"))]
+        {
+            let _ = namespace; // no vector data without semantic search
+            Ok(())
+        }
     }
 
     /// Run `drop`, which removes `namespace`'s vector namespaces, with its
     /// partition's maintenance and vector writes stopped and finished first, no
     /// partition of it handed out meanwhile
-    /// ([`SemanticSearchContext::begin_drop`]), and no reindex of it enqueueing:
-    /// a write after the removal would recreate what was removed, and an
-    /// enqueue after the queue is cleared would outlive the store.
+    /// ([`SemanticSearchContext::begin_drop`]): a write after the removal would
+    /// recreate what was removed. (A reindex enqueueing is a job, which the
+    /// drop's own job or state refuses.)
     pub(in crate::doc_store) async fn without_partition_maintenance<T>(
         &self,
         namespace: &str,
@@ -226,7 +298,8 @@ impl DocStore {
         let _lifecycle = self.lifecycle.lock(namespace).await;
         #[cfg(feature = "semantic-search")]
         if let Some(ctx) = &self.semantic_ctx {
-            // A guard, as in `without_writes`: left in place, the namespace's
+            // A guard, so a drop cut short at an await (its future dropped)
+            // does not leave it in place: left in place, the namespace's
             // partition is refused for good. Declared after `_lifecycle`, so the
             // drop has ended before another lifecycle operation starts.
             struct EndDrop<'a>(&'a SemanticSearchContext, &'a str);
@@ -238,8 +311,6 @@ impl DocStore {
             }
             let _end = EndDrop(ctx, namespace);
             ctx.begin_drop(namespace).await;
-            // A reindex sees the drop and stops at its next enqueue.
-            self.wait_for_reindex(namespace).await;
             return drop.await;
         }
         #[cfg(not(feature = "semantic-search"))]
@@ -249,7 +320,7 @@ impl DocStore {
 
     #[cfg(feature = "semantic-search")]
     async fn drop_vector_index_data_now(&self, namespace: &str) -> Result<(), DocStoreError> {
-        info!("drop_vector_index_data: clearing embedding queue for namespace='{namespace}'");
+        info!("drop_vector_index: clearing embedding queue for namespace='{namespace}'");
         self.delete_all_queue_entries(namespace).await?;
 
         // Remove the companion vector namespaces outright (reclaiming their
@@ -264,7 +335,7 @@ impl DocStore {
             }
             if let Err(e) = self.db.remove_namespace(companion.clone()).await {
                 // Best-effort: a missing companion is fine (nothing was indexed).
-                debug!("drop_vector_index_data: removing companion '{companion}' for '{namespace}': {e}");
+                debug!("drop_vector_index: removing companion '{companion}' for '{namespace}': {e}");
             }
         }
 
@@ -275,11 +346,13 @@ impl DocStore {
             ctx.evict(namespace);
         }
 
+        // The ended records of the vector jobs describe an index that is gone.
         if let Some(ns_id) = self.schemas.get(namespace).and_then(|s| s.ns_id()) {
-            let _ = std::fs::remove_file(vec_reindex_path(&self.db_path, ns_id));
+            self.jobs.forget(JobKey::vector_reindex(ns_id))?;
+            self.jobs.forget(JobKey::new(ns_id, JobKind::PartitionRebuild))?;
         }
 
-        info!("drop_vector_index_data: namespace='{namespace}' cleanup complete");
+        info!("drop_vector_index: namespace='{namespace}' cleanup complete");
         Ok(())
     }
 }

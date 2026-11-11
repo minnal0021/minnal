@@ -23,6 +23,7 @@
 //! POST /admin/storage/index-checkpoint                → flush + compact field indexes (and row maps) — runs in background (202)
 //! ```
 
+use minnal_db::NamespaceId;
 use std::collections::HashMap;
 
 use axum::{
@@ -540,7 +541,8 @@ impl FieldInfo {
 #[derive(Serialize)]
 pub struct DocStoreNamespaceInfo {
     name: String,
-    ns_id: u32,
+    /// `null` until the store has its namespace.
+    ns_id: Option<NamespaceId>,
     key_type: String,
     semantic_search_enabled: bool,
     indexed_fields: Vec<FieldInfo>,
@@ -549,7 +551,8 @@ pub struct DocStoreNamespaceInfo {
 #[derive(Serialize)]
 pub struct KvStoreNamespaceInfo {
     name: String,
-    ns_id: u32,
+    /// `null` until the store has its namespace.
+    ns_id: Option<NamespaceId>,
     key_type: String,
     value_type: String,
     semantic_search_enabled: bool,
@@ -566,7 +569,7 @@ pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
     let mut doc_stores: Vec<DocStoreNamespaceInfo> = schemas
         .iter()
         .map(|(name, schema)| {
-            let ns_id = schema.ns_id.unwrap_or(0);
+            let ns_id = schema.ns_id;
             let indexed_fields = if let Some(id) = schema.ns_id {
                 // Filter to the schema's current indices — the db registry retains
                 // dropped fields (for field_id reuse), which must not show here.
@@ -597,7 +600,7 @@ pub async fn namespaces(State(state): State<AppState>) -> impl IntoResponse {
         .values()
         .map(|s| KvStoreNamespaceInfo {
             name: s.namespace.clone(),
-            ns_id: s.ns_id.unwrap_or(0),
+            ns_id: s.ns_id,
             key_type: kv_key_type_str(s.key_type),
             value_type: kv_value_type_str(s.value_type),
             semantic_search_enabled: s.semantic_search_enabled,
@@ -807,7 +810,7 @@ pub async fn value_log_segments(
 #[derive(Serialize)]
 pub struct KvNamespaceInfo {
     name: String,
-    id: u32,
+    id: NamespaceId,
     role: &'static str,
 }
 
@@ -1001,7 +1004,7 @@ pub struct FieldWasteInfo {
 #[derive(Serialize)]
 pub struct NamespaceWasteInfo {
     namespace: String,
-    ns_id: u32,
+    ns_id: NamespaceId,
     fields: Vec<FieldWasteInfo>,
 }
 
@@ -1071,7 +1074,7 @@ pub struct AssociatedKvStore {
 #[derive(Serialize)]
 pub struct DocStoreKvMeta {
     namespace: String,
-    ns_id: u32,
+    ns_id: NamespaceId,
     semantic_search_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     lsm: Option<LsmNamespaceInfo>,
@@ -1131,7 +1134,7 @@ pub fn build_namespace_meta(
 #[derive(Serialize)]
 pub struct KvStoreKvMeta {
     namespace: String,
-    ns_id: u32,
+    ns_id: NamespaceId,
     key_type: String,
     value_type: String,
     semantic_search_enabled: bool,
@@ -1233,6 +1236,7 @@ fn system_ns_purpose(name: &str) -> &'static str {
     match name {
         "system" => "system namespace root (reserved; never stores user data)",
         "system_qemb_cache" => "query-embedding cache shared across all semantic-search namespaces (TTL configurable; default 1 day)",
+        "system_namespace_maintenance" => "maintenance tasks and their progress: field-index builds, reindex-all and vector reindexes, per store",
         "system_partition_history" => {
             "vector-partition history: code health, recall checks and rebuilds per namespace (TTL configurable; default 30 days)"
         }
@@ -1245,7 +1249,7 @@ fn system_ns_purpose(name: &str) -> &'static str {
 #[derive(Serialize)]
 pub struct SystemKvStoreInfo {
     name: String,
-    ns_id: u32,
+    ns_id: NamespaceId,
     purpose: &'static str,
     ttl_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1259,7 +1263,7 @@ pub struct SystemKvStoreInfo {
 #[derive(Serialize)]
 pub struct SystemDocStoreInfo {
     namespace: String,
-    ns_id: u32,
+    ns_id: Option<NamespaceId>,
     semantic_search_enabled: bool,
 }
 
@@ -1272,7 +1276,7 @@ pub struct SystemStoresResponse {
 #[derive(Serialize)]
 pub struct SystemStoreMeta {
     name: String,
-    ns_id: u32,
+    ns_id: NamespaceId,
     purpose: &'static str,
     ttl_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1331,7 +1335,7 @@ pub async fn system_stores(State(state): State<AppState>) -> impl IntoResponse {
         .filter(|s| is_system_ns(&s.namespace))
         .map(|s| SystemDocStoreInfo {
             namespace: s.namespace.clone(),
-            ns_id: s.ns_id.unwrap_or(0),
+            ns_id: s.ns_id,
             semantic_search_enabled: s.semantic_search_enabled,
         })
         .collect();
@@ -1352,7 +1356,7 @@ pub async fn system_store_meta(
         ));
     }
 
-    let kv_map: HashMap<String, u32> = state.db.list_namespaces().into_iter().collect();
+    let kv_map: HashMap<String, NamespaceId> = state.db.list_namespaces().into_iter().collect();
 
     let ns_id = match kv_map.get(&ns) {
         Some(&id) => id,

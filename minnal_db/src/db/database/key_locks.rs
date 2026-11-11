@@ -24,6 +24,7 @@
 //! globally on `wal_metadata.write()` across an fsync, so an uncontended
 //! `parking_lot::Mutex` acquire disappears into the noise.
 
+use crate::namespace::NamespaceId;
 use mm3h::Murmur3Hasher;
 use parking_lot::{Mutex, MutexGuard};
 use std::hash::Hasher;
@@ -57,7 +58,7 @@ impl KeyLocks {
     /// Not reentrant — `parking_lot::Mutex` deadlocks on a second acquire from
     /// the same thread. Callers must never take two stripes at once, and a
     /// merge closure must not call back into the database.
-    pub(crate) fn guard(&self, namespace_id: u32, key: &[u8]) -> MutexGuard<'_, ()> {
+    pub(crate) fn guard(&self, namespace_id: NamespaceId, key: &[u8]) -> MutexGuard<'_, ()> {
         self.stripes[self.stripe_of(namespace_id, key)].lock()
     }
 
@@ -65,9 +66,9 @@ impl KeyLocks {
     /// [`get_bucket_for_key`](crate::support::get_bucket_for_key), which hashes
     /// only the first 8 bytes: reusing it would collapse every key sharing an
     /// 8-byte prefix — the common shape for string keys — onto one stripe.
-    pub(crate) fn stripe_of(&self, namespace_id: u32, key: &[u8]) -> usize {
+    pub(crate) fn stripe_of(&self, namespace_id: NamespaceId, key: &[u8]) -> usize {
         let mut hasher = Murmur3Hasher::new_with_seed(SEED);
-        hasher.write(&namespace_id.to_le_bytes());
+        hasher.write(&namespace_id.to_bytes());
         hasher.write(key);
         (hasher.finish() as usize) & (STRIPES - 1)
     }
@@ -88,7 +89,10 @@ mod tests {
     #[test]
     fn the_same_key_always_maps_to_the_same_stripe() {
         let locks = KeyLocks::new();
-        assert_eq!(locks.stripe_of(7, b"alpha"), locks.stripe_of(7, b"alpha"));
+        assert_eq!(
+            locks.stripe_of(NamespaceId::from_u128(7), b"alpha"),
+            locks.stripe_of(NamespaceId::from_u128(7), b"alpha")
+        );
     }
 
     #[test]
@@ -96,7 +100,9 @@ mod tests {
         // Not a correctness requirement (a collision is legal), just a check
         // that the namespace is actually mixed in rather than ignored.
         let locks = KeyLocks::new();
-        let differs = (0..64u32).any(|ns| locks.stripe_of(ns, b"k") != locks.stripe_of(ns + 1, b"k"));
+        let differs = (0..64u32).any(|ns| {
+            locks.stripe_of(NamespaceId::from_u128(u128::from(ns)), b"k") != locks.stripe_of(NamespaceId::from_u128(u128::from(ns + 1)), b"k")
+        });
         assert!(differs, "namespace_id is not affecting the stripe");
     }
 
@@ -105,7 +111,9 @@ mod tests {
     #[test]
     fn keys_sharing_an_eight_byte_prefix_spread_across_stripes() {
         let locks = KeyLocks::new();
-        let stripes: std::collections::HashSet<usize> = (0..64).map(|i| locks.stripe_of(0, format!("job_content_{}", i).as_bytes())).collect();
+        let stripes: std::collections::HashSet<usize> = (0..64)
+            .map(|i| locks.stripe_of(NamespaceId::from_u128(0), format!("job_content_{}", i).as_bytes()))
+            .collect();
         assert!(stripes.len() > 32, "expected keys to spread, got {} distinct stripes", stripes.len());
     }
 
@@ -121,7 +129,7 @@ mod tests {
                 let (locks, counter, live, overlap) = (Arc::clone(&locks), Arc::clone(&counter), Arc::clone(&live), Arc::clone(&observed_overlap));
                 s.spawn(move || {
                     for _ in 0..500 {
-                        let _g = locks.guard(0, b"contended");
+                        let _g = locks.guard(NamespaceId::from_u128(0), b"contended");
                         if live.fetch_add(1, Ordering::SeqCst) != 0 {
                             overlap.fetch_add(1, Ordering::SeqCst);
                         }

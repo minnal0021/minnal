@@ -41,7 +41,7 @@ impl DocStore {
     /// Counts the live documents by listing every key, so it costs a key scan
     /// of the store; meant for occasional admin checks, not a hot path.
     pub async fn rowmap_stats(&self, namespace: &str) -> Result<Option<RowMapStats>, DocStoreError> {
-        let schema = self.load_schema(namespace)?;
+        let schema = self.view_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
@@ -64,7 +64,7 @@ impl DocStore {
     /// Return the number of distinct indexed values for a field, or `None` if the
     /// field is not currently active (e.g. still building).
     pub fn field_index_distinct_count(&self, namespace: &str, field: &str) -> Option<usize> {
-        let schema = self.load_schema(namespace).ok()?;
+        let schema = self.view_schema(namespace).ok()?;
         let ns_id = schema.ns_id?;
         let fields = self.db.list_index_fields(ns_id);
         let fm = fields.iter().find(|f| f.field_name == field)?;
@@ -75,7 +75,7 @@ impl DocStore {
     /// append-only index stores, or `None` if the field is not currently active.
     /// Useful for monitoring how close a field is to triggering compaction.
     pub fn field_index_waste(&self, namespace: &str, field: &str) -> Option<(f64, f64)> {
-        let schema = self.load_schema(namespace).ok()?;
+        let schema = self.view_schema(namespace).ok()?;
         let ns_id = schema.ns_id?;
         let fields = self.db.list_index_fields(ns_id);
         let fm = fields.iter().find(|f| f.field_name == field)?;
@@ -88,7 +88,7 @@ impl DocStore {
     /// absolute blob *growth* between compactions that the waste *ratio* alone
     /// hides — worst for low-cardinality, high-churn fields.
     pub fn field_index_blob_stats(&self, namespace: &str, field: &str) -> Option<crate::IndexBlobStats> {
-        let schema = self.load_schema(namespace).ok()?;
+        let schema = self.view_schema(namespace).ok()?;
         let ns_id = schema.ns_id?;
         let fields = self.db.list_index_fields(ns_id);
         let fm = fields.iter().find(|f| f.field_name == field)?;
@@ -123,7 +123,7 @@ impl DocStore {
     /// Report the health of every field index in a namespace: where its
     /// persisted state reaches, whether it is active, and any outstanding gap.
     pub async fn index_health(&self, namespace: &str) -> Result<Vec<crate::db::indexing::manager::FieldIndexHealth>, DocStoreError> {
-        let schema = self.load_schema(namespace)?;
+        let schema = self.view_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
             namespace: namespace.to_owned(),
         })?;
@@ -163,7 +163,7 @@ impl DocStore {
     /// is not semantic-search-enabled.
     #[cfg(feature = "semantic-search")]
     pub async fn reindex_doc_vector(&self, namespace: &str, id: DocId) -> Result<VectorReindexOutcome, DocStoreError> {
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let schema = self.load_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
             return Err(DocStoreError::SemanticSearchNotEnabled {
@@ -196,7 +196,7 @@ impl DocStore {
     /// is not semantic-search-enabled.
     #[cfg(feature = "semantic-search")]
     pub async fn kv_reindex_doc_vector(&self, namespace: &str, raw_key: &str) -> Result<VectorReindexOutcome, DocStoreError> {
-        let _write = self.writes.enter(namespace)?;
+        let _write = self.enter_write(namespace)?;
         let schema = self.load_kv_schema(namespace)?;
         if !schema.is_semantic_search_enabled() {
             return Err(DocStoreError::SemanticSearchNotEnabled {

@@ -1,6 +1,7 @@
 //! Creating, listing, persisting and removing namespaces, and their isolation.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 /// Regression (F6): concurrent first use of a namespace must not fail.
 ///
@@ -119,9 +120,9 @@ fn test_database_multiple_namespaces() {
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
 
-    // Create additional namespace — ID 0 = default, 1 = system, so users gets 2.
     let users_id = db.create_namespace("users").unwrap();
-    assert_eq!(users_id, 2);
+    assert_ne!(users_id, NamespaceId::DEFAULT);
+    assert_ne!(users_id, NamespaceId::SYSTEM);
 
     // Write to default namespace
     db.put(b"global_key", b"global_value").unwrap();
@@ -147,17 +148,20 @@ fn test_database_namespace_listing() {
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
 
-    db.create_namespace("users").unwrap();
-    db.create_namespace("orders").unwrap();
+    let users = db.create_namespace("users").unwrap();
+    let orders = db.create_namespace("orders").unwrap();
 
     let mut namespaces = db.list_namespaces();
-    namespaces.sort_by_key(|(_, id)| *id);
-    // default(0), system(1), users(2), orders(3)
-    assert_eq!(namespaces.len(), 4);
-    assert_eq!(namespaces[0], ("default".to_string(), 0));
-    assert_eq!(namespaces[1], ("system".to_string(), 1));
-    assert_eq!(namespaces[2], ("users".to_string(), 2));
-    assert_eq!(namespaces[3], ("orders".to_string(), 3));
+    namespaces.sort();
+    assert_eq!(
+        namespaces,
+        vec![
+            ("default".to_string(), NamespaceId::DEFAULT),
+            ("orders".to_string(), orders),
+            ("system".to_string(), NamespaceId::SYSTEM),
+            ("users".to_string(), users),
+        ]
+    );
 
     db.shutdown().unwrap();
 }
@@ -290,7 +294,7 @@ fn test_delete_ns_invalid_namespace_returns_error() {
     let db = Database::open(dir.path(), create_db_config()).unwrap();
 
     // Namespace 9999 was never created.
-    let result = db.delete_ns(9999, b"k");
+    let result = db.delete_ns(NamespaceId::from_u128(9999), b"k");
     assert!(result.is_err(), "delete_ns on unknown namespace should fail");
 
     db.shutdown().unwrap();

@@ -17,6 +17,7 @@
 //! `database/`.
 
 use crate::db::wal::segmented_log::{self, LogError, LogFormat, LogPosition, OpenFrom, SegmentedLog};
+use crate::namespace::NamespaceId;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::path::Path;
 #[cfg(test)]
@@ -63,7 +64,7 @@ pub type Result<T> = std::result::Result<T, WalError>;
 pub(crate) static FORMAT: LogFormat = LogFormat {
     name: "main WAL",
     magic: *b"MWAL",
-    version: 1,
+    version: 2,
 };
 
 /// Default WAL segment size (64 MiB).
@@ -98,7 +99,7 @@ pub enum WalOperationType {
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct WalEntry {
     pub operation: WalOperationType,
-    pub namespace_id: u32,
+    pub namespace_id: NamespaceId,
     /// Global monotonic sequence number assigned at write time.
     pub sequence: u64,
     /// Human-readable label for this operation, used in fail-log output.
@@ -109,14 +110,14 @@ pub struct WalEntry {
 
 impl WalEntry {
     pub fn new_upsert(key: Vec<u8>, value: Vec<u8>) -> Self {
-        Self::new_upsert_ns(0, key, value)
+        Self::new_upsert_ns(NamespaceId::DEFAULT, key, value)
     }
 
     pub fn new_delete(key: Vec<u8>) -> Self {
-        Self::new_delete_ns(0, key)
+        Self::new_delete_ns(NamespaceId::DEFAULT, key)
     }
 
-    pub fn new_upsert_ns(namespace_id: u32, key: Vec<u8>, value: Vec<u8>) -> Self {
+    pub fn new_upsert_ns(namespace_id: NamespaceId, key: Vec<u8>, value: Vec<u8>) -> Self {
         Self {
             operation: WalOperationType::Upsert,
             namespace_id,
@@ -127,7 +128,7 @@ impl WalEntry {
         }
     }
 
-    pub fn new_delete_ns(namespace_id: u32, key: Vec<u8>) -> Self {
+    pub fn new_delete_ns(namespace_id: NamespaceId, key: Vec<u8>) -> Self {
         Self {
             operation: WalOperationType::Delete,
             namespace_id,
@@ -168,10 +169,10 @@ impl WalEntry {
     /// (see [`Wal::scan_segment_keys`]): a segment can hold tens of thousands of
     /// documents, and full deserialisation would copy every one of their values
     /// into memory just to throw them away.
-    pub fn peek_namespace_and_key(bytes: &[u8]) -> Result<(u32, Vec<u8>)> {
+    pub fn peek_namespace_and_key(bytes: &[u8]) -> Result<(NamespaceId, Vec<u8>)> {
         let archived = rkyv::access::<ArchivedWalEntry, rkyv::rancor::Error>(bytes)
             .map_err(|e| WalError::Serialization(format!("WAL entry validation failed: {}", e)))?;
-        Ok((archived.namespace_id.into(), archived.key.to_vec()))
+        Ok(((&archived.namespace_id).into(), archived.key.to_vec()))
     }
 
     /// Read only the sequence, copying nothing (`Wal::recover_sequence`).
@@ -193,7 +194,7 @@ impl WalEntry {
 
         Ok(WalEntry {
             operation,
-            namespace_id: archived.namespace_id.into(),
+            namespace_id: (&archived.namespace_id).into(),
             sequence: archived.sequence.to_native(),
             op_name: archived.op_name.to_string(),
             key: archived.key.to_vec(),
@@ -259,7 +260,7 @@ pub struct WalMetadata {
     pub cut: u64,
     /// Namespaces whose safe offset is above `cut`, sorted by namespace: each
     /// one's writes below its offset are in L0 files too.
-    pub safe: Vec<(u32, u64)>,
+    pub safe: Vec<(NamespaceId, u64)>,
     /// WAL GC passes ever run.
     pub total_gc_runs: u64,
     /// Bytes of segment files ever deleted by WAL GC.
@@ -308,7 +309,7 @@ impl WalMetadata {
 
     /// Where replay starts for namespace `ns`: its saved safe offset, or the
     /// cut for a namespace not listed.
-    pub fn replay_from(&self, ns: u32) -> u64 {
+    pub fn replay_from(&self, ns: NamespaceId) -> u64 {
         self.progress().replay_from(ns)
     }
 
@@ -345,7 +346,7 @@ impl WalMetadata {
     }
 }
 
-/// The main WAL's state for operators, from [`Db::wal_stats`](crate::Db::wal_stats).
+/// The main WAL's state for operators, from [`AsyncDb::wal_stats`](crate::AsyncDb::wal_stats).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WalStats {
     /// The first record still on disk; segments below it were reclaimed.
@@ -578,7 +579,7 @@ impl Wal {
     /// materialising any values**, in log order and with duplicates: a key
     /// written five times appears five times. Callers wanting a work list want
     /// [`scan_segment_keys`](Self::scan_segment_keys), which deduplicates.
-    pub fn scan_keys_in_entries(&self, start: u64, end: u64) -> Result<Vec<(u32, Vec<u8>)>> {
+    pub fn scan_keys_in_entries(&self, start: u64, end: u64) -> Result<Vec<(NamespaceId, Vec<u8>)>> {
         self.walk(start, end, |at, body| {
             WalEntry::peek_namespace_and_key(body).map_err(|e| undecodable(at, e))
         })
@@ -599,7 +600,7 @@ impl Wal {
     ///
     /// A segment already reclaimed yields an empty result rather than an error:
     /// failing here would abort the whole GC pass.
-    pub fn scan_segment_keys(&self, segment_id: u64) -> Result<Vec<(u32, Vec<u8>)>> {
+    pub fn scan_segment_keys(&self, segment_id: u64) -> Result<Vec<(NamespaceId, Vec<u8>)>> {
         if !self
             .missing_segments(segmented_log::segment_start(segment_id), segmented_log::segment_start(segment_id) + 1)
             .is_empty()
@@ -611,7 +612,7 @@ impl Wal {
             .segment_end(segment_id)
             .unwrap_or_else(|| segmented_log::segment_start(segment_id + 1));
         let pairs = self.scan_keys_in_entries(segmented_log::segment_start(segment_id), end)?;
-        let mut seen: std::collections::HashSet<(u32, Vec<u8>)> = std::collections::HashSet::with_capacity(pairs.len());
+        let mut seen: std::collections::HashSet<(NamespaceId, Vec<u8>)> = std::collections::HashSet::with_capacity(pairs.len());
         let mut keys = Vec::with_capacity(pairs.len());
         for pair in pairs {
             if seen.insert(pair.clone()) {
@@ -687,7 +688,10 @@ mod tests {
     }
 
     fn upserts(n: u32) -> impl Iterator<Item = WalEntry> {
-        (0..n).map(|i| WalEntry::new_upsert_ns(i % 3, format!("k{i}").into_bytes(), vec![b'x'; 40]).with_sequence(u64::from(i) + 1))
+        (0..n).map(|i| {
+            WalEntry::new_upsert_ns(NamespaceId::from_u128(u128::from(i % 3)), format!("k{i}").into_bytes(), vec![b'x'; 40])
+                .with_sequence(u64::from(i) + 1)
+        })
     }
 
     #[test]
@@ -720,7 +724,7 @@ mod tests {
             head: 16,
             tail: 1024,
             cut: 300,
-            safe: vec![(2, 500), (7, 900)],
+            safe: vec![(NamespaceId::from_u128(2), 500), (NamespaceId::from_u128(7), 900)],
             total_gc_runs: 2,
             total_bytes_reclaimed: 256,
             last_sequence: 41,
@@ -763,8 +767,11 @@ mod tests {
     fn test_default_constructors_have_zero_sequence() {
         assert_eq!(WalEntry::new_upsert(b"k".to_vec(), b"v".to_vec()).sequence, 0);
         assert_eq!(WalEntry::new_delete(b"k".to_vec()).sequence, 0);
-        assert_eq!(WalEntry::new_upsert_ns(1, b"k".to_vec(), b"v".to_vec()).sequence, 0);
-        assert_eq!(WalEntry::new_delete_ns(1, b"k".to_vec()).sequence, 0);
+        assert_eq!(
+            WalEntry::new_upsert_ns(NamespaceId::from_u128(1), b"k".to_vec(), b"v".to_vec()).sequence,
+            0
+        );
+        assert_eq!(WalEntry::new_delete_ns(NamespaceId::from_u128(1), b"k".to_vec()).sequence, 0);
     }
 
     /// Entries written across segments read back in order and in full, and a
@@ -781,7 +788,7 @@ mod tests {
         for (i, ((pointer, entry), expected)) in scanned.iter().zip(&pointers).enumerate() {
             assert_eq!(pointer.offset, expected.offset);
             assert_eq!(entry.key, format!("k{i}").into_bytes());
-            assert_eq!(entry.namespace_id, i as u32 % 3);
+            assert_eq!(entry.namespace_id, NamespaceId::from_u128(u128::from(i as u32 % 3)));
         }
         drop(wal);
         let cut = pointers[40].offset;
@@ -853,8 +860,9 @@ mod tests {
         let dir = TempDir::new()?;
         let (wal, _) = open(dir.path(), 512)?;
         let (_, tail) = append(&wal, upserts(60))?;
-        let expect =
-            |wal: &Wal| -> Result<Vec<(u32, Vec<u8>)>> { Ok(wal.scan_entries(0, tail)?.into_iter().map(|(_, e)| (e.namespace_id, e.key)).collect()) };
+        let expect = |wal: &Wal| -> Result<Vec<(NamespaceId, Vec<u8>)>> {
+            Ok(wal.scan_entries(0, tail)?.into_iter().map(|(_, e)| (e.namespace_id, e.key)).collect())
+        };
         assert_eq!(wal.scan_keys_in_entries(0, tail)?, expect(&wal)?);
         wal.delete_segments_below(2)?;
         let keys = wal.scan_keys_in_entries(0, tail)?;

@@ -3,6 +3,7 @@
 use crate::db::database::{Database, LsmFlushObserverHub, OpenStoreLookup};
 use crate::db::error::Result;
 use crate::kv_store::KVStore;
+use crate::namespace::NamespaceId;
 use crate::storage::lsm::tree::LsmFlushObserver;
 
 use log::warn;
@@ -11,14 +12,14 @@ use std::time::Duration;
 
 impl Database {
     /// Create a new namespace. Returns the namespace ID.
-    pub fn create_namespace(&self, name: &str) -> Result<u32> {
+    pub fn create_namespace(&self, name: &str) -> Result<NamespaceId> {
         self.create_namespace_with_ttl(name, None)
     }
 
     /// Create a new namespace with an optional TTL. Returns the namespace ID.
     /// The TTL is recorded on the store; the single global TTL worker (started by
     /// the async facade's `namespace_with_ttl`) expires records older than it.
-    pub fn create_namespace_with_ttl(&self, name: &str, ttl: Option<Duration>) -> Result<u32> {
+    pub fn create_namespace_with_ttl(&self, name: &str, ttl: Option<Duration>) -> Result<NamespaceId> {
         self.check_closed()?;
 
         // Held until this function returns, so no one can observe the window
@@ -91,12 +92,12 @@ impl Database {
     }
 
     /// List all namespaces (name, id)
-    pub fn list_namespaces(&self) -> Vec<(String, u32)> {
+    pub fn list_namespaces(&self) -> Vec<(String, NamespaceId)> {
         self.registry.read().list().into_iter().map(|(name, id)| (name.to_string(), id)).collect()
     }
 
     /// Get a namespace ID by name
-    pub fn get_namespace_id(&self, name: &str) -> Option<u32> {
+    pub fn get_namespace_id(&self, name: &str) -> Option<NamespaceId> {
         self.registry.read().get_id(name)
     }
 
@@ -140,7 +141,7 @@ impl Database {
     ///    and `{db_path}/field-index/{ns_id}` — never the shared WAL, the WAL metadata,
     ///    or the registry — so WAL recovery for the surviving namespaces is
     ///    completely unaffected.
-    pub fn remove_namespace(&self, name: &str) -> Result<u32> {
+    pub fn remove_namespace(&self, name: &str) -> Result<NamespaceId> {
         self.check_closed()?;
 
         // Held to the end. Removing a namespace `create_namespace` is still
@@ -213,7 +214,7 @@ impl Database {
     /// unreferenced — it wastes disk but cannot affect correctness or recovery.
     /// This deliberately never touches the shared WAL or its metadata, so WAL
     /// replay for other namespaces is unaffected.
-    fn remove_namespace_storage(&self, ns_id: u32, name: &str) {
+    fn remove_namespace_storage(&self, ns_id: NamespaceId, name: &str) {
         let ns_path = crate::layout::namespace_data_dir(&self.db_path, name);
         match std::fs::remove_dir_all(&ns_path) {
             Ok(()) => {}

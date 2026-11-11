@@ -1,6 +1,7 @@
 //! Reads and writes through the WAL, and the no-WAL and vector-log forms of each.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 impl Database {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -61,7 +62,7 @@ impl Database {
     /// Apply the in-memory write with bounded retry. Returns `true` if it
     /// succeeded, `false` if it failed after all attempts (the write is still
     /// durable in the WAL and will be replayed on the next open).
-    pub(super) fn apply_with_retry<F>(op_name: &str, namespace_id: u32, key: &[u8], seq: u64, mut apply: F) -> bool
+    pub(super) fn apply_with_retry<F>(op_name: &str, namespace_id: NamespaceId, key: &[u8], seq: u64, mut apply: F) -> bool
     where
         F: FnMut() -> Result<()>,
     {
@@ -97,7 +98,7 @@ impl Database {
         false
     }
 
-    pub fn put_ns(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put_ns(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
         // The key stripe is the outermost write lock (see `key_locks`). A blind
         // put does not need it for itself, but taking it is what lets `merge_ns`
@@ -125,7 +126,7 @@ impl Database {
     /// Returns the [`WriteOutcome`] so `merge_ns` can tell a write that became
     /// readable from one that is merely durable. `put_ns` discards it, keeping
     /// its own `Ok(())` contract unchanged.
-    fn put_ns_locked(&self, namespace_id: u32, key: &[u8], value: &[u8], op_name: &str) -> Result<WriteOutcome> {
+    fn put_ns_locked(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8], op_name: &str) -> Result<WriteOutcome> {
         self.check_write_size(key, value)?;
         self.wal_flush_observer.check_poisoned()?;
 
@@ -222,7 +223,7 @@ impl Database {
     /// via this method is unrecoverable if the process crashes before the
     /// value-log segment is flushed.  Only use this for bulk-loading scenarios
     /// where re-running the load is acceptable.
-    pub fn put_ns_no_wal(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put_ns_no_wal(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
         // Outermost write lock — see `put_ns`. No-WAL writes take it too, so a
         // merge is serialised against bulk loading as well as against `put`.
@@ -232,7 +233,7 @@ impl Database {
 
     /// The body of [`Self::put_ns_no_wal`], for a caller already holding the
     /// key's stripe ([`Self::merge_ns_no_wal`]).
-    fn put_ns_no_wal_locked(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+    fn put_ns_no_wal_locked(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_write_size(key, value)?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
@@ -256,7 +257,7 @@ impl Database {
     /// partition maintenance's per-document writes: one durability barrier per
     /// batch rather than per write. Order, as on every write path: key stripe,
     /// seq, append (registered as not yet applied), memtable apply, release.
-    pub fn put_ns_logged(&self, namespace_id: u32, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put_ns_logged(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
         self.check_write_size(key, value)?;
         let _stripe = self.key_locks.guard(namespace_id, key);
@@ -282,7 +283,7 @@ impl Database {
     /// the counterpart of [`Self::put_ns_logged`], durable once a later
     /// [`Self::sync_vector_index_wal`] returns. Replay applies it with its
     /// original seq, as the main WAL replays a delete.
-    pub fn delete_ns_logged(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+    pub fn delete_ns_logged(&self, namespace_id: NamespaceId, key: &[u8]) -> Result<()> {
         self.check_closed()?;
         self.check_write_size(key, &[])?;
         let _stripe = self.key_locks.guard(namespace_id, key);
@@ -315,7 +316,7 @@ impl Database {
     /// write-side trade-off. The delete still allocates from the global
     /// sequence counter (via `delete_from_storage`), so it resolves against
     /// concurrent same-key writes highest-sequence-wins like any other write.
-    pub fn delete_ns_no_wal(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+    pub fn delete_ns_no_wal(&self, namespace_id: NamespaceId, key: &[u8]) -> Result<()> {
         self.check_closed()?;
         // Outermost write lock — see `put_ns`.
         let _stripe = self.key_locks.guard(namespace_id, key);
@@ -324,7 +325,7 @@ impl Database {
 
     /// The body of [`Self::delete_ns_no_wal`], for a caller already holding the
     /// key's stripe ([`Self::merge_ns_no_wal`]).
-    fn delete_ns_no_wal_locked(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+    fn delete_ns_no_wal_locked(&self, namespace_id: NamespaceId, key: &[u8]) -> Result<()> {
         self.check_write_size(key, &[])?;
         let kv_store = self.get_store(namespace_id)?;
         if let Some(m) = kv_store.metrics() {
@@ -373,7 +374,7 @@ impl Database {
     /// TTL expiry takes the same stripe and deletes by compare-and-set, so a
     /// merge that rewrites a key about to expire keeps its result; the next TTL
     /// pass judges the new value on its own epoch.
-    pub fn merge_ns<F>(&self, namespace_id: u32, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
+    pub fn merge_ns<F>(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
     where
         F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
     {
@@ -428,7 +429,7 @@ impl Database {
     /// completions, where a lost removal brings the entry back and the document
     /// is embedded again. Like the other no-WAL writes it is never replayed into
     /// a field index (see [`Self::put_ns_no_wal`]).
-    pub fn merge_ns_no_wal<F>(&self, namespace_id: u32, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
+    pub fn merge_ns_no_wal<F>(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
     where
         F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
     {
@@ -472,13 +473,13 @@ impl Database {
         }
     }
 
-    pub fn get_ns(&self, namespace_id: u32, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get_ns(&self, namespace_id: NamespaceId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_closed()?;
         let kv_store = self.get_store(namespace_id)?;
         kv_store.get(key)
     }
 
-    pub fn delete_ns(&self, namespace_id: u32, key: &[u8]) -> Result<()> {
+    pub fn delete_ns(&self, namespace_id: NamespaceId, key: &[u8]) -> Result<()> {
         self.check_closed()?;
         // Outermost write lock — see `put_ns`.
         let _stripe = self.key_locks.guard(namespace_id, key);
@@ -488,7 +489,7 @@ impl Database {
 
     /// The body of [`Self::delete_ns`], with the caller holding the key stripe.
     /// See [`Self::put_ns_locked`] for why this split exists.
-    fn delete_ns_locked(&self, namespace_id: u32, key: &[u8], op_name: &str) -> Result<WriteOutcome> {
+    fn delete_ns_locked(&self, namespace_id: NamespaceId, key: &[u8], op_name: &str) -> Result<WriteOutcome> {
         self.check_write_size(key, &[])?; // delete carries only a key
         self.wal_flush_observer.check_poisoned()?;
 

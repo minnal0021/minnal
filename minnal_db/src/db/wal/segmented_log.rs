@@ -79,6 +79,7 @@
 
 use crate::db::wal::commit_rounds::CommitRounds;
 use crate::db::wal::segment_prep::{self, SegmentPrep};
+use crate::namespace::NamespaceId;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -205,12 +206,12 @@ pub(crate) struct Progress {
     /// Records below this are retired; GC deletes segments wholly below it.
     pub cut: u64,
     /// Namespaces whose safe offset is above the cut, sorted by namespace.
-    pub safe: Vec<(u32, u64)>,
+    pub safe: Vec<(NamespaceId, u64)>,
 }
 
 impl Progress {
     /// Where replay starts for namespace `ns`.
-    pub(crate) fn replay_from(&self, ns: u32) -> u64 {
+    pub(crate) fn replay_from(&self, ns: NamespaceId) -> u64 {
         self.safe
             .binary_search_by_key(&ns, |&(n, _)| n)
             .map_or(self.cut, |i| self.safe[i].1.max(self.cut))
@@ -237,7 +238,7 @@ impl Progress {
 /// magic.
 ///
 /// ```text
-/// [magic 4][version u32][cut u64][count u32][count × (ns u32, safe u64)]
+/// [magic 4][version u32][cut u64][count u32][count × (ns 16 bytes big-endian, safe u64)]
 /// [extra_len u32][extra][crc32 of everything before it]
 /// ```
 pub(crate) struct ProgressFile {
@@ -246,9 +247,9 @@ pub(crate) struct ProgressFile {
 }
 
 /// The progress file layout's version.
-const PROGRESS_VERSION: u32 = 3;
+const PROGRESS_VERSION: u32 = 4;
 const PROGRESS_FIXED_LEN: usize = 4 + 4 + 8 + 4;
-const PROGRESS_ENTRY_LEN: usize = 4 + 8;
+const PROGRESS_ENTRY_LEN: usize = 16 + 8;
 
 impl ProgressFile {
     /// The file's bytes for `p` and `extra`.
@@ -259,7 +260,7 @@ impl ProgressFile {
         b.extend_from_slice(&p.cut.to_le_bytes());
         b.extend_from_slice(&(p.safe.len() as u32).to_le_bytes());
         for (ns, safe) in &p.safe {
-            b.extend_from_slice(&ns.to_le_bytes());
+            b.extend_from_slice(&ns.to_bytes());
             b.extend_from_slice(&safe.to_le_bytes());
         }
         b.extend_from_slice(&(extra.len() as u32).to_le_bytes());
@@ -291,14 +292,14 @@ impl ProgressFile {
             .checked_add(count.checked_mul(PROGRESS_ENTRY_LEN).ok_or_else(|| bad("entry count overflows"))?)
             .filter(|&e| e + 4 <= body.len())
             .ok_or_else(|| bad("length does not match its entry count"))?;
-        let safe: Vec<(u32, u64)> = body[PROGRESS_FIXED_LEN..entries_end]
+        let safe: Vec<(NamespaceId, u64)> = body[PROGRESS_FIXED_LEN..entries_end]
             .as_chunks::<PROGRESS_ENTRY_LEN>()
             .0
             .iter()
             .map(|e| {
                 (
-                    u32::from_le_bytes(e[0..4].try_into().unwrap()),
-                    u64::from_le_bytes(e[4..12].try_into().unwrap()),
+                    NamespaceId::from_bytes(e[0..16].try_into().unwrap()),
+                    u64::from_le_bytes(e[16..24].try_into().unwrap()),
                 )
             })
             .collect();
@@ -1827,12 +1828,15 @@ mod tests {
         let file = ProgressFile { magic: *b"TPRG" };
         let p = Progress {
             cut: segment_start(2),
-            safe: vec![(1, position(2, 900)), (7, position(3, 40))],
+            safe: vec![
+                (NamespaceId::from_u128(1), position(2, 900)),
+                (NamespaceId::from_u128(7), position(3, 40)),
+            ],
         };
         let bytes = file.encode(&p, b"extra");
         assert_eq!(file.decode(&bytes).unwrap(), (p.clone(), b"extra".to_vec()));
-        assert_eq!(p.replay_from(7), position(3, 40));
-        assert_eq!(p.replay_from(4), p.cut);
+        assert_eq!(p.replay_from(NamespaceId::from_u128(7)), position(3, 40));
+        assert_eq!(p.replay_from(NamespaceId::from_u128(4)), p.cut);
         assert_eq!(p.furthest(), position(3, 40));
 
         let damaged = |b: Vec<u8>| match file.decode(&b) {
@@ -1846,12 +1850,12 @@ mod tests {
         assert!(damaged(bytes[..bytes.len() - 3].to_vec()).contains("CRC"));
         let unsorted = Progress {
             cut: 0,
-            safe: vec![(7, 5), (1, 5)],
+            safe: vec![(NamespaceId::from_u128(7), 5), (NamespaceId::from_u128(1), 5)],
         };
         assert!(damaged(file.encode(&unsorted, &[])).contains("not sorted"));
         let below = Progress {
             cut: 100,
-            safe: vec![(1, 50)],
+            safe: vec![(NamespaceId::from_u128(1), 50)],
         };
         assert!(damaged(file.encode(&below, &[])).contains("below the cut"));
 

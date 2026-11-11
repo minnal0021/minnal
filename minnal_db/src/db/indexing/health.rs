@@ -9,6 +9,7 @@
 //! only the first is a WAL problem, which is why they live here rather than
 //! beside the collector.
 
+use crate::namespace::NamespaceId;
 use log::{error, info, warn};
 
 use crate::db::database::Database;
@@ -39,7 +40,7 @@ impl Database {
     /// Does not re-put documents: no WAL traffic, no vector re-embedding, no
     /// other field's extractor. Returns [`FieldRepairOutcome::NotDegraded`] when
     /// there is nothing to repair.
-    pub fn repair_field_index(&self, namespace_id: u32, field_id: FieldId) -> Result<FieldRepairOutcome> {
+    pub fn repair_field_index(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<FieldRepairOutcome> {
         use crate::db::indexing::manager::RepairMode;
         use crate::field_index::FieldReindexOutcome;
 
@@ -147,7 +148,7 @@ impl Database {
     /// signal: that tells a caller their *answer* may be short, this tells an
     /// operator *which indices* need repair and why. Dropped fields are omitted —
     /// they have no index to be healthy or otherwise.
-    pub fn index_health(&self, namespace_id: u32) -> Result<Vec<crate::db::indexing::manager::FieldIndexHealth>> {
+    pub fn index_health(&self, namespace_id: NamespaceId) -> Result<Vec<crate::db::indexing::manager::FieldIndexHealth>> {
         let store = self.get_store(namespace_id)?;
         let wal_tail = self.wal_metadata.read().tail;
 
@@ -194,7 +195,7 @@ impl Database {
     /// Best-effort: a marker that cannot be written is logged. Failing the write
     /// itself would be a worse trade (the caller asked for the fast path), but it
     /// does mean a crash could then go unreported.
-    pub(crate) fn note_no_wal_index_exposure(&self, namespace_id: u32) {
+    pub(crate) fn note_no_wal_index_exposure(&self, namespace_id: NamespaceId) {
         {
             let stores = self.stores.read();
             match stores.get(&namespace_id) {
@@ -222,7 +223,7 @@ impl Database {
     /// state, so they are a first-time build rather than a damaged index — the
     /// same judgement `detect_replay_gap` and the watermark make.
     pub(crate) fn record_no_wal_gaps_after_unclean_shutdown(&self) {
-        let namespaces: Vec<(u32, Vec<FieldId>)> = {
+        let namespaces: Vec<(NamespaceId, Vec<FieldId>)> = {
             let registry = self.registry.read();
             registry
                 .list()
@@ -699,7 +700,7 @@ mod tests {
         use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
         let mk = |from: u64, to: u64, segs: Vec<u64>, keys: &[&str]| GapRecord {
-            namespace_id: 0,
+            namespace_id: NamespaceId::from_u128(0),
             field_id: 1,
             cause: GapCause::BackstopReclaim,
             from,

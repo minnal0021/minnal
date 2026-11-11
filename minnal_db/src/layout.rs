@@ -25,6 +25,7 @@
 //!   fail_logs/            ← recovery failures
 //! ```
 
+use crate::namespace::NamespaceId;
 use std::path::{Path, PathBuf};
 
 /// Prefix for a namespace's data directory.
@@ -94,7 +95,7 @@ pub(crate) fn index_root(db_path: &Path) -> PathBuf {
 /// the root, not the path — can use the same function instead of keeping its own
 /// copy of the rule. Callers starting from a database path compose:
 /// `namespace_index_dir(&index_root(db_path), ns_id)`.
-pub(crate) fn namespace_index_dir(index_root: &Path, ns_id: u32) -> PathBuf {
+pub(crate) fn namespace_index_dir(index_root: &Path, ns_id: NamespaceId) -> PathBuf {
     index_root.join(ns_id.to_string())
 }
 
@@ -128,7 +129,10 @@ mod tests {
         assert_eq!(namespace_data_dir(root, "users"), Path::new("/db/ns_users"));
         assert_eq!(index_root(root), Path::new("/db/field-index"));
         assert_eq!(main_wal_dir(root), Path::new("/db/wal"));
-        assert_eq!(namespace_index_dir(&index_root(root), 7), Path::new("/db/field-index/7"));
+        assert_eq!(
+            namespace_index_dir(&index_root(root), NamespaceId::from_u128(7)),
+            Path::new("/db/field-index/00000000-0000-0000-0000-000000000007")
+        );
         assert_eq!(vector_index_wal_dir(root), Path::new("/db/vector_index_wal"));
     }
 
@@ -139,6 +143,10 @@ mod tests {
     fn data_and_index_dirs_use_different_keys() {
         let root = Path::new("/db");
         assert!(namespace_data_dir(root, "users").to_string_lossy().contains("ns_users"));
-        assert!(!namespace_index_dir(&index_root(root), 7).to_string_lossy().contains("users"));
+        assert!(
+            !namespace_index_dir(&index_root(root), NamespaceId::from_u128(7))
+                .to_string_lossy()
+                .contains("users")
+        );
     }
 }

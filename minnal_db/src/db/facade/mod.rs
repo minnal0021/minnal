@@ -4,21 +4,21 @@
 //! user-facing API for CRUD, iteration, namespaces, and maintenance.
 
 mod async_db;
+mod async_db_index;
+mod async_db_maintenance;
+mod async_db_typed;
 mod async_namespace;
 mod db;
-mod namespace;
 
 pub use async_db::AsyncDb;
 pub use async_namespace::AsyncNamespace;
-pub use db::Db;
+pub(crate) use db::Db;
 use log::info;
-pub use namespace::Namespace;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::db::config::DbConfig;
-use crate::db::config::toml::MinnalTomlConfig;
 use crate::db::database::{Database, OpenStoreLookup};
 use crate::db::error::{KVError, Result};
 use crate::db::indexing::manager::FieldIndexHealth;
@@ -38,9 +38,20 @@ mod typed;
 pub use typed::{RkyvDecode, RkyvEncode};
 use typed::{deserialize_keys, deserialize_pairs, rkyv_deserialize, rkyv_serialize};
 
+/// Not API (feature `bench-internals`): what the benches need to time the
+/// engine directly. Nothing here is stable.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_internals {
+    pub use super::db::Db;
+    pub use super::typed::{deserialize_keys, deserialize_pairs, rkyv_deserialize, rkyv_serialize};
+}
+
 #[cfg(test)]
 mod tests;
 
 /// Tests of the facade that reach into internal state.
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod iterator_tests;

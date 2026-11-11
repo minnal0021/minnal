@@ -8,6 +8,7 @@
 //! Key encodings are chosen so that byte order matches value order — integer
 //! keys are big-endian, which is what makes range scans work on them.
 
+use crate::namespace::NamespaceId;
 use serde::{Deserialize, Serialize};
 
 use crate::doc_store::error::SchemaError;
@@ -54,7 +55,7 @@ pub struct KvStoreSchema {
     /// Mandatory store-kind discriminant; must be [`StoreType::Kv`].
     pub store_type: StoreType,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ns_id: Option<u32>,
+    pub ns_id: Option<NamespaceId>,
     pub key_type: KvKeyType,
     pub value_type: KvValueType,
     /// Enable ANN semantic search on this namespace.  Only valid when

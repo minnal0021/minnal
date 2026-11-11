@@ -20,7 +20,7 @@ re-check them before starting work.
 | [FR-007](#fr-007--a-recall-check-that-says-when-a-rebuild-helps) | A recall check that says when a rebuild helps | `minnal_db` (`ivf_split`), `minnal_db_api` | Low | ✅ **Done — 2026-10-12** |
 | [FR-008](#fr-008--collect-unused-ivf-centres) | Collect unused IVF centres | `minnal_db` (`ivf_split`, `semantic_search`) | Low | Proposed |
 | [FR-009](#fr-009--a-blocked-simd-bloom-filter-for-l1-lookups) | A blocked SIMD Bloom filter for L1 lookups | `minnal_db` (`storage/lsm`) | Low | Proposed |
-| [FR-010](#fr-010--refuse-an-enable-for-as-long-as-a-vector-index-drop-is-pending) | Refuse an enable for as long as a vector-index drop is pending | `minnal_db` (`doc_store`), `minnal_db_api` | Low | Proposed |
+| [FR-010](#fr-010--refuse-an-enable-for-as-long-as-a-vector-index-drop-is-pending) | Refuse an enable for as long as a vector-index drop is pending | `minnal_db` (`doc_store`), `minnal_db_api` | Low | ✅ **Done — 2026-11-08** |
 | [FR-011](#fr-011--a-test-harness-for-api-routes) | A test harness for API routes | `minnal_db_api` | Low | Proposed |
 | [FR-012](#fr-012--make-a-skipped-upsert_vectors-visible-to-its-caller) | Make a skipped `upsert_vectors` visible to its caller | `minnal_db` (`vector_kv`) | Low | Proposed |
 | [FR-013](#fr-013--namespace-identity-without-a-central-registry-file) | Namespace identity without a central registry file | `minnal_db` (`db`), `minnal_db_api` | Medium | Proposed |
@@ -1015,6 +1015,10 @@ document ID, so they are unaffected.
   window where a crash left a half-built index nothing resumed.
 - Queries list a field whose build is in progress or failed in
   `degraded_fields` (`QueryOutcome::touched_fields`).
+- Now (2026-11-08, branch `store-lifecycle`): `reindex-all` and `drop-all` are
+  one `reindex_all` index job whose record in `system_namespace_maintenance`
+  holds the specs and phase, resumed by the lifecycle governor; the intent file
+  and `resume_pending_builds` are gone (`minnal_db/docs/Namespace-Lifecycle.md`).
 - `GET /admin/indices/{ns}/rowmap`: IDs allocated, live documents, dead IDs,
   bytes.
 - Manual test (100k uuid documents, 90k deleted): 100,000 → 10,000 IDs, row map
@@ -1343,7 +1347,11 @@ a crash cannot leave one layout on disk for the other to read.
 ## FR-010 — Refuse an enable for as long as a vector-index drop is pending
 
 **Filed:** 2026-11-05
-**Area:** `minnal_db` (`src/doc_store/lifecycle.rs`), `minnal_db_api`
+**Status:** Done (branch `store-lifecycle`, 2026-11-08). Enabling and dropping a
+vector index are now index jobs (`vector_enable`, `vector_cleanup`) of the
+namespace lifecycle, and the jobs registry refuses either while the other is
+live, with `JobConflict` (409). Test: `an_enable_is_refused_while_a_vector_cleanup_runs`.
+**Area:** `minnal_db` (`src/doc_store/vector/lifecycle.rs`), `minnal_db_api`
 (`src/routes/stores.rs`, `indices.rs`, `admin_indices.rs`)
 **Severity:** Low — needs an enable and a drop of one store within moments of each
 other; the affected documents are repaired by a reindex
@@ -1485,6 +1493,14 @@ at `warn`, but a drop racing the worker would then warn in normal operation.
 **Severity:** Medium — a damaged registry stops the whole database opening; no data
 is at risk from the design as it stands
 **Source:** Design discussion on how `ns_id` is generated. Not prototyped or measured.
+**Status:** Partly done (branch `namespace-uuid`, 2026-11-08). Ids are `NamespaceId`
+(random UUID, read from `/dev/urandom`, no new dependency) everywhere, and `next_id` is
+gone. Decided to **keep** the `namespace_registry` file (it now stores UUIDs), so the
+"no central file" half below stays open. Part of the store-lifecycle refactor.
+WAL cost measured (`bench_wal`, criterion, `TMPDIR=/var/tmp`, main `98cddcf` vs the branch):
+appends with and without fsync at 128 B / 4 KiB / 64 KiB and `db_put_with_wal` show no
+change (p > 0.05); `WalEntry` serialisation is 0.4–2.7% slower (+0.2 ns to +20 ns per
+entry); scans are within noise (< 1%).
 
 ### Summary
 

@@ -20,6 +20,7 @@
 //!       gap.json       ← present only while the index is known to be missing updates
 //! ```
 
+use crate::namespace::NamespaceId;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -152,7 +153,7 @@ pub enum GapCause {
 /// (FR-001).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GapRecord {
-    pub namespace_id: u32,
+    pub namespace_id: NamespaceId,
     pub field_id: FieldId,
     /// Why the index is incomplete.
     pub cause: GapCause,
@@ -218,7 +219,7 @@ impl GapRecord {
 /// is alertable instead of buried in a log line.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FieldIndexHealth {
-    pub namespace_id: u32,
+    pub namespace_id: NamespaceId,
     pub field_id: FieldId,
     pub field_name: String,
     /// WAL offset the field's persisted index reflects, if it has ever been
@@ -252,7 +253,7 @@ impl FieldIndexHealth {
 /// its own outage.
 #[derive(Default)]
 pub struct RejectedUpdateBuffer {
-    inner: parking_lot::Mutex<std::collections::HashMap<(u32, FieldId), RejectedField>>,
+    inner: parking_lot::Mutex<std::collections::HashMap<(NamespaceId, FieldId), RejectedField>>,
 }
 
 /// Per-field accumulation inside a [`RejectedUpdateBuffer`].
@@ -269,7 +270,7 @@ pub struct RejectedField {
 
 impl RejectedUpdateBuffer {
     /// Take everything buffered so far, leaving the buffer empty.
-    pub fn drain(&self) -> Vec<((u32, FieldId), RejectedField)> {
+    pub fn drain(&self) -> Vec<((NamespaceId, FieldId), RejectedField)> {
         self.inner.lock().drain().collect()
     }
 
@@ -280,7 +281,7 @@ impl RejectedUpdateBuffer {
     }
 
     /// Record a rejection, bounded by `cap` keys per field.
-    fn note(&self, namespace_id: u32, field_id: FieldId, key: &[u8], cap: usize) {
+    fn note(&self, namespace_id: NamespaceId, field_id: FieldId, key: &[u8], cap: usize) {
         let mut guard = self.inner.lock();
         let entry = guard.entry((namespace_id, field_id)).or_default();
         if entry.overflowed {
@@ -296,7 +297,7 @@ impl RejectedUpdateBuffer {
 }
 
 impl IndexGapSink for RejectedUpdateBuffer {
-    fn note_rejected_update(&self, namespace_id: u32, field_id: FieldId, key: &[u8]) {
+    fn note_rejected_update(&self, namespace_id: NamespaceId, field_id: FieldId, key: &[u8]) {
         self.note(namespace_id, field_id, key, REJECTED_UPDATE_BUFFER_CAP);
     }
 }
@@ -326,7 +327,7 @@ impl IndexManager {
     /// Ensure the per-field index directory exists.
     ///
     /// Path: `{index_base}/{namespace_id}/{field_id}/`
-    pub fn ensure_field_path(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn ensure_field_path(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         let path = self.field_path(namespace_id, field_id);
         std::fs::create_dir_all(&path)?;
         Ok(())
@@ -337,13 +338,13 @@ impl IndexManager {
     /// Path: `{index_base}/{namespace_id}/{field_id}/`
     ///
     /// Does not create the directory or verify the field is registered.
-    pub fn field_path(&self, namespace_id: u32, field_id: FieldId) -> PathBuf {
+    pub fn field_path(&self, namespace_id: NamespaceId, field_id: FieldId) -> PathBuf {
         self.namespace_path(namespace_id).join(field_id.to_string())
     }
 
     /// Compute the on-disk path for a namespace's whole index subtree:
     /// `{index_base}/{namespace_id}/`.
-    pub fn namespace_path(&self, namespace_id: u32) -> PathBuf {
+    pub fn namespace_path(&self, namespace_id: NamespaceId) -> PathBuf {
         crate::layout::namespace_index_dir(&self.index_base_path, namespace_id)
     }
 
@@ -352,7 +353,7 @@ impl IndexManager {
     /// Path: `{index_base}/{namespace_id}/rowmap/` — a sibling of the per-field
     /// directories. (`rowmap` can never collide with a `FieldId`, which is
     /// numeric.) The `RowMap` creates the directory on first use.
-    pub fn rowmap_path(&self, namespace_id: u32) -> PathBuf {
+    pub fn rowmap_path(&self, namespace_id: NamespaceId) -> PathBuf {
         self.namespace_path(namespace_id).join("rowmap")
     }
 
@@ -362,7 +363,7 @@ impl IndexManager {
     /// directories, blob stores, keymaps, and checkpoint markers). Called when a
     /// namespace is dropped. A missing directory is treated as success, so this
     /// is safe to call when the namespace had no indexed fields.
-    pub fn remove_namespace_path(&self, namespace_id: u32) -> Result<()> {
+    pub fn remove_namespace_path(&self, namespace_id: NamespaceId) -> Result<()> {
         let path = self.namespace_path(namespace_id);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => Ok(()),
@@ -382,7 +383,7 @@ impl IndexManager {
     ///
     /// The caller must have persisted the field's `dropped` flag first; see
     /// `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
-    pub fn remove_field_path(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn remove_field_path(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         let path = self.field_path(namespace_id, field_id);
         // A build or a checkpoint can still be writing a file there when the drop
         // runs; `remove_dir_all` then finds the directory refilled and fails. The
@@ -423,7 +424,7 @@ impl IndexManager {
     /// checkpoint ran has no directory any more and is left out: the checkpoint
     /// gathers its fields first and writes their markers after, so a drop can
     /// land in between, and it used to fail the whole checkpoint with NotFound.
-    pub fn checkpoint_fields(&self, wal_tail: u64, fields: &[(u32, FieldId)]) -> Result<Vec<(u32, FieldId)>> {
+    pub fn checkpoint_fields(&self, wal_tail: u64, fields: &[(NamespaceId, FieldId)]) -> Result<Vec<(NamespaceId, FieldId)>> {
         let mut written = Vec::with_capacity(fields.len());
         for &(namespace_id, field_id) in fields {
             let field_path = self.field_path(namespace_id, field_id);
@@ -459,7 +460,7 @@ impl IndexManager {
     }
 
     /// Path of a field's durable gap record.
-    fn gap_path(&self, namespace_id: u32, field_id: FieldId) -> PathBuf {
+    fn gap_path(&self, namespace_id: NamespaceId, field_id: FieldId) -> PathBuf {
         self.field_path(namespace_id, field_id).join("gap.json")
     }
 
@@ -469,7 +470,7 @@ impl IndexManager {
     /// the index, not index data, so a corrupt one must not fail the open. The
     /// index is still queryable; the worst case is that an operator has to notice
     /// the condition another way.
-    pub fn read_gap(&self, namespace_id: u32, field_id: FieldId) -> Option<GapRecord> {
+    pub fn read_gap(&self, namespace_id: NamespaceId, field_id: FieldId) -> Option<GapRecord> {
         let bytes = std::fs::read(self.gap_path(namespace_id, field_id)).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
@@ -512,7 +513,7 @@ impl IndexManager {
     /// Clear a field's gap record after a successful repair.
     ///
     /// Idempotent — a missing record is success.
-    pub fn clear_gap(&self, namespace_id: u32, field_id: FieldId) -> Result<()> {
+    pub fn clear_gap(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         match std::fs::remove_file(self.gap_path(namespace_id, field_id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -521,7 +522,7 @@ impl IndexManager {
     }
 
     /// Path of a namespace's "no-WAL writes are outstanding" marker.
-    fn no_wal_marker_path(&self, namespace_id: u32) -> PathBuf {
+    fn no_wal_marker_path(&self, namespace_id: NamespaceId) -> PathBuf {
         self.namespace_path(namespace_id).join("no_wal_pending")
     }
 
@@ -544,20 +545,20 @@ impl IndexManager {
     /// Marker-then-write can only produce a spurious gap (a full rebuild is
     /// idempotent); write-then-marker can lose both and leave the index silently
     /// incomplete, which is the failure being closed.
-    pub fn set_no_wal_pending(&self, namespace_id: u32) -> Result<()> {
+    pub fn set_no_wal_pending(&self, namespace_id: NamespaceId) -> Result<()> {
         let dir = self.namespace_path(namespace_id);
         std::fs::create_dir_all(&dir)?;
         crate::support::write_atomic_durable(&self.no_wal_marker_path(namespace_id), b"1").map_err(KVError::Io)
     }
 
     /// Whether a namespace's no-WAL marker is present.
-    pub fn no_wal_pending(&self, namespace_id: u32) -> bool {
+    pub fn no_wal_pending(&self, namespace_id: NamespaceId) -> bool {
         self.no_wal_marker_path(namespace_id).exists()
     }
 
     /// Clear a namespace's no-WAL marker — called once a checkpoint has made its
     /// index state durable. Idempotent.
-    pub fn clear_no_wal_pending(&self, namespace_id: u32) -> Result<()> {
+    pub fn clear_no_wal_pending(&self, namespace_id: NamespaceId) -> Result<()> {
         match std::fs::remove_file(self.no_wal_marker_path(namespace_id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -574,7 +575,7 @@ impl IndexManager {
     /// the tail only grows — and returning the raw value would let recovery's
     /// `offset < wal_tail` check skip replay and silently drop index entries.
     /// Clamping to `0` instead forces a safe (idempotent) full replay.
-    pub fn read_checkpoint(&self, namespace_id: u32, field_id: FieldId, wal_tail: u64) -> u64 {
+    pub fn read_checkpoint(&self, namespace_id: NamespaceId, field_id: FieldId, wal_tail: u64) -> u64 {
         self.read_checkpoint_state(namespace_id, field_id, wal_tail).replay_offset()
     }
 
@@ -585,7 +586,7 @@ impl IndexManager {
     /// is this function with the distinction thrown away — but callers that need
     /// to judge whether a short replay window is expected or alarming can see
     /// which case they are in.
-    pub fn read_checkpoint_state(&self, namespace_id: u32, field_id: FieldId, wal_tail: u64) -> CheckpointState {
+    pub fn read_checkpoint_state(&self, namespace_id: NamespaceId, field_id: FieldId, wal_tail: u64) -> CheckpointState {
         let path = self.field_path(namespace_id, field_id).join("checkpoint");
         let Ok(bytes) = std::fs::read(&path) else {
             return CheckpointState::Absent;
@@ -667,25 +668,26 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
         // ensure_field_path creates the namespace dir as a side-effect
-        mgr.ensure_field_path(0, 3).unwrap();
-        assert!(dir.path().join("field-index").join("0").exists());
-        assert!(dir.path().join("field-index").join("0").join("3").exists());
+        mgr.ensure_field_path(NamespaceId::from_u128(0), 3).unwrap();
+        let ns_dir = dir.path().join("field-index").join(NamespaceId::from_u128(0).to_string());
+        assert!(ns_dir.exists());
+        assert!(ns_dir.join("3").exists());
     }
 
     #[test]
     fn test_remove_namespace_path() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(7, 1).unwrap();
-        mgr.ensure_field_path(7, 2).unwrap();
-        let ns_index_dir = dir.path().join("field-index").join("7");
+        mgr.ensure_field_path(NamespaceId::from_u128(7), 1).unwrap();
+        mgr.ensure_field_path(NamespaceId::from_u128(7), 2).unwrap();
+        let ns_index_dir = dir.path().join("field-index").join(NamespaceId::from_u128(7).to_string());
         assert!(ns_index_dir.exists());
 
-        mgr.remove_namespace_path(7).unwrap();
+        mgr.remove_namespace_path(NamespaceId::from_u128(7)).unwrap();
         assert!(!ns_index_dir.exists());
 
         // Idempotent: removing an already-absent namespace is a no-op, not an error.
-        mgr.remove_namespace_path(7).unwrap();
+        mgr.remove_namespace_path(NamespaceId::from_u128(7)).unwrap();
     }
 
     // ── replay-gap detection ────────────────────────────────────────────
@@ -694,33 +696,33 @@ mod tests {
     fn read_checkpoint_state_distinguishes_absent_from_recorded_zero() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(0, 1).unwrap();
+        mgr.ensure_field_path(NamespaceId::from_u128(0), 1).unwrap();
 
         // No marker written yet.
-        assert_eq!(mgr.read_checkpoint_state(0, 1, 100), CheckpointState::Absent);
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 100), CheckpointState::Absent);
 
         // A marker recording 0 is a *recorded* position, not an absent one — both
         // replay from 0, which is exactly why read_checkpoint alone cannot tell
         // a fresh field from one whose marker was lost.
-        mgr.checkpoint_fields(0, &[(0, 1)]).unwrap();
-        assert_eq!(mgr.read_checkpoint_state(0, 1, 100), CheckpointState::At(0));
-        assert_eq!(mgr.read_checkpoint(0, 1, 100), 0);
+        mgr.checkpoint_fields(0, &[(NamespaceId::from_u128(0), 1)]).unwrap();
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 100), CheckpointState::At(0));
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 1, 100), 0);
 
-        mgr.checkpoint_fields(64, &[(0, 1)]).unwrap();
-        assert_eq!(mgr.read_checkpoint_state(0, 1, 100), CheckpointState::At(64));
+        mgr.checkpoint_fields(64, &[(NamespaceId::from_u128(0), 1)]).unwrap();
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 100), CheckpointState::At(64));
 
         // Ahead of the tail — only reachable from a torn write.
-        assert_eq!(mgr.read_checkpoint_state(0, 1, 10), CheckpointState::Unusable);
-        assert_eq!(mgr.read_checkpoint(0, 1, 10), 0, "unusable still replays from 0");
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 10), CheckpointState::Unusable);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 1, 10), 0, "unusable still replays from 0");
     }
 
     #[test]
     fn read_checkpoint_state_reports_a_short_marker_as_unusable() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(0, 1).unwrap();
-        std::fs::write(mgr.field_path(0, 1).join("checkpoint"), [1u8, 2, 3]).unwrap();
-        assert_eq!(mgr.read_checkpoint_state(0, 1, 100), CheckpointState::Unusable);
+        mgr.ensure_field_path(NamespaceId::from_u128(0), 1).unwrap();
+        std::fs::write(mgr.field_path(NamespaceId::from_u128(0), 1).join("checkpoint"), [1u8, 2, 3]).unwrap();
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 100), CheckpointState::Unusable);
     }
 
     #[test]
@@ -782,23 +784,23 @@ mod tests {
     fn test_field_path_is_pure_computation() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        let path = mgr.field_path(5, 2);
-        assert_eq!(path, dir.path().join("field-index").join("5").join("2"));
+        let path = mgr.field_path(NamespaceId::from_u128(5), 2);
+        assert_eq!(path, dir.path().join("field-index").join(NamespaceId::from_u128(5).to_string()).join("2"));
     }
 
     #[test]
     fn test_checkpoint_and_read_back() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(0, 0).unwrap();
+        mgr.ensure_field_path(NamespaceId::from_u128(0), 0).unwrap();
 
-        assert_eq!(mgr.read_checkpoint(0, 0, u64::MAX), 0); // no file yet
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, u64::MAX), 0); // no file yet
 
-        mgr.checkpoint_fields(55555, &[(0, 0)]).unwrap();
-        assert_eq!(mgr.read_checkpoint(0, 0, u64::MAX), 55555);
+        mgr.checkpoint_fields(55555, &[(NamespaceId::from_u128(0), 0)]).unwrap();
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, u64::MAX), 55555);
 
-        mgr.checkpoint_fields(99999, &[(0, 0)]).unwrap();
-        assert_eq!(mgr.read_checkpoint(0, 0, u64::MAX), 99999);
+        mgr.checkpoint_fields(99999, &[(NamespaceId::from_u128(0), 0)]).unwrap();
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, u64::MAX), 99999);
     }
 
     /// Only a checkpoint that started after the counter was read covers the
@@ -822,12 +824,24 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
         for field in 0..3 {
-            std::fs::create_dir_all(mgr.field_path(1, field)).unwrap();
+            std::fs::create_dir_all(mgr.field_path(NamespaceId::from_u128(1), field)).unwrap();
         }
-        mgr.remove_field_path(1, 1).unwrap();
-        let written = mgr.checkpoint_fields(42, &[(1, 0), (1, 1), (1, 2)]).unwrap();
-        assert_eq!(written, vec![(1, 0), (1, 2)]);
-        assert!(!mgr.field_path(1, 1).exists(), "no directory recreated for the dropped field");
+        mgr.remove_field_path(NamespaceId::from_u128(1), 1).unwrap();
+        let written = mgr
+            .checkpoint_fields(
+                42,
+                &[
+                    (NamespaceId::from_u128(1), 0),
+                    (NamespaceId::from_u128(1), 1),
+                    (NamespaceId::from_u128(1), 2),
+                ],
+            )
+            .unwrap();
+        assert_eq!(written, vec![(NamespaceId::from_u128(1), 0), (NamespaceId::from_u128(1), 2)]);
+        assert!(
+            !mgr.field_path(NamespaceId::from_u128(1), 1).exists(),
+            "no directory recreated for the dropped field"
+        );
     }
 
     #[test]
@@ -835,35 +849,43 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
         for field_id in 0u32..3 {
-            mgr.ensure_field_path(1, field_id).unwrap();
+            mgr.ensure_field_path(NamespaceId::from_u128(1), field_id).unwrap();
         }
 
-        mgr.checkpoint_fields(42, &[(1, 0), (1, 1), (1, 2)]).unwrap();
-        assert_eq!(mgr.read_checkpoint(1, 0, u64::MAX), 42);
-        assert_eq!(mgr.read_checkpoint(1, 1, u64::MAX), 42);
-        assert_eq!(mgr.read_checkpoint(1, 2, u64::MAX), 42);
+        mgr.checkpoint_fields(
+            42,
+            &[
+                (NamespaceId::from_u128(1), 0),
+                (NamespaceId::from_u128(1), 1),
+                (NamespaceId::from_u128(1), 2),
+            ],
+        )
+        .unwrap();
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(1), 0, u64::MAX), 42);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(1), 1, u64::MAX), 42);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(1), 2, u64::MAX), 42);
     }
 
     #[test]
     fn test_read_checkpoint_missing_returns_zero() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        assert_eq!(mgr.read_checkpoint(99, 99, u64::MAX), 0);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(99), 99, u64::MAX), 0);
     }
 
     #[test]
     fn test_read_checkpoint_ahead_of_wal_tail_is_uncheckpointed() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(0, 0).unwrap();
-        mgr.checkpoint_fields(99_999, &[(0, 0)]).unwrap();
+        mgr.ensure_field_path(NamespaceId::from_u128(0), 0).unwrap();
+        mgr.checkpoint_fields(99_999, &[(NamespaceId::from_u128(0), 0)]).unwrap();
 
         // In range (≤ wal_tail) → returned verbatim.
-        assert_eq!(mgr.read_checkpoint(0, 0, 100_000), 99_999);
-        assert_eq!(mgr.read_checkpoint(0, 0, 99_999), 99_999);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, 100_000), 99_999);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, 99_999), 99_999);
 
         // Ahead of the WAL tail (only possible from a corrupt/torn marker) → 0,
         // forcing a safe full replay instead of skipping it.
-        assert_eq!(mgr.read_checkpoint(0, 0, 50_000), 0);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, 50_000), 0);
     }
 }

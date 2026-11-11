@@ -1,6 +1,7 @@
 //! What the background workers call: GC, compaction, and the `*Target` trait impls.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 impl Database {
     /// Run value log GC on a specific namespace.
@@ -9,7 +10,7 @@ impl Database {
     /// bucket-level trigger: an explicit `garbage_collect()` call has already decided
     /// the namespace is worth collecting, so what is left to decide is which *segments*
     /// to rewrite.
-    pub fn garbage_collect_namespace(&self, namespace_id: u32) -> Result<GCStats> {
+    pub fn garbage_collect_namespace(&self, namespace_id: NamespaceId) -> Result<GCStats> {
         let kv_store = self.get_store(namespace_id)?;
         let segment_threshold = self.config.threshold_config.segment_gc_threshold;
         let tail_threshold = self.config.threshold_config.effective_tail_gc_min_garbage_pct();

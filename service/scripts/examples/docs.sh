@@ -22,6 +22,19 @@ BASE_URL="${1:-http://localhost:8080}"
 
 pp() { command -v jq &>/dev/null && jq . || cat; }
 
+# A store's create, drop and index jobs run in the background (the routes
+# answer 202). Wait until store $1 is in state $2 ("created", or "gone").
+wait_for_state() {
+  local ns="$1" want="$2" st=""
+  for _ in $(seq 1 300); do
+    st=$(curl -s "$BASE_URL/stores" | python3 -c "import json,sys; print(next((s.get('state','') for s in json.load(sys.stdin) if s['namespace']=='$ns'),'gone'))")
+    [[ "$st" == "$want" ]] && return 0
+    sleep 0.1
+  done
+  echo "  timed out waiting for '$ns' to be $want (it is $st)"
+  return 1
+}
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 echo "=== Setup: create test stores ==="
@@ -64,6 +77,7 @@ curl -s -X POST "$BASE_URL/stores" \
     ]
   }' -o /dev/null || true
 
+for ns in users products events; do wait_for_state "$ns" created; done
 echo "  -> stores ready"
 
 # ── UUID-keyed store (users) ──────────────────────────────────────────────────
@@ -275,7 +289,7 @@ SS_CREATE_STATUS=$(curl -s -o /tmp/ss_create_resp.json -w "%{http_code}" \
     ]
   }')
 
-if [[ "$SS_CREATE_STATUS" != "201" ]]; then
+if [[ "$SS_CREATE_STATUS" != "202" ]]; then
   echo "  SKIPPED — store creation returned HTTP $SS_CREATE_STATUS:"
   cat /tmp/ss_create_resp.json | pp
   echo
@@ -283,7 +297,8 @@ if [[ "$SS_CREATE_STATUS" != "201" ]]; then
   echo "  embedding service is running:  ./run.sh config/sample.toml"
   echo
 else
-  echo "  -> HTTP 201 Created"
+  echo "  -> HTTP 202 Accepted"
+  wait_for_state profiles created
 
   PROFILE_1="aaaaaaaa-0000-0000-0000-000000000001"
   PROFILE_2="aaaaaaaa-0000-0000-0000-000000000002"

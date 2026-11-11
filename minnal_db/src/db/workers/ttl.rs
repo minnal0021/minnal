@@ -116,6 +116,7 @@ mod tests {
     use super::{TtlTarget, TtlWorker};
     use crate::db::config::SyncConfig;
     use crate::kv_store::KVStore;
+    use crate::namespace::NamespaceId;
     use crate::storage::lsm::tree::LSMConfig;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -182,7 +183,7 @@ mod tests {
         let path = dir.path().join("ns_test");
         Arc::new(
             KVStore::open(
-                0,
+                NamespaceId::from_u128(0),
                 "test",
                 &path,
                 lsm_config,

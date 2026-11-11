@@ -1,6 +1,7 @@
 //! The in-flight write barrier: what a flush, a seal or the WAL cut may claim while a write is still applying.
 
 use super::*;
+use crate::namespace::NamespaceId;
 
 // ── The in-flight write barrier ────────────────────────────────────────────
 //
@@ -369,7 +370,7 @@ fn concurrent_flushes_leave_the_saved_progress_equal_to_the_live_one() {
     let mut config = create_db_config();
     config.lsm_config.skip_list_capacity = 32;
     let db = Database::open(dir.path(), config).unwrap();
-    let namespaces: Vec<u32> = (0..8).map(|i| db.create_namespace(&format!("ns{i}")).unwrap()).collect();
+    let namespaces: Vec<NamespaceId> = (0..8).map(|i| db.create_namespace(&format!("ns{i}")).unwrap()).collect();
 
     std::thread::scope(|s| {
         for &ns in &namespaces {

@@ -1,7 +1,7 @@
 //! Integration tests for the segmented value log: segment rollover, per-segment GC,
 //! the unlink-after-durable ordering, and monotone segment ids across restarts.
 
-use minnal_db::{Db, DbConfig};
+use minnal_db::{AsyncDb, DbConfig};
 use std::path::{Path, PathBuf};
 
 /// A small segment size, so a handful of values roll several segments.
@@ -44,14 +44,14 @@ fn walkdir(dir: &Path) -> Vec<PathBuf> {
 
 /// Writes roll over into new segment files at the configured size, and every value
 /// stays readable across the rollover and a reopen.
-#[test]
-fn writes_roll_into_new_segments_and_survive_reopen() {
+#[tokio::test]
+async fn writes_roll_into_new_segments_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     let value = vec![0x11u8; 100 * 1024];
     for i in 0..30 {
-        db.put(format!("key{i:03}").as_bytes(), &value).unwrap();
+        db.put(format!("key{i:03}").into_bytes(), value.clone()).await.unwrap();
     }
 
     // 30 × 100 KiB cannot fit in one 1 MiB segment.
@@ -62,46 +62,46 @@ fn writes_roll_into_new_segments_and_survive_reopen() {
     );
 
     for i in 0..30 {
-        assert_eq!(db.get(format!("key{i:03}").as_bytes()).unwrap(), Some(value.clone()));
+        assert_eq!(db.get(format!("key{i:03}").into_bytes()).await.unwrap(), Some(value.clone()));
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
     for i in 0..30 {
         assert_eq!(
-            db.get(format!("key{i:03}").as_bytes()).unwrap(),
+            db.get(format!("key{i:03}").into_bytes()).await.unwrap(),
             Some(value.clone()),
             "key{i:03} lost across reopen"
         );
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 }
 
 /// GC reclaims whole segments: it rewrites only the survivors of the segments it
 /// selects, unlinks those files, and leaves untouched segments alone. Every live
 /// value must survive.
-#[test]
-fn gc_reclaims_whole_segments_and_preserves_live_values() {
+#[tokio::test]
+async fn gc_reclaims_whole_segments_and_preserves_live_values() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     // One key we keep, and one we overwrite until its old records dominate.
     let keep = vec![0x22u8; 100 * 1024];
-    db.put(b"keep", &keep).unwrap();
+    db.put(b"keep".to_vec(), keep.clone()).await.unwrap();
 
     let churn = vec![0x33u8; 100 * 1024];
     for _ in 0..40 {
-        db.put(b"hot", &churn).unwrap();
+        db.put(b"hot".to_vec(), churn.clone()).await.unwrap();
     }
     let final_value = vec![0x44u8; 100 * 1024];
-    db.put(b"hot", &final_value).unwrap();
+    db.put(b"hot".to_vec(), final_value.clone()).await.unwrap();
 
     let before = db.stats();
     let files_before = segment_files(dir.path()).len();
     assert!(before.garbage_size > 0, "expected accumulated garbage");
     assert!(db.waste_ratio() >= 30.0, "expected enough waste to be worth collecting");
 
-    let gc = db.garbage_collect().unwrap();
+    let gc = db.garbage_collect().await.unwrap();
     assert!(gc.bytes_reclaimed > 0, "GC should reclaim whole segments");
 
     let after = db.stats();
@@ -114,36 +114,40 @@ fn gc_reclaims_whole_segments_and_preserves_live_values() {
     assert!(after.disk_bytes < before.disk_bytes, "on-disk footprint should shrink");
 
     // Both live values survive the relocation.
-    assert_eq!(db.get(b"hot").unwrap(), Some(final_value.clone()), "live value lost by GC");
-    assert_eq!(db.get(b"keep").unwrap(), Some(keep.clone()), "untouched value lost by GC");
+    assert_eq!(db.get(b"hot".to_vec()).await.unwrap(), Some(final_value.clone()), "live value lost by GC");
+    assert_eq!(db.get(b"keep".to_vec()).await.unwrap(), Some(keep.clone()), "untouched value lost by GC");
 
     // ...and they still resolve after a reopen, i.e. the re-pointed pointers are durable.
-    db.shutdown().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
-    assert_eq!(db.get(b"hot").unwrap(), Some(final_value), "relocated value lost across reopen");
-    assert_eq!(db.get(b"keep").unwrap(), Some(keep), "relocated value lost across reopen");
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
+    assert_eq!(
+        db.get(b"hot".to_vec()).await.unwrap(),
+        Some(final_value),
+        "relocated value lost across reopen"
+    );
+    assert_eq!(db.get(b"keep".to_vec()).await.unwrap(), Some(keep), "relocated value lost across reopen");
+    db.shutdown().await.unwrap();
 }
 
 /// GC must stay bounded across repeated cycles: the same churn, collected again and
 /// again, must not grow the on-disk footprint without limit.
-#[test]
-fn gc_stays_bounded_across_repeated_cycles() {
+#[tokio::test]
+async fn gc_stays_bounded_across_repeated_cycles() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     let blob = vec![0xAAu8; 100 * 1024];
     let mut disk_each_cycle = Vec::new();
 
     for cycle in 0u8..4 {
         for _ in 0..20 {
-            db.put(b"hot", &blob).unwrap();
+            db.put(b"hot".to_vec(), blob.clone()).await.unwrap();
         }
         let final_value = vec![cycle; 100 * 1024];
-        db.put(b"hot", &final_value).unwrap();
+        db.put(b"hot".to_vec(), final_value.clone()).await.unwrap();
 
-        db.garbage_collect().unwrap();
-        assert_eq!(db.get(b"hot").unwrap(), Some(final_value), "cycle {cycle}: value lost");
+        db.garbage_collect().await.unwrap();
+        assert_eq!(db.get(b"hot".to_vec()).await.unwrap(), Some(final_value), "cycle {cycle}: value lost");
         disk_each_cycle.push(db.stats().disk_bytes);
     }
 
@@ -155,7 +159,7 @@ fn gc_stays_bounded_across_repeated_cycles() {
             "cycle {cycle}: disk footprint growing without bound ({disk_each_cycle:?})"
         );
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 }
 
 /// Regression: GC used to leave sub-threshold garbage on disk **forever**.
@@ -164,33 +168,33 @@ fn gc_stays_bounded_across_repeated_cycles() {
 /// collecting?") was passed straight through as the per-*page* dirty threshold, so
 /// garbage spread just under it could never be collected. The page threshold is now a
 /// separate, lower knob (`segment_gc_threshold`) that selects **segments**.
-#[test]
-fn gc_reclaims_garbage_below_the_bucket_trigger() {
+#[tokio::test]
+async fn gc_reclaims_garbage_below_the_bucket_trigger() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(SEGMENT_SIZE);
     assert!(
         cfg.threshold_config.segment_gc_threshold < cfg.threshold_config.value_log_waste_threshold,
         "the segment threshold must sit below the bucket trigger, or sub-threshold garbage is uncollectable"
     );
-    let db = Db::open_with_config(dir.path(), cfg).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), cfg).await.unwrap();
 
     let value = vec![0x11u8; 90 * 1024];
     let n = 60;
     for i in 0..n {
-        db.put(format!("key{i:04}").as_bytes(), &value).unwrap();
+        db.put(format!("key{i:04}").into_bytes(), value.clone()).await.unwrap();
     }
     // Overwrite a strided ~20%: garbage lands thinly spread across segments — enough
     // to put the bucket over its 30% trigger, but well under what a coupled 30%
     // per-segment threshold would have demanded of any single segment.
     let overwrite = vec![0x22u8; 90 * 1024];
     for i in (0..n).step_by(5) {
-        db.put(format!("key{i:04}").as_bytes(), &overwrite).unwrap();
+        db.put(format!("key{i:04}").into_bytes(), overwrite.clone()).await.unwrap();
     }
 
     let before = db.stats();
     assert!(before.garbage_size > 0, "expected accumulated garbage");
 
-    let gc = db.garbage_collect().unwrap();
+    let gc = db.garbage_collect().await.unwrap();
     assert!(gc.bytes_reclaimed > 0, "GC reclaimed nothing — sub-threshold garbage is stranded again");
 
     let after = db.stats();
@@ -204,12 +208,12 @@ fn gc_reclaims_garbage_below_the_bucket_trigger() {
     for i in 0..n {
         let expected = if i % 5 == 0 { &overwrite } else { &value };
         assert_eq!(
-            db.get(format!("key{i:04}").as_bytes()).unwrap().as_ref(),
+            db.get(format!("key{i:04}").into_bytes()).await.unwrap().as_ref(),
             Some(expected),
             "value for key{i:04} lost or corrupted by GC"
         );
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 }
 
 /// Segment ids are **monotone and never reused**, across restarts as well as within a
@@ -217,24 +221,24 @@ fn gc_reclaims_garbage_below_the_bucket_trigger() {
 /// segment and the next id were derived from `max(existing files) + 1`, that id would
 /// be handed out again — and a reader holding the old pointer would silently read a
 /// *different* key's record. A persisted high-water mark prevents it.
-#[test]
-fn segment_ids_never_repeat_across_restarts() {
+#[tokio::test]
+async fn segment_ids_never_repeat_across_restarts() {
     let dir = tempfile::tempdir().unwrap();
     let mut seen: Vec<u32> = Vec::new();
 
     for round in 0u8..4 {
-        let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
         // Churn enough to roll segments and give GC something to reclaim, including
         // the newest segments — the case that would tempt id reuse.
         let blob = vec![round; 100 * 1024];
         for i in 0..15 {
-            db.put(format!("k{i}").as_bytes(), &blob).unwrap();
+            db.put(format!("k{i}").into_bytes(), blob.clone()).await.unwrap();
         }
         for _ in 0..15 {
-            db.put(b"hot", &blob).unwrap();
+            db.put(b"hot".to_vec(), blob.clone()).await.unwrap();
         }
-        db.garbage_collect().unwrap();
+        db.garbage_collect().await.unwrap();
 
         for (_, segments) in db.value_log_segment_stats("default").unwrap() {
             for s in segments {
@@ -247,7 +251,7 @@ fn segment_ids_never_repeat_across_restarts() {
                 seen.push(s.id);
             }
         }
-        db.shutdown().unwrap();
+        db.shutdown().await.unwrap();
     }
 
     assert!(seen.len() > 4, "expected several segments across the rounds, saw {seen:?}");
@@ -257,64 +261,68 @@ fn segment_ids_never_repeat_across_restarts() {
 /// encoded in any pointer, so existing segments keep the size they were written at and
 /// new ones use whatever is configured now. Reopening with a different size must work
 /// and must not lose a single value.
-#[test]
-fn segment_size_can_change_across_restarts() {
+#[tokio::test]
+async fn segment_size_can_change_across_restarts() {
     let dir = tempfile::tempdir().unwrap();
 
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
     let small = vec![0x55u8; 100 * 1024];
     for i in 0..12 {
-        db.put(format!("a{i}").as_bytes(), &small).unwrap();
+        db.put(format!("a{i}").into_bytes(), small.clone()).await.unwrap();
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 
     // Reopen with 4x the segment size — the old segments are still readable.
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE * 4)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE * 4))
+        .await
+        .unwrap();
     for i in 0..12 {
         assert_eq!(
-            db.get(format!("a{i}").as_bytes()).unwrap(),
+            db.get(format!("a{i}").into_bytes()).await.unwrap(),
             Some(small.clone()),
             "a{i} unreadable after the segment size changed"
         );
     }
     for i in 0..12 {
-        db.put(format!("b{i}").as_bytes(), &small).unwrap();
+        db.put(format!("b{i}").into_bytes(), small.clone()).await.unwrap();
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE * 4)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE * 4))
+        .await
+        .unwrap();
     for i in 0..12 {
-        assert_eq!(db.get(format!("a{i}").as_bytes()).unwrap(), Some(small.clone()));
-        assert_eq!(db.get(format!("b{i}").as_bytes()).unwrap(), Some(small.clone()));
+        assert_eq!(db.get(format!("a{i}").into_bytes()).await.unwrap(), Some(small.clone()));
+        assert_eq!(db.get(format!("b{i}").into_bytes()).await.unwrap(), Some(small.clone()));
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 }
 
 /// A deleted key must stay deleted through a GC pass. GC's re-point is a
 /// compare-and-set against the LSM, so a key deleted since GC's scan is skipped rather
 /// than resurrected by having its old record copied forward.
-#[test]
-fn gc_does_not_resurrect_deleted_keys() {
+#[tokio::test]
+async fn gc_does_not_resurrect_deleted_keys() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     let blob = vec![0x66u8; 100 * 1024];
     for i in 0..20 {
-        db.put(format!("d{i}").as_bytes(), &blob).unwrap();
+        db.put(format!("d{i}").into_bytes(), blob.clone()).await.unwrap();
     }
     // Delete half of them, then churn so their segments become GC candidates.
     for i in (0..20).step_by(2) {
-        db.delete(format!("d{i}").as_bytes()).unwrap();
+        db.delete(format!("d{i}").into_bytes()).await.unwrap();
     }
     for _ in 0..10 {
-        db.put(b"churn", &blob).unwrap();
+        db.put(b"churn".to_vec(), blob.clone()).await.unwrap();
     }
 
-    db.garbage_collect().unwrap();
+    db.garbage_collect().await.unwrap();
 
     for i in 0..20 {
         let key = format!("d{i}");
-        let got = db.get(key.as_bytes()).unwrap();
+        let got = db.get(key.as_bytes().to_vec()).await.unwrap();
         if i % 2 == 0 {
             assert_eq!(got, None, "{key} was resurrected by GC");
         } else {
@@ -322,33 +330,37 @@ fn gc_does_not_resurrect_deleted_keys() {
         }
     }
 
-    db.shutdown().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    db.shutdown().await.unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
     for i in (0..20).step_by(2) {
-        assert_eq!(db.get(format!("d{i}").as_bytes()).unwrap(), None, "d{i} resurrected across reopen");
+        assert_eq!(
+            db.get(format!("d{i}").into_bytes()).await.unwrap(),
+            None,
+            "d{i} resurrected across reopen"
+        );
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 }
 
 /// A bucket whose metadata file is lost has no live/garbage accounting, so GC would
 /// never trigger on it — the value log would grow forever. On open, that accounting is
 /// recomputed **exactly** from the LSM's pointers (a record is live iff the LSM still
 /// points at it), not guessed at.
-#[test]
-fn segment_accounting_is_rebuilt_from_the_lsm_when_metadata_is_lost() {
+#[tokio::test]
+async fn segment_accounting_is_rebuilt_from_the_lsm_when_metadata_is_lost() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     let value = vec![0x88u8; 100 * 1024];
     for i in 0..10 {
-        db.put(format!("k{i}").as_bytes(), &value).unwrap();
+        db.put(format!("k{i}").into_bytes(), value.clone()).await.unwrap();
     }
     // Churn, so a large share of the value log is garbage.
     for _ in 0..25 {
-        db.put(b"hot", &value).unwrap();
+        db.put(b"hot".to_vec(), value.clone()).await.unwrap();
     }
     assert!(db.waste_ratio() > 0.0, "expected garbage before the metadata is lost");
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 
     // Lose every bucket's metadata, as a crash before its flush would.
     let metadata_files: Vec<PathBuf> = walkdir(dir.path())
@@ -361,7 +373,7 @@ fn segment_accounting_is_rebuilt_from_the_lsm_when_metadata_is_lost() {
     }
 
     // Reopen: the accounting is recomputed from the LSM's pointers.
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
     assert!(
         db.waste_ratio() > 0.0,
         "garbage accounting was not rebuilt after the metadata was lost — GC would never trigger \
@@ -370,17 +382,17 @@ fn segment_accounting_is_rebuilt_from_the_lsm_when_metadata_is_lost() {
 
     // And it is *exact*, not conservative: GC still finds the garbage and reclaims it,
     // while every live value survives.
-    let gc = db.garbage_collect().unwrap();
+    let gc = db.garbage_collect().await.unwrap();
     assert!(gc.bytes_reclaimed > 0, "GC found nothing to reclaim after the rebuild");
     for i in 0..10 {
         assert_eq!(
-            db.get(format!("k{i}").as_bytes()).unwrap(),
+            db.get(format!("k{i}").into_bytes()).await.unwrap(),
             Some(value.clone()),
             "k{i} lost after the accounting rebuild"
         );
     }
-    assert_eq!(db.get(b"hot").unwrap(), Some(value));
-    db.shutdown().unwrap();
+    assert_eq!(db.get(b"hot".to_vec()).await.unwrap(), Some(value));
+    db.shutdown().await.unwrap();
 }
 /// Regression: garbage in a bucket's **active tail** used to be uncollectable forever.
 ///
@@ -393,25 +405,25 @@ fn segment_accounting_is_rebuilt_from_the_lsm_when_metadata_is_lost() {
 ///
 /// GC now seals a tail that is mostly garbage (`TAIL_GC_MIN_GARBAGE_PCT`) so it can be
 /// collected in the same pass.
-#[test]
-fn garbage_in_the_active_tail_is_reclaimed() {
+#[tokio::test]
+async fn garbage_in_the_active_tail_is_reclaimed() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     // Small enough that nothing ever fills a segment: it all lives in the active tail.
     let value = vec![0x11u8; 4 * 1024];
     for i in 0..8 {
-        db.put(format!("k{i}").as_bytes(), &value).unwrap();
+        db.put(format!("k{i}").into_bytes(), value.clone()).await.unwrap();
     }
     for i in 0..8 {
-        db.delete(format!("k{i}").as_bytes()).unwrap();
+        db.delete(format!("k{i}").into_bytes()).await.unwrap();
     }
 
     let before = db.stats();
     assert!(before.garbage_size > 0 && before.live_bytes == 0, "expected an all-garbage tail");
     assert!(before.waste_ratio >= 99.0, "expected ~100% waste, got {:.1}%", before.waste_ratio);
 
-    let gc = db.garbage_collect().unwrap();
+    let gc = db.garbage_collect().await.unwrap();
     assert!(
         gc.bytes_reclaimed > 0,
         "GC reclaimed nothing — the garbage is all in the active tail, which GC would never select"
@@ -422,28 +434,28 @@ fn garbage_in_the_active_tail_is_reclaimed() {
     assert!(after.waste_ratio < 1.0, "waste should have collapsed, got {:.1}%", after.waste_ratio);
 
     // ...and the store still works: writes land, reads resolve.
-    db.put(b"fresh", &value).unwrap();
-    assert_eq!(db.get(b"fresh").unwrap(), Some(value));
+    db.put(b"fresh".to_vec(), value.clone()).await.unwrap();
+    assert_eq!(db.get(b"fresh".to_vec()).await.unwrap(), Some(value));
     for i in 0..8 {
-        assert_eq!(db.get(format!("k{i}").as_bytes()).unwrap(), None, "k{i} was resurrected");
+        assert_eq!(db.get(format!("k{i}").into_bytes()).await.unwrap(), None, "k{i} was resurrected");
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 }
 
 /// A tail that is mostly LIVE must not be sealed and rewritten — that would relocate all
 /// of it to reclaim very little, on every GC tick. Only a tail dominated by garbage is
 /// worth the rewrite.
-#[test]
-fn a_mostly_live_tail_is_left_alone() {
+#[tokio::test]
+async fn a_mostly_live_tail_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_with_config(dir.path(), config(SEGMENT_SIZE)).unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     let value = vec![0x22u8; 4 * 1024];
     for i in 0..10 {
-        db.put(format!("k{i}").as_bytes(), &value).unwrap();
+        db.put(format!("k{i}").into_bytes(), value.clone()).await.unwrap();
     }
     // Overwrite just one key: ~10% garbage — well under the seal threshold.
-    db.put(b"k0", &value).unwrap();
+    db.put(b"k0".to_vec(), value.clone()).await.unwrap();
 
     let segments_before: Vec<u32> = db
         .value_log_segment_stats("default")
@@ -452,7 +464,7 @@ fn a_mostly_live_tail_is_left_alone() {
         .flat_map(|(_, ss)| ss.iter().map(|s| s.id))
         .collect();
 
-    db.garbage_collect().unwrap();
+    db.garbage_collect().await.unwrap();
 
     let segments_after: Vec<u32> = db
         .value_log_segment_stats("default")
@@ -466,7 +478,7 @@ fn a_mostly_live_tail_is_left_alone() {
     );
 
     for i in 0..10 {
-        assert_eq!(db.get(format!("k{i}").as_bytes()).unwrap(), Some(value.clone()), "k{i} lost");
+        assert_eq!(db.get(format!("k{i}").into_bytes()).await.unwrap(), Some(value.clone()), "k{i} lost");
     }
-    db.shutdown().unwrap();
+    db.shutdown().await.unwrap();
 }

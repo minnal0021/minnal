@@ -732,7 +732,11 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     let target = Arc::new(Target {
         store: Arc::clone(&store),
         ns: cfg.namespace.clone(),
-        ns_id: schema["ns_id"].as_u64().ok_or("schema has no ns_id")? as u32,
+        ns_id: schema["ns_id"]
+            .as_str()
+            .ok_or("schema has no ns_id")?
+            .parse()
+            .map_err(|e: minnal_db::BadNamespaceId| e.to_string())?,
         key_type: serde_json::from_value::<KeyType>(schema["key_type"].clone()).map_err(|e| e.to_string())?,
     });
     let data = Arc::new(Data::load(&cfg.data)?);

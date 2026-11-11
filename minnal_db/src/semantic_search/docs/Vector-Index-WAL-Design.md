@@ -233,7 +233,7 @@ no-WAL flush tick does not need to flush them.
 - **End of a segment's records.** A full segment is sealed with an end marker:
   a length of `0xFFFF_FFFF`, which no record can have. A length of 0 is
   unwritten space: the records end there.
-- **Record:** length, CRC32 of the body, then the body: namespace id (u32), seq
+- **Record:** length, CRC32 of the body, then the body: namespace id (16 bytes), seq
   (u64), key length and key, value length and value. A **delete** has value
   length `u32::MAX` and no value bytes; no put can be that long, since a record
   must fit a segment. Replay applies a delete with its seq.
