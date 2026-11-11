@@ -96,7 +96,39 @@ impl Database {
         Ok(())
     }
 
-    pub(in crate::db) fn recover_from_wal(&self) -> Result<()> {
+    /// Replay the catalog's records of the main WAL into its store, at their
+    /// original seqs, before any other namespace is opened: they say which
+    /// namespaces exist. Returns how many it applied; [`recover_from_wal`]
+    /// skips them and flushes them with the rest.
+    ///
+    /// [`recover_from_wal`]: Self::recover_from_wal
+    pub(in crate::db) fn recover_catalog_from_wal(&self) -> Result<u64> {
+        let wal_metadata = self.wal_metadata.read().clone();
+        let start = wal_metadata.cut.max(wal_metadata.head);
+        if start >= wal_metadata.tail {
+            return Ok(0);
+        }
+        let replay_from = wal_metadata.replay_from(NamespaceId::CATALOG);
+        let mut eligible: Vec<WalEntry> = self
+            .wal
+            .scan_entries(start, wal_metadata.tail)?
+            .into_iter()
+            .filter(|(pointer, entry)| entry.namespace_id == NamespaceId::CATALOG && pointer.offset >= replay_from)
+            .map(|(_, entry)| entry)
+            .collect();
+        eligible.sort_by_key(|e| e.sequence);
+        let (recovered, failed) = self.apply_wal_entries(eligible);
+        if recovered + failed > 0 {
+            info!("[RECOVERY] system catalog: replayed {recovered} record(s), {failed} failed (see the fail log)");
+        }
+        Ok(recovered)
+    }
+
+    /// Replay the main WAL into every namespace but the catalog (replayed
+    /// first, `recover_catalog_from_wal`), then flush and retire the log.
+    /// `catalog_replayed` counts the catalog records already replayed: they
+    /// are flushed with the rest before the log is retired.
+    pub(in crate::db) fn recover_from_wal(&self, catalog_replayed: u64) -> Result<()> {
         let wal_metadata = self.wal_metadata.read().clone();
         let tail = wal_metadata.tail;
         let start = wal_metadata.cut.max(wal_metadata.head);
@@ -145,6 +177,9 @@ impl Database {
                 skipped_flushed_count += 1;
                 continue;
             }
+            if entry.namespace_id == NamespaceId::CATALOG {
+                continue; // replayed first, by `recover_catalog_from_wal`
+            }
             if !known_namespaces.contains(&entry.namespace_id) {
                 // Log once per namespace to avoid flooding the log when a deleted
                 // namespace had many un-persisted entries at crash time.
@@ -164,9 +199,40 @@ impl Database {
         // Stable sort by sequence so entries replay in their original order.
         eligible.sort_by_key(|e| e.sequence);
 
-        // Apply each entry in sequence order, retrying once *immediately* on
-        // failure. Immediate (rather than deferred) retry is what preserves the
-        // ordering guarantee: a failed entry has no effect, so retrying it before
+        let (recovered_count, error_count) = self.apply_wal_entries(eligible);
+
+        // Flush all namespaces that had recovered entries, then retire the whole
+        // log: every replayed entry is in L0 now (or in the fail log, which is
+        // the operator's recovery path). A flush that fails leaves the progress
+        // where it was, so the next open replays again.
+        let mut flushed = true;
+        if recovered_count + catalog_replayed > 0 {
+            let stores = self.stores.read();
+            for kv_store in stores.values() {
+                if let Err(e) = kv_store.flush_and_compact_all() {
+                    warn!("[RECOVERY] Flushing a namespace after replay failed; the WAL keeps its entries: {e:?}");
+                    flushed = false;
+                }
+            }
+        }
+        if flushed {
+            self.wal_flush_observer.retire_all()?;
+        }
+
+        info!(
+            "[RECOVERY] Complete. Recovered: {}, Skipped (already in L0): {}, \
+             Skipped (unknown/deleted namespaces): {}, Failed after retry (see fail log): {}",
+            recovered_count, skipped_flushed_count, skipped_unknown_ns_count, error_count
+        );
+        Ok(())
+    }
+
+    /// Apply `eligible` (in sequence order) to their stores, retrying each
+    /// once *immediately* on failure, and write what still fails to the fail
+    /// log. Returns how many were applied and how many failed.
+    fn apply_wal_entries(&self, eligible: Vec<WalEntry>) -> (u64, u64) {
+        // Immediate (rather than deferred) retry is what preserves the ordering
+        // guarantee: a failed entry has no effect, so retrying it before
         // moving on means a later write to the same key still lands afterwards.
         let mut recovered_count = 0u64;
         let mut error_count = 0u64;
@@ -208,30 +274,7 @@ impl Database {
             crate::db::wal::wal_fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
         }
 
-        // Flush all namespaces that had recovered entries, then retire the whole
-        // log: every replayed entry is in L0 now (or in the fail log, which is
-        // the operator's recovery path). A flush that fails leaves the progress
-        // where it was, so the next open replays again.
-        let mut flushed = true;
-        if recovered_count > 0 {
-            let stores = self.stores.read();
-            for kv_store in stores.values() {
-                if let Err(e) = kv_store.flush_and_compact_all() {
-                    warn!("[RECOVERY] Flushing a namespace after replay failed; the WAL keeps its entries: {e:?}");
-                    flushed = false;
-                }
-            }
-        }
-        if flushed {
-            self.wal_flush_observer.retire_all()?;
-        }
-
-        info!(
-            "[RECOVERY] Complete. Recovered: {}, Skipped (already in L0): {}, \
-             Skipped (unknown/deleted namespaces): {}, Failed after retry (see fail log): {}",
-            recovered_count, skipped_flushed_count, skipped_unknown_ns_count, error_count
-        );
-        Ok(())
+        (recovered_count, error_count)
     }
 
     /// Apply a single WAL entry to its KV store.  Returns `Err` if the

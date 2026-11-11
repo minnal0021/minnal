@@ -214,6 +214,11 @@ pub struct Database {
     // Per-namespace counters live on each KVStore's own Metrics instance; the
     // engine-wide view (`metrics_snapshot`) sums those with this global one.
     pub(crate) metrics: Arc<crate::support::metrics::Metrics>,
+
+    /// Test-only: leave the system catalog unflushed after a change, so a
+    /// crash finds its records in the WAL only.
+    #[cfg(test)]
+    pub(crate) catalog_flush_paused: AtomicBool,
 }
 
 impl Database {

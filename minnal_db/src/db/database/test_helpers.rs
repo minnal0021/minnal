@@ -55,24 +55,9 @@ impl Database {
             Arc::clone(&next_seq),
         ));
 
-        let registry = NamespaceRegistry::open(db_path)?;
         let index_manager = IndexManager::open(db_path)?;
-
         let mut stores = HashMap::new();
-        for (name, ns_id) in registry.list() {
-            let ns_path = crate::layout::namespace_data_dir(db_path, name);
-            let kv_store = KVStore::open(
-                ns_id,
-                name,
-                &ns_path,
-                config.lsm_config.clone(),
-                config.sync_config,
-                config.segment_size_bytes,
-            )?;
-            kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
-            kv_store.cleanup_old_files_on_startup()?;
-            stores.insert(ns_id, Arc::new(kv_store));
-        }
+        stores.insert(NamespaceId::CATALOG, Arc::new(Self::open_catalog_store(db_path, &config)?));
 
         let old_wal = db_path.join("wal.log.old");
         if old_wal.exists() {
@@ -83,7 +68,7 @@ impl Database {
 
         // The engine-wide counters, shared with the vector index WAL.
         let metrics = Arc::new(crate::support::metrics::Metrics::default());
-        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &registry, &metrics)?);
+        let vector_index_wal = Arc::new(Self::open_vector_index_wal(db_path, &metrics)?);
 
         // One write-buffer budget for every field index of this database.
         let index_overlay_budget = Arc::new(crate::field_index::IndexOverlayBudget::new(
@@ -99,7 +84,7 @@ impl Database {
             pending_wal_flushes,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             vector_index_wal,
-            registry: RwLock::new(registry),
+            registry: RwLock::new(NamespaceRegistry::new()),
             namespace_create_lock: Mutex::new(()),
             index_activate_lock: Mutex::new(()),
             stores: RwLock::new(stores),
@@ -120,32 +105,11 @@ impl Database {
             key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics,
+            #[cfg(test)]
+            catalog_flush_paused: AtomicBool::new(false),
         };
 
-        // Share the global WAL sequence counter with every store (see the other
-        // open path); must happen before recovery replays entries. Share the
-        // operational counters too.
-        {
-            let stores = db.stores.read();
-            for kv_store in stores.values() {
-                kv_store.set_seq_counter(db.next_seq.clone());
-                kv_store.set_metrics(std::sync::Arc::new(crate::support::metrics::Metrics::default()));
-                kv_store.set_index_gap_sink(Some(
-                    Arc::clone(&db.rejected_index_updates) as Arc<dyn crate::kv_store::index_set::IndexGapSink>
-                ));
-            }
-        }
-
-        db.complete_interrupted_field_drops();
-
-        // Report field indices left incomplete by no-WAL writes that an unclean
-        // shutdown caught before any checkpoint covered them.
-        db.record_no_wal_gaps_after_unclean_shutdown();
-        db.recover_from_vector_index_wal()?;
-        db.recover_from_wal()?;
-        db.wire_up_flush_observers();
-
-        Ok(db)
+        db.finish_open()
     }
 
     /// Test hook: the key-stripe lock `key` takes in `namespace_id`.

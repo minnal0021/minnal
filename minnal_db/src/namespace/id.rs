@@ -1,13 +1,16 @@
 //! `NamespaceId`: a namespace's identity, a 64-bit id.
 //!
-//! An id is drawn when a namespace is created and never handed out again, so a
-//! name dropped and created again gets a new id: WAL records, field-index files
-//! and caches of the old namespace can never be taken for the new one's.
+//! An id comes from the system catalog's counter when a namespace is created,
+//! and is never handed out again, so a name dropped and created again gets a
+//! new id: WAL records, field-index files and caches of the old namespace can
+//! never be taken for the new one's. Ids below [`NamespaceId::FIRST_ALLOCATED`]
+//! are reserved for namespaces with fixed ids.
 //!
 //! Written as a decimal number in JSON, directory names and logs, and as 8
 //! big-endian bytes in the binary formats (both WALs and their progress files).
 
 use std::fmt;
+#[cfg(test)]
 use std::io::Read;
 use std::str::FromStr;
 
@@ -22,11 +25,18 @@ impl NamespaceId {
     pub const DEFAULT: Self = Self(0);
     /// The `system` namespace's fixed id.
     pub const SYSTEM: Self = Self(1);
+    /// The `system_catalog` namespace's fixed id: it holds every other
+    /// namespace's record, so it is known before anything is read.
+    pub const CATALOG: Self = Self(2);
+    /// The first id the catalog's counter hands out (namespaces and field
+    /// indexes alike). Ids below it are reserved for namespaces with fixed ids.
+    pub const FIRST_ALLOCATED: u64 = 1024;
     /// Bytes in the binary form ([`to_bytes`](Self::to_bytes)).
     pub const LEN: usize = 8;
 
-    /// A new random id below 2^53 (so it stays exact as a JSON number in a
-    /// browser), read from the operating system's random source.
+    /// Test-only: a random id below 2^53, for tests that need ids no other
+    /// test uses.
+    #[cfg(test)]
     pub fn random() -> std::io::Result<Self> {
         let mut bytes = [0u8; 8];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;

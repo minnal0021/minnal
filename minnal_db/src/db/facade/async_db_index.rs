@@ -106,7 +106,7 @@ impl AsyncDb {
 
     /// Return all indexed fields registered for a namespace, sorted by [`FieldId`].
     ///
-    /// On a fresh open the list is populated from `config.json` automatically,
+    /// On a fresh open the list is loaded from the system catalog automatically,
     /// so callers do not need to re-call `register_index_field` after a restart.
     pub fn list_index_fields(&self, namespace_id: NamespaceId) -> Vec<crate::field_index::FieldMeta> {
         self.inner.inner.list_index_fields(namespace_id)

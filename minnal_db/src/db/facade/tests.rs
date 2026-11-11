@@ -132,8 +132,10 @@ async fn test_per_namespace_ops_metrics() {
     assert_eq!(db.ops_metrics_for("a").unwrap().puts, 2);
     assert_eq!(db.ops_metrics_for("b").unwrap().puts, 1);
 
-    // Engine-wide view is the sum across namespaces.
-    assert_eq!(db.ops_metrics().puts, 3);
+    // Engine-wide view is the sum across namespaces, the system catalog's
+    // own records (one per namespace created) among them.
+    let catalog_puts = || db.ops_metrics_for(crate::CATALOG_NAMESPACE).unwrap().puts;
+    assert_eq!(db.ops_metrics().puts - catalog_puts(), 3);
 
     // by-namespace map carries each namespace's own counters.
     let by_ns: std::collections::HashMap<String, _> = db.ops_metrics_by_namespace().into_iter().collect();
@@ -148,7 +150,7 @@ async fn test_per_namespace_ops_metrics() {
     // individually queryable.
     drop(a);
     db.remove_namespace("a".to_string()).await.unwrap();
-    assert_eq!(db.ops_metrics().puts, 3, "engine total stays monotonic after drop");
+    assert_eq!(db.ops_metrics().puts - catalog_puts(), 3, "engine total stays monotonic after drop");
     assert!(db.ops_metrics_for("a").is_err(), "dropped ns is no longer queryable");
     assert!(!db.ops_metrics_by_namespace().iter().any(|(n, _)| n == "a"));
 

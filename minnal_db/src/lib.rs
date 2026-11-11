@@ -239,11 +239,16 @@ pub use kv_store::index_set::RowToKeyFn;
 
 /// Namespace ID for the implicit default namespace.
 pub use namespace::DEFAULT_NAMESPACE_ID;
-/// A namespace's identity: a random UUID, never reused.
+/// A namespace's identity: a 64-bit id from the system catalog's counter, never reused.
 pub use namespace::{BadNamespaceId, NamespaceId};
 
 /// Name and ID for the system-wide namespace (always present, never removable).
 pub use namespace::{SYSTEM_NAMESPACE, SYSTEM_NAMESPACE_ID};
+
+/// Name of the system catalog: the namespace that holds every other
+/// namespace's record (always present, never removable; its id is
+/// [`NamespaceId::CATALOG`]).
+pub use namespace::CATALOG_NAMESPACE;
 
 /// Snapshot statistics returned by [`AsyncDb::stats`].
 pub use db::stats::Stats;

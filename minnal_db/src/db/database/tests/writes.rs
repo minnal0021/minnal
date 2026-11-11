@@ -84,6 +84,8 @@ fn put_and_delete_accept_normal_sized_keys_and_values() {
 fn test_ops_metrics_counters_move() {
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
+    // Opening writes the system catalog's first records.
+    let base = db.metrics_snapshot();
 
     db.put(b"k1", b"v1").unwrap();
     db.put(b"k2", b"v2").unwrap();
@@ -92,13 +94,13 @@ fn test_ops_metrics_counters_move() {
     db.delete(b"k2").unwrap();
 
     let m = db.metrics_snapshot();
-    assert_eq!(m.puts, 2, "two WAL-backed puts");
-    assert_eq!(m.deletes, 1, "one delete");
-    assert_eq!(m.reads, 2, "two user reads");
-    assert_eq!(m.read_hits, 1, "one hit");
-    assert_eq!(m.read_misses, 1, "one miss");
+    assert_eq!(m.puts - base.puts, 2, "two WAL-backed puts");
+    assert_eq!(m.deletes - base.deletes, 1, "one delete");
+    assert_eq!(m.reads - base.reads, 2, "two user reads");
+    assert_eq!(m.read_hits - base.read_hits, 1, "one hit");
+    assert_eq!(m.read_misses - base.read_misses, 1, "one miss");
     // Every WAL-backed write fsyncs once (2 puts + 1 delete).
-    assert_eq!(m.wal_writes, 3);
+    assert_eq!(m.wal_writes - base.wal_writes, 3);
     assert!(m.wal_bytes_appended > 0);
     // Reads go through the LSM point-lookup path.
     assert!(m.lookups >= 2, "lookups should cover the user reads, got {}", m.lookups);

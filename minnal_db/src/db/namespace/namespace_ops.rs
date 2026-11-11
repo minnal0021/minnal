@@ -34,7 +34,7 @@ impl Database {
             return Ok(existing);
         }
 
-        let ns_id = self.registry.write().create(name)?;
+        let ns_id = self.update_registry(|r| r.create(name))?;
 
         let ns_path = crate::layout::namespace_data_dir(&self.db_path, name);
         let dir_existed = ns_path.exists();
@@ -51,7 +51,7 @@ impl Database {
             Err(e) => {
                 // The registry is durable already: left there, the next open of
                 // the database would try this store again, and fail the same way.
-                if let Err(undo) = self.registry.write().remove(name) {
+                if let Err(undo) = self.update_registry(|r| r.remove(name)) {
                     warn!("namespace '{name}': create failed and could not be undone in the registry: {undo:?}");
                 }
                 if !dir_existed {
@@ -152,9 +152,9 @@ impl Database {
         let _create = self.namespace_create_lock.lock();
 
         // (1) Durable point: once this returns, the namespace is gone from the
-        // persisted registry (including its TTL config, so the global TTL worker
+        // system catalog (including its TTL config, so the global TTL worker
         // stops scanning it) and recovery will skip its WAL entries.
-        let ns_id = self.registry.write().remove(name)?;
+        let ns_id = self.update_registry(|r| r.remove(name))?;
 
         // (2) Flush + close, then drop so the data directory's file handles are
         // released before we delete it.

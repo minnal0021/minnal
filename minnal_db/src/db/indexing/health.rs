@@ -434,7 +434,7 @@ mod tests {
 
             // Simulate a crash between step (1) persist and step (3) delete:
             // mark the field dropped durably, then leave every file in place.
-            db.registry.write().mark_schema_field_dropped(ns, field_id).unwrap();
+            db.update_registry(|r| r.mark_schema_field_dropped(ns, field_id)).unwrap();
             assert!(field_path.exists(), "precondition: files still present at the crash point");
             db.shutdown().unwrap();
         }

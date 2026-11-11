@@ -332,6 +332,8 @@ mod merge_tests {
     fn merges_are_counted_separately_from_the_writes_they_produce() {
         let dir = TempDir::new().unwrap();
         let db = Database::open(dir.path(), create_db_config()).unwrap();
+        // Opening writes the system catalog's first records.
+        let base = db.metrics_snapshot();
 
         db.merge(b"counter", &1u64.to_le_bytes(), add).unwrap();
         db.merge(b"counter", &1u64.to_le_bytes(), add).unwrap();
@@ -340,8 +342,8 @@ mod merge_tests {
         db.merge(b"absent", b"", |_, _| Ok(None)).unwrap();
 
         let m = db.metrics_snapshot();
-        assert_eq!(m.merges, 4);
-        assert_eq!(m.puts, 2, "only the two writing merges should count as puts");
+        assert_eq!(m.merges - base.merges, 4);
+        assert_eq!(m.puts - base.puts, 2, "only the two writing merges should count as puts");
 
         db.shutdown().unwrap();
     }

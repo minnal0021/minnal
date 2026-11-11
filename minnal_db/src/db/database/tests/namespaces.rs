@@ -159,6 +159,7 @@ fn test_database_namespace_listing() {
             ("default".to_string(), NamespaceId::DEFAULT),
             ("orders".to_string(), orders),
             ("system".to_string(), NamespaceId::SYSTEM),
+            ("system_catalog".to_string(), NamespaceId::CATALOG),
             ("users".to_string(), users),
         ]
     );
