@@ -54,7 +54,7 @@ fn a_last_segment_with_a_blank_header_is_created_again() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), SMALL_SEGMENT);
     let appended = append_n(&wal, 3);
-    wal.append(NamespaceId::from_u128(0), b"k", b"v", 99).unwrap(); // starts segment 1
+    wal.append(NamespaceId::from_u64(0), b"k", b"v", 99).unwrap(); // starts segment 1
     drop(wal);
     zero(dir.path(), 1, 0, u64::from(SMALL_SEGMENT));
     let (wal, report) = reopen(dir.path(), SMALL_SEGMENT).unwrap();
@@ -102,7 +102,7 @@ fn the_next_segment_is_prepared_ahead_and_installed() {
     assert!(prep.exists() && !segment_path(dir.path(), 1).exists());
     let before = appended.len() as u64;
     appended.extend((before..per_segment + 2).map(|i| {
-        wal.append(NamespaceId::from_u128(u128::from((i % 3) as u32)), &key(i), &value(i), i + 1)
+        wal.append(NamespaceId::from_u64(u64::from((i % 3) as u32)), &key(i), &value(i), i + 1)
             .unwrap()
             .appended()
     }));
@@ -151,7 +151,7 @@ fn records_past_a_lost_one_never_rejoin_the_log() {
     let past = bytes_of(dir.path(), 0, u64::from(lost), 64 * 1024);
     assert!(past.iter().all(|&b| b == 0), "open zeroes every byte past the tail");
     let new = wal
-        .append(NamespaceId::from_u128(0), &key(9_000), &value(9_000), 9_001)
+        .append(NamespaceId::from_u64(0), &key(9_000), &value(9_000), 9_001)
         .unwrap()
         .appended();
     assert_eq!(new.end, appended[11].start, "a same-size record ends where an old one started");

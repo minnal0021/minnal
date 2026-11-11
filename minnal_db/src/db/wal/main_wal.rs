@@ -64,7 +64,7 @@ pub type Result<T> = std::result::Result<T, WalError>;
 pub(crate) static FORMAT: LogFormat = LogFormat {
     name: "main WAL",
     magic: *b"MWAL",
-    version: 2,
+    version: 3,
 };
 
 /// Default WAL segment size (64 MiB).
@@ -689,7 +689,7 @@ mod tests {
 
     fn upserts(n: u32) -> impl Iterator<Item = WalEntry> {
         (0..n).map(|i| {
-            WalEntry::new_upsert_ns(NamespaceId::from_u128(u128::from(i % 3)), format!("k{i}").into_bytes(), vec![b'x'; 40])
+            WalEntry::new_upsert_ns(NamespaceId::from_u64(u64::from(i % 3)), format!("k{i}").into_bytes(), vec![b'x'; 40])
                 .with_sequence(u64::from(i) + 1)
         })
     }
@@ -724,7 +724,7 @@ mod tests {
             head: 16,
             tail: 1024,
             cut: 300,
-            safe: vec![(NamespaceId::from_u128(2), 500), (NamespaceId::from_u128(7), 900)],
+            safe: vec![(NamespaceId::from_u64(2), 500), (NamespaceId::from_u64(7), 900)],
             total_gc_runs: 2,
             total_bytes_reclaimed: 256,
             last_sequence: 41,
@@ -768,10 +768,10 @@ mod tests {
         assert_eq!(WalEntry::new_upsert(b"k".to_vec(), b"v".to_vec()).sequence, 0);
         assert_eq!(WalEntry::new_delete(b"k".to_vec()).sequence, 0);
         assert_eq!(
-            WalEntry::new_upsert_ns(NamespaceId::from_u128(1), b"k".to_vec(), b"v".to_vec()).sequence,
+            WalEntry::new_upsert_ns(NamespaceId::from_u64(1), b"k".to_vec(), b"v".to_vec()).sequence,
             0
         );
-        assert_eq!(WalEntry::new_delete_ns(NamespaceId::from_u128(1), b"k".to_vec()).sequence, 0);
+        assert_eq!(WalEntry::new_delete_ns(NamespaceId::from_u64(1), b"k".to_vec()).sequence, 0);
     }
 
     /// Entries written across segments read back in order and in full, and a
@@ -788,7 +788,7 @@ mod tests {
         for (i, ((pointer, entry), expected)) in scanned.iter().zip(&pointers).enumerate() {
             assert_eq!(pointer.offset, expected.offset);
             assert_eq!(entry.key, format!("k{i}").into_bytes());
-            assert_eq!(entry.namespace_id, NamespaceId::from_u128(u128::from(i as u32 % 3)));
+            assert_eq!(entry.namespace_id, NamespaceId::from_u64(u64::from(i as u32 % 3)));
         }
         drop(wal);
         let cut = pointers[40].offset;

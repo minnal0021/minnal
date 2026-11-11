@@ -412,7 +412,7 @@ mod tests {
         StoredSchema::Doc(Arc::new(DocStoreSchema {
             store_type: StoreType::Doc,
             namespace: name.to_owned(),
-            ns_id: Some(NamespaceId::from_u128(7)),
+            ns_id: Some(NamespaceId::from_u64(7)),
             key_type: KeyType::U64,
             indices: vec![],
             attributes: vec![],
@@ -426,7 +426,7 @@ mod tests {
         StoredSchema::Kv(Arc::new(KvStoreSchema {
             store_type: StoreType::Kv,
             namespace: name.to_owned(),
-            ns_id: Some(NamespaceId::from_u128(8)),
+            ns_id: Some(NamespaceId::from_u64(8)),
             key_type: KvKeyType::Str,
             value_type: KvValueType::Str,
             semantic_search_enabled: false,

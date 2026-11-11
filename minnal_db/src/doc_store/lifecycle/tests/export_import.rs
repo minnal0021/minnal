@@ -70,14 +70,14 @@ async fn test_import_schema_stale_ns_id_is_replaced() {
 
     // Schema carries a stale ns_id from a previous database instance.
     let mut schema = make_schema("ns_id_test", vec![]);
-    schema.ns_id = Some(NamespaceId::from_u128(99999));
+    schema.ns_id = Some(NamespaceId::from_u64(99999));
 
     store.create(schema).await.unwrap();
 
     let stored = store.get_schema("ns_id_test").unwrap();
     // The stored ns_id must be the one assigned by this store, not the
     // stale value that came in with the import body.
-    assert_ne!(stored.ns_id, Some(NamespaceId::from_u128(99999)));
+    assert_ne!(stored.ns_id, Some(NamespaceId::from_u64(99999)));
     assert!(stored.ns_id.is_some(), "ns_id must be assigned after create");
 }
 

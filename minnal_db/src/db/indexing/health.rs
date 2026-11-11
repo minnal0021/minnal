@@ -700,7 +700,7 @@ mod tests {
         use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
 
         let mk = |from: u64, to: u64, segs: Vec<u64>, keys: &[&str]| GapRecord {
-            namespace_id: NamespaceId::from_u128(0),
+            namespace_id: NamespaceId::from_u64(0),
             field_id: 1,
             cause: GapCause::BackstopReclaim,
             from,

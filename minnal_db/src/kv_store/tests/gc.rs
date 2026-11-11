@@ -33,7 +33,7 @@ fn gc_resolves_liveness_in_batches_not_per_record() {
     };
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "queue",
         dir.path(),
         lsm,
@@ -105,7 +105,7 @@ fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
         ..LSMConfig::default()
     };
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         lsm_config,
@@ -156,7 +156,7 @@ fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
 fn test_kvstore_gc() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -191,7 +191,7 @@ fn test_gc_write_before_gc_survives() {
     // A write that completes immediately before GC starts must not be lost.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -225,7 +225,7 @@ fn test_gc_writes_after_swap_go_to_new_file() {
     // new file and be readable.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -258,7 +258,7 @@ fn test_gc_multi_round_all_values_survive() {
     // Multiple sequential GC runs must not lose any values.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -285,7 +285,7 @@ fn test_gc_multi_round_all_values_survive() {
 fn test_gc_after_delete_sequential_stays_deleted() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),

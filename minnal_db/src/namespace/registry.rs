@@ -195,7 +195,7 @@ impl NamespaceSchema {
 }
 
 const REGISTRY_MAGIC: [u8; 4] = *b"NSRG";
-const REGISTRY_VERSION: u32 = 2;
+const REGISTRY_VERSION: u32 = 3;
 const REGISTRY_FILENAME: &str = "namespace_registry";
 const CONFIG_FILENAME: &str = "config.json";
 

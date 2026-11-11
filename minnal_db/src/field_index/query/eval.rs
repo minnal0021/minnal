@@ -384,7 +384,7 @@ mod tests {
         Arc::new(RwLock::new(idx))
     }
 
-    fn schema(fields: &[(&str, u32)]) -> SchemaMap {
+    fn schema(fields: &[(&str, FieldId)]) -> SchemaMap {
         fields.iter().map(|&(n, id)| (n.to_string(), id)).collect()
     }
 
@@ -392,7 +392,7 @@ mod tests {
     fn test_int_eq() {
         let age_idx = make_int_index(&[(25, 1), (30, 2), (25, 3)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
 
         let bm = parse_and_evaluate("age = 25", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
@@ -403,7 +403,7 @@ mod tests {
     fn test_int_gt() {
         let age_idx = make_int_index(&[(10, 1), (20, 2), (30, 3)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
 
         let bm = parse_and_evaluate("age > 15", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
@@ -414,7 +414,7 @@ mod tests {
     fn test_str_eq() {
         let status_idx = make_str_index(&[("active", 1), ("inactive", 2), ("active", 3)]);
         let s = schema(&[("status", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
 
         let bm = parse_and_evaluate("status = 'active'", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
@@ -427,7 +427,7 @@ mod tests {
         // with the same literal — broken when the lexer mangled UTF-8 byte-wise.
         let name_idx = make_str_index(&[("மின்னல்", 1), ("lightning", 2), ("⚡", 3), ("மின்னல்", 4)]);
         let s = schema(&[("name", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&name_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&name_idx)) } else { None };
 
         let bm = parse_and_evaluate("name = 'மின்னல்'", &s, &get_index).unwrap();
         assert_eq!(bm.iter().collect::<Vec<u128>>(), vec![1, 4]);
@@ -440,7 +440,7 @@ mod tests {
     fn test_bool_eq() {
         let active_idx = make_bool_index(&[(true, 1), (false, 2), (true, 3)]);
         let s = schema(&[("active", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&active_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&active_idx)) } else { None };
 
         let bm = parse_and_evaluate("active = true", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
@@ -452,7 +452,7 @@ mod tests {
         let age_idx = make_int_index(&[(25, 1), (30, 2), (25, 3)]);
         let status_idx = make_str_index(&[("active", 1), ("active", 2), ("inactive", 3)]);
         let s = schema(&[("age", 0), ("status", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&age_idx)),
             1 => Some(Arc::clone(&status_idx)),
             _ => None,
@@ -468,7 +468,7 @@ mod tests {
     fn or_unions_rows_matching_either_predicate() {
         let age_idx = make_int_index(&[(10, 1), (50, 2), (80, 3)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
 
         let bm = parse_and_evaluate("age < 20 OR age > 70", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
@@ -479,7 +479,7 @@ mod tests {
     fn not_returns_rows_not_matching_predicate() {
         let status_idx = make_str_index(&[("active", 1), ("inactive", 2), ("active", 3)]);
         let s = schema(&[("status", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
 
         let bm = parse_and_evaluate("NOT status = 'active'", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
@@ -490,7 +490,7 @@ mod tests {
     fn test_in_integers() {
         let age_idx = make_int_index(&[(10, 1), (20, 2), (30, 3), (40, 4)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
 
         let bm = parse_and_evaluate("age IN (10, 30)", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
@@ -501,7 +501,7 @@ mod tests {
     fn test_in_strings() {
         let status_idx = make_str_index(&[("a", 1), ("b", 2), ("c", 3)]);
         let s = schema(&[("status", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
 
         let bm = parse_and_evaluate("status IN ('a', 'c')", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
@@ -518,7 +518,7 @@ mod tests {
         let b = make_int_index(&[(9, 1), (2, 2), (2, 3)]);
         let c = make_int_index(&[(9, 1), (3, 2), (9, 3)]);
         let s = schema(&[("a", 0), ("b", 1), ("c", 2)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&a)),
             1 => Some(Arc::clone(&b)),
             2 => Some(Arc::clone(&c)),
@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn test_unknown_field_error() {
         let s: SchemaMap = HashMap::new();
-        let get_index = |_: u32| None;
+        let get_index = |_: FieldId| None;
         let err = parse_and_evaluate("missing = 1", &s, &get_index).unwrap_err();
         assert!(matches!(err, QueryError::UnknownField { .. }));
     }
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn test_inactive_field_error() {
         let s = schema(&[("age", 0)]);
-        let get_index = |_: u32| None; // no active index
+        let get_index = |_: FieldId| None; // no active index
         let err = parse_and_evaluate("age = 1", &s, &get_index).unwrap_err();
         assert!(matches!(err, QueryError::InactiveField { .. }));
     }
@@ -553,7 +553,7 @@ mod tests {
     fn test_type_mismatch_error() {
         let age_idx = make_int_index(&[(25, 1)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
         // Passing a string to an int field
         let err = parse_and_evaluate("age = 'hello'", &s, &get_index).unwrap_err();
         assert!(matches!(err, QueryError::TypeMismatch { .. }));
@@ -563,7 +563,7 @@ mod tests {
     fn test_bool_unsupported_op() {
         let active_idx = make_bool_index(&[(true, 1)]);
         let s = schema(&[("active", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&active_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&active_idx)) } else { None };
         let err = parse_and_evaluate("active > true", &s, &get_index).unwrap_err();
         assert!(matches!(err, QueryError::UnsupportedOp { .. }));
     }
@@ -575,7 +575,7 @@ mod tests {
         let age_idx = make_int_index(&[(99, 1)]);
         let active_idx = make_bool_index(&[(true, 1)]);
         let s = schema(&[("age", 0), ("active", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&age_idx)),
             1 => Some(Arc::clone(&active_idx)),
             _ => None,
@@ -596,7 +596,7 @@ mod tests {
     fn test_and_empty_left_still_errors_on_unknown_right_field() {
         let age_idx = make_int_index(&[(99, 1)]);
         let s = schema(&[("age", 0)]); // `missing` is not in the schema
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
         // age = 5 is empty, but `missing` is an unknown field → UnknownField.
         let err = parse_and_evaluate("age = 5 AND missing = 1", &s, &get_index).unwrap_err();
         assert!(matches!(err, QueryError::UnknownField { .. }), "got: {err:?}");
@@ -607,7 +607,7 @@ mod tests {
         let age_idx = make_int_index(&[(99, 1)]);
         // `status` is a known field but has no active index.
         let s = schema(&[("age", 0), ("status", 1)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
         let err = parse_and_evaluate("age = 5 AND status = 'x'", &s, &get_index).unwrap_err();
         assert!(matches!(err, QueryError::InactiveField { .. }), "got: {err:?}");
     }
@@ -617,7 +617,7 @@ mod tests {
         let age_idx = make_int_index(&[(99, 1)]);
         let label_idx = make_str_index(&[("a", 1)]);
         let s = schema(&[("age", 0), ("label", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&age_idx)),
             1 => Some(Arc::clone(&label_idx)),
             _ => None,
@@ -632,7 +632,7 @@ mod tests {
         let age_idx = make_int_index(&[(99, 1)]);
         let active_idx = make_bool_index(&[(true, 1)]);
         let s = schema(&[("age", 0), ("active", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&age_idx)),
             1 => Some(Arc::clone(&active_idx)),
             _ => None,
@@ -649,7 +649,7 @@ mod tests {
         let age_idx = make_int_index(&[(99, 1)]);
         let active_idx = make_bool_index(&[(true, 1)]);
         let s = schema(&[("age", 0), ("active", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&age_idx)),
             1 => Some(Arc::clone(&active_idx)),
             _ => None,
@@ -664,7 +664,7 @@ mod tests {
         let age_idx = make_int_index(&[(10, 1), (50, 2), (90, 3)]);
         let active_idx = make_bool_index(&[(true, 1), (true, 2), (true, 3)]);
         let s = schema(&[("age", 0), ("active", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&age_idx)),
             1 => Some(Arc::clone(&active_idx)),
             _ => None,
@@ -686,7 +686,7 @@ mod tests {
         let status_idx = make_str_index(&[("a", 1), ("b", 2)]);
         let other_idx = make_int_index(&[(7, 3)]); // row 3 has only `other`, no status
         let s = schema(&[("status", 0), ("other", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&status_idx)),
             1 => Some(Arc::clone(&other_idx)),
             _ => None,
@@ -702,7 +702,7 @@ mod tests {
         let status_idx = make_str_index(&[("active", 1), ("inactive", 2), ("active", 3)]);
         let age_idx = make_int_index(&[(25, 1), (30, 2), (25, 3), (40, 4)]);
         let s = schema(&[("status", 0), ("age", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&status_idx)),
             1 => Some(Arc::clone(&age_idx)),
             _ => None,
@@ -721,7 +721,7 @@ mod tests {
         let status_idx = make_str_index(&[("active", 1), ("inactive", 2), ("active", 3)]);
         let age_idx = make_int_index(&[(25, 1), (15, 2), (30, 3), (22, 4)]);
         let s = schema(&[("status", 0), ("age", 1)]);
-        let get_index = |id: u32| match id {
+        let get_index = |id: FieldId| match id {
             0 => Some(Arc::clone(&status_idx)),
             1 => Some(Arc::clone(&age_idx)),
             _ => None,
@@ -739,7 +739,7 @@ mod tests {
         // NOT (NOT status = 'active') is semantically active rows
         let status_idx = make_str_index(&[("active", 1), ("inactive", 2), ("active", 3)]);
         let s = schema(&[("status", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
         let bm = parse_and_evaluate("NOT (NOT status = 'active')", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
         assert_eq!(rows, vec![1, 3]);
@@ -750,7 +750,7 @@ mod tests {
         // NOT on something that matches nothing → full universe
         let status_idx = make_str_index(&[("active", 1), ("inactive", 2), ("active", 3)]);
         let s = schema(&[("status", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&status_idx)) } else { None };
         let bm = parse_and_evaluate("NOT status = 'missing'", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
         // "missing" matches no rows, so NOT = all rows with a status value
@@ -763,7 +763,7 @@ mod tests {
     fn test_int_lt() {
         let age_idx = make_int_index(&[(10, 1), (20, 2), (30, 3)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
         let bm = parse_and_evaluate("age < 25", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
         assert_eq!(rows, vec![1, 2]);
@@ -773,7 +773,7 @@ mod tests {
     fn test_int_le() {
         let age_idx = make_int_index(&[(10, 1), (20, 2), (30, 3)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
         let bm = parse_and_evaluate("age <= 20", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
         assert_eq!(rows, vec![1, 2]);
@@ -783,7 +783,7 @@ mod tests {
     fn test_int_ge() {
         let age_idx = make_int_index(&[(10, 1), (20, 2), (30, 3)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
         let bm = parse_and_evaluate("age >= 20", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
         assert_eq!(rows, vec![2, 3]);
@@ -793,7 +793,7 @@ mod tests {
     fn test_int_ne() {
         let age_idx = make_int_index(&[(10, 1), (20, 2), (10, 3)]);
         let s = schema(&[("age", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
         let bm = parse_and_evaluate("age != 10", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
         assert_eq!(rows, vec![2]);
@@ -803,7 +803,7 @@ mod tests {
     fn test_str_ne() {
         let s_idx = make_str_index(&[("a", 1), ("b", 2), ("a", 3)]);
         let s = schema(&[("label", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&s_idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&s_idx)) } else { None };
         let bm = parse_and_evaluate("label != 'a'", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
         assert_eq!(rows, vec![2]);
@@ -813,7 +813,7 @@ mod tests {
     fn test_bool_ne() {
         let idx = make_bool_index(&[(true, 1), (false, 2), (true, 3)]);
         let s = schema(&[("active", 0)]);
-        let get_index = |id: u32| if id == 0 { Some(Arc::clone(&idx)) } else { None };
+        let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&idx)) } else { None };
         let bm = parse_and_evaluate("active != true", &s, &get_index).unwrap();
         let rows: Vec<u128> = bm.iter().collect();
         assert_eq!(rows, vec![2]);
@@ -839,7 +839,7 @@ mod tests {
             .spawn(move || {
                 let age_idx = make_int_index(&[(25, 1), (30, 2)]);
                 let s = schema(&[("age", 0)]);
-                let get_index = |id: u32| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
+                let get_index = |id: FieldId| if id == 0 { Some(Arc::clone(&age_idx)) } else { None };
                 let bm = parse_and_evaluate(&query, &s, &get_index).unwrap();
                 bm.iter().collect::<Vec<u128>>()
             })

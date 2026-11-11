@@ -9,7 +9,7 @@ fn test_gc_concurrent_writes_no_data_loss() {
     // Writer thread writes 200 unique keys while GC runs 5 times in parallel.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -69,7 +69,7 @@ fn test_gc_concurrent_reads_never_error_or_return_stale() {
     // last-written value while GC churns the same buckets continuously.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -131,7 +131,7 @@ fn test_gc_concurrent_deletes_are_not_resurrected() {
     // delete removed it, resurrecting the key.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -214,7 +214,7 @@ fn scan_during_gc_round() {
     let mut cfg = default_lsm_config();
     cfg.num_buckets = 1; // concentrate every key in one bucket
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         cfg,
@@ -349,7 +349,7 @@ fn test_scan_completeness_during_concurrent_flush_compaction_and_gc() {
     let mut cfg = default_lsm_config();
     cfg.num_buckets = 1; // concentrate every key in one bucket
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         cfg,

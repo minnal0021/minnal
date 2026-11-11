@@ -519,7 +519,7 @@ pub async fn lsm(State(state): State<AppState>) -> impl IntoResponse {
 
 #[derive(Serialize)]
 pub struct FieldInfo {
-    field_id: u32,
+    field_id: u64,
     field_name: String,
     field_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -985,7 +985,7 @@ pub async fn trigger_index_checkpoint(State(state): State<AppState>) -> Result<S
 
 #[derive(Serialize)]
 pub struct FieldWasteInfo {
-    field_id: u32,
+    field_id: u64,
     field_name: String,
     field_type: String,
     /// Reclaimable fraction (`0.0..1.0`) of the bitmap value region; `null` when

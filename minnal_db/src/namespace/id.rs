@@ -1,13 +1,11 @@
-//! `NamespaceId`: a namespace's identity, a random 128-bit id (a version-4 UUID).
+//! `NamespaceId`: a namespace's identity, a 64-bit id.
 //!
 //! An id is drawn when a namespace is created and never handed out again, so a
 //! name dropped and created again gets a new id: WAL records, field-index files
-//! and caches of the old namespace can never be taken for the new one's. No
-//! counter is kept anywhere, so creating a namespace reads no shared state to
-//! pick its id.
+//! and caches of the old namespace can never be taken for the new one's.
 //!
-//! Written as the usual hyphenated UUID text in JSON, directory names and logs,
-//! and as 16 bytes in the binary formats (the registry and both WALs).
+//! Written as a decimal number in JSON, directory names and logs, and as 8
+//! big-endian bytes in the binary formats (both WALs and their progress files).
 
 use std::fmt;
 use std::io::Read;
@@ -17,51 +15,50 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 /// A namespace's id. See the module docs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Archive, RkyvSerialize, RkyvDeserialize)]
-pub struct NamespaceId(u128);
+pub struct NamespaceId(u64);
 
 impl NamespaceId {
     /// The `default` namespace's fixed id.
     pub const DEFAULT: Self = Self(0);
     /// The `system` namespace's fixed id.
     pub const SYSTEM: Self = Self(1);
+    /// Bytes in the binary form ([`to_bytes`](Self::to_bytes)).
+    pub const LEN: usize = 8;
 
-    /// A new random id (version-4 UUID), read from the operating system's
-    /// random source.
+    /// A new random id below 2^53 (so it stays exact as a JSON number in a
+    /// browser), read from the operating system's random source.
     pub fn random() -> std::io::Result<Self> {
-        let mut bytes = [0u8; 16];
+        let mut bytes = [0u8; 8];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        // RFC 9562 version 4, variant 10.
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        Ok(Self(u128::from_be_bytes(bytes)))
+        Ok(Self(u64::from_be_bytes(bytes) >> 11))
     }
 
-    /// The id from its 128-bit value.
-    pub const fn from_u128(value: u128) -> Self {
+    /// The id from its 64-bit value.
+    pub const fn from_u64(value: u64) -> Self {
         Self(value)
     }
 
-    /// The id's 128-bit value.
-    pub const fn as_u128(self) -> u128 {
+    /// The id's 64-bit value.
+    pub const fn as_u64(self) -> u64 {
         self.0
     }
 
-    /// The id as 16 big-endian bytes, the form the binary formats store.
-    pub const fn to_bytes(self) -> [u8; 16] {
+    /// The id as 8 big-endian bytes, the form the binary formats store.
+    pub const fn to_bytes(self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
 
-    /// The id from 16 big-endian bytes.
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(u128::from_be_bytes(bytes))
+    /// The id from 8 big-endian bytes.
+    pub const fn from_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_be_bytes(bytes))
     }
 }
 
 /// Tests name namespaces by small numbers; `id == 3` reads better there than
-/// `id == NamespaceId::from_u128(3)`.
+/// `id == NamespaceId::from_u64(3)`.
 #[cfg(test)]
-impl PartialEq<u128> for NamespaceId {
-    fn eq(&self, other: &u128) -> bool {
+impl PartialEq<u64> for NamespaceId {
+    fn eq(&self, other: &u64) -> bool {
         self.0 == *other
     }
 }
@@ -74,9 +71,7 @@ impl From<&ArchivedNamespaceId> for NamespaceId {
 
 impl fmt::Display for NamespaceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let b = self.to_bytes();
-        let hex = |r: std::ops::Range<usize>| b[r].iter().map(|x| format!("{x:02x}")).collect::<String>();
-        write!(f, "{}-{}-{}-{}-{}", hex(0..4), hex(4..6), hex(6..8), hex(8..10), hex(10..16))
+        write!(f, "{}", self.0)
     }
 }
 
@@ -86,35 +81,32 @@ impl fmt::Debug for NamespaceId {
     }
 }
 
-/// Text that is not a hyphenated UUID.
+/// Text that is not a namespace id (a decimal number).
 #[derive(Debug, thiserror::Error)]
-#[error("not a namespace id (a hyphenated UUID): {0:?}")]
+#[error("not a namespace id (a decimal number): {0:?}")]
 pub struct BadNamespaceId(pub String);
 
 impl FromStr for NamespaceId {
     type Err = BadNamespaceId;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bad = || BadNamespaceId(s.to_owned());
-        let groups: Vec<&str> = s.split('-').collect();
-        if groups.iter().map(|g| g.len()).collect::<Vec<_>>() != [8, 4, 4, 4, 12] {
-            return Err(bad());
+        // `u64::from_str` takes a leading `+`; an id's text never has one.
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(BadNamespaceId(s.to_owned()));
         }
-        let hex: String = groups.concat();
-        u128::from_str_radix(&hex, 16).map(Self).map_err(|_| bad())
+        s.parse().map(Self).map_err(|_| BadNamespaceId(s.to_owned()))
     }
 }
 
 impl serde::Serialize for NamespaceId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
+        serializer.serialize_u64(self.0)
     }
 }
 
 impl<'de> serde::Deserialize<'de> for NamespaceId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        s.parse().map_err(serde::de::Error::custom)
+        u64::deserialize(deserializer).map(Self)
     }
 }
 
@@ -123,35 +115,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn random_ids_are_version_4_and_differ() {
+    fn random_ids_differ_and_stay_exact_in_json() {
         let a = NamespaceId::random().unwrap();
         let b = NamespaceId::random().unwrap();
         assert_ne!(a, b);
-        let text = a.to_string();
-        assert_eq!(text.len(), 36);
-        assert_eq!(&text[14..15], "4", "version nibble: {text}");
-        assert!(matches!(&text[19..20], "8" | "9" | "a" | "b"), "variant: {text}");
+        assert!(a.as_u64() < 1 << 53 && b.as_u64() < 1 << 53);
     }
 
     #[test]
     fn text_bytes_and_json_round_trip() {
-        let id = NamespaceId::random().unwrap();
+        let id = NamespaceId::from_u64(1234567);
+        assert_eq!(id.to_string(), "1234567");
         assert_eq!(id.to_string().parse::<NamespaceId>().unwrap(), id);
         assert_eq!(NamespaceId::from_bytes(id.to_bytes()), id);
         let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "1234567");
         assert_eq!(serde_json::from_str::<NamespaceId>(&json).unwrap(), id);
-        assert_eq!(NamespaceId::DEFAULT.to_string(), "00000000-0000-0000-0000-000000000000");
+        assert_eq!(NamespaceId::DEFAULT.to_string(), "0");
     }
 
     #[test]
     fn malformed_text_is_rejected() {
-        for bad in [
-            "",
-            "1",
-            "00000000000000000000000000000000",
-            "0000000-00000-0000-0000-000000000000",
-            "zzzzzzzz-0000-0000-0000-000000000000",
-        ] {
+        for bad in ["", "+1", "-1", "1a", " 1", "18446744073709551616"] {
             assert!(bad.parse::<NamespaceId>().is_err(), "{bad}");
         }
     }

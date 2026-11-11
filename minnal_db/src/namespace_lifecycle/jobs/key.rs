@@ -1,17 +1,19 @@
 //! `JobKey`: which namespace a job belongs to, and which job it is. It is also
 //! the key of the job's record in `system_namespace_maintenance`.
 //!
-//! Encoded as the namespace id (16 bytes), a job tag (1 byte) and the job's
-//! subject: the field id (4 bytes, big-endian) for a field job, nothing
-//! otherwise. The namespace id comes first, so one namespace's records are a
-//! prefix scan, and a namespace dropped and created again (which gets a new id)
-//! never sees the old one's records. The id is random, so the leading bytes
-//! vary and the records spread over the value-log buckets.
+//! Encoded as the namespace id (8 bytes, big-endian), a job tag (1 byte) and
+//! the job's subject: the field id (8 bytes, big-endian) for a field job,
+//! nothing otherwise. The namespace id comes first, so one namespace's records
+//! are a prefix scan, and a namespace dropped and created again (which gets a
+//! new id) never sees the old one's records.
 
 use std::fmt;
 
 use crate::FieldId;
 use crate::namespace::NamespaceId;
+
+/// Bytes of the namespace id at the start of a key.
+const NS: usize = NamespaceId::LEN;
 
 /// A job's key. See the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -126,7 +128,7 @@ impl JobKey {
 
     /// The key as stored.
     pub fn to_bytes(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(21);
+        let mut out = Vec::with_capacity(NS + 1 + 8);
         out.extend_from_slice(&self.namespace.to_bytes());
         let tag = match self.kind {
             JobKind::FieldBuild(_) => TAG_FIELD_BUILD,
@@ -146,9 +148,9 @@ impl JobKey {
 
     /// Decode a stored key; `None` for bytes no `to_bytes` produced.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let namespace = NamespaceId::from_bytes(bytes.get(..16)?.try_into().ok()?);
+        let namespace = NamespaceId::from_bytes(bytes.get(..NS)?.try_into().ok()?);
         let field = |b: &[u8]| -> Option<FieldId> { Some(FieldId::from_be_bytes(b.try_into().ok()?)) };
-        let kind = match (bytes.get(16)?, &bytes[17..]) {
+        let kind = match (bytes.get(NS)?, &bytes[NS + 1..]) {
             (&TAG_FIELD_BUILD, b) => JobKind::FieldBuild(field(b)?),
             (&TAG_FIELD_DROP, b) => JobKind::FieldDrop(field(b)?),
             (&TAG_REINDEX_ALL, []) => JobKind::ReindexAll,
@@ -186,7 +188,7 @@ mod tests {
         for kind in EVERY_KIND {
             let key = JobKey::new(namespace, kind);
             let bytes = key.to_bytes();
-            assert_eq!(&bytes[..16], &namespace.to_bytes());
+            assert_eq!(&bytes[..NS], &namespace.to_bytes());
             assert_eq!(JobKey::from_bytes(&bytes), Some(key));
         }
     }
@@ -195,7 +197,7 @@ mod tests {
     fn foreign_bytes_are_not_a_key() {
         let namespace = NamespaceId::random().unwrap().to_bytes();
         for bad in [
-            &namespace[..15],
+            &namespace[..NS - 1],
             &[&namespace[..], &[9]].concat(),
             &[&namespace[..], &[TAG_REINDEX_ALL, 0]].concat(),
             &[&namespace[..], &[TAG_FIELD_BUILD, 1, 2]].concat(),

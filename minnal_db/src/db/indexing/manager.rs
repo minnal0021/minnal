@@ -668,8 +668,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
         // ensure_field_path creates the namespace dir as a side-effect
-        mgr.ensure_field_path(NamespaceId::from_u128(0), 3).unwrap();
-        let ns_dir = dir.path().join("field-index").join(NamespaceId::from_u128(0).to_string());
+        mgr.ensure_field_path(NamespaceId::from_u64(0), 3).unwrap();
+        let ns_dir = dir.path().join("field-index").join(NamespaceId::from_u64(0).to_string());
         assert!(ns_dir.exists());
         assert!(ns_dir.join("3").exists());
     }
@@ -678,16 +678,16 @@ mod tests {
     fn test_remove_namespace_path() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(NamespaceId::from_u128(7), 1).unwrap();
-        mgr.ensure_field_path(NamespaceId::from_u128(7), 2).unwrap();
-        let ns_index_dir = dir.path().join("field-index").join(NamespaceId::from_u128(7).to_string());
+        mgr.ensure_field_path(NamespaceId::from_u64(7), 1).unwrap();
+        mgr.ensure_field_path(NamespaceId::from_u64(7), 2).unwrap();
+        let ns_index_dir = dir.path().join("field-index").join(NamespaceId::from_u64(7).to_string());
         assert!(ns_index_dir.exists());
 
-        mgr.remove_namespace_path(NamespaceId::from_u128(7)).unwrap();
+        mgr.remove_namespace_path(NamespaceId::from_u64(7)).unwrap();
         assert!(!ns_index_dir.exists());
 
         // Idempotent: removing an already-absent namespace is a no-op, not an error.
-        mgr.remove_namespace_path(NamespaceId::from_u128(7)).unwrap();
+        mgr.remove_namespace_path(NamespaceId::from_u64(7)).unwrap();
     }
 
     // ── replay-gap detection ────────────────────────────────────────────
@@ -696,33 +696,33 @@ mod tests {
     fn read_checkpoint_state_distinguishes_absent_from_recorded_zero() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(NamespaceId::from_u128(0), 1).unwrap();
+        mgr.ensure_field_path(NamespaceId::from_u64(0), 1).unwrap();
 
         // No marker written yet.
-        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 100), CheckpointState::Absent);
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u64(0), 1, 100), CheckpointState::Absent);
 
         // A marker recording 0 is a *recorded* position, not an absent one — both
         // replay from 0, which is exactly why read_checkpoint alone cannot tell
         // a fresh field from one whose marker was lost.
-        mgr.checkpoint_fields(0, &[(NamespaceId::from_u128(0), 1)]).unwrap();
-        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 100), CheckpointState::At(0));
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 1, 100), 0);
+        mgr.checkpoint_fields(0, &[(NamespaceId::from_u64(0), 1)]).unwrap();
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u64(0), 1, 100), CheckpointState::At(0));
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(0), 1, 100), 0);
 
-        mgr.checkpoint_fields(64, &[(NamespaceId::from_u128(0), 1)]).unwrap();
-        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 100), CheckpointState::At(64));
+        mgr.checkpoint_fields(64, &[(NamespaceId::from_u64(0), 1)]).unwrap();
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u64(0), 1, 100), CheckpointState::At(64));
 
         // Ahead of the tail — only reachable from a torn write.
-        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 10), CheckpointState::Unusable);
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 1, 10), 0, "unusable still replays from 0");
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u64(0), 1, 10), CheckpointState::Unusable);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(0), 1, 10), 0, "unusable still replays from 0");
     }
 
     #[test]
     fn read_checkpoint_state_reports_a_short_marker_as_unusable() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(NamespaceId::from_u128(0), 1).unwrap();
-        std::fs::write(mgr.field_path(NamespaceId::from_u128(0), 1).join("checkpoint"), [1u8, 2, 3]).unwrap();
-        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u128(0), 1, 100), CheckpointState::Unusable);
+        mgr.ensure_field_path(NamespaceId::from_u64(0), 1).unwrap();
+        std::fs::write(mgr.field_path(NamespaceId::from_u64(0), 1).join("checkpoint"), [1u8, 2, 3]).unwrap();
+        assert_eq!(mgr.read_checkpoint_state(NamespaceId::from_u64(0), 1, 100), CheckpointState::Unusable);
     }
 
     #[test]
@@ -784,23 +784,23 @@ mod tests {
     fn test_field_path_is_pure_computation() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        let path = mgr.field_path(NamespaceId::from_u128(5), 2);
-        assert_eq!(path, dir.path().join("field-index").join(NamespaceId::from_u128(5).to_string()).join("2"));
+        let path = mgr.field_path(NamespaceId::from_u64(5), 2);
+        assert_eq!(path, dir.path().join("field-index").join(NamespaceId::from_u64(5).to_string()).join("2"));
     }
 
     #[test]
     fn test_checkpoint_and_read_back() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(NamespaceId::from_u128(0), 0).unwrap();
+        mgr.ensure_field_path(NamespaceId::from_u64(0), 0).unwrap();
 
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, u64::MAX), 0); // no file yet
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(0), 0, u64::MAX), 0); // no file yet
 
-        mgr.checkpoint_fields(55555, &[(NamespaceId::from_u128(0), 0)]).unwrap();
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, u64::MAX), 55555);
+        mgr.checkpoint_fields(55555, &[(NamespaceId::from_u64(0), 0)]).unwrap();
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(0), 0, u64::MAX), 55555);
 
-        mgr.checkpoint_fields(99999, &[(NamespaceId::from_u128(0), 0)]).unwrap();
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, u64::MAX), 99999);
+        mgr.checkpoint_fields(99999, &[(NamespaceId::from_u64(0), 0)]).unwrap();
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(0), 0, u64::MAX), 99999);
     }
 
     /// Only a checkpoint that started after the counter was read covers the
@@ -824,22 +824,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
         for field in 0..3 {
-            std::fs::create_dir_all(mgr.field_path(NamespaceId::from_u128(1), field)).unwrap();
+            std::fs::create_dir_all(mgr.field_path(NamespaceId::from_u64(1), field)).unwrap();
         }
-        mgr.remove_field_path(NamespaceId::from_u128(1), 1).unwrap();
+        mgr.remove_field_path(NamespaceId::from_u64(1), 1).unwrap();
         let written = mgr
             .checkpoint_fields(
                 42,
                 &[
-                    (NamespaceId::from_u128(1), 0),
-                    (NamespaceId::from_u128(1), 1),
-                    (NamespaceId::from_u128(1), 2),
+                    (NamespaceId::from_u64(1), 0),
+                    (NamespaceId::from_u64(1), 1),
+                    (NamespaceId::from_u64(1), 2),
                 ],
             )
             .unwrap();
-        assert_eq!(written, vec![(NamespaceId::from_u128(1), 0), (NamespaceId::from_u128(1), 2)]);
+        assert_eq!(written, vec![(NamespaceId::from_u64(1), 0), (NamespaceId::from_u64(1), 2)]);
         assert!(
-            !mgr.field_path(NamespaceId::from_u128(1), 1).exists(),
+            !mgr.field_path(NamespaceId::from_u64(1), 1).exists(),
             "no directory recreated for the dropped field"
         );
     }
@@ -848,44 +848,44 @@ mod tests {
     fn test_checkpoint_multiple_fields() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        for field_id in 0u32..3 {
-            mgr.ensure_field_path(NamespaceId::from_u128(1), field_id).unwrap();
+        for field_id in 0u64..3 {
+            mgr.ensure_field_path(NamespaceId::from_u64(1), field_id).unwrap();
         }
 
         mgr.checkpoint_fields(
             42,
             &[
-                (NamespaceId::from_u128(1), 0),
-                (NamespaceId::from_u128(1), 1),
-                (NamespaceId::from_u128(1), 2),
+                (NamespaceId::from_u64(1), 0),
+                (NamespaceId::from_u64(1), 1),
+                (NamespaceId::from_u64(1), 2),
             ],
         )
         .unwrap();
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(1), 0, u64::MAX), 42);
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(1), 1, u64::MAX), 42);
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(1), 2, u64::MAX), 42);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(1), 0, u64::MAX), 42);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(1), 1, u64::MAX), 42);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(1), 2, u64::MAX), 42);
     }
 
     #[test]
     fn test_read_checkpoint_missing_returns_zero() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(99), 99, u64::MAX), 0);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(99), 99, u64::MAX), 0);
     }
 
     #[test]
     fn test_read_checkpoint_ahead_of_wal_tail_is_uncheckpointed() {
         let dir = TempDir::new().unwrap();
         let mgr = IndexManager::open(dir.path()).unwrap();
-        mgr.ensure_field_path(NamespaceId::from_u128(0), 0).unwrap();
-        mgr.checkpoint_fields(99_999, &[(NamespaceId::from_u128(0), 0)]).unwrap();
+        mgr.ensure_field_path(NamespaceId::from_u64(0), 0).unwrap();
+        mgr.checkpoint_fields(99_999, &[(NamespaceId::from_u64(0), 0)]).unwrap();
 
         // In range (≤ wal_tail) → returned verbatim.
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, 100_000), 99_999);
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, 99_999), 99_999);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(0), 0, 100_000), 99_999);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(0), 0, 99_999), 99_999);
 
         // Ahead of the WAL tail (only possible from a corrupt/torn marker) → 0,
         // forcing a safe full replay instead of skipping it.
-        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u128(0), 0, 50_000), 0);
+        assert_eq!(mgr.read_checkpoint(NamespaceId::from_u64(0), 0, 50_000), 0);
     }
 }

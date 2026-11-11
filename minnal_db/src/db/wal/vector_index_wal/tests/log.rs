@@ -17,9 +17,9 @@ fn appended_records_read_back_in_order() {
 fn a_delete_reads_back_as_a_delete_and_a_torn_one_is_dropped() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    let put = wal.append(NamespaceId::from_u128(1), b"k", b"v", 1).unwrap().appended();
-    let del = wal.append_delete(NamespaceId::from_u128(1), b"k", 2).unwrap().appended();
-    let empty = wal.append(NamespaceId::from_u128(1), b"e", b"", 3).unwrap().appended(); // an empty value is still a put
+    let put = wal.append(NamespaceId::from_u64(1), b"k", b"v", 1).unwrap().appended();
+    let del = wal.append_delete(NamespaceId::from_u64(1), b"k", 2).unwrap().appended();
+    let empty = wal.append(NamespaceId::from_u64(1), b"e", b"", 3).unwrap().appended(); // an empty value is still a put
     wal.sync().unwrap();
     assert_eq!(del.end - del.start, u64::from(FRAME_HEADER_LEN) + BODY_FIXED_LEN as u64 + 1);
     let want = vec![
@@ -45,8 +45,8 @@ fn a_delete_reads_back_as_a_delete_and_a_torn_one_is_dropped() {
 fn reopen_finds_the_tail_and_the_highest_seq() {
     let dir = TempDir::new().unwrap();
     let (wal, _) = open_at(dir.path(), DEFAULT_SEGMENT_SIZE);
-    wal.append(NamespaceId::from_u128(1), b"a", b"x", 10).unwrap();
-    let last = wal.append(NamespaceId::from_u128(1), b"b", b"y", 5).unwrap().appended(); // seqs are not in log order
+    wal.append(NamespaceId::from_u64(1), b"a", b"x", 10).unwrap();
+    let last = wal.append(NamespaceId::from_u64(1), b"b", b"y", 5).unwrap().appended(); // seqs are not in log order
     wal.sync().unwrap();
     drop(wal);
 
@@ -60,7 +60,7 @@ fn reopen_finds_the_tail_and_the_highest_seq() {
         }
     );
     assert_eq!(wal.last_seq(), 10);
-    let more = wal.append(NamespaceId::from_u128(2), b"c", b"z", 11).unwrap();
+    let more = wal.append(NamespaceId::from_u64(2), b"c", b"z", 11).unwrap();
     assert_eq!(more.start, last.end);
     let rows = rows_from(&wal, 0);
     assert_eq!(rows.len(), 3);
@@ -116,7 +116,7 @@ fn a_torn_tail_is_dropped_and_later_appends_read_back() {
         assert_eq!(report.tail, appended[4].start, "cut {cut}");
         assert_eq!(report.torn_bytes_dropped, cut);
         assert_eq!(report.last_seq, 4);
-        let fresh = wal.append(NamespaceId::from_u128(9), b"new", b"v", 99).unwrap().appended();
+        let fresh = wal.append(NamespaceId::from_u64(9), b"new", b"v", 99).unwrap().appended();
         assert_eq!(fresh.start, appended[4].start);
         let mut want = expected(&appended, 0..4);
         want.push((fresh.start, 9, 99, b"new".to_vec(), Some(b"v".to_vec())));
@@ -223,7 +223,7 @@ fn a_crash_mid_rotation_is_finished_at_open() {
     let (wal, report) = reopen(dir.path(), SMALL_SEGMENT).unwrap();
     assert_eq!(report.tail, position(1, SEGMENT_HEADER_LEN));
     assert_eq!(report.torn_bytes_dropped, 5);
-    let more = wal.append(NamespaceId::from_u128(0), b"k", b"v", 50).unwrap();
+    let more = wal.append(NamespaceId::from_u64(0), b"k", b"v", 50).unwrap();
     assert_eq!(more.start, position(1, SEGMENT_HEADER_LEN));
     assert_eq!(rows_from(&wal, 0).len(), 4);
 }
@@ -237,13 +237,13 @@ fn a_record_too_large_for_a_segment_writes_nothing() {
     let max = u64::from(SMALL_SEGMENT - SEGMENT_HEADER_LEN - END_MARKER_LEN);
     let fits = vec![0u8; (max - u64::from(FRAME_HEADER_LEN) - BODY_FIXED_LEN as u64) as usize];
     let too_big = vec![0u8; fits.len() + 1];
-    match wal.append(NamespaceId::from_u128(0), b"", &too_big, 9) {
+    match wal.append(NamespaceId::from_u64(0), b"", &too_big, 9) {
         Err(VectorIndexWalError::Log(LogError::RecordTooLarge { len, max: m })) => assert_eq!((len, m), (max + 1, max)),
         other => panic!("expected RecordTooLarge, got {other:?}"),
     }
     assert_eq!((wal.tail(), wal.segments().unwrap()), (tail, segs));
     // The largest record that fits is accepted, alone in its segment.
-    let a = wal.append(NamespaceId::from_u128(0), b"", &fits, 10).unwrap();
+    let a = wal.append(NamespaceId::from_u64(0), b"", &fits, 10).unwrap();
     assert_eq!(split(a.start), (1, SEGMENT_HEADER_LEN));
     assert_eq!(rows_from(&wal, a.start).len(), 1);
 }
@@ -290,7 +290,7 @@ fn concurrent_appends_and_syncs_lose_nothing() {
             std::thread::spawn(move || {
                 for i in 0..200u64 {
                     let seq = t * 1000 + i;
-                    wal.append(NamespaceId::from_u128(u128::from(t as u32)), &seq.to_le_bytes(), &[t as u8; 30], seq)
+                    wal.append(NamespaceId::from_u64(u64::from(t as u32)), &seq.to_le_bytes(), &[t as u8; 30], seq)
                         .unwrap();
                 }
             })

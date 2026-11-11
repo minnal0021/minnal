@@ -294,7 +294,7 @@ fn test_delete_ns_invalid_namespace_returns_error() {
     let db = Database::open(dir.path(), create_db_config()).unwrap();
 
     // Namespace 9999 was never created.
-    let result = db.delete_ns(NamespaceId::from_u128(9999), b"k");
+    let result = db.delete_ns(NamespaceId::from_u64(9999), b"k");
     assert!(result.is_err(), "delete_ns on unknown namespace should fail");
 
     db.shutdown().unwrap();

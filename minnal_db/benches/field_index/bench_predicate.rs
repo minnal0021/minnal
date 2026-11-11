@@ -20,7 +20,7 @@ const N_ROWS: u128 = 100_000;
 struct Indices {
     /// Keeps the index files alive for the benchmark's lifetime.
     _dir: tempfile::TempDir,
-    schema: HashMap<String, u32>,
+    schema: HashMap<String, u64>,
     status: Arc<RwLock<DynFieldIndex>>,
     age: Arc<RwLock<DynFieldIndex>>,
     active: Arc<RwLock<DynFieldIndex>>,
@@ -56,7 +56,7 @@ impl Indices {
             assert_eq!(idx.overlay_bytes(), 0, "nothing may remain buffered");
         }
 
-        let schema: HashMap<String, u32> = [("status".into(), 0u32), ("age".into(), 1u32), ("active".into(), 2u32)].into();
+        let schema: HashMap<String, u64> = [("status".into(), 0), ("age".into(), 1), ("active".into(), 2)].into();
 
         Self {
             _dir: dir,
@@ -67,7 +67,7 @@ impl Indices {
         }
     }
 
-    fn get(&self, id: u32) -> Option<Arc<RwLock<DynFieldIndex>>> {
+    fn get(&self, id: u64) -> Option<Arc<RwLock<DynFieldIndex>>> {
         match id {
             0 => Some(Arc::clone(&self.status)),
             1 => Some(Arc::clone(&self.age)),

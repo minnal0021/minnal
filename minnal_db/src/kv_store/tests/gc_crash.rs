@@ -38,7 +38,7 @@ fn stale_value_log_metadata_is_rebuilt_from_the_lsm_at_open() {
     let rec = crate::storage::value_log::ValueRecordHeader::record_len(b"k0".len(), value.len());
     let open = || {
         KVStore::open(
-            NamespaceId::from_u128(0),
+            NamespaceId::from_u64(0),
             "default",
             dir.path(),
             cfg.clone(),
@@ -90,7 +90,7 @@ fn test_gc_crash_between_repoint_and_unlink_loses_nothing() {
 
     let pending = {
         let store = KVStore::open(
-            NamespaceId::from_u128(0),
+            NamespaceId::from_u64(0),
             "default",
             dir.path(),
             default_lsm_config(),
@@ -138,7 +138,7 @@ fn test_gc_crash_between_repoint_and_unlink_loses_nothing() {
     // keys still point at the OLD segments — which is exactly why they must not have
     // been unlinked. Either way every value must still read back.
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -173,7 +173,7 @@ fn test_gc_crash_the_instant_segments_are_unlinked_loses_nothing() {
 
     {
         let store = KVStore::open(
-            NamespaceId::from_u128(0),
+            NamespaceId::from_u64(0),
             "default",
             dir.path(),
             default_lsm_config(),
@@ -198,7 +198,7 @@ fn test_gc_crash_the_instant_segments_are_unlinked_loses_nothing() {
     }
 
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -227,7 +227,7 @@ fn test_gc_survives_a_crash_immediately_after_the_pass() {
 
     {
         let store = KVStore::open(
-            NamespaceId::from_u128(0),
+            NamespaceId::from_u64(0),
             "default",
             dir.path(),
             default_lsm_config(),
@@ -249,7 +249,7 @@ fn test_gc_survives_a_crash_immediately_after_the_pass() {
     }
 
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),
@@ -275,7 +275,7 @@ fn test_gc_survives_a_crash_immediately_after_the_pass() {
 fn test_gc_makes_its_relocated_copies_durable() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "default",
         dir.path(),
         default_lsm_config(),

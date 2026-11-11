@@ -130,8 +130,8 @@ mod tests {
         assert_eq!(index_root(root), Path::new("/db/field-index"));
         assert_eq!(main_wal_dir(root), Path::new("/db/wal"));
         assert_eq!(
-            namespace_index_dir(&index_root(root), NamespaceId::from_u128(7)),
-            Path::new("/db/field-index/00000000-0000-0000-0000-000000000007")
+            namespace_index_dir(&index_root(root), NamespaceId::from_u64(7)),
+            Path::new("/db/field-index/7")
         );
         assert_eq!(vector_index_wal_dir(root), Path::new("/db/vector_index_wal"));
     }
@@ -144,7 +144,7 @@ mod tests {
         let root = Path::new("/db");
         assert!(namespace_data_dir(root, "users").to_string_lossy().contains("ns_users"));
         assert!(
-            !namespace_index_dir(&index_root(root), NamespaceId::from_u128(7))
+            !namespace_index_dir(&index_root(root), NamespaceId::from_u64(7))
                 .to_string_lossy()
                 .contains("users")
         );

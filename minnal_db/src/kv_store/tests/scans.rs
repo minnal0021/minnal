@@ -7,7 +7,7 @@ use crate::namespace::NamespaceId;
 fn test_get_multiple_matches_individual_get() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "ns",
         dir.path(),
         default_lsm_config(),
@@ -35,7 +35,7 @@ fn test_get_multiple_matches_individual_get() {
 fn test_get_multiple_missing_keys_are_none() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "ns",
         dir.path(),
         default_lsm_config(),
@@ -57,7 +57,7 @@ fn test_get_multiple_missing_keys_are_none() {
 fn test_get_multiple_after_flush_to_sstable() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "ns",
         dir.path(),
         default_lsm_config(),
@@ -92,7 +92,7 @@ fn u32_prefixed_key(prefix: u32, suffix: u32) -> Vec<u8> {
 fn test_scan_prefixes_batch_basic() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "test_ns",
         dir.path(),
         default_lsm_config(),
@@ -129,7 +129,7 @@ fn test_scan_prefixes_batch_basic() {
 fn test_scan_page_batch_limit_zero_still_advances() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "t",
         dir.path(),
         default_lsm_config(),
@@ -161,7 +161,7 @@ fn test_scan_page_batch_limit_zero_still_advances() {
 fn test_scan_page_batch_end_bound_excludes_upper() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "test_ns",
         dir.path(),
         default_lsm_config(),
@@ -184,7 +184,7 @@ fn test_scan_page_batch_end_bound_excludes_upper() {
 fn test_scan_page_batch_cursor_walk_is_complete_and_ordered() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "test_ns",
         dir.path(),
         default_lsm_config(),
@@ -216,7 +216,7 @@ fn test_scan_page_batch_cursor_walk_is_complete_and_ordered() {
 fn test_scan_prefixes_batch_missing_prefix_absent() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "test_ns",
         dir.path(),
         default_lsm_config(),
@@ -235,7 +235,7 @@ fn test_scan_prefixes_batch_missing_prefix_absent() {
 fn test_scan_prefixes_batch_after_flush() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
-        NamespaceId::from_u128(0),
+        NamespaceId::from_u64(0),
         "test_ns",
         dir.path(),
         default_lsm_config(),

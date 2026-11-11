@@ -183,7 +183,7 @@ mod tests {
         let path = dir.path().join("ns_test");
         Arc::new(
             KVStore::open(
-                NamespaceId::from_u128(0),
+                NamespaceId::from_u64(0),
                 "test",
                 &path,
                 lsm_config,

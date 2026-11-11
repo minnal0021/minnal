@@ -116,7 +116,7 @@
 //! is:
 //!
 //! ```text
-//! body: [ns_id 16 bytes big-endian][seq u64][key_len u32][key][value_len u32][value]
+//! body: [ns_id 8 bytes big-endian][seq u64][key_len u32][key][value_len u32][value]
 //! ```
 //!
 //! A delete is a body whose `value_len` is `u32::MAX` and that has no value
@@ -145,10 +145,14 @@ pub(crate) const DEFAULT_SEGMENT_SIZE: u32 = 64 * 1024 * 1024;
 pub(crate) static FORMAT: LogFormat = LogFormat {
     name: "vector index WAL",
     magic: *b"MVIW",
-    version: 3,
+    version: 4,
 };
 /// The body's fixed fields: `ns_id`, `seq`, `key_len`, `value_len`.
-const BODY_FIXED_LEN: usize = 16 + 8 + 4 + 4;
+const BODY_FIXED_LEN: usize = NS + 8 + 4 + 4;
+/// Where the body's fields start: `seq`, then `key_len`, then the key.
+const NS: usize = NamespaceId::LEN;
+const SEQ_END: usize = NS + 8;
+const KEY_START: usize = SEQ_END + 4;
 /// The `value_len` of a delete record, which has no value bytes.
 const DELETE_VALUE_LEN: u32 = u32::MAX;
 
@@ -205,10 +209,10 @@ fn decode_body(body: &[u8], at: u64) -> Result<RecordRef<'_>> {
     if body.len() < BODY_FIXED_LEN {
         return Err(bad());
     }
-    let ns_id = NamespaceId::from_bytes(body[0..16].try_into().unwrap());
-    let seq = u64::from_le_bytes(body[16..24].try_into().unwrap());
-    let key_len = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
-    let key_end = 28usize.checked_add(key_len).filter(|&e| e + 4 <= body.len()).ok_or_else(bad)?;
+    let ns_id = NamespaceId::from_bytes(body[..NS].try_into().unwrap());
+    let seq = u64::from_le_bytes(body[NS..SEQ_END].try_into().unwrap());
+    let key_len = u32::from_le_bytes(body[SEQ_END..KEY_START].try_into().unwrap()) as usize;
+    let key_end = KEY_START.checked_add(key_len).filter(|&e| e + 4 <= body.len()).ok_or_else(bad)?;
     let value_len = u32::from_le_bytes(body[key_end..key_end + 4].try_into().unwrap());
     let rest = &body[key_end + 4..];
     let value = match value_len {
@@ -219,7 +223,7 @@ fn decode_body(body: &[u8], at: u64) -> Result<RecordRef<'_>> {
     Ok(RecordRef {
         ns_id,
         seq,
-        key: &body[28..key_end],
+        key: &body[KEY_START..key_end],
         value,
     })
 }

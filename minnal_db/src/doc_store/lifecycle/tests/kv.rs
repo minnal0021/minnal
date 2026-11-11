@@ -16,7 +16,7 @@ async fn test_kv_create_and_list() {
     let list = store.list_kv().unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["namespace"], "cache");
-    assert!(list[0]["ns_id"].as_str().is_some_and(|s| s.parse::<NamespaceId>().is_ok()));
+    assert!(serde_json::from_value::<NamespaceId>(list[0]["ns_id"].clone()).is_ok());
     assert_eq!(list[0]["key_type"], "str");
     assert_eq!(list[0]["value_type"], "str");
 }
