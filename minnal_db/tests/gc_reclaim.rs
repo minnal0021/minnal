@@ -7,12 +7,24 @@ use std::path::{Path, PathBuf};
 /// A small segment size, so a handful of values roll several segments.
 const SEGMENT_SIZE: u64 = 1024 * 1024;
 
+/// Every test here runs GC itself (`garbage_collect`) and checks what is on disk
+/// before and after. The background GC worker, which every open starts, must not
+/// collect first: its first pass runs as soon as the database opens, and landing
+/// after a test's writes it reclaimed the garbage the test was about to measure
+/// (`garbage_in_the_active_tail_is_reclaimed` failed about once in 40 runs). An
+/// infinite trigger keeps it from collecting anything. `garbage_collect` reads
+/// the trigger only as the default tail-seal bar, which is pinned to the default
+/// trigger here, so the tests' own GC runs as with the default configuration.
 fn config(segment_size: u64) -> DbConfig {
-    DbConfig {
+    let mut config = DbConfig {
         num_buckets: 1,
         segment_size_bytes: segment_size,
         ..DbConfig::default()
-    }
+    };
+    let t = &mut config.threshold_config;
+    t.tail_gc_min_garbage_pct = Some(t.effective_tail_gc_min_garbage_pct());
+    t.value_log_waste_threshold = f64::INFINITY;
+    config
 }
 
 /// Every value-log segment file under the db dir (their namespace path is internal).
@@ -171,12 +183,12 @@ async fn gc_stays_bounded_across_repeated_cycles() {
 #[tokio::test]
 async fn gc_reclaims_garbage_below_the_bucket_trigger() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = config(SEGMENT_SIZE);
+    let defaults = DbConfig::default().threshold_config;
     assert!(
-        cfg.threshold_config.segment_gc_threshold < cfg.threshold_config.value_log_waste_threshold,
+        defaults.segment_gc_threshold < defaults.value_log_waste_threshold,
         "the segment threshold must sit below the bucket trigger, or sub-threshold garbage is uncollectable"
     );
-    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), cfg).await.unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     let value = vec![0x11u8; 90 * 1024];
     let n = 60;
