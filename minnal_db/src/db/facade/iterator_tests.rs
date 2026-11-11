@@ -349,7 +349,9 @@ async fn a_write_after_a_crash_beats_a_flushed_no_wal_value() {
 #[tokio::test]
 async fn a_simulated_crash_loses_unflushed_no_wal_writes() {
     let dir = TempDir::new().unwrap();
-    let open = || crate::db::facade::AsyncDb::open_with_config(dir.path().to_owned(), create_db_config());
+    // No workers: one could flush the memtable before the crash (1 run in
+    // about 100 did), and the test is about what the crash itself loses.
+    let open = || crate::db::facade::AsyncDb::open_without_workers(dir.path().to_owned(), create_db_config());
     let db = open().await.unwrap();
     let ns = db.namespace("n".to_string()).await.unwrap();
     ns.put_no_wal(b"flushed".to_vec(), b"1".to_vec()).await.unwrap();
