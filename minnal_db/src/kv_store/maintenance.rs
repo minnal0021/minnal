@@ -1,6 +1,7 @@
 //! Flush, compaction, TTL expiry, WAL replay and stats.
 
 use super::*;
+use std::ops::ControlFlow;
 
 impl KVStore {
     /// Delete records whose creation epoch is older than `ttl`, for a store with
@@ -14,46 +15,52 @@ impl KVStore {
 
     /// Delete records whose creation epoch is older than `ttl`.
     ///
-    /// Scans live keys and reads each record's `epoch` straight from the value log
-    /// (a 36-byte header read — no value bytes). At most `max_deletes_per_run`
-    /// records are removed per call so a single pass can't stall on a huge backlog;
-    /// value-log GC reclaims the physical space afterwards. Returns the number
-    /// deleted.
+    /// Walks the live keys a page at a time ([`for_each_key_page`](Self::for_each_key_page)),
+    /// so a pass holds one page of keys, and reads each record's `epoch` straight
+    /// from the value log (a 36-byte header read, no value bytes). At most
+    /// `max_deletes_per_run` records are removed per call so a single pass cannot
+    /// stall on a huge backlog; value-log GC reclaims the physical space
+    /// afterwards. Returns the number deleted.
     ///
     /// Each expired key is deleted by **compare-and-set**: only if it still points
     /// at the exact record judged expired ([`delete_if_current`](Self::delete_if_current)).
-    /// A key rewritten after the check — its fresh value just acknowledged to a
-    /// writer — is left alone; the old code deleted whatever was current. And the
-    /// delete runs under `lock_key(key)`, which the database supplies as the key
-    /// stripe: a WAL-backed write holds that stripe from allocating its seq to
-    /// applying it, so no same-key write can sit between the two while TTL
-    /// allocates its own seq. Without it TTL deletes carried seqs out of order
-    /// with concurrent puts, the one source of "lower-seq copy in a newer layer"
-    /// that the read paths (and the L1 tombstone-drop contract) had to tolerate.
+    /// A key rewritten after the page was read, its fresh value just acknowledged
+    /// to a writer, is left alone. A pointer the page holds that GC has since
+    /// moved fails the compare too, and the next pass judges the key afresh.
+    ///
+    /// The delete runs under `lock_key(key)`, which the database supplies as the
+    /// key stripe: a WAL-backed write holds that stripe from allocating its seq
+    /// to applying it, so no same-key write can sit between the two while TTL
+    /// allocates its own seq. Without it a TTL delete could carry a lower seq than
+    /// a concurrent put that lands in an older layer, and the read paths resolve
+    /// a key by highest seq.
     pub(crate) fn expire_records_locked<G>(&self, ttl: Duration, max_deletes_per_run: usize, lock_key: impl Fn(&[u8]) -> G) -> Result<usize> {
         let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ttl_millis = ttl.as_millis() as u64;
 
         let mut deleted = 0usize;
-        for key in self.keys()? {
-            if deleted >= max_deletes_per_run {
-                break;
-            }
-            // Resolved per key as the pass reaches it, not all up front: the
-            // compare-and-set below only holds off writes after this point.
-            let Some(pointer) = self.lsm.get(&key)?.and_then(decode_sharded_pointer) else {
-                continue; // deleted since the key list was taken
-            };
-            let Ok(meta) = self.value_log.read_record_meta(pointer) else {
-                continue;
-            };
-            if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
-                let _key_guard = lock_key(&key);
-                if self.delete_if_current(&key, pointer)? {
-                    deleted += 1;
+        self.for_each_key_page(&[], None, |page| {
+            for (key, pointer, _seq) in page {
+                if deleted >= max_deletes_per_run {
+                    return Ok(ControlFlow::Break(()));
+                }
+                let Some(pointer) = decode_sharded_pointer(pointer) else {
+                    continue;
+                };
+                // A segment GC reclaimed since the page was read: the key has
+                // moved, and the next pass reads it where it is now.
+                let Ok(meta) = self.value_log.read_record_meta(pointer) else {
+                    continue;
+                };
+                if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
+                    let _key_guard = lock_key(&key);
+                    if self.delete_if_current(&key, pointer)? {
+                        deleted += 1;
+                    }
                 }
             }
-        }
+            Ok(ControlFlow::Continue(()))
+        })?;
 
         Ok(deleted)
     }

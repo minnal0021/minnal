@@ -243,6 +243,26 @@ mod tests {
         assert_eq!(store.get(b"key1").unwrap(), Some(b"value1".to_vec()));
     }
 
+    /// A pass reads the keys a page at a time: it must reach keys past the
+    /// first page, and its delete cap must hold across pages.
+    #[test]
+    fn test_expire_records_reaches_every_page_and_caps_across_them() {
+        use crate::kv_store::KEY_PAGE;
+        let dir = TempDir::new().unwrap();
+        let store = create_test_store(&dir);
+        let n = KEY_PAGE * 2 + 5;
+        for i in 0..n {
+            store.put_to_storage(format!("key{i:06}").as_bytes(), b"value").unwrap();
+        }
+
+        let cap = KEY_PAGE + 3;
+        assert_eq!(store.expire_records(Duration::from_millis(0), cap).unwrap(), cap);
+        assert_eq!(store.count_keys().unwrap(), n - cap);
+
+        assert_eq!(store.expire_records(Duration::from_millis(0), usize::MAX).unwrap(), n - cap);
+        assert_eq!(store.count_keys().unwrap(), 0);
+    }
+
     // A TTL pass decides a record has expired, then deletes it. A write that lands
     // in between replaced the expired record with a fresh one that was just
     // acknowledged to its writer; the pass must leave it alone. It used to delete

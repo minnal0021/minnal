@@ -285,3 +285,24 @@ async fn test_queue_empty_after_cancel_following_restart() {
         remaining.len()
     );
 }
+
+/// `queued_namespaces` reads one key per namespace and jumps past the rest of
+/// that namespace's entries. Names where one is a prefix of another (`ab`,
+/// `abc`) must both be found, as must a namespace after a long run of another's
+/// entries, and the count must cover every entry.
+#[tokio::test]
+async fn queued_namespaces_finds_each_namespace_once() {
+    let dir = TempDir::new().unwrap();
+    let db = open_db(&dir).await;
+
+    for doc in 0..50u32 {
+        enqueue_embed(&db, "ab", &doc.to_be_bytes(), "t").await.unwrap();
+    }
+    enqueue_embed(&db, "abc", b"d", "t").await.unwrap();
+    enqueue_embed(&db, "b", b"d", "t").await.unwrap();
+    enqueue_embed(&db, "a", b"\xff\xff", "t").await.unwrap();
+
+    let namespaces: Vec<String> = queued_namespaces(&db).await.unwrap().into_iter().collect();
+    assert_eq!(namespaces, ["a", "ab", "abc", "b"]);
+    assert_eq!(count_queue_entries(&db).await.unwrap(), 53);
+}

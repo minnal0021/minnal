@@ -185,6 +185,25 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// The number of live keys. Every key is read, a page at a time, so memory
+    /// stays at one page whatever the namespace's size; no value is read.
+    pub async fn count(&self) -> Result<usize> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.count_keys())
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// At most `limit` live keys in `[cursor, end)`, in key order, and the key the
+    /// next page starts at (`None` after the last page): [`scan`](Self::scan)
+    /// without the values. `None` for `cursor` starts at the first key.
+    pub async fn key_page(&self, cursor: Option<Vec<u8>>, end: Option<Vec<u8>>, limit: usize) -> Result<crate::kv_store::KeyPage> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.key_page(cursor.as_deref(), end.as_deref(), limit))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
     pub async fn range(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> Result<Vec<KeyValue>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_range_batch(&start, end.as_deref()))

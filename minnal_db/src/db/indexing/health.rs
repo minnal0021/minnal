@@ -92,21 +92,26 @@ impl Database {
             }
             RepairMode::FullRebuild => {
                 let deactivated = || KVError::Serialization(format!("Field {field_id} in namespace {namespace_id} was deactivated mid-repair"));
-                let keys = store.keys()?;
-                let scanned = keys.len();
-                for key in &keys {
-                    if self.reindex_key(&store, namespace_id, field_id, key)? == FieldReindexOutcome::FieldNotActive {
-                        return Err(deactivated());
+                // Reindex every live key, a page at a time, and note its row.
+                let mut scanned = 0usize;
+                let mut live_rows: std::collections::HashSet<u128> = std::collections::HashSet::new();
+                store.for_each_key_page(&[], None, |page| {
+                    for (key, ..) in &page {
+                        if self.reindex_key(&store, namespace_id, field_id, key)? == FieldReindexOutcome::FieldNotActive {
+                            return Err(deactivated());
+                        }
+                        live_rows.extend(store.resolve_row_id_get(key));
                     }
-                }
+                    scanned += page.len();
+                    Ok(std::ops::ControlFlow::Continue(()))
+                })?;
 
                 // Walking live keys cannot clear a row whose key no longer
-                // exists — and a stale row of a deleted key is one of the ways an
+                // exists, and a stale row of a deleted key is one of the ways an
                 // index diverges (a lost delete). So also visit every row the
                 // index holds that no live key accounts for: `reindex_key` clears
                 // it if its key is still absent, or re-sets it if the key was
-                // written since the snapshot above.
-                let live_rows: std::collections::HashSet<u128> = keys.iter().filter_map(|k| store.resolve_row_id_get(k)).collect();
+                // written since the walk above passed it.
                 let mut orphan_rows = Vec::new();
                 {
                     let ns_index = store.namespace_index.read();

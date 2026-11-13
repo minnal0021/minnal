@@ -30,16 +30,16 @@ impl DocStore {
     pub async fn count_docs(&self, namespace: &str) -> Result<usize, DocStoreError> {
         self.load_schema(namespace)?;
         let ns = self.store_ns(namespace).await?;
-        let keys = ns.keys().await?;
-        Ok(keys.len())
+        Ok(ns.count().await?)
     }
 
     /// Row-map usage of a document store: row IDs allocated against live
     /// documents, and the files' size. `None` when the store has no row map —
     /// `u64` keys (row IDs come from the key) or no index ever built.
     ///
-    /// Counts the live documents by listing every key, so it costs a key scan
-    /// of the store; meant for occasional admin checks, not a hot path.
+    /// Counts the live documents by reading every key a page at a time, so it
+    /// costs a key scan of the store; meant for occasional admin checks, not a
+    /// hot path.
     pub async fn rowmap_stats(&self, namespace: &str) -> Result<Option<RowMapStats>, DocStoreError> {
         let schema = self.view_schema(namespace)?;
         let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {

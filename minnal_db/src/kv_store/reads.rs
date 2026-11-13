@@ -1,6 +1,12 @@
 //! Reads: point gets, key iteration, batch reads and scans.
 
 use super::*;
+use std::ops::ControlFlow;
+
+/// Keys per page of a whole-namespace pass ([`KVStore::for_each_key_page`]):
+/// large enough that a page's fixed cost is small beside its reads, small enough
+/// that a page's keys take little memory.
+pub(crate) const KEY_PAGE: usize = 1024;
 
 /// What a prefix-batch scan (`scan_prefixes_batch`) returns: every live entry
 /// under the requested 4-byte prefixes, in key order, so grouped by prefix.
@@ -154,6 +160,63 @@ impl KVStore {
 
     pub fn keys(&self) -> Result<Vec<Vec<u8>>> {
         self.lsm.keys().map_err(KVError::from)
+    }
+
+    /// Calls `visit` with successive pages of at most [`KEY_PAGE`] live
+    /// `(key, pointer, seq)` entries in `[start, end)`, in key order, until
+    /// `visit` breaks or the range ends. Each page is read on its own, so a pass
+    /// over a whole namespace holds one page of keys, not all of them.
+    ///
+    /// The pages are not one snapshot: a key written behind the cursor during
+    /// the pass is not visited, and one written ahead of it is. The pointers are
+    /// as current as the page; resolve them as for
+    /// [`scan_prefix_batch`](Self::scan_prefix_batch).
+    pub(crate) fn for_each_key_page(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        mut visit: impl FnMut(Vec<KeyPointer>) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        let mut from = start.to_vec();
+        loop {
+            let page = self.lsm.range_pointers_bounded(&from, end, KEY_PAGE)?;
+            let last_page = page.len() < KEY_PAGE;
+            // The next page starts just after this page's last key: the key
+            // followed by a zero byte is the smallest key greater than it.
+            if let Some((last, ..)) = page.last() {
+                from.clone_from(last);
+                from.push(0);
+            }
+            if visit(page)?.is_break() || last_page {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The number of live keys, counted a page at a time ([`for_each_key_page`](Self::for_each_key_page)):
+    /// every key is read, but only one page is held.
+    pub fn count_keys(&self) -> Result<usize> {
+        let mut count = 0;
+        self.for_each_key_page(&[], None, |page| {
+            count += page.len();
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(count)
+    }
+
+    /// At most `limit` live keys in `[cursor, end)`, in key order, and the key the
+    /// next page starts at (`None` after the last page). No value is read.
+    pub fn key_page(&self, cursor: Option<&[u8]>, end: Option<&[u8]>, limit: usize) -> Result<KeyPage> {
+        // `limit` 0 would return the cursor as its own next cursor, forever.
+        let limit = limit.max(1);
+        let mut keys: Vec<Vec<u8>> = self
+            .lsm
+            .range_pointers_bounded(cursor.unwrap_or(&[]), end, limit + 1)?
+            .into_iter()
+            .map(|(key, ..)| key)
+            .collect();
+        let next_cursor = if keys.len() > limit { keys.pop() } else { None };
+        Ok((keys, next_cursor))
     }
 
     pub fn resolve_entries_from_pointers(&self, key_pointers: Vec<KeyPointer>) -> Result<Vec<ResolvedEntry>> {

@@ -14,6 +14,8 @@ mod row_ids;
 pub mod stats;
 mod writes;
 
+#[cfg(any(test, feature = "semantic-search"))]
+pub(crate) use reads::KEY_PAGE;
 pub use reads::PrefixScan;
 
 use self::stats::{GCStats, Stats};
@@ -45,6 +47,10 @@ pub(crate) type KeyPointer = (Vec<u8>, u128, u64);
 /// One page of a cursor scan: the resolved pairs plus the next cursor
 /// (`None` when the scan is exhausted).
 pub(crate) type ScanPage = (Vec<KeyValue>, Option<Vec<u8>>);
+
+/// One page of a key-only cursor scan: the keys plus the next cursor (`None`
+/// when the scan is exhausted).
+pub(crate) type KeyPage = (Vec<Vec<u8>>, Option<Vec<u8>>);
 
 /// A scan entry resolved to what is needed to read its value: the key and its
 /// value-log pointer.

@@ -145,6 +145,21 @@ async fn test_clear_removes_all_entries() {
     assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 0);
 }
 
+/// The clear deletes a page of keys at a time: it must reach entries past the
+/// first page.
+#[tokio::test]
+async fn test_clear_removes_entries_past_the_first_page() {
+    let dir = TempDir::new().unwrap();
+    let db = open_db(&dir).await;
+    let n = crate::kv_store::KEY_PAGE + 10;
+    for i in 0..n {
+        put_cached_query_embedding(&db, MODEL, &format!("query-{i}"), &[1.0f32, 0.0], TEST_TTL).await;
+    }
+
+    assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), n);
+    assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 0);
+}
+
 /// Cache populates must stay off the WAL (no fsync on the query path),
 /// while the admin clear goes through it so it survives a crash. This pins
 /// the durability split for the TTL cache namespace.

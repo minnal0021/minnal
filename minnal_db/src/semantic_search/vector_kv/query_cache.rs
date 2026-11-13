@@ -141,17 +141,23 @@ pub async fn clear_cached_query_embeddings(db: &AsyncDb, ttl: Duration) -> Resul
         .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
         .await?;
 
-    let keys = cache_ns.keys().await?;
     let mut deleted = 0usize;
-    for key in keys {
-        // WAL-backed, unlike the populate path: the entries being cleared may
-        // already be flushed to disk, so a no-WAL tombstone lost to a crash
-        // before the next flush tick would bring them back. A clear is a rare
-        // admin operation; the per-delete fsync is off the query path.
-        cache_ns.delete(key).await?;
-        deleted += 1;
+    let mut cursor = None;
+    loop {
+        let (keys, next) = cache_ns.key_page(cursor, None, crate::kv_store::KEY_PAGE).await?;
+        for key in keys {
+            // WAL-backed, unlike the populate path: the entries being cleared may
+            // already be flushed to disk, so a no-WAL tombstone lost to a crash
+            // before the next flush tick would bring them back. A clear is a rare
+            // admin operation; the per-delete fsync is off the query path.
+            cache_ns.delete(key).await?;
+            deleted += 1;
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(deleted),
+        }
     }
-    Ok(deleted)
 }
 
 /// Encode a list of `Vec<f32>` embeddings as bytes.

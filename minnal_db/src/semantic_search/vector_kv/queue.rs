@@ -266,21 +266,39 @@ pub async fn list_queue_entries(db: &AsyncDb) -> Result<Vec<QueueEntry>, crate::
 /// How many entries the embedding queue holds, counted from the keys alone.
 pub async fn count_queue_entries(db: &AsyncDb) -> Result<usize, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
-    Ok(queue_ns.keys().await?.len())
+    queue_ns.count().await
 }
 
 /// The namespaces that have entries in the embedding queue, read from the keys
 /// alone. The queue key carries the namespace and the value carries the text, so
 /// this never reads a value: after a crash mid bulk-load the queue can hold every
 /// document's text, and the startup drop sweep needs only the namespaces.
+///
+/// Queue keys start with their namespace, so one namespace's entries are
+/// contiguous: the walk reads one key, then jumps past that namespace's entries.
+/// It reads about one key per queued namespace, however long the queue.
 pub async fn queued_namespaces(db: &AsyncDb) -> Result<std::collections::BTreeSet<String>, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
-    Ok(queue_ns
-        .keys()
-        .await?
-        .iter()
-        .filter_map(|key| decode_queue_key(key).map(|(namespace, _)| namespace.to_owned()))
-        .collect())
+    let mut namespaces = std::collections::BTreeSet::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let (keys, next) = queue_ns.key_page(cursor.clone(), None, 1).await?;
+        let Some(key) = keys.into_iter().next() else {
+            return Ok(namespaces);
+        };
+        cursor = match decode_queue_key(&key) {
+            Some((namespace, _)) => {
+                let past = crate::support::prefix_upper_bound(&queue_prefix(namespace));
+                namespaces.insert(namespace.to_owned());
+                past
+            }
+            // Not a queue key: step over it.
+            None => next,
+        };
+        if cursor.is_none() {
+            return Ok(namespaces);
+        }
+    }
 }
 
 /// The key prefix every queue entry of `namespace` starts with, for paging

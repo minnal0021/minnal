@@ -93,7 +93,7 @@ impl DocStore {
     pub async fn count_indexed_docs(&self, namespace: &str) -> Result<u64, DocStoreError> {
         let meta_ns = vector_kv::sparse_vectors_meta_ns(namespace);
         Ok(match self.db.existing_namespace(meta_ns).await? {
-            Some(ns) => ns.keys().await?.len() as u64,
+            Some(ns) => ns.count().await? as u64,
             None => 0,
         })
     }
