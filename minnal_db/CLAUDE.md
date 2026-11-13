@@ -32,7 +32,7 @@ WiscKey-style embedded store: keys live in an LSM tree, values in a separate val
 | `src/kv_store/` | `KVStore`: one namespace's LSM tree, value log and live field indexes. `writes`, `reads`, `row_ids`, `gc` (value-log GC), `maintenance` (flush, compaction, TTL, replay, stats) |
 | `src/kv_store/index_set.rs` | Per-namespace index registry, `ExtractorFn`, `RowIdFn`, `RowToKeyFn` |
 | `src/db/config/mod.rs` | `DbConfig`, `SyncConfig`, `ThresholdConfig`, `ScheduledTaskConfig` |
-| `src/db/config/toml.rs` | TOML → `DbConfig` parser (`MinnalTomlConfig`) |
+| `src/config_file/` | The config file's only parser (`ConfigFile`) and its only mapping to `DbConfig` and the rest; defaults come from `src/defaults.rs` |
 | `src/db/wal/segmented_log.rs` | **The log format and mechanics both WALs share** (`SegmentedLog`): segment header (per-log magic + version + id), `[len][crc32][body]` frames, `u32::MAX` end marker, positions `(segment << 32) \| byte`, preallocation + prepare-ahead, commit rounds, open's torn-tail/corruption rules, reads, deleting retired segments, the power-loss test hooks |
 | `src/db/wal/main_wal.rs` | The main WAL on `SegmentedLog` (magic `MWAL`): rkyv `WalEntry` bodies, `WalMetadata` (cut + per-namespace offsets, in `wal/metadata`), group commit (`Wal::commit`), the scans |
 | `src/db/wal/power_loss_tests.rs` | Power-loss model (`Database::power_loss_image`), group-commit and preallocation tests, randomised power-loss stress, repeated-SIGKILL harness |
@@ -241,7 +241,7 @@ The `key → id` slot table is **file-backed (`rows.slots`) but never adopted fr
 
 ## Sharding
 
-`num_buckets` (default 16) shards both the value log and LSM SSTables. Keys are hash-distributed. **Cannot change `num_buckets` on an existing database** — the value is locked at creation time.
+`num_buckets` (default 8) shards both the value log and LSM SSTables. Keys are hash-distributed. **Cannot change `num_buckets` on an existing database** — the value is locked at creation time.
 
 **The bucket is chosen from the FIRST 8 BYTES of the key only.** `get_bucket_for_key` (`support/mod.rs`) hashes `key_prefix_of(key)`, which zero-pads or truncates to 8 bytes; the same 8-byte prefix is what `SStableEntry.key_prefix` carries for fast comparison, so this is a deliberate performance choice, not an oversight. The consequence is a **key-design rule that callers must be told about**: keys whose first 8 bytes are constant all land in the *same* bucket, however many buckets are configured — one hot LSM shard, one value log absorbing every write, and unbalanced compaction. Fixed-width integer and UUID keys spread well by construction. String keys (`KeyType::Str`, `KvKeyType::Str`) do not, if they are built the way people naturally build them:
 

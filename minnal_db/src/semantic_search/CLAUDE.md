@@ -106,7 +106,7 @@ Three rules keep it working:
 
 **The embedding service must be running** for any vector insert or query to work. Without it, `semantic_search` calls will return an error. The service is not part of this workspace.
 
-Requests use a **batch interface** (chunking happens in minnal, not the service). The service loads several models (the companion one: `gemma`, `qwen`), so **every request names the model** — `{model}` is `SemanticSearchConfig::model_name` (`[semantic_search] model`, lower-cased by the API config's `resolve`):
+Requests use a **batch interface** (chunking happens in minnal, not the service). The service loads several models (the companion one: `gemma`, `qwen`), so **every request names the model** — `{model}` is `SemanticSearchConfig::model_name`, the namespace's `vector_index.embedding_model` (lower-cased):
 - `POST {base_url}/embedding/{model}/document` — body `{"payloads": [str, ...], "dimensions": N}` → `{"embeddings": [[f32], ...]}` (one vector per payload)
 - `POST {base_url}/embedding/{model}/query` — same request/response shape
 - `GET {base_url}/healthcheck` — `{"status", "models": {"<model>": {"status": "ok"|"loading"|"unreachable", ...}}}`; 503 while *any* model loads

@@ -191,6 +191,11 @@ Every endpoint at a glance, grouped by task. The [REST API reference](#rest-api-
 ## Configuration
 
 All settings have built-in defaults so no config file is required to get started.
+[`config/sample.toml`](../config/sample.toml) lists every key with its default and
+what it does. A key or table the server does not know stops it at startup, so a
+misspelt key cannot silently fall back to its default. The same file opens an
+embedded database (`minnal_db::ConfigFile`, or `AsyncDb::open_with_config_file`),
+which reads every table but `[api]` and `[logging]`.
 
 ```toml
 # minnal_db_api.toml

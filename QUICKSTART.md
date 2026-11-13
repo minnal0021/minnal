@@ -62,9 +62,9 @@ cargo build --release -p minnal_tools     # minnal_tools (bulk_load, …)
 > serves the **gemma** and **qwen** models over HTTP — see its
 > [README](https://github.com/minnal0021/embedding_service#readme) to get started,
 > then point `semantic_search.embedding_service_url` at it (default
-> `http://localhost:8001`). minnal names the model on every request, from
-> `[semantic_search] model` (default `qwen`), so set that to a model the service
-> loads.
+> `http://localhost:8001`). minnal names the model on every request: each store
+> picks its own in its schema (`vector_index.embedding_model`, default `gemma`),
+> so choose a model the service loads.
 
 ---
 

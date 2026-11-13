@@ -102,7 +102,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
 ┌──────────────────────────────────┐  ┌────────────────────────────────────┐
 │ LSM tree (keys + pointers)       │  │ Value log (values)                 │
 │                                  │  │                                    │
-│ MemTable: a skip list in memory, │  │ 16 buckets, each a series of       │
+│ MemTable: a skip list in memory, │  │ 8 buckets, each a series of        │
 │   up to 100k entries             │  │ 256 MB segment files               │
 │       │ flush when full          │  │                                    │
 │       ▼                          │  │ • append-only; sealed segments     │
@@ -126,7 +126,7 @@ A few things are worth pulling out of the diagram, because they shape everything
 - **A write fans out into two stores.** The LSM tree records the *key* and a pointer; the value log holds the *value*. A read reverses this: find the pointer in the LSM, then follow it into the value log.
 - **Background workers do the slow work off the critical path** — compaction, garbage collection, WAL cleanup, and TTL expiry all run on their own schedules so foreground reads and writes stay fast. Each is a single task for the whole database that visits every namespace in turn.
 
-> **A note on bucket count.** Throughout this document we use **16 buckets** as a concrete example, because that is the default. The count is actually set by `num_buckets`, fixed once at database creation, and everything that is "16-wide" here — the value-log shards, the L1 SSTables, and bucket routing — scales to whatever you configure.
+> **A note on bucket count.** Throughout this document we use **8 buckets** as a concrete example, because that is the default. The count is actually set by `num_buckets`, fixed once at database creation, and everything that is "8-wide" here — the value-log shards, the L1 SSTables, and bucket routing — scales to whatever you configure.
 
 ---
 
@@ -152,7 +152,7 @@ Because the same key can exist in several tiers at once, a read must decide whic
 
 Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
 
-Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash of their first 8 bytes**, so any given lookup only ever touches one bucket's L1 file — a single 1/16th-sized slice of the data rather than the whole tree.
+Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash of their first 8 bytes**, so any given lookup only ever touches one bucket's L1 file — a single 1/8th-sized slice of the data rather than the whole tree.
 
 #### Skip List
 
@@ -435,10 +435,10 @@ The design and its measurements are in `src/semantic_search/docs/Vector-Index-WA
 
 ### Sharding
 
-Sharding is what lets MinnalDB do its slow work in parallel. Every storage component is split across **16 buckets** (set at creation and fixed thereafter), which means:
+Sharding is what lets MinnalDB do its slow work in parallel. Every storage component is split across **8 buckets** by default (set at creation and fixed thereafter), which means:
 
-- Garbage collection runs across 16 independent value-log files at once.
-- Compaction runs across 16 independent L1 SSTables at once.
+- Garbage collection runs across 8 independent value-log files at once.
+- Compaction runs across 8 independent L1 SSTables at once.
 - Value-log writes take a **per-bucket lock** rather than one global value-log lock.
 
 Sharding does not parallelise durable writes, though. Every write appends to the one shared WAL and waits for an fsync that covers it; concurrent writes from all threads and namespaces share each fsync (group commit). Write throughput is set by the drive's fsync latency and how many writes share each fsync, not by the bucket count (see [Performance](#performance)).
@@ -761,7 +761,7 @@ Each design choice in MinnalDB pays off as a specific performance property:
 |---|---|
 | Key/value separation (WiscKey) | Low write amplification — LSM compaction never rewrites values |
 | Arena skip list | Reduced GC pressure and high cache locality for key lookups |
-| 16-bucket sharding | GC and compaction work on 16 independent shards; value-log writes lock one bucket, not the whole log |
+| Bucket sharding (8 by default) | GC and compaction work on independent shards; value-log writes lock one bucket, not the whole log |
 | Append-only value log | Sequential write I/O; ideal for SSDs and NVMe |
 | SIMD key comparison | Faster skip-list traversal on x86_64 (AVX-512/AVX2) and Apple Silicon (NEON). See [SIMD coverage by architecture](#simd-coverage-by-architecture) below. |
 | `rkyv` serialization | Typed reads and writes cost the same as raw-byte ones (within noise in [`benchmark.md`](benchmark.md#typed-api)) |
