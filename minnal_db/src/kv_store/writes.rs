@@ -31,10 +31,15 @@ impl KVStore {
         let want_old_for_index = !self.namespace_index.read().is_empty();
 
         // Hold the bucket lock across the existing-pointer read, the value-log append,
-        // AND the LSM insert. Reading the displaced pointer *inside* the lock is
-        // load-bearing for garbage accounting: two racing same-key writers must not both
-        // observe the same old pointer and each mark it displaced (double-counting it and
-        // leaking the intermediate record). GC re-point is excluded for the same reason.
+        // AND the LSM insert: it is what excludes value-log GC, the one writer that
+        // takes no key stripe. GC's phase 2 is a compare-and-set (the key still points
+        // at the record it copied → insert the copy at the key's OLD seq) under this
+        // lock. A write landing inside it could be undone: a delete that reaches L1
+        // (tombstone dropped) before GC's insert lets the old seq win, bringing the key
+        // back. Reading the displaced pointer inside the lock also keeps the garbage
+        // counters right (otherwise GC's fresh copy is dead but never counted).
+        // Same-key writers are already serialised by the key stripe, which every
+        // caller holds (`Database::key_locks`).
         let bucket = self.value_log.bucket_for_key(key);
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
