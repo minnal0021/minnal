@@ -3,19 +3,13 @@
 use super::*;
 use crate::namespace::NamespaceId;
 
-// ── GC swap-commit recovery (recover_gc_swaps) ──────────────────────────
-//
-// These exercise the FILE-level pass directly with distinct "OLD"/"NEW"
-
 /// Value-log GC must resolve liveness in BATCHES, not one point-get per
 /// record.
 ///
-/// A Level-0 file carries no bloom, no min/max and no sparse index, so a
-/// point-get reaching L0 scans every entry of every L0 file in the bucket.
-/// Done per record, GC becomes O(records × total L0 entries) — quadratic in
-/// churn. Measured before the fix at ~165 µs per record *per L0 file*, dead
-/// flat from 2 to 16 files: 8 000 records against 16 L0 files took 22 s, and
-/// a live run spent 484 s moving 9 MB on the vector-index queue.
+/// A point-get can read every L0 file of the bucket its summary cannot rule
+/// out. Done per record, GC's cost grows with records × L0 entries, quadratic
+/// in churn: measured at ~165 µs per record per L0 file read, 8,000 records
+/// against 16 L0 files took 22 s.
 ///
 /// Asserted on `l0_probes` rather than on elapsed time, so it is a statement
 /// about the algorithm and cannot flake on a slow machine. That counter is
@@ -66,7 +60,7 @@ fn gc_resolves_liveness_in_batches_not_per_record() {
     store.garbage_collect_with_thresholds(0.01, 0.01).unwrap();
     let probes = store.metrics().unwrap().snapshot().l0_probes - before.l0_probes;
 
-    // The per-record path issued one probe per record scanned (thousands
+    // A per-record path would issue one probe per record scanned (thousands
     // here); the batched path issues none at all. A tenth of one round is a
     // wide margin either side.
     assert!(
@@ -97,8 +91,8 @@ fn gc_resolves_liveness_in_batches_not_per_record() {
 fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
     // A small store keeps all its data in one active-tail segment per bucket that
     // never fills a 64 MiB segment, so tail-sealing is its only path to collection.
-    // With the tail-seal bar tracking the trigger, garbage in the 30-50% band — which
-    // sat stranded below the old hardcoded 50% bar — is reclaimed.
+    // With the tail-seal bar tracking the 30% trigger, garbage in the 30-50% band is
+    // reclaimed; a fixed 50% bar would strand it.
     let dir = TempDir::new().unwrap();
     let lsm_config = LSMConfig {
         num_buckets: 1, // one bucket → one active tail holds everything
@@ -119,7 +113,7 @@ fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
         store.put_to_storage(format!("k{i:03}").as_bytes(), &value).unwrap();
     }
     // Overwrite 70 keys: their old records become garbage — ~41% of the single tail
-    // segment (70 dead of 170 total), squarely in the old dead zone.
+    // segment (70 dead of 170 total), between the two bars.
     for i in 0..70u32 {
         store.put_to_storage(format!("k{i:03}").as_bytes(), &value).unwrap();
     }
@@ -129,7 +123,7 @@ fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
         "test needs tail garbage in the 30-50% band, got {waste_before:.1}%"
     );
 
-    // Old behavior (50% tail bar): the sub-50% tail is not sealed, nothing collectable.
+    // A 50% tail bar: the sub-50% tail is not sealed, nothing collectable.
     let stats = store.garbage_collect_with_thresholds(10.0, 50.0).unwrap();
     assert_eq!(stats.bytes_reclaimed, 0, "at a 50% tail bar a 41%-garbage tail must stay uncollected");
 
@@ -223,8 +217,8 @@ fn test_gc_write_before_gc_survives() {
 
 #[test]
 fn test_gc_writes_after_swap_go_to_new_file() {
-    // After GC swaps the value-log file, subsequent writes must go to the
-    // new file and be readable.
+    // After GC relocates survivors and unlinks their segments, later writes
+    // must land and be readable.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),

@@ -18,15 +18,15 @@ impl KVStore {
     /// segments that become safe to unlink *once the re-point is durable*.
     ///
     /// **Phase 1 (no lock):** read the segment sequentially. Every record carries its
-    /// **key**, so liveness is one LSM point-get per record — a record survives iff the
-    /// LSM still points at exactly this location. This is why GC's cost is proportional
-    /// to the segment rather than to the whole bucket or the whole key set. The segment
-    /// is sealed and immutable, so nothing can change it under us.
+    /// **key**, so liveness is one batched LSM lookup of the segment's keys: a record
+    /// survives iff the LSM still points at exactly this location. So GC's cost is
+    /// proportional to the segment rather than to the whole bucket or the whole key
+    /// set. The segment is sealed and immutable, so nothing can change it under us.
     ///
     /// **Phase 2 (bucket lock):** relocate each survivor as a **compare-and-set** —
     /// append it to the active tail and update the LSM only if the key *still* maps to
-    /// the old location. Phase 1 was not atomic with concurrent writers, so a key
-    /// deleted since then must stay deleted and one overwritten since then must keep
+    /// the old location. Phase 1 runs without the lock, so a key deleted since then
+    /// must stay deleted and one overwritten since then must keep
     /// its newer value. The relocation re-inserts under the key's **existing sequence**,
     /// so moving a record never changes its version.
     ///
@@ -64,18 +64,16 @@ impl KVStore {
             // ── Phase 1: what is still live in this segment? ──────────────────
             //
             // Liveness is resolved for the whole segment in ONE batched lookup,
-            // not one point-get per record. A Level-0 file carries no bloom, no
-            // min/max and no sparse index, so a point-get that reaches L0 scans
-            // every entry of every L0 file in the bucket — and doing that per
-            // record makes GC O(records × total L0 entries), i.e. quadratic in
-            // churn. Measured at ~165 µs per record *per L0 file*, dead flat
-            // across 2→16 files: 8 000 records against 16 L0 files took 22 s,
-            // and a live run spent 484 s moving 9 MB on the vector-index queue,
-            // which churns hardest and so accumulates the most L0 files.
+            // not one point-get per record. A point-get can read every L0 file of
+            // the bucket that its summary cannot rule out, and doing that per
+            // record makes GC cost grow with records × L0 entries, quadratic in
+            // churn: measured at ~165 µs per record per L0 file read, 8,000
+            // records against 16 L0 files took 22 s. The vector-index queue,
+            // which churns hardest, accumulates the most L0 files.
             //
-            // `get_multiple` inverts the loop: each L0 file is opened and
-            // streamed once, matched against every pending key at once. The cost
-            // becomes one pass per file rather than one scan per key.
+            // `get_multiple` inverts the loop: each L0 file is read once, matched
+            // against every pending key at once, so the cost is one pass per file
+            // rather than one search per key.
             //
             // The price is a second pass over the segment — pass A takes keys
             // only, pass B re-reads to materialise just the survivors' values.
@@ -124,9 +122,9 @@ impl KVStore {
                 // `get_with_seq` pays the same full L0 scan, and here it is paid
                 // while holding the bucket write lock, which blocks every writer
                 // to this bucket (`put_to_storage` / `delete_from_storage` hold
-                // it across their value-log append *and* their LSM update). That
-                // is what starved writes in the live run while reads, which take
-                // no such lock, ran at full speed.
+                // it across their value-log append *and* their LSM update): writes
+                // to the bucket would starve while reads, which take no such lock,
+                // run at full speed.
                 //
                 // Still a compare-and-set: holding that lock excludes every
                 // writer, so one batched read under it sees exactly what
@@ -174,8 +172,7 @@ impl KVStore {
     /// before 3 and the keys still point at the old segment, which is still there; die
     /// between 3 and 4 and they point at the new one while the old segment is merely
     /// dead weight, which the next pass reclaims. Nothing has to be rolled forward or
-    /// back — which is why there is no GC journal, no commit marker and no `.new`/`.old`
-    /// files any more.
+    /// back, so GC keeps no journal and no commit marker.
     ///
     /// **Unlinking before step 3 would be data loss**: the durable LSM would point into
     /// a segment that no longer exists, and the WAL entries that could replay those
@@ -314,9 +311,9 @@ impl KVStore {
     /// Does this namespace have value-log garbage GC can actually collect right now?
     ///
     /// The bucket-level waste ratio alone is not enough: garbage sitting in a bucket's
-    /// active tail is not collectable until the tail is sealed, so a small, fully-deleted
-    /// namespace could show 100% waste while GC had nothing to do — and the worker would
-    /// wake, log "starting GC", reclaim nothing, and repeat on every tick.
+    /// active tail is not collectable until the tail is sealed, so a small, fully deleted
+    /// namespace can show 100% waste while GC has nothing to do. Without this check the
+    /// worker would wake, log "starting GC", reclaim nothing, and repeat on every tick.
     pub(crate) fn has_gc_work(&self, segment_gc_threshold_pct: f64, tail_gc_threshold_pct: f64) -> bool {
         (0..self.value_log.num_buckets() as u32).any(|b| {
             self.value_log

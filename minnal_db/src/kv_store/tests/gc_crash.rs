@@ -3,17 +3,13 @@
 use super::*;
 use crate::namespace::NamespaceId;
 
-// ── GC race regression tests ──────────────────────────────────────────────
+// ── GC and concurrent writes ──────────────────────────────────────────────
 //
-// These tests guard against the bug where GC scanned the LSM *before*
-// acquiring the bucket lock.  Any write that completed its value-log write
-// but had not yet updated the LSM in that window was permanently lost:
-// GC deleted the old file without copying the record, leaving a stale
-// LSM pointer into a reclaimed segment (→ CorruptedLog on the next read).
-//
-// The fix: writes hold the bucket lock across the value-log write AND
-// the LSM insert; GC scans the LSM inside the same lock, guaranteeing a
-// consistent snapshot.
+// Writes hold the bucket lock across the value-log append AND the LSM insert,
+// and GC re-points inside the same lock. Were GC to judge liveness outside it,
+// a write between its value-log append and its LSM insert would be lost: GC
+// would unlink the segment without copying the record, leaving an LSM pointer
+// into a reclaimed segment.
 
 // ── GC crash-safety ordering ────────────────────────────────────────────
 //

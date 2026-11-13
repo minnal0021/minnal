@@ -16,8 +16,8 @@ impl KVStore {
 
     /// Put a key-value pair carrying an explicit global write sequence, so
     /// concurrent writes to the same key resolve highest-sequence-wins
-    /// (live == recovery). `seq` is the full global u64 sequence; the LSM stores
-    /// its low 32 bits, while the value record stores the full width.
+    /// (live == recovery). `seq` is the full global `u64` sequence, stored at full
+    /// width in both the LSM and the value record.
     pub fn put_to_storage_seq(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         self.put_to_storage_inner(key, value, seq)
     }
@@ -127,8 +127,8 @@ impl KVStore {
             drop(idx);
             if let Err(e) = result {
                 // A rejected update leaves this row absent from the field for
-                // good. Report it so it becomes a durable, repairable gap rather
-                // than only a log line — FR-001, *Rejected index updates*.
+                // good. Report it so it becomes a durable gap record, which index
+                // health reports and a repair fixes, rather than only a log line.
                 warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
                 if let Some(sink) = self.index_gap_sink.read().as_ref() {
                     sink.note_rejected_update(self.namespace_id, entry.field_id, key);
@@ -230,7 +230,7 @@ impl KVStore {
     }
 
     fn delete_from_storage_inner(&self, key: &[u8], seq: u64) -> Result<()> {
-        // Hold the bucket lock across the value-log tombstone AND the LSM delete,
+        // Hold the bucket lock across the garbage accounting AND the LSM delete,
         // for the same reason `put_to_storage` does (see its comment): GC scans
         // the LSM for live keys under this lock and then re-inserts the pointers
         // of the records it copied. Without the lock, a delete landing in GC's
@@ -250,8 +250,8 @@ impl KVStore {
     /// Like the put path, it asks whether this delete actually **wins**: a delete
     /// older than the key's current copy is dropped by the LSM, so it must not
     /// strip that live document's rows from the field indices or charge its record
-    /// as garbage. It used to do both unconditionally, so a delete that lost its
-    /// race left a live document missing from every query on the field.
+    /// as garbage. Doing both regardless would leave a live document missing from
+    /// every query on the field whenever a delete loses its race.
     pub(super) fn delete_with_bucket_locked(&self, key: &[u8], seq: u64, bucket_guard: parking_lot::MutexGuard<'_, ()>) -> Result<()> {
         // Read the prior value (under the bucket lock, so GC can't relocate it)
         // so index removal can target the old value's bucket instead of scanning

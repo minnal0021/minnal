@@ -50,12 +50,12 @@ fn test_kvstore_update() {
 fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
     // A put that loses to a higher-sequence write for the same key (the LSM drops
     // its insert under highest-sequence-wins) must account ITS OWN freshly-appended
-    // record as garbage — not displace the record that is still live. This is the
-    // deterministic form of the concurrent-put accounting race: the old code read
-    // the displaced pointer before the bucket lock and always marked it displaced,
-    // so this lower-seq put marked the LIVE record garbage (accounting would call the
-    // live value dead — GC could then reclaim it, losing data) and left its own dead
-    // record counted live.
+    // record as garbage, not displace the record that is still live. This is the
+    // deterministic form of the concurrent-put accounting race: a put that read the
+    // displaced pointer before the bucket lock and always marked it displaced would
+    // mark the LIVE record garbage here (accounting would call the live value dead,
+    // and GC could reclaim it, losing data) and leave its own dead record counted
+    // live.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),
@@ -98,11 +98,9 @@ fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
 
 #[test]
 fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
-    // A value-log read error in the batch path used to be swallowed by
-    // `.get(..).ok().flatten()`, making genuine corruption indistinguishable from a
-    // missing key. Now `get` surfaces a hard error (only a reclaimed segment retries),
-    // and so does `get_multiple`: the batch fails rather than reporting the corrupt
-    // key absent.
+    // A value-log read error must not read as a missing key. `get` surfaces a hard
+    // error (only a reclaimed segment retries), and so does `get_multiple`: the
+    // batch fails rather than reporting the corrupt key absent.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),

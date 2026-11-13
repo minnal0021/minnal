@@ -63,8 +63,8 @@ impl KVStore {
     }
 
     /// Resolve the row ID for `key` **without allocating** — returns `None` when
-    /// the dense map has never seen the key. Used on the delete and query
-    /// fallback paths, where an unseen key simply has nothing indexed.
+    /// the dense map has never seen the key. Used on the delete and repair
+    /// paths, where an unseen key simply has nothing indexed.
     ///
     /// Like `resolve_row_id_alloc`, only reached with an active field index, so a
     /// `row_id_fn` or a loaded `RowMap` is always present. If neither is (which
@@ -85,7 +85,6 @@ impl KVStore {
         None
     }
 
-    /// Resolve a row ID back to its key via the dense map, if loaded.
     /// The key a field-index row ID stands for, from whichever source assigns
     /// row IDs here: the registered `RowToKeyFn`, else the dense row map.
     pub(crate) fn key_for_row(&self, row_id: u128) -> Option<Vec<u8>> {
