@@ -215,8 +215,8 @@ async fn drop_all_resets_the_row_map() {
 }
 
 /// While a build of the store is live, `reindex-all` is refused before it
-/// changes anything. It used to drop the indexes, delete the running build's
-/// directory under it, fail, and leave the indexes out of the schema.
+/// changes anything. Otherwise it would drop the indexes, delete the running
+/// build's directory under it, fail, and leave the indexes out of the schema.
 #[tokio::test]
 async fn reindex_all_is_refused_while_a_build_runs() {
     let db_dir = TempDir::new().unwrap();
@@ -260,9 +260,9 @@ async fn a_reindex_all_that_failed_part_way_is_taken_over_by_the_next() {
 }
 
 /// Writers changing and deleting keys while `reindex-all` runs: afterwards
-/// every key is listed under exactly its current value. A re-added field's
-/// WAL replay used to leave a deleted key in the index, and a later write of
-/// it put the row in two buckets.
+/// every key is listed under exactly its current value: a re-added field's WAL
+/// replay must not leave a deleted key in the index (a later write of it would
+/// then put the row in two buckets).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reindex_all_under_concurrent_writes_leaves_no_stale_entries() {
     use std::sync::Arc;

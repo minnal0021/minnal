@@ -261,7 +261,7 @@ async fn a_rebuild_runs_in_the_background_without_the_embedding_service() {
     store.shutdown().await.unwrap();
 }
 
-// ── M2b: the namespace's own partition ──
+// ── The namespace's own partition ──
 
 #[tokio::test]
 async fn a_new_namespace_starts_from_one_root_posting_and_a_drop_resets_it() {

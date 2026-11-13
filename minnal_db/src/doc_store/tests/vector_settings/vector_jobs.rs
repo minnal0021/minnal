@@ -107,8 +107,8 @@ async fn an_enable_cut_short_is_finished_at_the_next_start() {
     store.shutdown().await.unwrap();
 }
 
-/// While a vector cleanup runs, an enable is refused (FR-010: writes between
-/// the enable and the cleanup lost their queue entries); once it is done the
+/// While a vector cleanup runs, an enable is refused (writes between the
+/// enable and the cleanup would lose their queue entries); once it is done the
 /// store can enable again, and indexes from a fresh partition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_enable_is_refused_while_a_vector_cleanup_runs() {

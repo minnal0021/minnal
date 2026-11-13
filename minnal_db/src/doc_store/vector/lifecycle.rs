@@ -4,8 +4,8 @@
 //! remove the vector data).
 //!
 //! The two jobs conflict with each other and with every other vector job of
-//! the store, so an enable can never land while a cleanup runs (FR-010: the
-//! writes between them lost their queue entries).
+//! the store, so an enable can never land while a cleanup runs (the writes
+//! between them would lose their queue entries).
 
 use crate::doc_store::*;
 use crate::namespace_lifecycle::{JobKind, JobRecord};

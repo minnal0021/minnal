@@ -73,8 +73,9 @@ async fn dropping_the_vector_index_of_an_unknown_store_is_not_found() {
     assert!(matches!(store.drop_vector_index("missing").await, Err(DocStoreError::NotFound { .. })));
 }
 
-/// R3 through the real delete path: deleting a key whose older value is being
-/// embedded leaves no vectors once that embed completes.
+/// Through the real delete path: deleting a key whose older value is being
+/// embedded leaves no vectors once that embed completes (the delete leaves a
+/// `Clear` entry the completing embed finds).
 #[cfg(feature = "semantic-search")]
 #[tokio::test]
 async fn kv_delete_during_embed_leaves_no_vectors() {
@@ -92,7 +93,7 @@ async fn kv_delete_during_embed_leaves_no_vectors() {
     assert!(!vector_kv::has_any_vector_state(&store.db, "sem_kv", b"x").await.unwrap());
 }
 
-/// R4: a KV value updated to empty text must stop matching its old text —
+/// A KV value updated to empty text must stop matching its old text —
 /// the vectors and any pending embed of the older value are cleared.
 #[cfg(feature = "semantic-search")]
 #[tokio::test]
@@ -114,7 +115,7 @@ async fn kv_put_empty_text_clears_old_vectors() {
     assert_eq!(pending.kind, vector_kv::QueueEntryKind::Clear);
 }
 
-/// R4, doc store: a document whose embedding field is emptied is cleared the
+/// A document whose embedding field is emptied is cleared the
 /// same way, including a pending embed of its older text.
 #[cfg(feature = "semantic-search")]
 #[tokio::test]

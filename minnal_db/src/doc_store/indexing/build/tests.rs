@@ -314,10 +314,10 @@ async fn test_add_index_rebuild_spans_multiple_pages() {
 }
 
 /// A new index must cover every existing document, not just the ones whose
-/// WAL entries are still around for activation to replay. The rebuild used to
-/// re-put each document's bytes, which the index ignores when nothing changed
-/// (`DynFieldIndex::update` skips old == new), so on a store whose WAL had
-/// been reclaimed it indexed 28 of these 300 documents and reported success.
+/// WAL entries are still around for activation to replay. A build that re-put
+/// each document's bytes would index nothing it had not seen change
+/// (`DynFieldIndex::update` skips old == new), so on a store whose WAL has been
+/// reclaimed it would index a few of these 300 documents and report success.
 #[tokio::test]
 async fn test_add_index_covers_documents_whose_wal_was_reclaimed() {
     let db_dir = TempDir::new().unwrap();

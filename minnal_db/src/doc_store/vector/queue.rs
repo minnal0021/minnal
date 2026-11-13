@@ -15,7 +15,7 @@ impl DocStore {
     #[cfg(feature = "semantic-search")]
     pub(in crate::doc_store) async fn clear_doc_vectors(&self, namespace: &str, key: &[u8]) -> Result<(), DocStoreError> {
         // The partition first, so the count change below always reaches it. A
-        // change made while no partition was loaded was dropped, which is right
+        // change made while no partition is loaded is dropped, which is right
         // only if the next load counts after the delete; a load already
         // counting (and not yet installed) would keep the deleted document for
         // good. Loading here installs it before the delete.

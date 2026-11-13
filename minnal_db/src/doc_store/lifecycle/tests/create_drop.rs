@@ -345,11 +345,9 @@ async fn an_interrupted_drop_is_finished_by_a_retry_or_the_next_open() {
     }
 }
 
-/// Regression: dropping a semantic store must clear its embed-queue entries.
-///
-/// Left behind, they outlive the store. They once brought back its vector
-/// namespaces: a store at ns_id 22 was dropped in a stress run and they
-/// reappeared as ns_ids 30/34/38.
+/// Dropping a semantic store must clear its embed-queue entries. Left behind,
+/// they outlive the store, and the vector worker processing them can bring its
+/// vector namespaces back under new ids.
 #[cfg(feature = "semantic-search")]
 #[tokio::test]
 async fn test_drop_store_clears_its_embed_queue() {
