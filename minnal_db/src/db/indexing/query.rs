@@ -223,6 +223,46 @@ mod tests {
         db.shutdown().unwrap();
     }
 
+    /// A delete that finds no value to delete does no index work. Its key keeps
+    /// its row id (row ids are never freed), and with no old bytes to target, the
+    /// delete fell back to `remove_all_for_row`: a probe of every value's bitmap
+    /// in every field, paid by every repeated `DELETE` of a document. A row
+    /// planted for the absent key stands in for that scan, since only the scan
+    /// could remove it.
+    #[test]
+    fn a_delete_of_an_absent_key_does_no_index_work() {
+        use crate::field_index::IndexValue;
+
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+        let store = db.get_store(ns).unwrap();
+
+        db.put(b"doc:A", br#"{"status":"active"}"#).unwrap();
+        db.delete(b"doc:A").unwrap();
+        let row_id = store.resolve_row_id_get(b"doc:A").expect("an indexed key keeps its row id");
+        let planted = IndexValue::Str("active".to_string());
+        store
+            .namespace_index
+            .read()
+            .get(field_id)
+            .unwrap()
+            .index
+            .write()
+            .insert(&planted, row_id)
+            .unwrap();
+
+        db.delete(b"doc:A").unwrap(); // past a tombstone
+        db.delete(b"doc:never").unwrap(); // a key with no row id
+        assert_eq!(
+            db.query_keys(ns, "status = \"active\"").unwrap().keys,
+            vec![b"doc:A".to_vec()],
+            "a delete with nothing to delete must not scan the index (the planted row would be gone)"
+        );
+        db.shutdown().unwrap();
+    }
+
     /// A put that adds/removes the indexed field (absent↔present) must
     /// update the index correctly via the targeted path — the row joins the new
     /// value's bucket and leaves whatever it was in (including "nothing").

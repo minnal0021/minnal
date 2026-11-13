@@ -282,8 +282,13 @@ impl KVStore {
         }
         drop(bucket_guard);
 
-        // Remove row from all field indices — only if the key is now deleted.
-        if wins {
+        // Remove the row from the field indices only if this delete removed a value
+        // (`displaced` is set only when it wins). A key with no current value has
+        // nothing indexed, as the put path assumes for a new key, so skip the
+        // `O(distinct values)` scan `update_indices_on_delete` falls back to
+        // without old bytes; a row a lost update left behind is for gap records
+        // and repair, not for every delete of an absent key.
+        if displaced.is_some() {
             self.update_indices_on_delete(key, old_value.as_deref());
         }
 
