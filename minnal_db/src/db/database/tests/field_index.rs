@@ -21,9 +21,9 @@ use super::*;
 /// length 0` writing the 64-byte header into a zero-length map.
 ///
 /// **Without the lock this test does not fail: the test binary dies.** There is
-/// nothing to assert against a signal. What the assertions below add is that serialising activation did not
-/// break it: every thread returns `Ok`, and the index answers correctly
-/// afterwards.
+/// nothing to assert against a signal. What the assertions below add is that
+/// serialising activation did not break it: every thread returns `Ok`, and the
+/// index answers correctly afterwards.
 #[test]
 fn test_concurrent_activation_of_one_field_index_does_not_kill_the_process() {
     use std::sync::Barrier;
