@@ -1,30 +1,27 @@
-//! LSM manifest snapshot for recovery and debugging.
-//!
-//! This is a minimal, serialized view of L0/L1 files per bucket.
+//! A snapshot of a namespace's LSM files: each level's files per bucket, with
+//! their entry counts. Built on request for the storage admin endpoints; never
+//! written to disk.
 
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use std::path::Path;
-
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct LsmManifest {
     pub version: u32,
     pub created_at_ms: u64,
     pub levels: Vec<ManifestLevel>,
 }
 
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ManifestLevel {
     pub level: u8,
     pub buckets: Vec<ManifestBucket>,
 }
 
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ManifestBucket {
     pub bucket: u32,
     pub files: Vec<ManifestFile>,
 }
 
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ManifestFile {
     pub path: String,
     pub created_at_ms: u128,
@@ -38,19 +35,5 @@ impl LsmManifest {
             created_at_ms,
             levels,
         }
-    }
-
-    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        rkyv::to_bytes::<rkyv::rancor::Error>(self)
-            .map_err(|e| format!("Failed to serialize LSM manifest: {}", e))
-            .map(|buf| buf.to_vec())
-    }
-
-    pub(crate) fn write_to_path(&self, path: &Path) -> std::io::Result<()> {
-        let bytes = self.to_bytes().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // `write_atomic_durable` generates a per-call unique temp name (so
-        // concurrent writers don't race on a shared "manifest.tmp"), fsyncs the
-        // temp file, renames over `path`, and fsyncs the parent directory.
-        crate::support::write_atomic_durable(path, &bytes)
     }
 }

@@ -1431,7 +1431,7 @@ value. There are two distinct kinds:
   `GET /admin/storage/stores/{ns}/ops-metrics` (see below).
 - **Storage metrics** (the other `/admin/storage/*` GET endpoints) — structural
   snapshots of *how big the engine is* and *how much dead space it holds*. These
-  are **recomputed from on-disk state** (WAL metadata, LSM manifests, value-log
+  are **recomputed from on-disk state** (WAL metadata, the LSM's SSTable files, value-log
   metadata, index blob stores) on every request, so a restart does not reset them
   — they reflect whatever is durably on disk.
 
@@ -1643,11 +1643,11 @@ On a database whose vector worker has written nothing:
 }
 ```
 
-**`GET /admin/storage/lsm`** — per-namespace LSM manifest:
+**`GET /admin/storage/lsm`** — per-namespace LSM manifest, a list of each level's SSTable files built from what is on disk:
 
 | Field | Meaning | Survives restart? |
 |-------|---------|-------------------|
-| `manifest_version`, `created_at_ms` | Manifest version + creation time | **Yes** |
+| `manifest_version`, `created_at_ms` | The response format's version, and when this snapshot was built | **Yes** |
 | `level_count`, `total_entries`, `total_size_bytes` | Levels, key count, on-disk SSTable bytes | **Yes** |
 | `levels[].buckets[].files[]` | Per-file `{path, created_at_ms, entry_count, size_bytes}` | **Yes** |
 | `in_memory.memtable_entries` | Live active-memtable entry count | **No** |
@@ -2729,7 +2729,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   fail_logs/                  ← written only if WAL recovery could not apply an entry
   ns_system_catalog/          ← every namespace's id and TTL settings, every field index's id and type, the id counter
   ns_{namespace}/             ← one directory per namespace (doc store, KV store, or vector companion)
-    lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
+    lsm/                      ← keys: level0/, level1/level1_{bucket}.dat
     value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
   ns_{namespace}_sparse_vector/      ← chunk embeddings (1, 2 or 4 bits), keyed by [posting_id ‖ doc_id] (Pass 1)
   ns_{namespace}_dense_vector/       ← multi-bit whole-document embeddings, keyed by doc_id (Pass 2)

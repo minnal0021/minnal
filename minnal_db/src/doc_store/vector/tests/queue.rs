@@ -32,7 +32,7 @@ async fn the_vector_index_config_sets_max_retries() {
 async fn test_pending_vector_index_count_empty() {
     let db_dir = TempDir::new().unwrap();
     let store = open_fresh(db_dir.path()).await;
-    assert_eq!(store.pending_vector_index_count().await, 0);
+    assert_eq!(store.pending_vector_index_count().await.unwrap(), 0);
 }
 
 #[cfg(feature = "semantic-search")]
@@ -53,7 +53,7 @@ async fn test_pending_queue_count_and_list_after_enqueue() {
     vector_kv::enqueue_embed(&store.db, "ns_a", b"doc1", "text a").await.unwrap();
     vector_kv::enqueue_embed(&store.db, "ns_b", b"doc2", "text b").await.unwrap();
 
-    assert_eq!(store.pending_vector_index_count().await, 2);
+    assert_eq!(store.pending_vector_index_count().await.unwrap(), 2);
 
     let entries = store.list_queue_entries().await;
     assert_eq!(entries.len(), 2);
@@ -71,11 +71,11 @@ async fn test_delete_pending_queue_entry_removes_entry() {
 
     vector_kv::enqueue_embed(&store.db, "ns", b"doc1", "text").await.unwrap();
 
-    assert_eq!(store.pending_vector_index_count().await, 1);
+    assert_eq!(store.pending_vector_index_count().await.unwrap(), 1);
 
     store.delete_queue_entry("ns", b"doc1").await.unwrap();
 
-    assert_eq!(store.pending_vector_index_count().await, 0);
+    assert_eq!(store.pending_vector_index_count().await.unwrap(), 0);
 }
 
 #[cfg(feature = "semantic-search")]
@@ -86,7 +86,7 @@ async fn test_delete_pending_queue_entry_noop_for_missing() {
 
     // Deleting a non-existent entry should not error.
     store.delete_queue_entry("ns", b"ghost").await.unwrap();
-    assert_eq!(store.pending_vector_index_count().await, 0);
+    assert_eq!(store.pending_vector_index_count().await.unwrap(), 0);
 }
 
 #[cfg(feature = "semantic-search")]
@@ -150,21 +150,21 @@ async fn test_reindex_doc_vector_enqueues_single_doc() {
     for e in store.list_queue_entries().await {
         vector_kv::remove_queue_entry(&store.db, &e.namespace, &e.doc_id_bytes).await.unwrap();
     }
-    assert_eq!(store.pending_vector_index_count().await, 0);
+    assert_eq!(store.pending_vector_index_count().await.unwrap(), 0);
 
     // Reindex just doc 2 → exactly one enqueue.
     assert_eq!(
         store.reindex_doc_vector("sem", DocId::U64(2)).await.unwrap(),
         VectorReindexOutcome::Enqueued
     );
-    assert_eq!(store.pending_vector_index_count().await, 1);
+    assert_eq!(store.pending_vector_index_count().await.unwrap(), 1);
 
     // A missing document reports NotFound and enqueues nothing more.
     assert_eq!(
         store.reindex_doc_vector("sem", DocId::U64(99)).await.unwrap(),
         VectorReindexOutcome::NotFound
     );
-    assert_eq!(store.pending_vector_index_count().await, 1);
+    assert_eq!(store.pending_vector_index_count().await.unwrap(), 1);
 
     // A namespace without semantic search is rejected.
     store

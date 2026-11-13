@@ -38,8 +38,8 @@ pub struct NsVectorProgress {
 }
 
 /// `GET /admin/indices/progress` — all active index builds across every namespace.
-pub async fn progress_all(State(state): State<AppState>) -> impl IntoResponse {
-    Json(build_progress_response(&state, None).await)
+pub async fn progress_all(State(state): State<AppState>) -> Result<impl IntoResponse, crate::error::AppError> {
+    Ok(Json(build_progress_response(&state, None).await?))
 }
 
 /// `GET /admin/indices/{ns}/progress` — index progress for one namespace.
@@ -47,10 +47,10 @@ pub async fn progress_ns(State(state): State<AppState>, Path(ns): Path<String>) 
     // Unknown stores are a 404, as on every other per-store route, rather than an
     // empty report that reads like a store with nothing running.
     state.store.store_type(&ns).map_err(|e| crate::error::AppError::from(e).with_ns(&ns))?;
-    Ok(Json(build_progress_response(&state, Some(&ns)).await))
+    Ok(Json(build_progress_response(&state, Some(&ns)).await?))
 }
 
-async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> IndexProgressResponse {
+async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> Result<IndexProgressResponse, crate::error::AppError> {
     let max_retries = state.store.vector_index_max_retries();
 
     let attribute_builds: Vec<IndexBuildSnapshot> = state.store.field_index_builds(ns_filter);
@@ -85,7 +85,11 @@ async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> I
 
     let mut vector_progress = Vec::with_capacity(ss_namespaces.len());
     for ns in ss_namespaces {
-        let indexed_count = state.store.count_indexed_docs(&ns).await;
+        let indexed_count = state
+            .store
+            .count_indexed_docs(&ns)
+            .await
+            .map_err(|e| crate::error::AppError::from(e).with_ns(&ns))?;
         let total_pending = pending_by_ns.get(&ns).copied().unwrap_or(0);
         let exhausted = exhausted_by_ns.get(&ns).copied().unwrap_or(0);
         let actionable = total_pending.saturating_sub(exhausted);
@@ -104,8 +108,8 @@ async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> I
         });
     }
 
-    IndexProgressResponse {
+    Ok(IndexProgressResponse {
         attribute_builds,
         vector_progress,
-    }
+    })
 }

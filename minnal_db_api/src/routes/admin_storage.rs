@@ -396,7 +396,7 @@ pub struct LsmFileInfo {
     size_bytes: u64,
 }
 
-/// In-memory LSM state (active + sealed memtables) that the on-disk manifest
+/// In-memory LSM state (active + sealed memtables) that the manifest of SSTable files
 /// does not capture.
 #[derive(Serialize)]
 pub struct LsmInMemoryInfo {
@@ -495,7 +495,7 @@ pub fn build_lsm_namespace_info(ns: String, m: LsmManifest) -> LsmNamespaceInfo 
 
 pub async fn lsm(State(state): State<AppState>) -> impl IntoResponse {
     // In-memory stats (active + sealed memtables) keyed by namespace, to enrich
-    // the on-disk manifest view.
+    // the manifest of SSTable files.
     let runtime: HashMap<String, minnal_db::LSMStats> = state.db.lsm_runtime_stats().into_iter().collect();
     let result: Vec<LsmNamespaceInfo> = state
         .db

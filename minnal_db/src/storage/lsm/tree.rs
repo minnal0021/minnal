@@ -2647,7 +2647,6 @@ impl LSMTree {
         }
 
         self.defer_old_memtables_cleanup()?;
-        self.write_manifest_snapshot()?;
         Ok(())
     }
 
@@ -2714,9 +2713,7 @@ impl LSMTree {
         self.cleanup_obsolete_level0_files();
 
         let ro_snapshot = self.read_only_memtables.read().clone();
-        let mut changed = false;
         for ro in ro_snapshot.iter() {
-            changed |= !ro.is_flushed_to_level0();
             self.flush_ro_memtable_to_level0(ro)?;
         }
 
@@ -2724,7 +2721,6 @@ impl LSMTree {
             if !self.compaction_due(bucket) {
                 continue;
             }
-            changed = true;
             if let Err(err) = self.compact_bucket(bucket) {
                 if let LSMError::Io(io_err) = &err
                     && io_err.kind() == std::io::ErrorKind::NotFound
@@ -2736,14 +2732,7 @@ impl LSMTree {
         }
 
         self.defer_old_memtables_cleanup()?;
-        if changed {
-            self.write_manifest_snapshot()?;
-        }
         Ok(())
-    }
-
-    fn manifest_path(&self) -> PathBuf {
-        self.base_path.join("manifest")
     }
 
     pub fn build_manifest_snapshot(&self) -> Result<LsmManifest> {
@@ -2792,13 +2781,6 @@ impl LSMTree {
         });
 
         Ok(LsmManifest::new(levels, now_ms))
-    }
-
-    pub(crate) fn write_manifest_snapshot(&self) -> Result<()> {
-        let manifest = self.build_manifest_snapshot()?;
-        let path = self.manifest_path();
-        std::fs::create_dir_all(path.parent().unwrap_or(&self.base_path))?;
-        manifest.write_to_path(&path).map_err(LSMError::Io)
     }
 
     /// Get statistics about the LSM tree
@@ -4210,7 +4192,7 @@ impl LSMTree {
 }
 
 /// In-memory (non-SSTable) statistics about an LSM tree: the live state that
-/// the on-disk manifest does not capture.
+/// the manifest snapshot ([`LSMTree::build_manifest_snapshot`]) does not capture.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct LSMStats {
     /// Live entries in the active memtable.

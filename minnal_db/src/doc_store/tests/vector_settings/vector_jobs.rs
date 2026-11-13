@@ -103,7 +103,7 @@ async fn an_enable_cut_short_is_finished_at_the_next_start() {
     partition(&store, "g").await;
     store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
     wait_for_empty_queue(&store).await;
-    assert_eq!(store.count_indexed_docs("g").await, 1);
+    assert_eq!(store.count_indexed_docs("g").await.unwrap(), 1);
     store.shutdown().await.unwrap();
 }
 
@@ -128,13 +128,13 @@ async fn an_enable_is_refused_while_a_vector_cleanup_runs() {
     assert!(matches!(store.amend("g", enable()).await, Err(DocStoreError::JobConflict { running, .. }) if running == "vector_cleanup"));
     assert!(!store.get_schema("g").unwrap().semantic_search_enabled);
     store.run_live_jobs().await.unwrap();
-    assert_eq!(store.count_indexed_docs("g").await, 0, "the cleanup removed the old vectors");
+    assert_eq!(store.count_indexed_docs("g").await.unwrap(), 0, "the cleanup removed the old vectors");
 
     store.amend("g", enable()).await.unwrap();
     assert!(store.get_schema("g").unwrap().semantic_search_enabled);
     partition(&store, "g").await;
     store.put("g", DocId::U64(2), serde_json::json!({"text": TEXT})).await.unwrap();
     wait_for_empty_queue(&store).await;
-    assert_eq!(store.count_indexed_docs("g").await, 1, "the store indexes again");
+    assert_eq!(store.count_indexed_docs("g").await.unwrap(), 1, "the store indexes again");
     store.shutdown().await.unwrap();
 }

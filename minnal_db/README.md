@@ -541,10 +541,9 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 │       ├── level0/
 │       │   ├── level0_0/       # L0 files for bucket 0
 │       │   └── ...
-│       ├── level1/
-│       │   ├── level1_0.dat    # L1 SSTable for bucket 0
-│       │   └── ...
-│       └── manifest
+│       └── level1/
+│           ├── level1_0.dat    # L1 SSTable for bucket 0
+│           └── ...
 │
 └── ns_<name>/                  # Each named namespace (e.g. ns_orders), same shape
 ```
@@ -693,7 +692,7 @@ The components above were each designed with one shared goal: surviving a crash 
 
 1. Load the WAL metadata (the cut, each namespace's safe offset, and the sequence high-water mark), then open the WAL from its cut: check every segment from there on, find the tail (zeroing a torn one), and read each entry's sequence number. Segments below the cut are not read; the head is the oldest segment on disk. If the saved progress names positions past what survived a power loss, new writes start in a new segment, above all of them.
 2. Open the `system_catalog` namespace, replay its WAL entries, and load the list of namespaces from it.
-3. For every namespace it lists, load the LSM manifest and reopen the L0/L1 SSTables.
+3. For every namespace it lists, reopen the L0/L1 SSTables in its `lsm/` directory.
 4. Open each bucket's value-log segments: reconcile the segment files on disk against the recorded inventory, and seed the segment-id allocator from `max(persisted high-water mark, highest existing id + 1)` so an id is never reused. A bucket whose metadata was lost has its live/garbage accounting recomputed exactly from the LSM's pointers.
 5. Replay the vector index WAL: every record at or above its namespace's safe offset, with its original seq. Then flush the namespaces it replayed into and record them as retired, before anything below can compact (see [Vector index WAL](#vector-index-wal)).
 6. Replay the WAL entries at or above their namespace's safe offset (or the cut):
