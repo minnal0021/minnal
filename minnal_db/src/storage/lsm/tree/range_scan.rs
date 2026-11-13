@@ -74,9 +74,7 @@ impl LSMTree {
     /// key order. Each key resolves to its highest-seq copy across the layers,
     /// so a tombstone in a newer layer hides an older live copy.
     ///
-    /// Returned pointers are complete as far as the LSM goes, but must be resolved
-    /// against the value log only inside the value-log generation bracket or under
-    /// the GC bucket lock, as for [`scan_prefix`](Self::scan_prefix).
+    /// Its pointers can go stale as [`scan_prefix`](Self::scan_prefix)'s can.
     pub(crate) fn range_pointers_bounded(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, u128, u64)>> {
         if limit == 0 {
             return Ok(Vec::new());

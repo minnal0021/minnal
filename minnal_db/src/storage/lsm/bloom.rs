@@ -1,6 +1,6 @@
 //! Per-SSTable Bloom filter — a probabilistic "is this key absent?" test used
 //! to skip the linear SSTable scan on a miss (see
-//! [`LSMTree::lookup_in_sstable_file`](super::tree)).
+//! `LSMTree::lookup_in_sstable_file_from`).
 //!
 //! [`contains`](BloomFilter::contains) returning `false` is **exact**: the key
 //! is definitely not in the file, so the caller can return `Missing` without

@@ -193,7 +193,7 @@ impl KVStore {
         }
     }
 
-    /// The number of live keys, counted a page at a time ([`for_each_key_page`](Self::for_each_key_page)):
+    /// The number of live keys, counted a page at a time (`for_each_key_page`):
     /// every key is read, but only one page is held.
     pub fn count_keys(&self) -> Result<usize> {
         let mut count = 0;

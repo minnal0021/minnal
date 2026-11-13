@@ -1,14 +1,18 @@
-//! LSM Tree implementation using skip_list as in-memory store with Minnal-style architecture
+//! One namespace's LSM tree: the index from each key to its value's place in
+//! the value log (a `u128` pointer), with the write sequence that produced it.
 //!
-//! Architecture:
-//! - In-memory: SkipList storing (key -> value_log_offset)
-//! - Read-only layer: Vector of KeyValueRecords when skiplist approaches capacity
-//! - Persistent layer: 16 sharded SSTable files (bucketed by key hash)
+//! Layers, newest first:
+//! - **Active memtable**: an in-memory skip list that takes every write.
+//! - **Read-only memtables**: the active memtable, sealed once it nears capacity
+//!   and kept as a sorted record list until it is flushed.
+//! - **Level 0**: a flush writes each read-only memtable as one file per bucket.
+//!   A key's bucket is a hash of its first 8 bytes (`num_buckets`, default 8).
+//! - **Level 1**: one sorted file per bucket. A bucket's Level-0 files are merged
+//!   into it once they are numerous or large enough ([`LSMTree::compaction_due`]).
 //!
-//! Operations:
-//! - Write: Always goes to in-memory skip list (auto-triggers compaction when full)
-//! - Read: Skip list -> read-only records -> SSTable files
-//! - Compaction: Background thread merges read-only records into SSTable files
+//! A key can have copies in several layers; the copy with the highest write
+//! sequence wins, and if that copy is a tombstone the key is deleted. Every read
+//! resolves this way, never by which layer a copy is in.
 
 use super::bloom::BloomFilter;
 use super::manifest::{LsmManifest, ManifestBucket, ManifestFile, ManifestLevel};
@@ -136,18 +140,11 @@ impl LSMConfig {
 /// In-memory summary of a bucket's Level-1 SSTable, rebuilt by scanning the file
 /// at open — it is never serialised, so it has no on-disk format of its own.
 ///
-/// Deliberately only what readers consume: `min_key`/`max_key` bound the range
-/// check that lets a lookup skip the file entirely, and `entry_count` distinguishes
-/// a populated bucket from an empty one. It previously also carried `bucket`,
-/// `min_key_prefix`, `max_key_prefix`, `data_offset` and `data_size`, none of which
-/// were ever read — `bucket` duplicates the index into `sstable_metadata`, and
-/// `data_offset`/`data_size` were an accident waiting to happen: `data_offset` was
-/// hard-coded to `0` while its doc claimed "offset where entries data starts"
-/// (which is [`SSTABLE_DATA_START`] since the header landed), and `data_size`
-/// counts entry bytes only, so using it as a file position lands 16 bytes short.
-/// The dead fields were masked from the `dead_code` lint by `rkyv` derives that
-/// nothing exercised; those are gone too. **Do not add a field here without a
-/// reader** — the lint is the only thing keeping this honest.
+/// Only what readers use: `min_key`/`max_key` bound the range check that lets a
+/// lookup skip the file entirely, and `entry_count` tells a populated bucket from
+/// an empty one. **Do not add a field without a reader**, and do not derive a
+/// trait (such as `rkyv`'s) that nothing uses: the `dead_code` lint is what keeps
+/// an unused field from going stale here.
 #[derive(Clone, Debug)]
 struct SStableMetadata {
     /// Minimum key in this SSTable
@@ -171,13 +168,10 @@ const SSTABLE_MAGIC: [u8; 4] = *b"MSST";
 
 /// On-disk format version for the entry encoding that follows the header.
 ///
-/// Bump this whenever the `SStableEntry` layout changes in a way that makes old
-/// files unreadable. Version 1 is the first versioned format; it carries a `u64`
-/// write sequence. Files written before headers existed had a `u32` sequence and
-/// no magic, so they are rejected by [`validate_sstable_header`] rather than
-/// silently misread — the entry CRC covers only the body and cannot catch a
-/// layout change, since the bytes are unchanged and only their interpretation
-/// differs.
+/// Bump this whenever the `SStableEntry` layout changes. A file with another
+/// version, or without the magic, is rejected by [`validate_sstable_header`]
+/// rather than misread: the entry CRC covers only the bytes, so it cannot catch a
+/// change in how they are interpreted.
 const SSTABLE_FORMAT_VERSION: u32 = 1;
 
 /// Byte offset at which entry frames begin: `magic(4) | version(4) | reserved(8)`.
@@ -202,9 +196,8 @@ const LEVEL0_TMP_SUFFIX: &str = ".dat.tmp";
 
 /// Verify that `file` begins with a header this build can read.
 ///
-/// Returns [`LSMError::Corruption`] for a truncated header, a bad magic (which is
-/// what a pre-header file looks like), or a format version this build does not
-/// understand.
+/// Returns [`LSMError::Corruption`] for a truncated header, a bad magic, or a
+/// format version this build does not understand.
 fn validate_sstable_header(file: &File, path: &Path) -> Result<()> {
     let mut header = [0u8; SSTABLE_DATA_START as usize];
     file.read_exact_at(&mut header, 0)
@@ -248,10 +241,10 @@ fn open_sstable_for_scan(path: &Path) -> Result<File> {
 ///
 /// The 4-byte length prefix sits *outside* the entry CRC — which covers only the
 /// body — so a flipped bit there is undetectable until after the payload has been
-/// read. Allocating first meant a corrupt length could request up to 4 GiB from a
-/// file of a few hundred bytes. A frame can never be longer than its file, so that
-/// is the bound; `valid_scan_start` already applies the same reasoning to a sparse
-/// hint, and this brings the sequential readers in line.
+/// read, and allocating for it first would let a corrupt length request up to
+/// 4 GiB from a file of a few hundred bytes. A frame can never be longer than its
+/// file, so that is the bound (`valid_scan_start` applies the same bound to a
+/// sparse-index hint).
 ///
 /// Zero is rejected too: a body is `crc32(4) + rkyv payload`, so it is never empty.
 #[inline]
@@ -266,9 +259,9 @@ fn check_frame_len(size: u64, file_len: u64) -> Result<()> {
 
 /// Buffered, positional reader of consecutive SSTable frames (`u32 LE len ‖ body`).
 ///
-/// Replaces two `pread` syscalls per entry (length, then body) with one `pread`
-/// per buffer refill. Sparse-vector entries are ~60 bytes, so a per-entry read
-/// made syscalls — not parsing — the dominant cost of a cluster range walk.
+/// One `pread` per buffer refill, not two per entry (length, then body):
+/// sparse-vector entries are ~60 bytes, so reading each alone would make
+/// syscalls, not parsing, the main cost of a cluster range walk.
 ///
 /// The refill size starts at [`MIN_READ`](Self::MIN_READ) and doubles up to
 /// [`MAX_READ`](Self::MAX_READ): most range walks are short (a median IVF cluster
@@ -545,10 +538,9 @@ fn key_head(key: &[u8]) -> u128 {
 /// [`LSMTree::open`] validates every on-disk L0 file it loads
 /// (`load_existing_level0_files` → `level0_file_summary`), and
 /// [`register_level0_file`](LSMTree::register_level0_file) only ever receives a
-/// file this process just wrote with a header. Re-validating on each read bought
-/// nothing and cost a `pread` per L0 file on every point get —
-/// `search_level0_files` opens every L0 file in the bucket its summary cannot
-/// rule out.
+/// file this process just wrote with a header. Re-validating on each read would
+/// cost a `pread` per L0 file on every point get, since `search_level0_files`
+/// opens every L0 file in the bucket its summary cannot rule out.
 ///
 /// **Precondition:** `path` comes from an `L0FileEntry`. Opening an unvetted file
 /// with this would parse a foreign layout as entries — use
@@ -691,10 +683,10 @@ type ScanMap = std::collections::BTreeMap<Vec<u8>, (Option<u128>, u64)>;
 /// go to the newer layer — the same rule `get_with_seq` applies.
 ///
 /// Every multi-key read resolves through this, never by "the newer layer
-/// overwrites": a lower-seq copy can sit in a newer layer (a TTL delete that
-/// allocated its seq before a put it lost to, or L0 files ordered by a wall clock
-/// that stepped backwards), and overwriting by layer then hides a live key or
-/// surfaces a deleted one (`test_scans_agree_with_brute_force_resolution`).
+/// overwrites": nothing in the LSM keeps a newer layer's copies at higher seqs
+/// (a GC re-point, for one, writes a key's existing seq into the active
+/// memtable), and overwriting by layer would then hide a live key or surface a
+/// deleted one (`test_scans_agree_with_brute_force_resolution`).
 fn fold_newest(map: &mut ScanMap, key: Vec<u8>, value: Option<u128>, seq: u64) {
     match map.entry(key) {
         std::collections::btree_map::Entry::Occupied(mut e) => {
@@ -997,14 +989,13 @@ impl Drop for L0ReadGuard {
 /// breaks exact ties.
 ///
 /// Sequences are the global `u64` counter (`Database::next_seq`) at full width,
-/// so this is a plain comparison. It was previously a `u32` truncation compared
-/// with wrapping serial-number arithmetic, which silently inverts once two
-/// sequences differ by more than 2^31 — reachable here because an L1 entry keeps
-/// its original sequence for the lifetime of the database, so the gap to a later
-/// write of the same key is unbounded (~2.1B writes, ~2.5 days at 10k writes/s).
-/// The effect was a stale read that `merge_level0_to_level1` then baked into L1
-/// permanently. **Do not narrow the sequence again** — see
-/// `test_write_after_huge_seq_gap_beats_cold_l1_entry`.
+/// so this is a plain comparison. **Do not narrow it** to a smaller, wrapping
+/// type: an L1 entry keeps its sequence for the life of the database, so the gap
+/// to a later write of the same key is unbounded, and a wrapping comparison
+/// inverts once two sequences are more than half its range apart (2^31 writes,
+/// about 2.5 days at 10k writes/s, for 32 bits). The newer write would then read
+/// as older, and `merge_level0_to_level1` would keep the stale copy in L1 for
+/// good. See `test_write_after_huge_seq_gap_beats_cold_l1_entry`.
 #[inline]
 fn seq_newer(a: u64, b: u64) -> bool {
     a > b
@@ -1045,12 +1036,12 @@ pub(crate) struct LSMTree {
     /// Current active memtable
     memtable: Arc<RwLock<MemTable>>,
 
-    /// Read-only memtables waiting for compaction
-    /// Now uses Arc<Vec<>> to support reference counting
+    /// Sealed memtables, oldest first, waiting to be flushed to Level 0 (and,
+    /// once flushed, to be released).
     read_only_memtables: Arc<RwLock<Vec<ReadOnlyMemTable>>>,
 
-    /// SSTable files for each bucket wrapped in Arc for atomic swaps
-    /// Arc<RwLock<Arc<File>>> allows readers to keep old file while new file is installed
+    /// Each bucket's Level-1 file. A merge swaps in the new file's `Arc<File>`;
+    /// a reader holding the previous one keeps reading it until it is done.
     sstable_files: Vec<Arc<RwLock<Arc<File>>>>,
     sstable_metadata: Vec<Arc<RwLock<Vec<SStableMetadata>>>>,
     /// Per-bucket Bloom filter over the L1 file's keys, used to skip the linear
@@ -1069,11 +1060,11 @@ pub(crate) struct LSMTree {
     /// (read-only memtables + L0 + L1). Read resolution is highest-sequence-wins
     /// across all layers, but an active-memtable hit whose sequence is `>=` this
     /// bound dominates everything below it and can be returned without scanning
-    /// the lower layers — restoring the early-return fast path for normal writes,
-    /// which always carry the newest sequence. Only a GC re-point (a low sequence
-    /// re-inserted into the active memtable) fails the bound and falls through to
-    /// the full seq-aware scan. Folded (serial-max) on every memtable flush and
-    /// from the L1 files loaded at open.
+    /// the lower layers, which is the common case: a normal write carries the
+    /// newest sequence. Only a GC re-point (a low sequence re-inserted into the
+    /// active memtable) fails the bound and falls through to the full seq-aware
+    /// search. Raised to the newest sequence of every memtable flushed and of the
+    /// L1 files loaded at open.
     max_lower_seq: AtomicU64,
 
     /// Engine-wide operational counters, shared from `Database` via
@@ -1091,8 +1082,9 @@ pub(crate) struct LSMTree {
 
     memtable_sequence: Arc<AtomicUsize>,
 
-    /// Pending old read-only memtables to be deleted on next compaction
-    /// Similar to pending_old_logs in ValueLog GC
+    /// Flushed read-only memtables taken off the read path while a reader still
+    /// counted itself on them; released by a later compaction tick once their
+    /// reader count is zero.
     pending_old_memtables: Arc<RwLock<Vec<ReadOnlyMemTable>>>,
 
     /// Level 0 files tracked per bucket for reader-safe compaction/deletion.
@@ -1145,8 +1137,8 @@ impl LSMTree {
     /// The result is tri-state, and the distinction between
     /// [`SsLookup::Deleted`] and [`SsLookup::Missing`] is load-bearing: a
     /// tombstone found in a newer layer (e.g. an L0 file) must *shadow* a live
-    /// value in an older layer (L1). Collapsing both into `None` let `get` fall
-    /// through an L0 tombstone to a stale L1 value, resurrecting deleted keys.
+    /// value in an older layer (L1). Collapsing both into `None` would let `get`
+    /// fall through an L0 tombstone to a stale L1 value and resurrect a deleted key.
     ///
     /// The hint is validated against the file first: if it does not point at a
     /// complete, CRC-valid frame whose key is `<= key` — e.g. a concurrent
@@ -1287,7 +1279,7 @@ impl LSMTree {
 
         let num_buckets = config.num_buckets;
 
-        // Initialize SSTable files and metadata with Arc<File> for atomic swaps
+        // Each bucket's Level-1 file sits behind an `Arc<File>` that a merge swaps.
         let mut sstable_files_vec: Vec<Arc<RwLock<Arc<File>>>> = Vec::with_capacity(num_buckets);
         let mut sstable_metadata_vec: Vec<Arc<RwLock<Vec<SStableMetadata>>>> = Vec::with_capacity(num_buckets);
         let mut sstable_blooms_vec: Vec<Arc<RwLock<Option<Arc<BloomFilter>>>>> = Vec::with_capacity(num_buckets);
@@ -1296,7 +1288,7 @@ impl LSMTree {
         // bound for the read fast path.
         let mut max_lower_seq_init: Option<u64> = None;
 
-        // Open or create Level 1 SSTable files per bucket (similar to sharded value log)
+        // Open or create each bucket's Level-1 file.
         for bucket in 0u32..num_buckets as u32 {
             let level1_path = Self::level1_path_from(&base_path, bucket);
             let file = OpenOptions::new()
@@ -1423,16 +1415,15 @@ impl LSMTree {
         }
     }
 
-    /// Create a null/empty file for initialization
+    /// A handle to `/dev/null`, which reads as empty: the Level-1 handle of a
+    /// bucket whose merge left no entries.
     fn create_null_file() -> Result<File> {
-        // Return a temporary file that will be replaced
         OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open("/dev/null")
-            .or_else(|_| OpenOptions::new().read(true).write(true).create(true).truncate(false).open("nul"))
             .map_err(LSMError::Io)
     }
 
@@ -1462,12 +1453,9 @@ impl LSMTree {
         base_path.join("level1")
     }
 
-    /// Level 1 SSTable path for a bucket
-    ///
-    /// Naming note:
-    /// - Level 1 uses a fixed file per bucket (level1_<bucket>.dat).
-    /// - Level 0 uses timestamp-based filenames per flush (see write_level0_file_for_records).
-    ///   This is why you can see gaps in L0 and the same bucket id in both levels.
+    /// A bucket's Level-1 file: one fixed file per bucket, `level1_{bucket}.dat`.
+    /// (Level-0 files are named by a per-flush stamp instead; see
+    /// `write_level0_file_for_records`.)
     fn level1_path_from(base_path: &Path, bucket: u32) -> PathBuf {
         Self::level1_dir_from(base_path).join(format!("level1_{}.dat", bucket))
     }
@@ -1573,13 +1561,13 @@ impl LSMTree {
     /// L0 file order breaks **exact seq ties**, and GC's relocation makes them: it
     /// re-inserts a key at its existing seq with a new pointer, so the old and the
     /// relocated copy can sit in two L0 files with the same seq, and only file
-    /// order says the relocation is newer. Ordering by raw wall time let a clock
-    /// step backwards (NTP, a VM or WSL resume) between the two flushes put the
-    /// relocation *first*: every read returned the pre-relocation pointer, the
-    /// L0→L1 merge baked it into L1, and once GC unlinked its segment the key read
-    /// `SegmentMissing` for good (and the next GC pass judged the real record
-    /// dead). Stamps are taken after the per-memtable flush lock, and memtables
-    /// flush in version order, so a later flush always gets a larger stamp.
+    /// order says the relocation is newer. Ordered by raw wall time, a clock that
+    /// steps backwards (NTP, a VM or WSL resume) between the two flushes would put
+    /// the relocation *first*: every read would return the pre-relocation pointer,
+    /// the L0→L1 merge would keep it in L1, and once GC unlinked its segment the key
+    /// would read `SegmentMissing` for good (and the next GC pass would judge the
+    /// real record dead). Stamps are taken after the per-memtable flush lock, and
+    /// memtables flush in version order, so a later flush always gets a larger stamp.
     fn next_l0_stamp(&self, candidate: u128) -> u128 {
         let mut last = self.last_l0_stamp.lock();
         let stamp = candidate.max(last.saturating_add(1));
@@ -1656,9 +1644,9 @@ impl LSMTree {
     fn flush_ro_memtable_to_level0(&self, ro_memtable: &ReadOnlyMemTable) -> Result<()> {
         // The flushed check and the flush must be one step. Several paths flush
         // (the compaction worker, a GC pass, the no-WAL unpin) and nothing else
-        // serialises them, so an unlocked check let two write the same memtable:
-        // a duplicate L0 file, or — in the same millisecond — the same file name,
-        // with the second `File::create` truncating the first mid-write. A second
+        // serialises them, so an unlocked check would let two write the same
+        // memtable: a duplicate L0 file, or (in the same millisecond) the same file
+        // name, with the second `File::create` truncating the first mid-write. A second
         // flusher WAITS rather than skipping, because callers rely on the flush
         // being durable when this returns: GC unlinks value-log segments right
         // after, and returning early would let it unlink before the fsync.
@@ -1749,9 +1737,9 @@ impl LSMTree {
         let level0_path = level0_dir.join(format!("{}.dat", timestamp_ms));
         // Written under a temporary name and renamed once complete and fsynced, as
         // L1 is, so a `.dat` file is always whole. Written in place, a process
-        // killed mid-flush left a `.dat` cut anywhere, even inside a frame, and the
-        // next open failed on it (`UnexpectedEof`, or a frame longer than its file):
-        // the database would not open again until the file was removed by hand.
+        // killed mid-flush would leave a `.dat` cut anywhere, even inside a frame,
+        // and the next open would fail on it (`UnexpectedEof`, or a frame longer
+        // than its file) until the file was removed by hand.
         // Open deletes leftover temporaries (`load_existing_level0_files`).
         let tmp_path = level0_dir.join(format!("{timestamp_ms}{LEVEL0_TMP_SUFFIX}"));
 
@@ -1972,7 +1960,6 @@ impl LSMTree {
         Ok((min_key, max_key, entries.len() as u64, total_size, index))
     }
 
-    /// Get a value from the LSM tree
     /// Attach the engine-wide operational counters (called once by `KVStore`).
     pub(crate) fn set_metrics(&self, metrics: Arc<Metrics>) {
         let _ = self.metrics.set(metrics);
@@ -2011,13 +1998,13 @@ impl LSMTree {
     /// is this with tombstones read as absent; the write path needs the
     /// tombstone's seq to tell whether a write is newer than the delete.
     fn newest_copy(&self, key: &[u8]) -> Result<Candidate> {
-        // Resolve by highest write sequence across ALL layers. Layer order is no
-        // longer assumed to imply recency — a GC re-point can re-insert a value at
-        // its old (low) sequence into a newer layer, above a deleting tombstone in
-        // an older layer — so we cannot early-return at the first layer holding
-        // the key. We inspect every layer and keep the newest-sequence entry; a
-        // tombstone winning means the key is deleted. Layers are visited
-        // newest-first so an exact sequence tie resolves to the newer copy.
+        // Resolve by highest write sequence across ALL layers. Layer order does
+        // not imply recency (a GC re-point can re-insert a value at its old, low
+        // sequence into a newer layer, above a deleting tombstone in an older
+        // layer), so we cannot return at the first layer holding the key. We
+        // inspect every layer and keep the newest-sequence entry; a tombstone
+        // winning means the key is deleted. Layers are visited newest-first so an
+        // exact sequence tie resolves to the newer copy.
         let mut best: Candidate = None;
 
         if let Some(m) = self.metrics() {
@@ -2071,14 +2058,14 @@ impl LSMTree {
     /// garbage correctly when same-key writes race: the winner displaces the existing
     /// record, but a **loser** (a lower-sequence write that arrived at the lock after a
     /// higher-sequence one) does not — its own freshly-appended record is the garbage
-    /// instead. Deciding this from a pre-lock read (as the old code did) let two writers
-    /// see the same old pointer and both mark it displaced, double-counting it while
+    /// instead. Deciding this from a read taken before the lock would let two writers
+    /// see the same displaced pointer and both mark it, counting it twice while
     /// leaking the loser's record.
     ///
     /// A winning **tombstone** counts: the pointer is `None` (nothing to displace),
     /// but a write older than the delete still loses to it. Reading that case as
-    /// "absent, so any write wins" made a lost put add a field-index row for a
-    /// key that reads as deleted. `true` only when no layer holds the key at all,
+    /// "absent, so any write wins" would make a lost put add a field-index row for
+    /// a key that reads as deleted. `true` only when no layer holds the key at all,
     /// or the write is at least as new as whatever does.
     pub(crate) fn current_pointer_and_wins(&self, key: &[u8], new_seq: u64) -> Result<(Option<u128>, bool)> {
         match self.newest_copy(key)? {
@@ -2130,7 +2117,7 @@ impl LSMTree {
         }
     }
 
-    /// Fold a sequence into the lower-layer bound (serial-max), used whenever
+    /// Raise the lower-layer bound to `seq` if it is newer, whenever
     /// entries move from the active memtable into a lower layer.
     fn note_lower_seq(&self, seq: u64) {
         let mut cur = self.max_lower_seq.load(Ordering::Relaxed);
@@ -2171,8 +2158,8 @@ impl LSMTree {
     /// Flush the current memtable (if non-empty) and all read-only memtables to
     /// level-0 SSTable files on disk.  Unlike `flush_and_compact_all` this does
     /// not run a full compaction, so it is cheaper and suitable for use in the
-    /// GC path where we only need to guarantee that in-memory LSM pointer updates
-    /// survive a crash before the GCJournal is deleted.
+    /// GC path, which must make its in-memory pointer updates durable before it
+    /// unlinks the value-log segments they moved out of.
     pub(crate) fn flush_memtable_to_level0(&self) -> Result<()> {
         self.flush_to_level0(false)
     }
@@ -2464,8 +2451,8 @@ impl LSMTree {
         // *flush* time, which can run out of seal/seq order (a higher-version
         // memtable can flush to L0 before a lower one, inverting recency relative
         // to seq); a GC re-point likewise preserves a low seq into a newer file.
-        // Resolving by recency then let a lower-seq value beat a higher-seq
-        // tombstone and resurrected deleted keys. Point reads (`get_with_seq`)
+        // Resolving by recency would let a lower-seq value beat a higher-seq
+        // tombstone and resurrect deleted keys. Point reads (`get_with_seq`)
         // already resolve by seq, so seq-aware resolution here keeps the merge
         // consistent with them. The oldest-first sort only breaks exact seq ties
         // (prefer the newer file).
@@ -2670,9 +2657,10 @@ impl LSMTree {
     /// A merge rewrites the bucket's whole Level-1 file, so merging whatever L0
     /// holds at every opportunity costs the size of Level 1 per flush. Callers
     /// that flush small memtables often (the vector worker's durability barrier,
-    /// one flush per batch) then rewrote megabytes to add a dozen entries: at 50
-    /// requests/s the M5 benchmark measured 10 flushes and 16 merges a second,
-    /// about 2 MB rewritten per document and 93% of all disk writes.
+    /// one flush per batch) would then rewrite megabytes to add a dozen entries:
+    /// merging at every flush, the system benchmark at 50 requests/s measured 10
+    /// flushes and 16 merges a second, about 2 MB rewritten per document and 93%
+    /// of all disk writes.
     ///
     /// So a bucket waits until its L0 files hold [`L0_COMPACTION_RATIO_PERCENT`]
     /// of Level 1's entries, which bounds the rewrite to about 100 / that times
@@ -2800,16 +2788,14 @@ impl LSMTree {
         }
     }
 
-    /// Efficient prefix scan across all layers (memtable, read-only, SSTables)
-    /// Returns vector of (key, value_log_offset) pairs matching the prefix
+    /// Every live `(key, pointer, seq)` whose key starts with `prefix`, across
+    /// every layer, in key order.
     ///
-    /// POINTER-RESOLUTION INVARIANT: the returned pointers guarantee LSM-side
-    /// completeness only. They are safe to resolve against the value log *solely*
-    /// inside the caller's value-log generation bracket
-    /// ([`KVStore::read_generation_stable`](crate::kv_store::KVStore)) or under
-    /// the value-log bucket write lock (GC compaction). This snapshot does NOT
-    /// extend value-log GC protection — resolving a returned pointer outside that
-    /// bracket reopens the wrong-file window closed in commit 420ac8e.
+    /// A returned pointer is what the LSM held when its layer was read. Value-log GC
+    /// may relocate the value and delete its segment before the caller reads it; that
+    /// read then fails with `SegmentMissing` and the caller re-resolves the key through
+    /// the LSM (`KVStore::refetch_dropped`). Segment ids are never reused, so a stale
+    /// pointer can fail but never return another key's value.
     pub(crate) fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, u128, u64)>> {
         // Layers are folded oldest→newest by `fold_newest`: each key resolves to its
         // highest-seq copy, exactly as `get_with_seq` resolves it, so a tombstone
@@ -2970,6 +2956,7 @@ impl LSMTree {
     /// The sparse-index offset is validated against the file (`valid_scan_start`): a
     /// stale hint after a concurrent compaction falls back to a full scan, so it is a
     /// performance hint, never a correctness input.
+    ///
     /// `max_live`, when set, stops the scan after that many **non-tombstone** entries
     /// have been visited (tombstones are still visited but do not count). This is the
     /// per-bucket early-stop that bounds a paginated scan: since keys are hash-sharded
@@ -3028,8 +3015,8 @@ impl LSMTree {
     /// When the prefixes are close together, as when a search probes most
     /// postings, the jumps vanish and this is one sequential read. Calling
     /// [`for_each_l1_entry_in_range`](Self::for_each_l1_entry_in_range) per prefix
-    /// started a fresh reader (and an `fstat` and a seek check) for every prefix,
-    /// which dominated a search probing hundreds of postings.
+    /// instead would start a fresh reader (and an `fstat` and a seek check) for
+    /// every prefix, the main cost of a search probing hundreds of postings.
     ///
     /// Keys shorter than 4 bytes have no prefix id and are skipped, as the L0 and
     /// memtable passes of [`scan_prefixes`](Self::scan_prefixes) skip them.
@@ -3095,15 +3082,13 @@ impl LSMTree {
     /// first, then L0 oldest-to-newest** — the same oldest→newest layer order the
     /// other scans use. A tombstone is carried as `None` (not dropped) so the
     /// caller's merge map can let a newer L0 tombstone shadow a live L1 value,
-    /// and a newer L0 value shadow a stale L1 value. Dropping tombstones here (as
-    /// the old implementation did) resurrected deleted keys and could surface a
-    /// stale L1 value over an updated L0 one, because L0 holds entries — including
-    /// tombstones — not yet compacted into L1.
+    /// and a newer L0 value shadow a stale L1 value. Dropping tombstones here would
+    /// resurrect deleted keys: L0 holds entries, tombstones included, not yet merged
+    /// into L1.
     ///
     /// `upper` is the prefix's upper bound (`prefix_upper_bound(prefix)`): the L1
     /// read skips a non-overlapping file via min/max and seeks via the sparse index
-    /// over `[prefix, upper)`. L0 files carry no min/max or index, so they are still
-    /// scanned in full with a prefix match.
+    /// over `[prefix, upper)`. Each L0 file is read in full with a prefix match.
     fn scan_prefix_in_bucket(&self, bucket: u32, prefix: &[u8], upper: Option<&[u8]>) -> Result<Vec<ScanEntry>> {
         let mut results = Vec::new();
         let mut entry_bytes = Vec::new();
@@ -3200,18 +3185,16 @@ impl LSMTree {
     /// * **Memtables** — the active one is range-iterated per prefix; read-only ones
     ///   are filtered.
     ///
-    /// The layers are resolved by [`merge_scan_layers`]: L1 entries are sorted and
-    /// deduplicated in bulk, then a sorted merge lets the newer layers shadow them.
-    /// The newer layers go through a `BTreeMap` first, which is cheap because they are
-    /// usually small; L1 is not, since a per-entry map insert was most of the cost of
-    /// a large scan.
+    /// The layers are resolved like [`merge_scan_layers`]: L1's key-sorted runs are
+    /// merged in bulk, then a sorted merge lets the newer layers shadow them. The
+    /// newer layers go through a `BTreeMap` first, which is cheap because they are
+    /// usually small; L1 does not, since a map insert per entry would be most of the
+    /// cost of a large scan.
     ///
     /// The caller maps entries back to their originating prefix via the first 4
     /// bytes of each key.
     ///
-    /// Same pointer-resolution invariant as [`scan_prefix`](Self::scan_prefix):
-    /// returned pointers are LSM-complete but must be resolved against the value log
-    /// only inside the value-log generation bracket / GC bucket lock.
+    /// Its pointers can go stale as [`scan_prefix`](Self::scan_prefix)'s can.
     pub(crate) fn scan_prefixes(&self, prefix_ids: &std::collections::HashSet<u32>) -> Result<PrefixScanKeys> {
         if prefix_ids.is_empty() {
             return Ok(PrefixScanKeys::default());
@@ -3222,9 +3205,9 @@ impl LSMTree {
         // concurrent flush/compaction cannot drop a live key — see `scan_prefix`.
         //
         // L1 — the bulk of a large scan — is gathered into a Vec and resolved by
-        // `resolve_scan_layers`, not inserted into the map: a per-entry BTreeMap
-        // insert of an owned key was ~8 ms of a ~10 ms scan over 87k entries, while
-        // the parallel L1 reads were ~1 ms. The newer layers (usually small) still
+        // `resolve_scan_layers`, not inserted into the map: a BTreeMap insert of an
+        // owned key per entry measured ~8 ms of a ~10 ms scan over 87k entries,
+        // against ~1 ms for the parallel L1 reads. The newer layers (usually small) still
         // merge through `newer` by `fold_newest`. Each worker packs its L1 keys into
         // one buffer (`l1_keys`) instead of allocating one per entry.
         let mut l1_keys: Vec<Vec<u8>> = Vec::new();
@@ -3271,8 +3254,8 @@ impl LSMTree {
         //    parallel. Each worker reads its group's postings from every overlapping
         //    bucket and merges those runs itself; the groups are ascending, disjoint
         //    ranges of prefix ids, so their merged outputs simply follow one another
-        //    in key order. One worker per bucket merging the buckets' runs afterwards
-        //    on one thread was about half a 1,024-posting scan's time.
+        //    in key order. One worker per bucket, with the buckets' runs merged
+        //    afterwards on one thread, measured about half a 1,024-posting scan's time.
         let l1_buckets: Vec<(usize, &Arc<File>)> = l1_files
             .iter()
             .enumerate()
@@ -3331,7 +3314,7 @@ impl LSMTree {
         //    probed prefix is skipped, and the rest are read with one cursor that
         //    seeks per prefix through the file's sparse index, as L1 is: L0 can hold
         //    a tenth of L1's entries before it is merged, and reading every file
-        //    whole cost every search that share of L1 again.
+        //    whole would cost every search that share of L1 again.
         {
             let mut first_err: Option<LSMError> = None;
             std::thread::scope(|s| {
@@ -3409,10 +3392,8 @@ impl LSMTree {
     /// L0 files and its L1 file, resolving all of that bucket's keys together.
     /// The pass reads only near the keys: it jumps between them with the
     /// sparse indexes (`scan_sorted_candidates`), so a query page of a few keys
-    /// reads a few KiB per file and a large batch one sequential read. It used to
-    /// read the whole L1 file into memory for any batch, which made every
-    /// document-store query page cost 1-14 ms on a 1M-document store (0.3 ms
-    /// after the change).
+    /// reads a few KiB per file and a large batch one sequential read, never more
+    /// than the file.
     ///
     /// Resolution is identical to [`get_with_seq`](Self::get_with_seq): the
     /// highest-`seq` copy across **every** layer wins (a winning tombstone ⇒
@@ -3678,42 +3659,32 @@ impl LSMTree {
         Ok((frames.bytes_read, rejected))
     }
 
-    /// Get all keys in the LSM tree (for compatibility with existing API)
+    /// Every live key, in key order, as one list in memory.
     pub(crate) fn keys(&self) -> Result<Vec<Vec<u8>>> {
-        // Delegate to key_pointer_pairs which merges layers in the correct order
-        // (SSTable → read-only memtables → active memtable) with proper tombstone
-        // suppression.  The old inline implementation added SSTable keys last,
-        // so active-memtable tombstones never suppressed SSTable entries — causing
-        // deleted keys to re-appear in iterators after a flush (e.g. WAL recovery).
+        // `key_pointer_pairs` resolves every layer by seq, so a newer tombstone
+        // hides an older live copy.
         Ok(self.key_pointer_pairs(None)?.into_iter().map(|(k, _)| k).collect())
     }
 
-    /// Get all key-value pairs from the LSM tree, optionally filtered by qualifying buckets.
+    /// Every live `(key, pointer)`, optionally only for the keys of the buckets
+    /// `qualifying_buckets` marks (their SSTables alone are read).
     ///
-    /// Eliminates the double-read pattern where `keys()` + per-key `get()` was used.
-    /// When `qualifying_buckets` is provided, only keys that hash to a qualifying bucket
-    /// are returned, and SSTable I/O is skipped entirely for non-qualifying buckets.
-    ///
-    /// Same pointer-resolution invariant as [`scan_prefix`](Self::scan_prefix):
-    /// returned pointers are LSM-complete but must be resolved against the value log
-    /// only inside the value-log generation bracket / GC bucket lock. (Value-log GC's
-    /// `compact_single_bucket` satisfies this by holding the bucket write lock across
-    /// this scan, the value reads, and the reinsert.)
+    /// Its pointers can go stale as [`scan_prefix`](Self::scan_prefix)'s can.
     pub(crate) fn key_pointer_pairs(&self, qualifying_buckets: Option<&[bool]>) -> Result<Vec<(Vec<u8>, u128)>> {
-        // Merge stays oldest→newest into a BTreeMap so last insert wins (L1 → L0 →
-        // read-only → active), preserving tombstone precedence. The *capture* order
-        // is reversed to newest-first so a concurrent flush/compaction cannot drop a
-        // live key — critical here because this scan also backs value-log GC's
-        // compaction pass, where a dropped live key means lost data. See `scan_prefix`.
+        // Layers are folded oldest→newest (L1 → L0 → read-only → active) into a map
+        // by `fold_newest`. The *capture* order is newest-first so a concurrent
+        // flush or merge cannot drop a live key, which matters most here: this scan
+        // rebuilds the value log's live accounting, where a missed live key would be
+        // counted as garbage. See `scan_prefix`.
         //
         // Liveness is resolved by highest write `seq` (globally ordered), matching
         // the seq-resolved point reads (`get_with_seq`) and the seq-aware L0→L1
         // merge. Layer/file recency is NOT used to pick the winner: an out-of-order
         // ro→L0 flush (file `created_at_ms` is set at flush time, which can run out
         // of seal/seq order) or a GC re-point can leave a lower-seq value in a
-        // "newer" file above a higher-seq tombstone. Resolving by recency was the
-        // *data-loss* direction — value-log GC would treat a higher-seq live value
-        // as dead (a newer-file lower-seq tombstone shadowing it) and drop it. The
+        // "newer" file above a higher-seq tombstone. Resolving by recency would read
+        // a higher-seq live value as dead (a newer-file lower-seq tombstone
+        // shadowing it). The
         // map carries each key's best `(value-or-tombstone, seq)`; a later insert
         // wins only if its seq is newer-or-equal. The *capture* order stays
         // newest-first (memtables before SSTables) so a concurrent flush/compaction
@@ -3781,10 +3752,10 @@ impl LSMTree {
 
         // 2. Level-0 SSTable files (newer than L1, older than the memtables). This
         //    step is essential for correctness: L0 holds data flushed off the
-        //    memtable/read-only layer but not yet compacted into L1 — including
-        //    tombstones. Omitting L0 makes a flushed tombstone invisible to GC, so
-        //    GC resurrects a deleted key still live in L1, and can drop a live key
-        //    that exists only in L0. Captured guards are read oldest-file-first per
+        //    memtable/read-only layer but not yet merged into L1, tombstones
+        //    included. Without L0 a flushed tombstone would be invisible, so a key
+        //    deleted but still live in L1 would count as live, and a live key that
+        //    exists only in L0 would be missed. Captured guards are read oldest-file-first per
         //    bucket so newer L0 entries (and tombstones) shadow older ones.
         {
             let l0_ref = &l0_guards;
@@ -3905,7 +3876,7 @@ impl LSMTree {
         Ok(kvs)
     }
 
-    /// Cleanup old read-only memtables that were deferred from previous compaction
+    /// Release the retired read-only memtables that have no readers left.
     fn cleanup_pending_memtables(&self) {
         let mut pending = self.pending_old_memtables.write();
 
@@ -3914,7 +3885,9 @@ impl LSMTree {
         pending.extend(still_in_use);
     }
 
-    /// Defer cleanup of old read-only memtables to next compaction
+    /// Take the flushed read-only memtables older than the current version off
+    /// the read path: drop those with no readers, and retire the rest until a
+    /// later [`cleanup_pending_memtables`](Self::cleanup_pending_memtables).
     fn defer_old_memtables_cleanup(&self) -> Result<()> {
         let version = self.ro_memtable_version.load(Ordering::SeqCst);
 
@@ -3938,14 +3911,13 @@ impl LSMTree {
         Ok(())
     }
 
-    /// Cleanup all pending memtables on database close
-    /// Called during database shutdown to ensure cleanup happens
     /// Test-only: hold the active memtable, so a flush of this tree waits.
     #[cfg(test)]
     pub(crate) fn hold_memtable(&self) -> impl Sized + '_ {
         self.memtable.write()
     }
 
+    /// Release every retired read-only memtable, at database close.
     pub(crate) fn cleanup_pending_memtables_on_close(&self) {
         let mut pending = self.pending_old_memtables.write();
         let count = pending.len();
@@ -3989,7 +3961,7 @@ impl LSMTree {
 }
 
 /// In-memory (non-SSTable) statistics about an LSM tree: the live state that
-/// the manifest snapshot ([`LSMTree::build_manifest_snapshot`]) does not capture.
+/// the manifest snapshot (`LSMTree::build_manifest_snapshot`) does not capture.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct LSMStats {
     /// Live entries in the active memtable.
@@ -4026,16 +3998,15 @@ mod tests {
 
     // The entry CRC covers only the body, so it cannot detect a *layout* change:
     // the bytes are identical and only their interpretation differs. That is why
-    // SSTable files carry a magic + format version — without one, a database
-    // written before the `seq` widening would pass CRC and then be reinterpreted
-    // under the new layout, yielding garbage pointers instead of an error.
-    // These pin the guard that makes such a file fail loudly.
+    // SSTable files carry a magic + format version: without one, a file in
+    // another layout would pass the CRC and be misread, yielding garbage pointers
+    // instead of an error. These pin the guard that makes such a file fail loudly.
     #[test]
     fn test_pre_header_sstable_is_rejected_not_misread() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("legacy.dat");
 
-        // A file in the old headerless format: entry frames straight from offset 0.
+        // A file without a header: entry frames straight from offset 0.
         {
             let entry = SStableEntry {
                 key: b"k".to_vec(),
@@ -4093,7 +4064,7 @@ mod tests {
             lsm.compact_all()?; // → a real, header-bearing L1 file
         }
 
-        // Strip the header to simulate a file written before headers existed.
+        // Strip the header, leaving a file this build cannot identify.
         let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
         let l1 = LSMTree::level1_path_from(temp_dir.path(), bucket);
         let body = std::fs::read(&l1)?;
@@ -4111,13 +4082,13 @@ mod tests {
 
     // A frame's 4-byte length prefix sits *outside* the entry CRC (which covers only
     // the body), so a flipped bit there is undetectable until after the payload has
-    // been read — and the readers used to allocate from it first. A corrupt length
-    // could therefore request up to 4 GiB from a file of a few dozen bytes.
+    // been read. A reader that allocated from it first could request up to 4 GiB
+    // from a file of a few dozen bytes.
     //
-    // Both the old and new code end in an error here, so the assertion has to be on
-    // *which* error: the guard reports the impossible length itself, whereas an
-    // unguarded reader allocates, tries to fill the buffer, and surfaces an unrelated
-    // `Io(UnexpectedEof)` — having already committed the allocation.
+    // A reader without the guard also ends in an error here, so the assertion has
+    // to be on *which* error: the guard reports the impossible length itself,
+    // whereas an unguarded reader allocates, tries to fill the buffer, and surfaces
+    // an unrelated `Io(UnexpectedEof)`, having already committed the allocation.
     #[test]
     fn test_corrupt_frame_length_is_rejected_before_allocating() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -4160,8 +4131,8 @@ mod tests {
         Ok(())
     }
 
-    // The buffered frame reader must return exactly the frames the per-entry
-    // `read_exact_at` loop did — including frames that straddle a refill boundary
+    // The buffered frame reader must return exactly the frames a per-entry
+    // `read_exact_at` loop returns, including frames that straddle a refill boundary
     // and a frame larger than the maximum read size — starting from a mid-file
     // offset (the sparse-index seek), and end cleanly at EOF.
     #[test]
@@ -4186,8 +4157,8 @@ mod tests {
     }
 
     // EOF inside a frame is corruption, not a clean end: a truncated length prefix
-    // or a truncated body must surface `UnexpectedEof`, exactly as `read_exact_at`
-    // did, rather than silently ending the scan early.
+    // or a truncated body must surface `UnexpectedEof`, as `read_exact_at` does,
+    // rather than silently ending the scan early.
     #[test]
     fn test_frame_reader_truncated_frame_is_an_error() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -4297,18 +4268,16 @@ mod tests {
             assert_eq!(lsm.get(b"k")?, Some(0xAAAA), "setup: key should be readable from L1");
         }
 
-        // The key must now live *only* in L1, or this test cannot observe the bug.
+        // The key must now live *only* in L1, or this test cannot observe a loss.
         let l0_dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), bucket);
         let l0_files = std::fs::read_dir(&l0_dir).map(|r| r.count()).unwrap_or(0);
         assert_eq!(l0_files, 0, "setup: no L0 file may remain, or it would mask the loss");
         assert!(std::fs::metadata(&l1)?.len() > SSTABLE_DATA_START, "setup: L1 must hold the entry");
 
-        // The window is only visible *during* a publish — a completed merge removed its
-        // `.old`, so inspecting the final state proves nothing (an earlier version of
-        // this test asserted exactly that and passed against the bug). Watch the L1 path
-        // from another thread while compactions run, and assert it is never absent: that
-        // is precisely the state a crash would freeze, and the state `LSMTree::open`
-        // turns into an empty bucket.
+        // A missing path could only be seen *during* a publish, so inspecting the
+        // final state proves nothing. Watch the L1 path from another thread while
+        // compactions run, and assert it is never absent: that is the state a crash
+        // would freeze, and the state `LSMTree::open` turns into an empty bucket.
         let lsm = Arc::new(LSMTree::open(temp_dir.path(), test_lsm_config())?);
         let stop = Arc::new(AtomicBool::new(false));
         let vanished = Arc::new(AtomicUsize::new(0));
@@ -4354,8 +4323,8 @@ mod tests {
     }
 
     // Reads of a *registered* L0 file skip header validation (`open_registered_l0`),
-    // so `LSMTree::open` is the only thing standing between a pre-header database and
-    // a garbage reinterpretation of its L0 files. This pins that single guard: without
+    // so `LSMTree::open` is the only thing standing between an L0 file in an unknown
+    // layout and a garbage reinterpretation of it. This pins that single guard: without
     // it, the stripped file would be loaded and its entries parsed under the wrong
     // layout, with nothing downstream to notice.
     #[test]
@@ -4416,8 +4385,9 @@ mod tests {
     /// is written under a temporary name and renamed only once complete, so what
     /// a kill leaves is a `.dat.tmp`: open removes it, and since its flush never
     /// retired its WAL entries, replay restores its records. Written in place,
-    /// it was a torn `.dat` that failed every later open (found by
-    /// `acknowledged_writes_survive_repeated_kills`, ~1 kill in 800).
+    /// it would be a torn `.dat` that fails every later open
+    /// (`acknowledged_writes_survive_repeated_kills` hits that about once in 800
+    /// kills).
     #[test]
     fn test_open_removes_a_level0_file_a_kill_left_unfinished() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -4663,15 +4633,13 @@ mod tests {
         Ok(())
     }
 
-    // Regression test for the GC resurrection bug: a relocated value re-inserted
-    // at the key's OLD sequence into the newest layer must NOT shadow a
-    // higher-sequence tombstone that has flushed to an older layer. Before the
-    // seq-aware read resolution (highest-seq-wins across all layers), `get`
-    // early-returned at the first layer holding the key, so this inverted state
-    // resolved to the value and resurrected a deleted key. This constructs the
-    // inverted state directly; production prevents it at the GC re-point guard
+    // A relocated value re-inserted at the key's OLD sequence into the newest
+    // layer must NOT shadow a higher-sequence tombstone that has flushed to an
+    // older layer. A `get` that returned at the first layer holding the key would
+    // resolve this to the value and resurrect a deleted key. The test builds the
+    // inverted state directly; production also prevents it at the GC re-point
     // (seq-aware `get_with_seq` under the bucket lock), so this guards the read
-    // path as defense-in-depth.
+    // path as a second line of defence.
     #[test]
     fn test_repoint_at_old_seq_does_not_resurrect_across_layers() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -4691,17 +4659,13 @@ mod tests {
         Ok(())
     }
 
-    // Regression: a cold key's L1 entry keeps its original seq forever, so the
-    // gap between it and a much-later write to the same key is unbounded. The
-    // sequence width must therefore cover the database's whole lifetime — a
-    // 32-bit seq with RFC-1982 serial comparison silently inverts once the gap
-    // exceeds 2^31 (~2.1B writes, ~2.5 days at 10k writes/s), making the *newer*
-    // write compare as older. The skip list's own justification for a narrow seq
-    // ("the memtable flushes long before 2 billion writes accumulate") holds only
-    // for the memtable and must not be extended to the SSTable levels.
-    //
-    // Symptoms this pins: `get` returns the stale L1 value, and
-    // `merge_level0_to_level1` then bakes it into L1 permanently.
+    // A cold key's L1 entry keeps its original seq forever, so the gap between it
+    // and a much-later write to the same key is unbounded. The sequence width must
+    // therefore cover the database's whole lifetime: a 32-bit seq with wrapping
+    // comparison inverts once the gap exceeds 2^31 (~2.1B writes, ~2.5 days at
+    // 10k writes/s), making the *newer* write compare as older. `get` would then
+    // return the stale L1 value, and `merge_level0_to_level1` would keep it in L1
+    // for good.
     #[test]
     fn test_write_after_huge_seq_gap_beats_cold_l1_entry() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -4748,7 +4712,7 @@ mod tests {
         Ok(())
     }
 
-    // Regression: the read fast-path bound `max_lower_seq` must be initialized
+    // The read fast-path bound `max_lower_seq` must be initialized
     // from L0 files (not just L1) at open. L0 is newer than L1, so an L0-only
     // tombstone's seq would otherwise be missing from the bound after a restart,
     // letting a low-seq active entry wrongly short-circuit above it. This is the
@@ -4798,12 +4762,10 @@ mod tests {
         Ok(())
     }
 
-    // Regression test: a delete tombstone in the active memtable must suppress
-    // the corresponding entry in the SSTable.  The old keys() implementation
-    // added SSTable keys last (without tombstone suppression), so after a flush
-    // deleted keys re-appeared in iterators — causing the vec-index queue worker
-    // to loop forever after restart (WAL recovery flushed queue entries to SSTable,
-    // then cancel_pending_embed tombstones were ignored by keys()).
+    // A delete tombstone in the active memtable must hide the key's entry in an
+    // SSTable. If `keys()` missed it, deleted keys would reappear after a flush:
+    // after a restart, WAL recovery flushes the embed queue's entries to an
+    // SSTable, and the queue worker would keep finding entries already cancelled.
     #[test]
     fn test_keys_excludes_sstable_entry_tombstoned_in_memtable() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -4892,12 +4854,11 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: a failed `merge_level0_to_level1` must not leave a bucket's
+    /// A failed `merge_level0_to_level1` must not leave a bucket's
     /// `compaction_in_progress` flag stuck at `true` (which would make every
-    /// future compaction of that bucket a silent no-op until restart). We force
-    /// the merge to fail by deleting the on-disk L0 file while its in-memory L0
-    /// entry still references it, then assert the flag is cleared and a retry
-    /// actually re-enters the merge.
+    /// future compaction of that bucket a silent no-op until restart). The merge
+    /// is made to fail by corrupting the bucket's registered L0 files, then the
+    /// test asserts the flag is cleared and a retry re-enters the merge.
     #[test]
     fn test_compact_bucket_resets_flag_on_merge_error() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -5363,13 +5324,12 @@ mod tests {
         Ok(())
     }
 
-    // Regression: `get_multiple` must resolve a key by highest `seq` across all
-    // layers, exactly like `get_with_seq` — never by layer order. Value-log GC
-    // decides liveness with `get_multiple`, so a layer-order answer of "deleted"
-    // for a live key makes GC drop its record and unlink the segment: permanent
-    // loss. The inversion (a lower-seq copy in a newer layer) is reachable in
-    // production: a TTL delete allocates its seq before taking the bucket lock, so
-    // it can apply after a higher-seq put has already been sealed below it.
+    // `get_multiple` must resolve a key by highest `seq` across all layers,
+    // exactly like `get_with_seq`, never by layer order. Value-log GC decides
+    // liveness with `get_multiple`, so a layer-order answer of "deleted" for a
+    // live key would make GC drop its record and unlink the segment: permanent
+    // loss. Nothing in the LSM keeps a newer layer's copies at higher seqs, so the
+    // inversion (a lower-seq copy in a newer layer) must resolve correctly.
     //
     // Each case places `high` (seq 20) in an older layer and `low` (seq 10) in a
     // newer one, at every layer boundary the batch path walks.
@@ -5777,10 +5737,9 @@ mod tests {
     // Every multi-key scan must resolve each key exactly as a point read does —
     // highest seq across all layers — never by "the newer layer overwrites". Random
     // writes carry OUT-OF-ORDER seqs, so a lower-seq copy often sits in a newer
-    // layer (the shape a TTL delete racing a put, or a wall-clock step between two
-    // L0 flushes, produces); flushes, compactions and reopens are mixed in. After
-    // every step each scan must equal the brute-force view built from
-    // `reference_get`, including bounded pages small enough to exercise the L1 cap.
+    // layer; flushes, compactions and reopens are mixed in. After every step each
+    // scan must equal the brute-force view built from `reference_get`, including
+    // bounded pages small enough that their window cuts layers short.
     #[test]
     fn test_scans_agree_with_brute_force_resolution() -> Result<()> {
         let mut state = 0xD1B5_4A32_D192_ED03u64;
@@ -5882,9 +5841,9 @@ mod tests {
     }
 
     // The L0 prefix filter compares a key's zero-padded 8-byte `key_prefix`, so a
-    // key shorter than a prefix that ends in 0x00 bytes used to match it — but only
-    // while the key sat in L0; the memtable and L1 paths compare real key bytes.
-    // All three layers must agree that "ab" does not start with "ab\0".
+    // key shorter than a prefix that ends in 0x00 bytes would match it unless the
+    // filter checks the length too; the memtable and L1 paths compare real key
+    // bytes. All three layers must agree that "ab" does not start with "ab\0".
     #[test]
     fn test_scan_prefix_rejects_a_key_shorter_than_the_prefix_in_every_layer() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -5903,8 +5862,8 @@ mod tests {
 
     // Two threads flushing the same read-only memtable must produce ONE L0 file,
     // and both must return only once it is durable. Without the per-memtable flush
-    // lock both wrote it (a duplicate file; in the same millisecond, one file name
-    // with the second `File::create` truncating the first).
+    // lock both would write it (a duplicate file; in the same millisecond, one file
+    // name with the second `File::create` truncating the first).
     /// Records each flush event with the number of L0 files registered at that
     /// moment, reading the tree through a weak handle set after it is built.
     struct EventLog {
@@ -6108,9 +6067,9 @@ mod tests {
 
     // GC relocation re-inserts a key at its existing seq with a new pointer, so the
     // old and relocated copies tie on seq and only L0 file order says which is
-    // newer. File order came from the raw wall clock, so a clock step backwards
-    // between the two flushes inverted it: every read (and the L0→L1 merge) chose
-    // the stale pointer, whose segment GC then unlinks. Simulated here by moving
+    // newer. Were file order taken from the raw wall clock, a clock step backwards
+    // between the two flushes would invert it: every read (and the L0→L1 merge)
+    // would choose the stale pointer, whose segment GC then unlinks. Simulated here by moving
     // the first file's stamp into the future — the state a clock step leaves
     // behind — and reopening, which also checks the stamp floor is seeded from
     // disk.
@@ -6153,13 +6112,13 @@ mod tests {
         Ok(())
     }
 
-    // ── scan_prefix tombstone regression ──────────────────────────────────────
+    // ── scan_prefix and tombstones ─────────────────────────────────────────────
 
     #[test]
     fn test_scan_prefix_deleted_after_flush_returns_none() -> Result<()> {
-        // Regression: before the fix, scan_prefix used the active memtable's live
-        // iterator (which skips tombstones), so a key deleted after a flush still
-        // appeared in prefix-scan results because the SSTable entry was not shadowed.
+        // A key deleted after a flush must not appear: the active memtable's
+        // tombstone must hide its SSTable entry, which a memtable iterator that
+        // skips tombstones would miss.
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
@@ -6195,11 +6154,10 @@ mod tests {
         Ok(())
     }
 
-    // ── scan_prefix L0-vs-L1 regressions ──────────────────────────────────────
-    // scan_prefix_in_bucket used to scan L0 then L1 into one flat live-only Vec,
-    // dropping tombstones and letting the older L1 entry overwrite the newer L0
-    // one in the caller's merge. These cover the L0/L1 interactions that the
-    // memtable/read-only-only tests above never exercised.
+    // ── scan_prefix across L0 and L1 ──────────────────────────────────────────
+    // A newer L0 entry or tombstone must win over the older L1 copy of its key,
+    // which needs both layers' copies, tombstones included, resolved by seq. These
+    // cover the L0/L1 cases the memtable tests above do not reach.
 
     #[test]
     fn test_scan_prefix_sees_l0_only_data() -> Result<()> {
@@ -6357,9 +6315,8 @@ mod tests {
 
     #[test]
     fn scan_across_l0_and_l1_after_partial_flush() -> Result<()> {
-        // Some keys in L1, a newer overlapping batch in L0 (no min/max there): the
-        // scan must still merge both. Exercises the "L1 skipped/seeked, L0 always
-        // scanned" split.
+        // Some keys in L1, a newer overlapping batch in L0: the scan must merge
+        // both, with the L0 overwrite winning.
         let temp = TempDir::new()?;
         let lsm = LSMTree::open(temp.path(), test_lsm_config())?;
         for seq in 0..100u64 {
@@ -6424,7 +6381,7 @@ mod tests {
         Ok(())
     }
 
-    /// `merge_scan_layers` sorts by `key_head` and then the key; that must be the
+    /// `merge_scan_layers` orders by `key_head` and then the key; that must be the
     /// keys' byte order, including keys that are prefixes of others, zero bytes
     /// where padding sits, and keys on both sides of 16 bytes.
     #[test]
@@ -6742,12 +6699,12 @@ mod tests {
     //   cargo test -p minnal_db --lib scan_latency_benchmark -- --ignored --nocapture
     //
     // It lives here (not in `benches/`) on purpose: building an exact L0+L1 state is
-    // only possible through the crate-internal `LSMTree` flush methods — the public
-    // `Db` facade only flushes to SSTables via the background worker, so a criterion
+    // only possible through the crate-internal `LSMTree` flush methods: the public
+    // `AsyncDb` flushes to SSTables only through its background worker, so a criterion
     // bench cannot construct these states deterministically. The full scans show
     // throughput per layer; the *selective* scans show the L1 min/max skip +
     // sparse-index seek (a bounded slice out of a large L1 should not read the whole
-    // file), which the memtable-resident timings never exercised.
+    // file), which memtable-resident timings cannot show.
 
     /// Insert `k:{seq:06}` for `seq` in `0..total`, all left in the active memtable.
     fn bench_state_memtable(total: u64) -> (TempDir, LSMTree) {
@@ -6847,13 +6804,12 @@ mod tests {
         }
     }
 
-    // ── scan_prefixes tombstone regressions ───────────────────────
+    // ── scan_prefixes and tombstones ──────────────────────────────
 
     #[test]
     fn test_scan_prefixes_deleted_after_flush() -> Result<()> {
-        // Regression: before the fix, scan_prefixes used the active
-        // memtable's live-only iterator, so a key deleted after a flush still
-        // appeared because the SSTable entry was never shadowed by the tombstone.
+        // A key deleted after a flush must not appear: the active memtable's
+        // tombstone must hide its SSTable entry.
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
@@ -6961,12 +6917,11 @@ mod tests {
         Ok(())
     }
 
-    // ── range_keys_bounded tombstone regressions ──────────────────────────────
+    // ── range pages and tombstones ────────────────────────────────────────────
 
     #[test]
-    fn test_range_keys_bounded_deleted_after_flush() -> Result<()> {
-        // Regression: before the fix, range_keys_bounded scanned SSTables last and
-        // used blind set-insert, so a key deleted after a flush still appeared.
+    fn test_range_keys_deleted_after_flush() -> Result<()> {
+        // A key deleted after a flush must not appear in a range page.
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
@@ -6986,7 +6941,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_keys_bounded_tombstone_in_ro_memtable() -> Result<()> {
+    fn test_range_keys_tombstone_in_ro_memtable() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
@@ -7004,7 +6959,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_keys_bounded_delete_then_reinsert() -> Result<()> {
+    fn test_range_keys_delete_then_reinsert() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
@@ -7019,7 +6974,7 @@ mod tests {
         Ok(())
     }
 
-    // ── range_pointers_bounded tombstone regressions ─────────────────────
+    // ── range_pointers_bounded and tombstones ────────────────────────────
 
     #[test]
     fn test_range_pointers_bounded_deleted_after_flush() -> Result<()> {
@@ -7089,7 +7044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_keys_bounded_sees_l0_only_data() -> Result<()> {
+    fn test_range_keys_sees_l0_only_data() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
@@ -7126,7 +7081,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_keys_bounded_l0_tombstone_suppresses_l1() -> Result<()> {
+    fn test_range_keys_l0_tombstone_suppresses_l1() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
@@ -7206,7 +7161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_keys_bounded_limit_respected_with_l0() -> Result<()> {
+    fn test_range_keys_limit_respected_with_l0() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
@@ -7260,9 +7215,9 @@ mod tests {
         Ok(())
     }
 
-    /// Keys-only twin of the tombstone-slack test.
+    /// Keys-only twin of `test_range_pointers_bounded_page_not_shorted_by_newer_tombstones`.
     #[test]
-    fn test_range_keys_bounded_page_not_shorted_by_newer_tombstones() -> Result<()> {
+    fn test_range_keys_page_not_shorted_by_newer_tombstones() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(
             temp_dir.path(),
@@ -7291,7 +7246,7 @@ mod tests {
     /// come back full; a window that stopped growing would read only tombstones there
     /// and short the page.
     #[test]
-    fn test_range_pointers_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
+    fn test_range_pointers_bounded_skip_clustered_tombstones() -> Result<()> {
         let num_buckets = 8;
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(
@@ -7333,8 +7288,8 @@ mod tests {
             lsm.delete(k)?;
         }
 
-        // Scan the "a" range: only bucket 0 has in-range keys, so its per-bucket cap is what
-        // gates the page. limit=15 needs the cap to reach past all 20 head tombstones.
+        // Scan the "a" range: only bucket 0 has in-range keys, so its window is what
+        // gates the page. limit=15 needs the window to reach past all 20 head tombstones.
         let pairs = lsm.range_pointers_bounded(b"a", Some(b"b"), 15)?;
         let keys: Vec<Vec<u8>> = pairs.iter().map(|(k, _, _)| k.clone()).collect();
         assert_eq!(
@@ -7351,9 +7306,9 @@ mod tests {
         Ok(())
     }
 
-    /// Keys-only twin of the clustered-tombstone per-bucket-slack test.
+    /// Keys-only twin of `test_range_pointers_bounded_skip_clustered_tombstones`.
     #[test]
-    fn test_range_keys_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
+    fn test_range_keys_skip_clustered_tombstones() -> Result<()> {
         let num_buckets = 8;
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(
@@ -7431,8 +7386,8 @@ mod tests {
     }
 
     /// A full cursor walk with small pages, over multiple buckets with scattered deletes,
-    /// must return exactly the same ordered set as one unbounded scan — the bounded
-    /// per-bucket L1 cap must never drop or duplicate a live key across page boundaries.
+    /// must return exactly the same ordered set as one unbounded scan: the windowed
+    /// read must never drop or duplicate a live key across page boundaries.
     #[test]
     fn test_bounded_page_walk_matches_unbounded_reference() -> Result<()> {
         let temp_dir = TempDir::new()?;

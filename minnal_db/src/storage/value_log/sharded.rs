@@ -50,8 +50,8 @@ pub type Result<T> = std::result::Result<T, ShardedValueLogError>;
 /// ```
 ///
 /// `value_len` rides along so a read is **one `pread` of exactly
-/// `header + value_len` bytes** — there is no page header to consult and no slot
-/// table to walk. `segment_id == 0` is the reserved "no value" sentinel.
+/// `header + value_len` bytes**, with nothing to look up first.
+/// `segment_id == 0` is the reserved "no value" sentinel.
 ///
 /// Segment ids are **never reused**, so an address identifies one record for the
 /// life of the database: a pointer GC has superseded still resolves to the same

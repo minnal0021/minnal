@@ -1,3 +1,8 @@
+//! The memtable's sorted map: a skip list from byte keys to `u128` value-log
+//! pointers, where every entry carries the write sequence that produced it and
+//! a tombstone flag. Conflicting writes to one key resolve to the higher
+//! sequence, so the winner in memory is the one WAL replay would pick.
+
 #[allow(clippy::module_inception)]
 pub mod skip_list {
     use crate::support::key_prefix_of;
@@ -24,34 +29,26 @@ pub mod skip_list {
         CapacityExceeded,
     }
 
-    // key_index_offset is the offset (start index) into the skip list’s keys: Vec<u8> arena where this node’s key bytes are stored.
-    // In this implementation, keys aren’t stored as Vec<u8> per node (which would allocate per entry).
-    // Instead, all key bytes are appended into one contiguous buffer (SkipList.keys), and each node stores a slice descriptor:
-    // key_index_offset: u32 → start position in self.keys
-    // key_length: u32 → length of the key
-    // Then the real key for a node is obtained via:
-    // key_slice(node):
-    // start = n.key_index_offset as usize
-    // end = start + n.key_length as usize
-    // returns &self.keys[start..end]
-
-    ///links_index_offset is the start offset (index) into the skip list’s links: Vec<u32> arena where this node’s forward pointers (“tower”) are stored.
-    // The implementation stores all forward-links for all nodes in one contiguous Vec<u32> (an arena), instead of Vec<u32> per node. Each node then needs two things to locate its links:
-    // links_index_offset: u32 → the first index in self.links for this node
-    // height: u8 → how many levels this node actually has (how many forward pointers it owns)
-    // So for a given node:
-    // the forward pointer at level lvl lives at:
-    // self.links[node.links_index_offset as usize + lvl]
-    // but only if lvl < node.height (otherwise that node has no link at that level)
+    /// One entry. A node owns no allocation: its key bytes live in the list's
+    /// shared key arena (`SkipList::keys`) and its forward links in the shared
+    /// link arena (`SkipList::links`), so an insert appends to three vectors
+    /// instead of allocating per entry.
     #[derive(Clone, Debug)]
     struct Node {
+        /// Where the key starts in the key arena: the key is
+        /// `keys[key_index_offset..key_index_offset + key_length]`.
         key_index_offset: u32,
         key_length: u32,
+        /// The key's first 8 bytes as an integer, so most comparisons are
+        /// settled without reading the arena.
         key_prefix: u64,
         value: u128,
         tombstone: bool,
         sequence: u64,
+        /// How many levels the node is linked at (its number of forward links).
         height: u8,
+        /// Where the node's forward links start in the link arena: the link at
+        /// level `l` (for `l < height`) is `links[links_index_offset + l]`.
         links_index_offset: u32,
     }
 
@@ -140,14 +137,10 @@ pub mod skip_list {
         /// to the higher sequence.
         ///
         /// The sequence is carried at its full `u64` width, so this is a plain
-        /// comparison. It previously stored a `u32` truncation and compared with
-        /// wrapping serial-number ("RFC 1982") arithmetic, which is only valid
-        /// while the two values are within 2^31 of each other. That held for the
-        /// memtable (it flushes long before 2 billion writes accumulate) but the
-        /// same comparison also governed the SSTable levels, where it does *not*
-        /// hold: an L1 entry keeps its original sequence for the lifetime of the
-        /// database, so the gap to a later write of the same key is unbounded.
-        /// **Do not narrow the sequence again** — see
+        /// comparison. **Do not narrow it** to a smaller, wrapping type: an L1
+        /// entry keeps its sequence for the life of the database, so the gap to a
+        /// later write of the same key is unbounded, and a wrapping comparison
+        /// would rank that newer write as older. See
         /// `tree::test_write_after_huge_seq_gap_beats_cold_l1_entry`.
         #[inline]
         fn seq_is_newer_or_equal(new: u64, existing: u64) -> bool {
@@ -206,10 +199,9 @@ pub mod skip_list {
         /// write sequence), with **highest-sequence-wins** conflict resolution.
         ///
         /// If the key already exists with a *newer* sequence, the write is
-        /// dropped (returns `Ok(None)`) — this is what makes the in-memory winner
-        /// for two racing writes to one key identical to the winner recovery
-        /// would pick (it replays in sequence order), closing the live-vs-recovery
-        /// divergence for concurrent same-key writes.
+        /// dropped (returns `Ok(None)`). So the in-memory winner of two racing
+        /// writes to one key is the one recovery picks (it replays in sequence
+        /// order), and a value seen live survives a crash.
         pub fn try_insert_with_seq(&mut self, key: &[u8], value: u128, seq: u64) -> Result<Option<u128>, InsertError> {
             let (found, update) = self.find_path(key);
 
@@ -484,7 +476,7 @@ pub mod skip_list {
 
         /// Iterates over all entries including tombstones, yielding `(key, value, seq, tombstone)`.
         ///
-        /// Intended for merge/compaction logic. Use `iter()` for normal live-entry access.
+        /// Flushes and scans use it: a tombstone must reach the older layers it shadows.
         pub fn iter_raw(&self) -> IterRaw<'_> {
             IterRaw {
                 list: self,
@@ -569,8 +561,6 @@ pub mod skip_list {
     }
 
     /// Iterates over all nodes (including tombstones) yielding `(key, value, seq, tombstone)`.
-    ///
-    /// Used by merge/compaction logic. For normal use, prefer `iter()`.
     pub struct IterRaw<'a> {
         list: &'a SkipList,
         current: u32,
@@ -808,12 +798,11 @@ pub mod skip_list {
         fn insert_tombstone_seq_comparison_spans_the_whole_sequence_space() {
             // Sequences are compared at full u64 width, so an arbitrarily large
             // gap between a tombstone and a later write still resolves correctly.
-            // (This replaced a u32-wraparound test: the truncation it tolerated is
-            // exactly what let a newer write lose to an older entry.)
+            // A truncated, wrapping comparison would let the newer write lose.
             let mut sl = SkipList::new();
             let old = 1_000u64;
             sl.insert_tombstone_with_seq(b"k", old).unwrap();
-            // Far beyond the old 2^31 serial-comparison window.
+            // Further apart than 2^31, where a wrapping 32-bit comparison inverts.
             sl.try_insert_with_seq(b"k", 1, old + 3_000_000_000).unwrap();
             assert_eq!(sl.get_value(b"k"), Some(1), "a much-later write must beat the tombstone");
             sl.insert_tombstone_with_seq(b"k", old + 6_000_000_000).unwrap();
@@ -889,8 +878,8 @@ pub mod skip_list {
 
         #[test]
         fn seq_comparison_spans_the_whole_sequence_space() {
-            // The comparison must hold across a gap far wider than the 2^31 window
-            // the old truncated-u32 serial arithmetic could represent.
+            // The comparison must hold across a gap far wider than 2^31, the most
+            // a wrapping 32-bit comparison can order.
             let mut sl = SkipList::new();
             sl.try_insert_with_seq(b"k", 1, 1_000).unwrap();
             sl.try_insert_with_seq(b"k", 2, 1_000 + 3_000_000_000).unwrap();
@@ -998,7 +987,7 @@ pub mod skip_list {
         fn zero_value_is_valid() {
             let mut sl = SkipList::new();
 
-            // value=0 is now a valid data value
+            // 0 is a valid value: a tombstone is a flag, not a reserved value.
             assert!(sl.insert(b"a", 0));
             assert_eq!(sl.get_value(b"a"), Some(0));
 

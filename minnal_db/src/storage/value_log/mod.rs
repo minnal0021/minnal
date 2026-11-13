@@ -12,9 +12,9 @@
 //!   has since re-pointed still resolves to *that key's own bytes* (GC preserves a
 //!   key's sequence when it relocates the record), and a pointer into a segment GC
 //!   has already deleted fails loudly with [`ValueLogError::SegmentMissing`] —
-//!   never silently to a *different* key's record. Readers therefore need no
-//!   seqlock and no stale-slot detection: on `SegmentMissing` they re-resolve
-//!   through the LSM and retry.
+//!   never silently to a *different* key's record. So a reader needs no check
+//!   that its pointer is still current: on `SegmentMissing` it re-resolves the
+//!   key through the LSM and retries.
 //! - GC's unit is a segment, not the whole bucket. It rewrites one sealed
 //!   segment's survivors and unlinks the file; it never copies untouched data and
 //!   never rewrites a file in place.
@@ -36,11 +36,10 @@
 //!
 //! Records carry **no tombstone/updated flags** — the LSM is the sole authority on
 //! what is live. When a write displaces an older record the writer just adds that
-//! record's size to its segment's garbage counter: it already holds the old
-//! pointer, and the pointer carries `value_len`, so the accounting costs **zero
-//! I/O** (the old design did a read-modify-write of a record header at a random,
-//! possibly-cold offset on *every* overwrite and delete). The counters are a *hint*
-//! for GC selection; the exact live set always comes from the LSM.
+//! record's size to its segment's garbage counter: it already holds the
+//! displaced pointer, and the pointer carries `value_len`, so the accounting
+//! costs **zero I/O** and no record on disk is ever touched again. The counters
+//! are a *hint* for GC selection; the exact live set always comes from the LSM.
 
 pub mod sharded;
 
@@ -102,10 +101,9 @@ const MAX_SEGMENT_SIZE_BYTES: u64 = u32::MAX as u64;
 
 /// Validate a configured segment size.
 ///
-/// Unlike the page size it replaces, this is **not** fixed at creation: a
-/// segment's size is not encoded in any pointer (only its id and a byte offset
-/// are), so existing segments keep the size they were written at and new ones use
-/// whatever is configured now.
+/// The segment size is **not** fixed at creation: no pointer encodes a segment's
+/// size (only its id and a byte offset), so existing segments keep the size they
+/// were written at and new ones use whatever is configured now.
 pub fn validate_segment_size(segment_size: u64) -> Result<()> {
     if !(MIN_SEGMENT_SIZE_BYTES..=MAX_SEGMENT_SIZE_BYTES).contains(&segment_size) || !segment_size.is_multiple_of(SEGMENT_SIZE_ALIGNMENT) {
         return Err(ValueLogError::InvalidSegmentSize(segment_size));
@@ -171,7 +169,7 @@ pub struct ValueRecordMeta {
     /// Creation time in Unix millis. TTL expiry reads this straight from the record.
     pub epoch: u64,
     /// The global write sequence that produced this record. GC preserves it when it
-    /// relocates a record. Reads no longer verify it: a segment id is never reused,
+    /// relocates a record. Reads do not check it: a segment id is never reused,
     /// so a pointer can never resolve to a different write.
     pub seq: u64,
 }
@@ -370,10 +368,9 @@ impl ValueLogMetadata {
         Ok(out)
     }
 
-    /// Decode metadata. An older version is **rejected, never upgraded**: the
-    /// segmented value log is a hard format break (segment files, keys in records, a
-    /// re-meaning of the value pointer), so an old file cannot be reinterpreted —
-    /// only misread. The caller rebuilds from the segment files instead.
+    /// Decode metadata. A file of any other version is **rejected, never
+    /// upgraded**; the caller then rebuilds the accounting from the segment files
+    /// and the LSM's pointers.
     fn from_file_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 16 || bytes.get(0..4) != Some(&VALUE_LOG_METADATA_MAGIC) {
             return Err(ValueLogError::Serialization("value log metadata: bad magic".into()));
@@ -972,8 +969,7 @@ impl ValueLog {
     }
 
     /// Read many of this bucket's values. Grouped by segment so each file is opened
-    /// once; one `pread` per value (there is no shared page header or slot directory
-    /// left to amortise — there isn't one).
+    /// once; one `pread` per value.
     pub fn read_values_batch(&self, entries: &[(usize, ValueLocation)]) -> Vec<BatchValue> {
         let mut out = Vec::with_capacity(entries.len());
         let mut by_segment: HashMap<u32, Vec<(usize, ValueLocation)>> = HashMap::new();
@@ -1022,7 +1018,7 @@ impl ValueLog {
         // planned before anything is read so `out` can be sized once: a run
         // also reads the gaps between its records, so the records' own sizes
         // undercount it, and growing a buffer of tens of megabytes copies all of
-        // it (12% of a 4-bit Pass-1 search before this).
+        // it (measured at 12% of a 4-bit first-pass semantic search).
         let mut planned: Vec<PlannedSegment> = Vec::with_capacity(by_segment.len());
         let mut total = 0usize;
         for (segment_id, mut group) in by_segment {
@@ -1124,8 +1120,8 @@ impl ValueLog {
     /// Is there anything for GC to actually do in this bucket?
     ///
     /// Cheap (in-memory counters) and exact enough to keep the GC worker from waking on a
-    /// bucket whose garbage it cannot collect — which is what made a small, fully-deleted
-    /// namespace log "starting GC ... reclaimed 0 bytes" on every tick.
+    /// bucket whose garbage it cannot collect; without it a small, fully deleted
+    /// namespace would log "starting GC ... reclaimed 0 bytes" on every tick.
     pub fn has_gc_work(&self, segment_threshold_pct: f64, tail_threshold_pct: f64) -> bool {
         !self.gc_candidates(segment_threshold_pct).is_empty() || self.tail_needs_sealing(tail_threshold_pct)
     }
@@ -1306,8 +1302,7 @@ impl ValueLog {
     }
 
     /// Physical bytes this bucket occupies on disk: the sum of its segment files.
-    /// (Segments are dense, appended files — there are no sparse holes to reason
-    /// about any more.)
+    /// Segments are dense, appended files, so this is exact.
     pub fn disk_bytes(&self) -> u64 {
         self.inner
             .read()
@@ -1678,9 +1673,9 @@ mod tests {
 
     #[test]
     fn a_corrupted_value_is_detected_when_checksums_are_verified() -> Result<()> {
-        // Regression: values carry a CRC32 of their payload, and `verify_checksums_on_read`
-        // makes reads re-check it. Without this the structural checks (length, offset)
-        // would happily serve bit-rotted bytes.
+        // Values carry a CRC32 of their payload, and `verify_checksums_on_read`
+        // makes reads re-check it. Without it the structural checks (length, offset)
+        // would serve bit-rotted bytes.
         let dir = TempDir::new()?;
         let log = ValueLog::open(dir.path(), 0, SEG)?;
         let loc = log.append(b"k", b"the-original-value", meta(1), true)?;
@@ -1832,8 +1827,8 @@ mod tests {
         // count undercounts that segment's garbage — and the from-LSM rebuild multiplies
         // the error, since it derives `garbage = total_bytes - live`. Open must reconcile
         // total_bytes to the file length, and re-seal the rolled segment, before the
-        // rebuild runs. (The existing rebuild test only covers a *missing* metadata file,
-        // where the whole persisted view is discarded.)
+        // rebuild runs. (`stats_rebuild_from_the_lsm_when_metadata_is_lost` covers only
+        // a *missing* metadata file, where the whole persisted view is discarded.)
         let dir = TempDir::new()?;
         let value = vec![0x42; 20 * 1024];
         let rec = ValueRecordHeader::record_len(b"k0".len(), value.len());
