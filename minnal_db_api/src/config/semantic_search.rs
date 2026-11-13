@@ -138,9 +138,6 @@ pub struct MaintenanceSection {
     pub rebuild_threads: Option<usize>,
 }
 
-/// Default maintenance threads per process.
-pub const DEFAULT_MAINTENANCE_THREADS: usize = 2;
-
 impl MaintenanceSection {
     fn spec(&self) -> minnal_db::doc_store::schema::vector_settings::MaintenanceSpec {
         use minnal_db::doc_store::schema::vector_settings::{MaintenanceSpec, Ratio};
@@ -158,7 +155,7 @@ impl MaintenanceSection {
 
     /// Maintenance threads, defaulted and checked (1–64).
     pub fn threads(&self) -> Result<usize, String> {
-        let t = self.threads.unwrap_or(DEFAULT_MAINTENANCE_THREADS);
+        let t = self.threads.unwrap_or(minnal_db::defaults::semantic_search::maintenance::THREADS);
         if !(1..=64).contains(&t) {
             return Err(format!("maintenance.threads must be between 1 and 64, got {t}"));
         }
@@ -169,7 +166,9 @@ impl MaintenanceSection {
     /// [`MAX_REBUILD_THREADS`](minnal_db::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS)).
     pub fn rebuild_threads(&self) -> Result<usize, String> {
         let max = minnal_db::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS;
-        let t = self.rebuild_threads.unwrap_or(max);
+        let t = self
+            .rebuild_threads
+            .unwrap_or(minnal_db::defaults::semantic_search::maintenance::REBUILD_THREADS);
         if !(1..=max).contains(&t) {
             return Err(format!("maintenance.rebuild_threads must be between 1 and {max}, got {t}"));
         }

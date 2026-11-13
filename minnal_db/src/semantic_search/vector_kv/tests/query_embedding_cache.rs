@@ -12,7 +12,7 @@ async fn open_db(dir: &TempDir) -> AsyncDb {
 }
 
 /// TTL used by the cache round-trip tests.
-const TEST_TTL: Duration = DEFAULT_QUERY_EMBEDDING_CACHE_TTL;
+const TEST_TTL: Duration = crate::defaults::semantic_search::QUERY_EMBEDDING_CACHE_TTL;
 const MODEL: &str = "gemma";
 
 // ── Encoding helpers ──────────────────────────────────────────────────────

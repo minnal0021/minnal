@@ -31,6 +31,7 @@
 //! [`DocStoreSchema`]: crate::doc_store::DocStoreSchema
 //! [`KvStoreSchema`]: crate::doc_store::schema::kv::KvStoreSchema
 
+use crate::defaults;
 use serde::{Deserialize, Serialize};
 
 /// A vector-index setting that was rejected. The document store reports these
@@ -56,74 +57,36 @@ pub enum VectorSettingsError {
     NotConfigured { namespace: String },
 }
 
-/// Model used when a namespace does not name one.
-pub const DEFAULT_EMBEDDING_MODEL: &str = "gemma";
 /// Longest accepted model name.
 pub const MAX_EMBEDDING_MODEL_LEN: usize = 64;
-/// Dimension used when a namespace does not give one.
-pub const DEFAULT_EMBEDDING_DIM: u32 = 768;
 /// Smallest dimension the rotation supports.
 pub const MIN_EMBEDDING_DIM: u32 = 8;
 /// Largest accepted dimension.
 pub const MAX_EMBEDDING_DIM: u32 = 4096;
-/// Default sentences per document chunk.
-pub const DEFAULT_WINDOW_SIZE: u32 = 4;
 /// Largest accepted chunk window, in sentences.
 pub const MAX_WINDOW_SIZE: u32 = 64;
-/// Default step between document chunks, in sentences.
-pub const DEFAULT_SLIDING_SIZE: u32 = 2;
-/// Rotation seed a new namespace gets (the same value as
-/// `semantic_search::cluster::DEFAULT_ROTATION_SEED`, pinned together by a test).
-pub const DEFAULT_ROTATION_SEED: u64 = 0x6d69_6e6e_616c_0001;
-/// Default code width of Pass-1 (chunk) codes.
-pub const PASS1_BITS: u8 = 1;
 /// The Pass-1 code widths a namespace can choose when it first enables semantic
 /// search; fixed for the namespace's life after that, like the chunking.
 pub const PASS1_WIDTHS: [u8; 3] = [1, 2, 4];
 /// Code width of Pass-2 (whole-document) codes. Read-only.
-pub const PASS2_BITS: u8 = 8;
+pub const PASS2_BITS: u8 = defaults::schema_vector_index::PASS2_BITS;
 /// What Pass-2 codes are encoded against. Read-only: only the zero centre
 /// (design doc M2c).
 pub const PASS2_CENTRE: &str = "zero";
-/// Default floor on the postings (clusters) a query probes.
-pub const DEFAULT_MIN_PROBES: u32 = 1;
-/// Default postings (clusters) a query probes: its nearest 256, or every
-/// posting of a namespace with fewer. Equal to
-/// `semantic_search::service::DEFAULT_PROBE`'s, pinned together by a test.
-pub const DEFAULT_MAX_PROBES: u32 = 256;
 /// Largest accepted `min_probes` / `max_probes`. A search probes at most the
 /// namespace's posting count, so this is a ceiling, not tied to any centroid
 /// file.
 pub const MAX_PROBES: u32 = 4096;
-/// Default number of candidates Pass 1 hands to Pass 2.
-pub const DEFAULT_FIRST_PASS_TOP_K: u32 = 1000;
 /// Largest accepted Pass-1 cut.
 pub const MAX_FIRST_PASS_TOP_K: u32 = 10_000;
-/// Default number of results a search returns.
-pub const DEFAULT_TOP_K: u32 = 100;
 /// Largest accepted result count (the API's result-limit cap).
 pub const MAX_TOP_K: u32 = 1000;
-/// Default target posting size, in chunks: a posting splits above twice this
-/// (design doc M3, *Levers and configuration*).
-pub const DEFAULT_TARGET_POSTING_SIZE: u32 = 128;
 /// Accepted `target_posting_size` range.
 pub const MIN_TARGET_POSTING_SIZE: u32 = 16;
 /// Accepted `target_posting_size` range.
 pub const MAX_TARGET_POSTING_SIZE: u32 = 65_536;
-/// Default number of nearest postings re-checked after a split (SPFresh §5.5).
-pub const DEFAULT_REASSIGN_RANGE: u32 = 64;
 /// Largest accepted `reassign_range`.
 pub const MAX_REASSIGN_RANGE: u32 = 1024;
-/// Default merge limit as a share of the split limit: SPFresh's 10 / 118.
-pub const DEFAULT_MERGE_RATIO: f64 = 10.0 / 118.0;
-/// Default members sampled per balanced 2-means iteration (SPTAG).
-pub const DEFAULT_SPLIT_SAMPLES: u32 = 1000;
-/// Default random starting pairs tried by balanced 2-means (SPTAG).
-pub const DEFAULT_SPLIT_INIT_TRIALS: u32 = 3;
-/// Default iteration cap of balanced 2-means (SPTAG).
-pub const DEFAULT_SPLIT_MAX_ITERS: u32 = 100;
-/// Default balance factor of balanced 2-means: `λ ≤ 1 / (factor · samples)` (SPTAG).
-pub const DEFAULT_SPLIT_LAMBDA_FACTOR: f64 = 100.0;
 
 /// A real-valued setting (a share or a factor). Compared by bit pattern so the
 /// settings can stay `Eq`; validation keeps it finite.
@@ -311,14 +274,14 @@ pub struct MaintenanceSettings {
 impl Default for MaintenanceSettings {
     fn default() -> Self {
         Self {
-            target_posting_size: DEFAULT_TARGET_POSTING_SIZE,
-            reassign_range: DEFAULT_REASSIGN_RANGE,
-            merge_ratio: Ratio(DEFAULT_MERGE_RATIO),
-            skip_uncertain_moves: false,
-            split_samples: DEFAULT_SPLIT_SAMPLES,
-            split_init_trials: DEFAULT_SPLIT_INIT_TRIALS,
-            split_max_iters: DEFAULT_SPLIT_MAX_ITERS,
-            split_lambda_factor: Ratio(DEFAULT_SPLIT_LAMBDA_FACTOR),
+            target_posting_size: defaults::semantic_search::maintenance::TARGET_POSTING_SIZE,
+            reassign_range: defaults::semantic_search::maintenance::REASSIGN_RANGE,
+            merge_ratio: Ratio(defaults::semantic_search::maintenance::MERGE_RATIO),
+            skip_uncertain_moves: defaults::semantic_search::maintenance::SKIP_UNCERTAIN_MOVES,
+            split_samples: defaults::semantic_search::maintenance::SPLIT_SAMPLES,
+            split_init_trials: defaults::semantic_search::maintenance::SPLIT_INIT_TRIALS,
+            split_max_iters: defaults::semantic_search::maintenance::SPLIT_MAX_ITERS,
+            split_lambda_factor: Ratio(defaults::semantic_search::maintenance::SPLIT_LAMBDA_FACTOR),
         }
     }
 }
@@ -437,10 +400,10 @@ pub struct SearchSettings {
 impl Default for SearchSettings {
     fn default() -> Self {
         Self {
-            min_probes: DEFAULT_MIN_PROBES,
-            max_probes: DEFAULT_MAX_PROBES,
-            first_pass_top_k: DEFAULT_FIRST_PASS_TOP_K,
-            top_k: DEFAULT_TOP_K,
+            min_probes: defaults::semantic_search::search_defaults::MIN_PROBES,
+            max_probes: defaults::semantic_search::search_defaults::MAX_PROBES,
+            first_pass_top_k: defaults::semantic_search::search_defaults::FIRST_PASS_TOP_K,
+            top_k: defaults::semantic_search::search_defaults::TOP_K,
         }
     }
 }
@@ -602,7 +565,7 @@ impl VectorIndexSpec {
         // alone is window 1 slide 1; a cut of 50 alone returns at most 50;
         // max_probes 4 alone probes at least 1, min_probes 2000 alone at most
         // 2000). Values the caller gives are checked as given.
-        let window_size = chunking.window_size.unwrap_or(DEFAULT_WINDOW_SIZE);
+        let window_size = chunking.window_size.unwrap_or(defaults::schema_vector_index::WINDOW_SIZE);
         let first_pass_top_k = search.first_pass_top_k.unwrap_or(d.first_pass_top_k);
         let (min_probes, max_probes) = match (search.min_probes, search.max_probes) {
             (Some(min), Some(max)) => (min, max),
@@ -611,15 +574,17 @@ impl VectorIndexSpec {
             (None, None) => (d.min_probes, d.max_probes),
         };
         let settings = VectorIndexSettings {
-            embedding_model: normalise_model(self.embedding_model.as_deref().unwrap_or(DEFAULT_EMBEDDING_MODEL))?,
-            embedding_dim: self.embedding_dim.unwrap_or(DEFAULT_EMBEDDING_DIM),
+            embedding_model: normalise_model(self.embedding_model.as_deref().unwrap_or(defaults::schema_vector_index::EMBEDDING_MODEL))?,
+            embedding_dim: self.embedding_dim.unwrap_or(defaults::schema_vector_index::EMBEDDING_DIM),
             window_size,
-            sliding_size: chunking.sliding_size.unwrap_or(DEFAULT_SLIDING_SIZE.min(window_size)),
-            pass1_bits: quantisation.pass1_bits.unwrap_or(PASS1_BITS),
+            sliding_size: chunking
+                .sliding_size
+                .unwrap_or(defaults::schema_vector_index::SLIDING_SIZE.min(window_size)),
+            pass1_bits: quantisation.pass1_bits.unwrap_or(defaults::schema_vector_index::PASS1_BITS),
             pass2_bits: quantisation.pass2_bits.unwrap_or(PASS2_BITS),
             rotation_seed: match &quantisation.rotation_seed {
                 Some(s) => parse_seed(s)?,
-                None => DEFAULT_ROTATION_SEED,
+                None => defaults::schema_vector_index::ROTATION_SEED,
             },
             pass2_centre: quantisation.pass2_centre.clone().unwrap_or_else(|| PASS2_CENTRE.to_string()),
             search: SearchSettings {
@@ -799,20 +764,13 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "semantic-search")]
-    #[test]
-    fn the_default_probes_match_the_search_default() {
-        let d = crate::semantic_search::service::DEFAULT_PROBE;
-        assert_eq!((DEFAULT_MIN_PROBES as usize, DEFAULT_MAX_PROBES as usize), (d.min_probes, d.max_probes));
-    }
-
     #[test]
     fn rotation_seed_is_hex_fixed_and_defaults_to_the_pinned_value() {
         let s = VectorIndexSpec::default().resolve().unwrap();
-        assert_eq!(s.rotation_seed, DEFAULT_ROTATION_SEED);
+        assert_eq!(s.rotation_seed, defaults::schema_vector_index::ROTATION_SEED);
         let filled = s.to_spec();
         assert_eq!(filled.quantisation.as_ref().unwrap().rotation_seed.as_deref(), Some("0x6d696e6e616c0001"));
-        assert_eq!(filled.resolve().unwrap().rotation_seed, DEFAULT_ROTATION_SEED);
+        assert_eq!(filled.resolve().unwrap().rotation_seed, defaults::schema_vector_index::ROTATION_SEED);
         assert_eq!(spec(r#"{"quantisation":{"rotation_seed":"0X1F"}}"#).resolve().unwrap().rotation_seed, 31);
         for bad in [r#""31""#, r#""0x""#, r#""0xZZ""#, r#""0x11112222333344445""#] {
             assert_eq!(
@@ -826,12 +784,6 @@ mod tests {
             "quantisation.rotation_seed"
         );
         assert!(spec(r#"{"quantisation":{"rotation_seed":"0x6D696E6E616C0001"}}"#).merge_onto(&s).is_ok());
-    }
-
-    #[cfg(feature = "semantic-search")]
-    #[test]
-    fn default_rotation_seed_matches_the_cluster_index() {
-        assert_eq!(DEFAULT_ROTATION_SEED, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED);
     }
 
     #[test]

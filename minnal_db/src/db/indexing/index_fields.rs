@@ -379,7 +379,7 @@ impl Database {
                     // the write path, and an unbounded replay leaves the database
                     // unopenable rather than merely slow.
                     let cap = match self.config.threshold_config.index_blob_backpressure_bytes {
-                        0 => crate::db::config::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+                        0 => crate::defaults::thresholds::INDEX_BLOB_BACKPRESSURE_BYTES,
                         n => n,
                     };
                     let mut compactions = 0usize;

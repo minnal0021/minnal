@@ -138,7 +138,7 @@ impl DocStore {
     pub fn vector_partition_history_ttl(&self) -> std::time::Duration {
         self.semantic_ctx
             .as_ref()
-            .map_or(crate::semantic_search::ivf_split::history::DEFAULT_HISTORY_TTL, |c| {
+            .map_or(crate::defaults::semantic_search::PARTITION_HISTORY_TTL, |c| {
                 c.config.partition_history_ttl
             })
     }

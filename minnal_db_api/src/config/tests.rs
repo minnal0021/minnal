@@ -76,7 +76,10 @@ fn maintenance_and_search_defaults_are_read_and_validated() {
     let cfg: DocStoreApiConfig = toml::from_str(base).unwrap();
     let d = cfg.semantic_search.index_defaults().unwrap();
     assert_eq!(d, minnal_db::doc_store::schema::vector_settings::IndexDefaults::default());
-    assert_eq!(cfg.semantic_search.maintenance.threads().unwrap(), DEFAULT_MAINTENANCE_THREADS);
+    assert_eq!(
+        cfg.semantic_search.maintenance.threads().unwrap(),
+        minnal_db::defaults::semantic_search::maintenance::THREADS
+    );
 
     let toml = format!(
         "{base}[semantic_search.maintenance]\ntarget_posting_size = 256\nskip_uncertain_moves = true\nthreads = 4\n\

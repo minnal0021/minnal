@@ -81,9 +81,6 @@ pub enum ValueLogError {
 
 pub type Result<T> = std::result::Result<T, ValueLogError>;
 
-/// Default size at which a segment is sealed and a new one opened.
-pub const DEFAULT_SEGMENT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
-
 /// The largest `key.len() + value.len()` a segment of `segment_size` bytes can
 /// hold, once the segment header and the per-record header are accounted for.
 ///

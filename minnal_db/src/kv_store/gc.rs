@@ -313,7 +313,7 @@ impl KVStore {
 
     #[allow(dead_code)]
     pub fn garbage_collect(&self) -> Result<GCStats> {
-        self.garbage_collect_with_threshold(DEFAULT_VALUE_LOG_WASTE_THRESHOLD)
+        self.garbage_collect_with_threshold(crate::defaults::thresholds::VALUE_LOG_WASTE_THRESHOLD)
     }
 
     /// Does this namespace have value-log garbage GC can actually collect right now?

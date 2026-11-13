@@ -170,7 +170,7 @@ fn test_recovery_applies_same_key_writes_in_sequence_order() {
     let wal_dir = crate::layout::main_wal_dir(dir.path());
     let wal_meta_path = wal_dir.join(crate::db::wal::METADATA_FILE);
     {
-        let (wal, report) = Wal::open(&wal_dir, crate::db::wal::DEFAULT_SEGMENT_SIZE, FRESH_WAL).unwrap();
+        let (wal, report) = Wal::open(&wal_dir, crate::defaults::wal::SEGMENT_SIZE_BYTES as u32, FRESH_WAL).unwrap();
         let mut tail = report.tail;
 
         // Physical order: seq 5, seq 9, seq 7. Sequence order says seq 9 wins.
@@ -208,7 +208,7 @@ fn test_recovery_reconstructs_wal_tail_past_stale_metadata() {
     let wal_meta_path = wal_dir.join(crate::db::wal::METADATA_FILE);
 
     {
-        let (wal, report) = Wal::open(&wal_dir, crate::db::wal::DEFAULT_SEGMENT_SIZE, FRESH_WAL).unwrap();
+        let (wal, report) = Wal::open(&wal_dir, crate::defaults::wal::SEGMENT_SIZE_BYTES as u32, FRESH_WAL).unwrap();
         let mut tail = report.tail;
 
         wal.append_entry(&WalEntry::new_upsert(b"k1".to_vec(), b"v1".to_vec()).with_sequence(1), &mut tail)

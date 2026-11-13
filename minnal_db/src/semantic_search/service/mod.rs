@@ -66,16 +66,11 @@ static SCORING_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
 
-/// The default probe settings: each query reads its 256 nearest postings
-/// (clusters), or every posting of a namespace with fewer. On FiQA (173k
-/// chunks, about 960 postings, the largest corpus measured) 256 is the smallest
-/// count within 0.001 nDCG of a full read at every cutoff from 10 to 100 on
-/// gemma and qwen; it reads 28% of the entries in 6.4 ms warm (192: up to
-/// 0.0024 behind). SciFact (about 135 postings) is read in full (frozen eval,
-/// 2026-10-19).
+/// The default probe settings, from
+/// [`defaults::semantic_search::search_defaults`](crate::defaults::semantic_search::search_defaults).
 pub const DEFAULT_PROBE: ProbeSettings = ProbeSettings {
-    min_probes: 1,
-    max_probes: 256,
+    min_probes: crate::defaults::semantic_search::search_defaults::MIN_PROBES as usize,
+    max_probes: crate::defaults::semantic_search::search_defaults::MAX_PROBES as usize,
 };
 
 /// Configuration required to call the embedding service.
@@ -151,21 +146,22 @@ pub struct SemanticSearchConfig {
 
 impl Default for SemanticSearchConfig {
     fn default() -> Self {
+        use crate::defaults;
         Self {
-            embedding_service_url: "http://localhost:8001".into(),
-            model_name: "qwen".into(),
-            embedding_dim: 768,
-            top_k_results: 100,
-            number_of_bits_for_dense_quantisation: 8,
-            pass1_bits: 1,
+            embedding_service_url: defaults::semantic_search::EMBEDDING_SERVICE_URL.into(),
+            model_name: defaults::schema_vector_index::EMBEDDING_MODEL.into(),
+            embedding_dim: defaults::schema_vector_index::EMBEDDING_DIM as usize,
+            top_k_results: defaults::semantic_search::search_defaults::TOP_K as usize,
+            number_of_bits_for_dense_quantisation: defaults::schema_vector_index::PASS2_BITS as usize,
+            pass1_bits: defaults::schema_vector_index::PASS1_BITS as usize,
             probe: DEFAULT_PROBE,
-            window_size: 4,
-            sliding_size: 2,
-            first_pass_sparse_search_top_k: 1000,
-            query_embedding_cache_ttl: std::time::Duration::from_secs(86_400),
-            partition_history_ttl: crate::semantic_search::ivf_split::history::DEFAULT_HISTORY_TTL,
-            embedding_request_timeout: std::time::Duration::from_secs(30),
-            embedding_connect_timeout: std::time::Duration::from_secs(10),
+            window_size: defaults::schema_vector_index::WINDOW_SIZE as usize,
+            sliding_size: defaults::schema_vector_index::SLIDING_SIZE as usize,
+            first_pass_sparse_search_top_k: defaults::semantic_search::search_defaults::FIRST_PASS_TOP_K as usize,
+            query_embedding_cache_ttl: defaults::semantic_search::QUERY_EMBEDDING_CACHE_TTL,
+            partition_history_ttl: defaults::semantic_search::PARTITION_HISTORY_TTL,
+            embedding_request_timeout: defaults::semantic_search::EMBEDDING_REQUEST_TIMEOUT,
+            embedding_connect_timeout: defaults::semantic_search::EMBEDDING_CONNECT_TIMEOUT,
         }
     }
 }
@@ -1219,7 +1215,7 @@ mod tests {
     fn test_default_config() {
         let config = SemanticSearchConfig::default();
         assert_eq!(config.embedding_dim, 768);
-        assert_eq!(config.model_name, "qwen");
+        assert_eq!(config.model_name, "gemma");
         assert_eq!(config.embedding_service_url, "http://localhost:8001");
     }
 
@@ -1297,7 +1293,7 @@ mod tests {
     }
 
     fn spawn_probe_server(dim: usize, norm: f32) -> String {
-        spawn_service(dim, norm, &["qwen"], healthy(&["qwen"])).url
+        spawn_service(dim, norm, &["gemma"], healthy(&["gemma"])).url
     }
 
     fn probe_config(url: String, embedding_dim: usize) -> SemanticSearchConfig {
@@ -1355,10 +1351,10 @@ mod tests {
     /// what it does load.
     #[tokio::test]
     async fn check_embedding_service_rejects_a_model_the_service_does_not_load() {
-        let service = spawn_service(8, 1.0, &["gemma"], healthy(&["gemma"]));
-        let result = check_embedding_service(&probe_config(service.url, 8)).await; // default model: qwen
+        let service = spawn_service(8, 1.0, &["qwen"], healthy(&["qwen"]));
+        let result = check_embedding_service(&probe_config(service.url, 8)).await; // default model: gemma
         assert!(
-            matches!(&result, Err(EmbeddingError::ModelNotServed { model, available }) if model == "qwen" && available == "gemma"),
+            matches!(&result, Err(EmbeddingError::ModelNotServed { model, available }) if model == "gemma" && available == "qwen"),
             "got {result:?}",
         );
     }
@@ -1369,19 +1365,19 @@ mod tests {
     async fn check_embedding_service_judges_only_the_configured_model() {
         let health = serde_json::json!({
             "status": "starting",
-            "models": { "gemma": { "status": "loading" }, "qwen": { "status": "ok" } },
+            "models": { "qwen": { "status": "loading" }, "gemma": { "status": "ok" } },
         });
         let service = spawn_service(8, 1.0, &["gemma", "qwen"], health);
-        let qwen = probe_config(service.url.clone(), 8);
-        assert!(check_embedding_service(&qwen).await.is_ok(), "qwen is ready");
+        let gemma = probe_config(service.url.clone(), 8);
+        assert!(check_embedding_service(&gemma).await.is_ok(), "gemma is ready");
 
-        let gemma = SemanticSearchConfig {
-            model_name: "gemma".into(),
-            ..qwen
+        let qwen = SemanticSearchConfig {
+            model_name: "qwen".into(),
+            ..gemma
         };
-        let result = check_embedding_service(&gemma).await;
+        let result = check_embedding_service(&qwen).await;
         assert!(
-            matches!(&result, Err(EmbeddingError::ModelNotReady { model, status }) if model == "gemma" && status == "loading"),
+            matches!(&result, Err(EmbeddingError::ModelNotReady { model, status }) if model == "qwen" && status == "loading"),
             "got {result:?}",
         );
     }
@@ -1389,12 +1385,12 @@ mod tests {
     /// An embed call for an unknown model surfaces the service's own message.
     #[tokio::test]
     async fn embed_for_an_unknown_model_reports_the_service_detail() {
-        let service = spawn_service(8, 1.0, &["gemma"], healthy(&["gemma"]));
+        let service = spawn_service(8, 1.0, &["qwen"], healthy(&["qwen"]));
         let result = embed_query(&probe_config(service.url, 8), "hello").await;
         match result {
             Err(EmbeddingError::Status { status, detail, .. }) => {
                 assert_eq!(status, 404);
-                assert_eq!(detail, "Unknown model 'qwen'; available: gemma");
+                assert_eq!(detail, "Unknown model 'gemma'; available: qwen");
             }
             other => panic!("expected a 404 Status error, got {other:?}"),
         }

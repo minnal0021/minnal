@@ -1053,7 +1053,6 @@ impl PartitionHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic_search::cluster::DEFAULT_ROTATION_SEED;
 
     fn centroids(dim: usize) -> HashMap<u32, Vec<f32>> {
         (0..4u32)
@@ -1068,7 +1067,7 @@ mod tests {
     #[test]
     fn seeded_layout_matches_the_identity_layout() {
         let c = centroids(16);
-        let ivf = NamespaceIvf::seeded(&c, DEFAULT_ROTATION_SEED).unwrap();
+        let ivf = NamespaceIvf::seeded(&c, crate::defaults::schema_vector_index::ROTATION_SEED).unwrap();
         let identity = ClusterIndex::from_clusters(c.iter().map(|(&id, v)| (id, Cluster::new(id, v.clone()))).collect());
         // Distinct distances to every centroid, so no tie is broken by map order.
         let q: Vec<f32> = (0..16).map(|i| 1.0 / (i as f32 + 1.0)).collect();
@@ -1095,7 +1094,7 @@ mod tests {
     fn routing_and_centres_are_separate() {
         let c = centroids(16);
         let postings = vec![Posting::seeded(10, c[&0].clone(), 0), Posting::seeded(11, c[&1].clone(), 0)];
-        let ivf = NamespaceIvf::new(postings, c.clone(), DEFAULT_ROTATION_SEED).unwrap();
+        let ivf = NamespaceIvf::new(postings, c.clone(), crate::defaults::schema_vector_index::ROTATION_SEED).unwrap();
         assert_eq!(IvfLayout::route(&ivf, &c[&1]), Some(11));
         assert_eq!(ivf.centre_of(11), Some(0));
         assert_eq!(ivf.centre_of(12), None);
@@ -1242,7 +1241,7 @@ mod tests {
     #[test]
     fn evolving_keeps_the_existing_rotated_centres() {
         let c = centroids(16);
-        let ivf = NamespaceIvf::seeded(&c, DEFAULT_ROTATION_SEED).unwrap();
+        let ivf = NamespaceIvf::seeded(&c, crate::defaults::schema_vector_index::ROTATION_SEED).unwrap();
         let added: Vec<f32> = (0..16).map(|i| (i as f32 - 7.5) / 10.0).collect();
         let next = ivf.evolve(&[(9, added.clone())], &[]).unwrap();
         for id in 0..4u32 {
@@ -1258,7 +1257,9 @@ mod tests {
     /// before it ...
     #[tokio::test]
     async fn a_barrier_waits_for_readers_that_started_before_it() {
-        let h = Arc::new(PartitionHandle::new(NamespaceIvf::seeded(&centroids(16), DEFAULT_ROTATION_SEED).unwrap()));
+        let h = Arc::new(PartitionHandle::new(
+            NamespaceIvf::seeded(&centroids(16), crate::defaults::schema_vector_index::ROTATION_SEED).unwrap(),
+        ));
         let old = h.read_epoch().await;
         let barrier = tokio::spawn({
             let h = Arc::clone(&h);
@@ -1274,7 +1275,9 @@ mod tests {
     /// queue behind a split waiting for an older, slow search.
     #[tokio::test]
     async fn a_new_reader_does_not_wait_behind_a_barrier() {
-        let h = Arc::new(PartitionHandle::new(NamespaceIvf::seeded(&centroids(16), DEFAULT_ROTATION_SEED).unwrap()));
+        let h = Arc::new(PartitionHandle::new(
+            NamespaceIvf::seeded(&centroids(16), crate::defaults::schema_vector_index::ROTATION_SEED).unwrap(),
+        ));
         let old = h.read_epoch().await;
         let barrier = tokio::spawn({
             let h = Arc::clone(&h);

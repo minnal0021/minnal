@@ -7,7 +7,7 @@
 //! nothing about [`IndexManager`] or [`NamespaceRegistry`] directly — it
 //! calls through [`IndexCheckpointTarget`], which [`Database`] implements.
 //!
-//! Default interval: [`DEFAULT_INDEX_CHECKPOINT_INTERVAL`](crate::db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL)
+//! Default interval: [`crate::defaults::scheduled_tasks::INDEX_CHECKPOINT_INTERVAL`](crate::defaults::scheduled_tasks::INDEX_CHECKPOINT_INTERVAL)
 //! (1750 ms) — the interval is the crash-replay window, so it is deliberately short.
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -188,7 +188,7 @@ mod tests {
                 &path,
                 lsm_config,
                 sync_config,
-                crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
+                crate::defaults::value_log::SEGMENT_SIZE_BYTES,
             )
             .unwrap(),
         )

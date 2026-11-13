@@ -113,10 +113,10 @@ pub struct LSMConfig {
 impl Default for LSMConfig {
     fn default() -> Self {
         Self {
-            compaction_threshold_percent: 95,
+            compaction_threshold_percent: crate::defaults::lsm::COMPACTION_THRESHOLD_PERCENT,
             data_dir: PathBuf::from("lsm_data"),
-            num_buckets: crate::support::DEFAULT_NUM_BUCKETS,
-            skip_list_capacity: 100_000,
+            num_buckets: crate::defaults::sharding::NUM_BUCKETS,
+            skip_list_capacity: crate::defaults::memtable::MAX_CAPACITY,
         }
     }
 }
@@ -127,8 +127,7 @@ impl LSMConfig {
         Self {
             compaction_threshold_percent,
             data_dir,
-            num_buckets: crate::support::DEFAULT_NUM_BUCKETS,
-            skip_list_capacity: 100_000,
+            ..Self::default()
         }
     }
 }

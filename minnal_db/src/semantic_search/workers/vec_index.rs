@@ -164,9 +164,9 @@ pub struct VectorIndexConfig {
 impl Default for VectorIndexConfig {
     fn default() -> Self {
         Self {
-            retry_wait_secs: 2,
-            max_retries: 5,
-            concurrency: 6,
+            retry_wait_secs: crate::defaults::vector_index::RETRY_WAIT_SECS,
+            max_retries: crate::defaults::vector_index::MAX_RETRIES,
+            concurrency: crate::defaults::vector_index::CONCURRENCY,
         }
     }
 }

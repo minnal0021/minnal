@@ -38,6 +38,8 @@ use crate::semantic_search::cluster::kmeans::{KmeansParams, kmeans};
 /// The most threads a rebuild's k-means may use.
 pub const MAX_REBUILD_THREADS: usize = 2;
 
+const _: () = assert!(crate::defaults::semantic_search::maintenance::REBUILD_THREADS <= MAX_REBUILD_THREADS);
+
 /// How a rebuild runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildParams {

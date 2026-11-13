@@ -75,9 +75,9 @@ pub struct LifecycleConfig {
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
-            max_restarts: 3,
-            restart_backoff: Duration::from_secs(1),
-            restart_window: Duration::from_secs(600),
+            max_restarts: crate::defaults::lifecycle::MAX_RESTARTS,
+            restart_backoff: crate::defaults::lifecycle::RESTART_BACKOFF,
+            restart_window: crate::defaults::lifecycle::RESTART_WINDOW,
         }
     }
 }

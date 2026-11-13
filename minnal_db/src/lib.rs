@@ -73,6 +73,7 @@
 compile_error!("minnal_db supports only Linux and macOS (its storage engine uses Unix pread/pwrite)");
 
 pub mod db;
+pub mod defaults;
 pub mod error;
 mod storage;
 mod support;
@@ -141,17 +142,6 @@ pub use db::config::DbConfig;
 
 /// Controls when the value-log GC is triggered.
 pub use db::config::ThresholdConfig;
-
-/// Default field-index bitmap compaction threshold (percentage of dead space).
-pub use db::config::{
-    DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_INDEX_OVERLAY_HARD_BYTES, DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
-    DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
-};
-
-pub use storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
-
-/// Default index checkpoint interval in milliseconds (the crash-replay window).
-pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS: u64 = db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL.as_millis() as u64;
 
 /// Hex encoding/decoding for raw key bytes.
 ///

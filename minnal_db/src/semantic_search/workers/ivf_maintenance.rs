@@ -26,9 +26,6 @@ use crate::AsyncDb;
 use crate::semantic_search::context::{ContextError, SemanticSearchContext};
 use crate::semantic_search::ivf_split;
 
-/// Default maintenance threads per process.
-pub const DEFAULT_MAINTENANCE_THREADS: usize = 2;
-
 /// A running maintenance task. [`shutdown`](Self::shutdown) stops it after the
 /// split or merge in progress in each namespace finishes, leaving the rest for
 /// the next start (startup recovery asks for maintenance of every namespace);

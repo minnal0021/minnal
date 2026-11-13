@@ -143,7 +143,7 @@ fn validate_centroids(map: &HashMap<u32, Vec<f32>>, expected_dim: Option<usize>)
 /// centroid at index time ([`rotated_centroid`](Self::rotated_centroid)), and the
 /// query's code-facing terms at search time ([`rotate`](Self::rotate)). Probing
 /// and `⟨q, c⟩` stay in the original space. The index holds one rotation, from a
-/// seed ([`DEFAULT_ROTATION_SEED`] unless built with
+/// seed ([`crate::defaults::schema_vector_index::ROTATION_SEED`] unless built with
 /// [`from_clusters_with_seed`](Self::from_clusters_with_seed)); a namespace records
 /// its seed, because changing it means re-encoding. It exists for every even dimension of at least 8 (production uses
 /// 768); smaller test dimensions are left unrotated.
@@ -164,11 +164,6 @@ pub struct ClusterIndex {
     /// `None` only for dimensions it cannot handle (odd, or below 8).
     rotation: Option<Rotation>,
 }
-
-/// Seed a new namespace's rotation gets, recorded in its schema
-/// (`vector_index.quantisation.rotation_seed`). Changing it affects only
-/// namespaces created afterwards.
-pub const DEFAULT_ROTATION_SEED: u64 = 0x6d69_6e6e_616c_0001;
 
 #[derive(Debug)]
 struct Rotation {
@@ -205,7 +200,7 @@ impl ClusterIndex {
         let centroid_map = read_clusters_from_file(cluster_file_path)?;
         let dim = validate_centroids(&centroid_map, expected_dim)?;
         let clusters: HashMap<u32, Cluster> = centroid_map.into_iter().map(|(id, centroid)| (id, Cluster::new(id, centroid))).collect();
-        Ok(Self::from_parts(clusters, dim, DEFAULT_ROTATION_SEED))
+        Ok(Self::from_parts(clusters, dim, crate::defaults::schema_vector_index::ROTATION_SEED))
     }
 
     /// Build the index from a validated cluster map of known dimension, deriving the
@@ -291,7 +286,7 @@ impl ClusterIndex {
     /// per-centroid validation done by [`load`](Self::load) is the file path's
     /// concern; in-memory callers are trusted to pass uniform centroids.
     pub fn from_clusters(clusters: HashMap<u32, Cluster>) -> Self {
-        Self::from_clusters_with_seed(clusters, DEFAULT_ROTATION_SEED)
+        Self::from_clusters_with_seed(clusters, crate::defaults::schema_vector_index::ROTATION_SEED)
     }
 
     /// An index searched only in the original space: no rotation is built, so
@@ -461,7 +456,7 @@ mod tests {
     /// benchmark gate assumes it. Update this test only on purpose.
     #[test]
     fn default_rotation_seed_is_pinned() {
-        assert_eq!(DEFAULT_ROTATION_SEED, 0x6d69_6e6e_616c_0001);
+        assert_eq!(crate::defaults::schema_vector_index::ROTATION_SEED, 0x6d69_6e6e_616c_0001);
     }
 
     #[test]

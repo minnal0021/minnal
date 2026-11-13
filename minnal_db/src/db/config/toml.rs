@@ -5,7 +5,6 @@ use std::time::Duration;
 use crate::db::config::{DbConfig, ScheduledTaskConfig, SyncConfig, ThresholdConfig};
 use crate::db::error::{KVError, Result};
 use crate::storage::lsm::tree::LSMConfig;
-use crate::support::DEFAULT_NUM_BUCKETS;
 
 /// Root structure mirroring `minnal.toml`.
 #[derive(Debug, Deserialize)]
@@ -69,7 +68,7 @@ impl Default for ShardingSection {
 }
 
 fn default_num_buckets() -> usize {
-    DEFAULT_NUM_BUCKETS
+    crate::defaults::sharding::NUM_BUCKETS
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,31 +159,31 @@ fn default_value_log_waste_threshold() -> f64 {
 }
 
 fn default_segment_gc_threshold() -> f64 {
-    crate::db::config::DEFAULT_SEGMENT_GC_THRESHOLD
+    crate::defaults::thresholds::SEGMENT_GC_THRESHOLD
 }
 
 fn default_index_blob_waste_threshold() -> f64 {
-    crate::db::config::DEFAULT_INDEX_BLOB_WASTE_THRESHOLD
+    crate::defaults::thresholds::INDEX_BLOB_WASTE_THRESHOLD
 }
 
 fn default_index_blob_backpressure_bytes() -> u64 {
-    crate::db::config::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
+    crate::defaults::thresholds::INDEX_BLOB_BACKPRESSURE_BYTES
 }
 
 fn default_index_overlay_soft_bytes() -> u64 {
-    crate::db::config::DEFAULT_INDEX_OVERLAY_SOFT_BYTES
+    crate::defaults::thresholds::INDEX_OVERLAY_SOFT_BYTES
 }
 
 fn default_index_overlay_hard_bytes() -> u64 {
-    crate::db::config::DEFAULT_INDEX_OVERLAY_HARD_BYTES
+    crate::defaults::thresholds::INDEX_OVERLAY_HARD_BYTES
 }
 
 fn default_index_checkpoint_interval_ms() -> u64 {
-    crate::db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL.as_millis() as u64
+    crate::defaults::scheduled_tasks::INDEX_CHECKPOINT_INTERVAL.as_millis() as u64
 }
 
 fn default_max_pinned_wal_segments() -> u32 {
-    crate::db::config::DEFAULT_MAX_PINNED_WAL_SEGMENTS
+    crate::defaults::thresholds::MAX_PINNED_WAL_SEGMENTS
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,7 +239,7 @@ impl Default for WalSection {
 }
 
 fn default_wal_segment_size_bytes() -> u64 {
-    crate::db::wal::DEFAULT_SEGMENT_SIZE as u64
+    crate::defaults::wal::SEGMENT_SIZE_BYTES
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,7 +262,7 @@ impl Default for ValueLogSection {
 }
 
 fn default_segment_size_bytes() -> u64 {
-    crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES
+    crate::defaults::value_log::SEGMENT_SIZE_BYTES
 }
 
 /// `[recovery]` — WAL recovery settings.
@@ -338,7 +337,7 @@ mod tests {
         let t: ThresholdSection = toml::from_str("index_overlay_soft_bytes = 1024\nindex_overlay_hard_bytes = 4096\n").unwrap();
         assert_eq!((t.index_overlay_soft_bytes, t.index_overlay_hard_bytes), (1024, 4096));
         let d: ThresholdSection = toml::from_str("").unwrap();
-        assert_eq!(d.index_overlay_soft_bytes, crate::db::config::DEFAULT_INDEX_OVERLAY_SOFT_BYTES);
-        assert_eq!(d.index_overlay_hard_bytes, crate::db::config::DEFAULT_INDEX_OVERLAY_HARD_BYTES);
+        assert_eq!(d.index_overlay_soft_bytes, crate::defaults::thresholds::INDEX_OVERLAY_SOFT_BYTES);
+        assert_eq!(d.index_overlay_hard_bytes, crate::defaults::thresholds::INDEX_OVERLAY_HARD_BYTES);
     }
 }

@@ -43,11 +43,12 @@ pub struct SplitParams {
 impl Default for SplitParams {
     /// SPTAG's values.
     fn default() -> Self {
+        use crate::defaults::semantic_search::maintenance as m;
         Self {
-            samples: 1000,
-            init_trials: 3,
-            max_iters: 100,
-            lambda_factor: 100.0,
+            samples: m::SPLIT_SAMPLES as usize,
+            init_trials: m::SPLIT_INIT_TRIALS as usize,
+            max_iters: m::SPLIT_MAX_ITERS as usize,
+            lambda_factor: m::SPLIT_LAMBDA_FACTOR,
         }
     }
 }

@@ -644,7 +644,7 @@ async fn eval_frozen() {
         other => panic!("unknown MINNAL_BENCH_PARTITION '{other}' (grow | file)"),
     }
     let handle = Arc::new(crate::semantic_search::PartitionHandle::new(
-        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::defaults::schema_vector_index::ROTATION_SEED)
             .await
             .unwrap()
             .expect("just made"),
@@ -808,7 +808,7 @@ async fn eval_frozen() {
     // Loaded again as a restarted store loads it: its entry counts come from the
     // stored keys.
     let ivf = Arc::new(
-        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::defaults::schema_vector_index::ROTATION_SEED)
             .await
             .unwrap()
             .expect("seeded"),

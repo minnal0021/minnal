@@ -65,10 +65,6 @@ fn decode_sharded_pointer(offset_u128: u128) -> Option<ShardedValuePointer> {
     (p.location.segment_id != 0).then_some(p)
 }
 
-/// Value-log waste percentage at which a namespace is due for GC, unless
-/// configured otherwise (`ThresholdConfig::value_log_waste_threshold`).
-pub const DEFAULT_VALUE_LOG_WASTE_THRESHOLD: f64 = 30.0;
-
 /// How many insert/update/delete operations to batch between fsyncs of the
 /// value log.
 ///
@@ -97,8 +93,8 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            records_per_sync: 1000,
-            commit_delay_us: 0,
+            records_per_sync: crate::defaults::sync::RECORDS_PER_SYNC,
+            commit_delay_us: crate::defaults::sync::COMMIT_DELAY_US,
         }
     }
 }
@@ -107,7 +103,7 @@ impl SyncConfig {
     pub fn new(records_per_sync: usize) -> Self {
         Self {
             records_per_sync,
-            commit_delay_us: 0,
+            ..Self::default()
         }
     }
 

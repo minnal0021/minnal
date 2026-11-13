@@ -321,7 +321,7 @@ fn default_lifecycle_max_restarts() -> u32 {
 }
 
 fn default_audit_retention_days() -> u64 {
-    minnal_db::namespace_lifecycle::DEFAULT_AUDIT_RETENTION.as_secs() / 86_400
+    minnal_db::defaults::lifecycle::AUDIT_RETENTION.as_secs() / 86_400
 }
 
 fn default_lifecycle_restart_backoff_ms() -> u64 {
@@ -455,27 +455,27 @@ fn default_waste_threshold() -> f64 {
 }
 
 fn default_segment_gc_threshold() -> f64 {
-    minnal_db::DEFAULT_SEGMENT_GC_THRESHOLD
+    minnal_db::defaults::thresholds::SEGMENT_GC_THRESHOLD
 }
 
 fn default_index_blob_waste_threshold() -> f64 {
-    minnal_db::DEFAULT_INDEX_BLOB_WASTE_THRESHOLD
+    minnal_db::defaults::thresholds::INDEX_BLOB_WASTE_THRESHOLD
 }
 
 fn default_index_blob_backpressure_bytes() -> u64 {
-    minnal_db::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES
+    minnal_db::defaults::thresholds::INDEX_BLOB_BACKPRESSURE_BYTES
 }
 
 fn default_index_overlay_soft_bytes() -> u64 {
-    minnal_db::DEFAULT_INDEX_OVERLAY_SOFT_BYTES
+    minnal_db::defaults::thresholds::INDEX_OVERLAY_SOFT_BYTES
 }
 
 fn default_index_overlay_hard_bytes() -> u64 {
-    minnal_db::DEFAULT_INDEX_OVERLAY_HARD_BYTES
+    minnal_db::defaults::thresholds::INDEX_OVERLAY_HARD_BYTES
 }
 
 fn default_max_pinned_wal_segments() -> u32 {
-    minnal_db::DEFAULT_MAX_PINNED_WAL_SEGMENTS
+    minnal_db::defaults::thresholds::MAX_PINNED_WAL_SEGMENTS
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,7 +510,7 @@ fn default_gc_interval_secs() -> u64 {
     60
 }
 fn default_index_checkpoint_interval_ms() -> u64 {
-    minnal_db::DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS
+    minnal_db::defaults::scheduled_tasks::INDEX_CHECKPOINT_INTERVAL.as_millis() as u64
 }
 
 fn default_ttl_cleanup_secs() -> u64 {
@@ -555,7 +555,7 @@ impl Default for ValueLogSection {
 }
 
 fn default_segment_size() -> u64 {
-    minnal_db::DEFAULT_SEGMENT_SIZE_BYTES
+    minnal_db::defaults::value_log::SEGMENT_SIZE_BYTES
 }
 
 mod semantic_search;

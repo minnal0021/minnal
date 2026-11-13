@@ -29,11 +29,6 @@ use crate::AsyncDb;
 /// serving it until the TTL expires.
 const SYSTEM_QUERY_EMB_CACHE_NS: &str = "system_qemb_cache";
 
-/// Fallback TTL for cached query embeddings (1 day) when no configured value is
-/// available — e.g. clearing the cache on a store without semantic search
-/// configured.
-pub const DEFAULT_QUERY_EMBEDDING_CACHE_TTL: Duration = Duration::from_secs(86_400);
-
 /// Maximum records the TTL worker will delete per pass.
 const QUERY_EMBEDDING_CACHE_MAX_DELETES: usize = 10_000;
 

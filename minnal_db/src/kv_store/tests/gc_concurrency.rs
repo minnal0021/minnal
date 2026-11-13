@@ -14,7 +14,7 @@ fn test_gc_concurrent_writes_no_data_loss() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -74,7 +74,7 @@ fn test_gc_concurrent_reads_never_error_or_return_stale() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -136,7 +136,7 @@ fn test_gc_concurrent_deletes_are_not_resurrected() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -219,7 +219,7 @@ fn scan_during_gc_round() {
         dir.path(),
         cfg,
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -354,7 +354,7 @@ fn test_scan_completeness_during_concurrent_flush_compaction_and_gc() {
         dir.path(),
         cfg,
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 

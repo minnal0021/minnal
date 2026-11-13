@@ -12,7 +12,7 @@ fn test_kvstore_basic_operations() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -35,7 +35,7 @@ fn test_kvstore_update() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -63,7 +63,7 @@ fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -110,7 +110,7 @@ fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -164,7 +164,7 @@ fn test_kvstore_recovery_replay() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -190,7 +190,7 @@ fn test_active_memtable_tombstone_shadows_sstable() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -214,7 +214,7 @@ fn test_put_to_storage_seq_keeps_highest_sequence() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -232,7 +232,7 @@ fn test_delete_from_storage_seq_respects_sequence() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 

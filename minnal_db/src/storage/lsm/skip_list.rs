@@ -5,7 +5,6 @@ pub mod skip_list {
     use core::cmp::Ordering;
     use std::borrow::Cow;
 
-    const DEFAULT_MAX_CAPACITY: usize = 100_000; // Default max number of nodes (including tombstones)
     const MAX_LEVEL: usize = 32;
     const NONE_VALUE: u32 = u32::MAX;
 
@@ -107,7 +106,7 @@ pub mod skip_list {
 
     impl SkipList {
         pub fn new() -> Self {
-            Self::with_capacity(DEFAULT_MAX_CAPACITY)
+            Self::with_capacity(crate::defaults::memtable::MAX_CAPACITY)
         }
 
         pub fn with_capacity(max_capacity: usize) -> Self {
@@ -770,7 +769,6 @@ pub mod skip_list {
 
     #[cfg(test)]
     mod tests {
-        use crate::storage::lsm::skip_list::skip_list::DEFAULT_MAX_CAPACITY;
 
         use super::{KeyValueRecord, SkipList};
         use std::collections::BTreeMap;
@@ -1011,7 +1009,7 @@ pub mod skip_list {
 
         #[test]
         fn randomized_against_btreemap() {
-            let max_capacity = DEFAULT_MAX_CAPACITY;
+            let max_capacity = crate::defaults::memtable::MAX_CAPACITY;
             let mut sl = SkipList::new();
             let mut model = BTreeMap::<Vec<u8>, u128>::new();
 

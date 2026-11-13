@@ -12,7 +12,7 @@ fn test_get_multiple_matches_individual_get() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -40,7 +40,7 @@ fn test_get_multiple_missing_keys_are_none() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -62,7 +62,7 @@ fn test_get_multiple_after_flush_to_sstable() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -97,7 +97,7 @@ fn test_scan_prefixes_batch_basic() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -134,7 +134,7 @@ fn test_scan_page_batch_limit_zero_still_advances() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
     for i in 0..3u8 {
@@ -166,7 +166,7 @@ fn test_scan_page_batch_end_bound_excludes_upper() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
     for i in 0u32..10 {
@@ -189,7 +189,7 @@ fn test_scan_page_batch_cursor_walk_is_complete_and_ordered() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
     for i in 0u32..10 {
@@ -221,7 +221,7 @@ fn test_scan_prefixes_batch_missing_prefix_absent() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -240,7 +240,7 @@ fn test_scan_prefixes_batch_after_flush() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 

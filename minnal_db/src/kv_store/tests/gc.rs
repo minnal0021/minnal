@@ -110,7 +110,7 @@ fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
         dir.path(),
         lsm_config,
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -161,7 +161,7 @@ fn test_kvstore_gc() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -196,7 +196,7 @@ fn test_gc_write_before_gc_survives() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -230,7 +230,7 @@ fn test_gc_writes_after_swap_go_to_new_file() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -263,7 +263,7 @@ fn test_gc_multi_round_all_values_survive() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -290,7 +290,7 @@ fn test_gc_after_delete_sequential_stays_deleted() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
     const N: u32 = 120;

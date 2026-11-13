@@ -624,7 +624,7 @@ async fn e2e_partition_invariants() {
     let db = AsyncDb::open_with_config(std::path::PathBuf::from(path), crate::DbConfig::default())
         .await
         .unwrap();
-    let ivf = load_ivf(&db, &ns, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+    let ivf = load_ivf(&db, &ns, crate::defaults::schema_vector_index::ROTATION_SEED)
         .await
         .unwrap()
         .unwrap();
@@ -973,7 +973,7 @@ async fn e2e_oversized_postings() {
     let db = AsyncDb::open_with_config(std::path::PathBuf::from(path), crate::DbConfig::default())
         .await
         .unwrap();
-    let ivf = load_ivf(&db, &ns, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+    let ivf = load_ivf(&db, &ns, crate::defaults::schema_vector_index::ROTATION_SEED)
         .await
         .unwrap()
         .unwrap();

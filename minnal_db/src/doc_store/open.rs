@@ -12,7 +12,7 @@ use std::time::Duration;
 use log::{debug, info};
 
 use super::*;
-use crate::namespace_lifecycle::{AuditLog, DEFAULT_AUDIT_RETENTION, Governor, Jobs};
+use crate::namespace_lifecycle::{AuditLog, Governor, Jobs};
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::service::SemanticSearchConfig;
 
@@ -50,7 +50,7 @@ impl DocStoreBuilder {
             db_path: db_path.as_ref().to_path_buf(),
             db_config: DbConfig::default(),
             lifecycle: LifecycleConfig::default(),
-            audit_retention: DEFAULT_AUDIT_RETENTION,
+            audit_retention: crate::defaults::lifecycle::AUDIT_RETENTION,
             #[cfg(feature = "semantic-search")]
             semantic_search: SemanticSearchContext::new(SemanticSearchConfig::default()),
             #[cfg(feature = "semantic-search")]
