@@ -33,12 +33,11 @@
 //! `BlobStore::sync_keys`. A slot then never reaches disk ahead of its blob.
 //!
 //! Slots are still rewritten in place, so a crash can tear one. Each live slot
-//! carries a CRC-32 of its other bytes (state byte 3; state 1 is a slot written
-//! without one, still read). `BlobStore::open` tombstones any torn slot or
-//! slot pointing past the value file, counts it in
-//! `BlobStore::damaged_at_open`, and recomputes the header (counts and the
-//! write cursor) from the slots, so a stale header cannot make a new append
-//! overwrite live data. Growing the key table (rehash) builds the new table in
+//! carries a CRC-32 of its other bytes (state byte 3). `BlobStore::open`
+//! tombstones any live slot that is torn, has no checksum or points past the
+//! value file, counts it in `BlobStore::damaged_at_open`, and recomputes the
+//! header (counts and the write cursor) from the slots, so a stale header
+//! cannot make a new append overwrite live data. Growing the key table (rehash) builds the new table in
 //! a separate file and renames it into place; compaction stages both files and
 //! commits with a marker (see `BlobStore::compact`).
 
@@ -72,8 +71,9 @@ const INITIAL_VAL_SIZE: usize = 4096;
 const VALUE_ALIGNMENT: usize = 16;
 
 const STATE_EMPTY: u8 = 0;
-/// A live slot without a checksum (written before checksums existed). Read as
-/// live; never written any more.
+/// The state [`read_slot`] reports for a live slot. It is never on disk: a live
+/// slot is written as [`STATE_OCCUPIED_CHECKED`], so this byte in a slot file is
+/// damage, and open drops the slot.
 const STATE_OCCUPIED: u8 = 1;
 const STATE_TOMBSTONE: u8 = 2;
 /// On-disk state byte of a live slot that carries a checksum. [`read_slot`]
@@ -172,10 +172,14 @@ fn write_slot(data: &mut [u8], i: usize, s: &Slot) {
     data[b + 40..b + 48].fill(0);
 }
 
-/// False only for a checksummed live slot whose checksum does not match: a
-/// slot torn by a crash. Unchecked (older) slots and non-live slots pass.
+/// False for a live slot whose checksum does not match (a slot torn by a crash)
+/// and for a live slot without a checksum, which nothing writes. Non-live slots
+/// pass.
 fn slot_checksum_ok(data: &[u8], i: usize) -> bool {
     let b = slot_byte_offset(i);
+    if data[b] == STATE_OCCUPIED {
+        return false;
+    }
     if data[b] != STATE_OCCUPIED_CHECKED {
         return true;
     }
@@ -1413,7 +1417,7 @@ mod tests {
 
     fn first_live_slot(key: &[u8]) -> usize {
         (0..INITIAL_CAPACITY)
-            .find(|&i| matches!(key[slot_byte_offset(i)], STATE_OCCUPIED | STATE_OCCUPIED_CHECKED))
+            .find(|&i| key[slot_byte_offset(i)] == STATE_OCCUPIED_CHECKED)
             .expect("seeded store has a live slot")
     }
 
@@ -1459,6 +1463,19 @@ mod tests {
         let store = BlobStore::open(dir.path()).unwrap();
         assert_eq!(store.damaged_at_open(), 1);
         assert_eq!(store.count(), 1, "the torn slot is dropped, the other survives");
+    }
+
+    #[test]
+    fn open_drops_a_live_slot_without_a_checksum() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed(dir.path());
+        let mut key = std::fs::read(dir.path().join("blobs.keys")).unwrap();
+        let b = slot_byte_offset(first_live_slot(&key));
+        key[b] = STATE_OCCUPIED; // live, but no checksum: nothing writes this
+        std::fs::write(dir.path().join("blobs.keys"), &key).unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.damaged_at_open(), 1);
+        assert_eq!(store.count(), 1, "the unchecked slot is dropped, the other survives");
     }
 
     #[test]
