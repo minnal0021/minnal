@@ -77,18 +77,6 @@ impl KVStore {
         Ok(true)
     }
 
-    /// Remove stale LSM files left by an interrupted compaction.
-    ///
-    /// The value log needs no startup cleanup any more: GC never writes a shadow file
-    /// and never swaps one in, so there is nothing half-finished to roll forward or
-    /// back. Its only mutation of existing state is unlinking a segment, which only
-    /// happens after the re-point is durable.
-    pub fn cleanup_old_files_on_startup(&self) -> Result<()> {
-        self.lsm
-            .cleanup_old_files_on_startup()
-            .map_err(|e| KVError::Io(std::io::Error::other(format!("Failed to cleanup LSM old files: {:?}", e))))
-    }
-
     /// Replay a single WAL entry into this namespace's storage, stamping the
     /// memtable with the entry's original WAL sequence so recovery reproduces the
     /// same per-key winner that was live before the crash (highest-sequence-wins).

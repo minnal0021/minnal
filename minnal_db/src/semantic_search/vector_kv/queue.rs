@@ -47,12 +47,9 @@ pub struct QueueEntry {
     pub last_error: Option<String>,
 }
 
-/// Version `0x01`: `[version] [retry_count: 4B BE] [text bytes]`
-const QUEUE_VALUE_V1: u8 = 0x01;
-/// Version `0x02`: `[version] [retry_count: 4B BE] [error_len: 4B BE] [error bytes] [text bytes]`
-const QUEUE_VALUE_V2: u8 = 0x02;
-/// Version `0x03`: `[version] [kind: 1B] [retry_count: 4B BE] [error_len: 4B BE] [error bytes] [text bytes]`
-/// — v2 plus the entry kind (`0` = embed, `1` = clear). v1/v2 entries decode as embed.
+/// The queue value's format version, its first byte. The value is
+/// `[version] [kind: 1B] [retry_count: 4B BE] [error_len: 4B BE] [error bytes] [text bytes]`,
+/// where `kind` is `0` (embed) or `1` (clear).
 const QUEUE_VALUE_VERSION: u8 = 0x03;
 
 const KIND_EMBED: u8 = 0;
@@ -106,35 +103,17 @@ impl QueueValue {
     }
 }
 
-/// Decode any on-disk queue value version (v1, v2, v3).
+/// Decode a queue value; `None` for an unknown version or a damaged value.
 pub(super) fn decode_queue_value(value: &[u8]) -> Option<QueueValue> {
-    let version = *value.first()?;
-    // v1 has no error field; v2 and v3 share the retry/error/text tail, v3 behind a kind byte.
-    let (kind, tail) = match version {
-        v if v == QUEUE_VALUE_V1 => {
-            if value.len() < 5 {
-                return None;
-            }
-            let retry_count = u32::from_be_bytes(value[1..5].try_into().ok()?);
-            let text = std::str::from_utf8(&value[5..]).ok()?.to_owned();
-            return Some(QueueValue {
-                kind: QueueEntryKind::Embed,
-                text,
-                retry_count,
-                last_error: None,
-            });
-        }
-        v if v == QUEUE_VALUE_V2 => (QueueEntryKind::Embed, &value[1..]),
-        v if v == QUEUE_VALUE_VERSION => {
-            let kind = match *value.get(1)? {
-                KIND_EMBED => QueueEntryKind::Embed,
-                KIND_CLEAR => QueueEntryKind::Clear,
-                _ => return None,
-            };
-            (kind, &value[2..])
-        }
+    if *value.first()? != QUEUE_VALUE_VERSION {
+        return None;
+    }
+    let kind = match *value.get(1)? {
+        KIND_EMBED => QueueEntryKind::Embed,
+        KIND_CLEAR => QueueEntryKind::Clear,
         _ => return None,
     };
+    let tail = &value[2..];
     if tail.len() < 8 {
         return None;
     }

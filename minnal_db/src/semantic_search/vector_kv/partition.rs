@@ -13,9 +13,8 @@ use super::{create_vector_namespaces, decode_sparse_meta, ivf_centres_ns, ivf_po
 use crate::AsyncDb;
 use crate::semantic_search::composite_key;
 
-/// Posting rows written since M3 start with this byte, so they are told apart
-/// from the seed-only rows written before (`centre_id ‖ state ‖ centroid`).
-const POSTING_ROW_V2: u8 = 0xB2;
+/// The first byte of every posting row: its format version.
+const POSTING_ROW_FORMAT: u8 = 0xB2;
 
 pub(crate) fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -37,7 +36,7 @@ pub(crate) fn encode_posting(p: &crate::semantic_search::Posting) -> Vec<u8> {
     use crate::semantic_search::PostingState;
     let centroid: &[f32] = if p.state == PostingState::Retired { &[] } else { &p.routing_centroid };
     let mut v = Vec::with_capacity(11 + centroid.len() * 4);
-    v.push(POSTING_ROW_V2);
+    v.push(POSTING_ROW_FORMAT);
     v.extend_from_slice(&p.centre_id.to_be_bytes());
     v.push(p.state as u8);
     v.extend_from_slice(&p.parent_id.unwrap_or(u32::MAX).to_be_bytes());
@@ -46,30 +45,21 @@ pub(crate) fn encode_posting(p: &crate::semantic_search::Posting) -> Vec<u8> {
     v
 }
 
-/// Decodes the current row and the pre-M3 seed row (`centre_id (4B) ‖ state (1B)
-/// ‖ centroid`). An old row is `1 + 4·D` bytes after its centre id, a new one
-/// starts with the marker byte and is `11 + 4·D` bytes long; their lengths
-/// differ modulo 4, so the marker can never be an old centre id's first byte by
-/// accident.
+/// Decodes a row [`encode_posting`] wrote; `None` for anything else.
 pub(crate) fn decode_posting(posting_id: u32, v: &[u8]) -> Option<crate::semantic_search::Posting> {
     use crate::semantic_search::{Posting, PostingOrigin, PostingState};
-    if v.len() >= 11 && v[0] == POSTING_ROW_V2 && (v.len() - 11).is_multiple_of(4) {
-        let parent = u32::from_be_bytes(v[6..10].try_into().ok()?);
-        return Some(Posting {
-            posting_id,
-            centre_id: u32::from_be_bytes(v[1..5].try_into().ok()?),
-            state: PostingState::from_byte(v[5])?,
-            parent_id: (parent != u32::MAX).then_some(parent),
-            origin: PostingOrigin::from_byte(v[10])?,
-            routing_centroid: bytes_to_f32s(&v[11..])?,
-        });
+    if v.len() < 11 || v[0] != POSTING_ROW_FORMAT || !(v.len() - 11).is_multiple_of(4) {
+        return None;
     }
-    if v.len() >= 5 && (v.len() - 5).is_multiple_of(4) {
-        let mut p = Posting::seeded(posting_id, bytes_to_f32s(&v[5..])?, u32::from_be_bytes(v[..4].try_into().ok()?));
-        p.state = PostingState::from_byte(v[4])?;
-        return Some(p);
-    }
-    None
+    let parent = u32::from_be_bytes(v[6..10].try_into().ok()?);
+    Some(Posting {
+        posting_id,
+        centre_id: u32::from_be_bytes(v[1..5].try_into().ok()?),
+        state: PostingState::from_byte(v[5])?,
+        parent_id: (parent != u32::MAX).then_some(parent),
+        origin: PostingOrigin::from_byte(v[10])?,
+        routing_centroid: bytes_to_f32s(&v[11..])?,
+    })
 }
 
 async fn ivf_rows(db: &AsyncDb, namespace: &str) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>), crate::KVError> {
@@ -123,9 +113,8 @@ pub async fn init_ivf(db: &AsyncDb, namespace: &str, dim: usize) -> Result<(), c
 /// Write `namespace`'s partition from a centroid set, replacing whatever an
 /// earlier, incomplete seed left: one posting per centroid, encoding against
 /// itself (posting id = centre id = cluster id). Durable on return (WAL-backed
-/// puts, as [`init_ivf`]). Tests and
-/// benches only (a static baseline, or a pre-M3 partition to rebuild): a
-/// namespace never starts from a centroid file.
+/// puts, as [`init_ivf`]). Tests only (a
+/// static baseline): a namespace never starts from a centroid file.
 #[cfg(test)]
 pub(crate) async fn seed_ivf(db: &AsyncDb, namespace: &str, centroids: &HashMap<u32, Vec<f32>>) -> Result<(), crate::KVError> {
     create_vector_namespaces(db, namespace).await?;

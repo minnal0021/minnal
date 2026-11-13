@@ -146,30 +146,12 @@ fn test_clear_entry_roundtrip() {
 }
 
 #[test]
-fn test_v1_backward_compat() {
-    // Simulate an on-disk v1 value: [0x01] [retry_count: 4B] [text bytes]
-    let mut v1 = vec![0x01u8, 0x00, 0x00, 0x00, 0x02];
-    v1.extend_from_slice(b"old text");
-    let v = decode_queue_value(&v1).unwrap();
-    assert_eq!((v.kind, v.text.as_str(), v.retry_count, v.last_error), (E, "old text", 2, None));
-}
-
-/// Entries written before the kind byte existed are embed entries.
-#[test]
-fn test_v2_backward_compat() {
-    // [0x02] [retry_count: 4B] [error_len: 4B] [error] [text]
-    let mut v2 = vec![0x02u8, 0, 0, 0, 1, 0, 0, 0, 3];
-    v2.extend_from_slice(b"errold text");
-    let v = decode_queue_value(&v2).unwrap();
-    assert_eq!((v.kind, v.text.as_str(), v.retry_count), (E, "old text", 1));
-    assert_eq!(v.last_error.as_deref(), Some("err"));
-}
-
-#[test]
 fn test_value_decoding_rejects_unknown_version() {
-    // 0x04 is not a known version.
-    let bad = b"\x04\x00\x00\x00\x00\x00\x00\x00\x00hello";
-    assert!(decode_queue_value(bad).is_none());
+    for version in [0x01u8, 0x02, 0x04] {
+        let mut bad = encode_queue_value(QueueEntryKind::Embed, "hello", 0, None);
+        bad[0] = version;
+        assert!(decode_queue_value(&bad).is_none(), "version {version}");
+    }
 }
 
 #[test]

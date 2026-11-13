@@ -128,16 +128,14 @@ impl KVStore {
     ///
     /// After this call every key passed through the index write path is
     /// assigned the row ID returned by `row_id_fn` instead of the default
-    /// dense row-ID map.  Providing `row_to_key_fn` (the inverse) also enables
-    /// O(|hits|) query resolution in `Database::query_keys` — the inverse
-    /// reconstructs each matching key directly from its row ID, requiring
-    /// zero extra memory and no maintenance on writes.
+    /// dense row-ID map, and `Database::query_keys` turns each matching row ID
+    /// back into its key with `row_to_key_fn`, with no map to keep up on writes.
     ///
     /// `row_id_fn` must be injective: distinct keys must produce distinct
     /// row IDs so that `row_to_key_fn` can invert it exactly.
-    pub fn set_row_id_fn(&self, f: RowIdFn, inv: Option<RowToKeyFn>) -> Result<()> {
+    pub fn set_row_id_fn(&self, f: RowIdFn, inv: RowToKeyFn) -> Result<()> {
         *self.row_id_fn.write() = Some(f);
-        *self.row_to_key_fn.write() = inv;
+        *self.row_to_key_fn.write() = Some(inv);
         Ok(())
     }
 }

@@ -28,13 +28,12 @@ impl Database {
         Ok(field_id)
     }
 
-    /// Register a custom row-ID function (and optionally its inverse) for a namespace.
+    /// Register a custom row-ID function and its exact inverse for a namespace.
     ///
-    /// When set, every key written to or deleted from `namespace_id` will be
-    /// assigned a row ID produced by `row_id_fn` rather than the default
-    /// dense row-ID map.  Providing `row_to_key_fn` (the exact inverse) additionally
-    /// enables O(|hits|) query resolution with zero memory overhead: each matching
-    /// key is reconstructed directly from its row ID without any in-memory map.
+    /// When set, every key written to or deleted from `namespace_id` is
+    /// assigned the row ID `row_id_fn` gives it rather than one from the dense
+    /// row map, and a query turns each matching row ID back into its key with
+    /// `row_to_key_fn`, with no map in memory.
     ///
     /// This must be called **before** [`activate_field_index`] so that the WAL
     /// replay during activation uses the same row IDs that future writes will
@@ -46,7 +45,7 @@ impl Database {
         &self,
         namespace_id: NamespaceId,
         row_id_fn: crate::kv_store::index_set::RowIdFn,
-        row_to_key_fn: Option<crate::kv_store::index_set::RowToKeyFn>,
+        row_to_key_fn: crate::kv_store::index_set::RowToKeyFn,
     ) -> Result<()> {
         self.get_store(namespace_id)?.set_row_id_fn(row_id_fn, row_to_key_fn)
     }
@@ -425,9 +424,9 @@ impl Database {
 
                     for (value, row_ids) in rows_by_value {
                         if dyn_index.reclaimable_dead_bytes() >= cap {
-                            dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                            dyn_index.flush().map_err(KVError::Io)?;
                             if dyn_index.maybe_compact(waste_threshold).map_err(KVError::Io)? {
-                                dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                                dyn_index.flush().map_err(KVError::Io)?;
                                 compactions += 1;
                             }
                         }
@@ -439,7 +438,7 @@ impl Database {
                             );
                         }
                     }
-                    dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                    dyn_index.flush().map_err(KVError::Io)?;
                     if compactions > 0 {
                         debug!(
                             "[activate_field_index] ns={namespace_id} field={field_id}: \

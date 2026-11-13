@@ -120,18 +120,6 @@ impl Database {
         let mut stores = HashMap::new();
         stores.insert(NamespaceId::CATALOG, Arc::new(Self::open_catalog_store(db_path, &config)?));
 
-        // Cleanup old WAL file
-        let old_wal = db_path.join("wal.log.old");
-        if old_wal.exists() {
-            match std::fs::remove_file(&old_wal) {
-                Ok(_) => info!("[STARTUP] Cleaned up old WAL file"),
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    warn!("[STARTUP] Failed to cleanup old WAL file: {:?}", e);
-                }
-                _ => {}
-            }
-        }
-
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
         // The engine-wide counters, shared with the vector index WAL.

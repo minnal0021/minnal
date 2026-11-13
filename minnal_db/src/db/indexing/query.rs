@@ -28,8 +28,7 @@ impl Database {
     /// # How it works
     /// 1. Parses and evaluates `query_str` against the in-memory field indices,
     ///    producing a bitmap of matching row IDs.
-    /// 2. Scans all keys in the namespace's KVStore and returns those whose
-    ///    row ID (from the dense row map) appears in the bitmap.
+    /// 2. Resolves each matching row ID to its key (see [`keys_for_rows`]).
     ///
     /// # Limitations
     /// Only fields activated via `activate_field_index` are queryable.
@@ -50,23 +49,7 @@ impl Database {
             });
         }
 
-        // Fast path: when a RowToKeyFn inverse is registered, reconstruct each
-        // matching key directly from its row ID — O(|hits|), zero memory overhead,
-        // crash-safe (no map to rebuild on restart).
-        let keys = if let Some(ref inv) = *store.row_to_key_fn.read() {
-            bitmap.iter().map(|row_id| inv(row_id)).collect()
-        } else if store.rowmap_active() {
-            // Fast path: the dense row map resolves each hit's key directly — O(|hits|).
-            bitmap.iter().filter_map(|row_id| store.rowmap_key_for(row_id)).collect()
-        } else {
-            // Fallback (no inverse function): scan all keys and check bitmap membership.
-            // Pre-existing O(n_keys) path retained for backward compatibility.
-            store
-                .keys()?
-                .into_iter()
-                .filter(|key| store.resolve_row_id_get(key).is_some_and(|id| bitmap.contains(id)))
-                .collect()
-        };
+        let keys = keys_for_rows(&store, bitmap.iter())?;
 
         Ok(QueryOutcome {
             keys,
@@ -141,8 +124,7 @@ impl Database {
     /// `limit` keys starting from `offset` in iteration order.
     ///
     /// More efficient than [`query_keys`] when only a page of results is needed:
-    /// - With a registered `RowToKeyFn`: O(offset + limit) key resolutions.
-    /// - Fallback (no inverse): O(n_keys) scan but no full match list allocated.
+    /// only the page's rows are resolved to keys.
     ///
     /// [`query_keys`]: Self::query_keys
     pub fn query_keys_paginated(&self, namespace_id: NamespaceId, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
@@ -161,51 +143,14 @@ impl Database {
             });
         }
 
-        // Both fast paths window the bitmap with `iter_page`, not
+        // The bitmap is windowed with `iter_page`, not
         // `iter().skip(offset).take(limit)`. `iter` deserialises and
         // materialises every container it passes over, so walking a full result
         // set page by page costs O(n²). `iter_page` is bounded at both ends: it
         // reaches the offset by skipping whole containers on their cardinality,
         // and materialises at most `limit` values from each container it opens.
 
-        // Fast path: RowToKeyFn registered — resolve only the page window.
-        if let Some(ref inv) = *store.row_to_key_fn.read() {
-            let keys: Vec<Vec<u8>> = bitmap.iter_page(offset, limit).map(|row_id| inv(row_id)).collect();
-            return Ok(QueryOutcome {
-                keys,
-                total,
-                degraded_fields,
-                touched_fields: touched.clone(),
-            });
-        }
-
-        // Fast path: dense row map — resolve only the page window.
-        if store.rowmap_active() {
-            let keys: Vec<Vec<u8>> = bitmap
-                .iter_page(offset, limit)
-                .filter_map(|row_id| store.rowmap_key_for(row_id))
-                .collect();
-            return Ok(QueryOutcome {
-                keys,
-                total,
-                degraded_fields,
-                touched_fields: touched.clone(),
-            });
-        }
-
-        // Fallback: scan all keys, filter by bitmap membership, then window.
-        // The `.skip(offset)` here walks *keys*, not the bitmap, so it gets no
-        // benefit from `iter_page` — and it is not the bottleneck on this
-        // path anyway: `store.keys()` already materialises the whole namespace
-        // regardless of the page requested. Reached only when a namespace has
-        // neither a RowToKeyFn nor a loaded row map.
-        let all_keys = store.keys()?;
-        let keys: Vec<Vec<u8>> = all_keys
-            .into_iter()
-            .filter(|key| store.resolve_row_id_get(key).is_some_and(|id| bitmap.contains(id)))
-            .skip(offset)
-            .take(limit)
-            .collect();
+        let keys = keys_for_rows(&store, bitmap.iter_page(offset, limit))?;
         Ok(QueryOutcome {
             keys,
             total,
@@ -700,4 +645,22 @@ mod differential_tests {
         );
         db.shutdown().unwrap();
     }
+}
+
+/// The key of each row: through the namespace's `RowToKeyFn` when it derives
+/// row IDs from keys, otherwise through its dense row map. Each costs one
+/// lookup per row. A namespace with an active field index always has one of
+/// the two (`activate_field_index` loads the row map, and a `RowIdFn` is
+/// registered with its inverse), so the error is an internal fault.
+fn keys_for_rows(store: &KVStore, rows: impl Iterator<Item = u128>) -> Result<Vec<Vec<u8>>> {
+    if let Some(inv) = &*store.row_to_key_fn.read() {
+        return Ok(rows.map(|row_id| inv(row_id)).collect());
+    }
+    if store.rowmap_active() {
+        return Ok(rows.filter_map(|row_id| store.rowmap_key_for(row_id)).collect());
+    }
+    Err(crate::KVError::Io(std::io::Error::other(format!(
+        "namespace '{}' has an active field index but neither a row map nor a row-to-key function",
+        store.name
+    ))))
 }

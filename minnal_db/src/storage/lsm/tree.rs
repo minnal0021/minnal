@@ -1421,26 +1421,6 @@ impl LSMTree {
         }
     }
 
-    /// Cleanup any old SSTable files left from previous runs
-    /// Called on startup to clean up .old files
-    pub(crate) fn cleanup_old_files_on_startup(&self) -> Result<()> {
-        for bucket in 0u32..self.config.num_buckets as u32 {
-            let old_path = Self::level1_dir_from(&self.base_path).join(format!("level1_{}.dat.old", bucket));
-            if old_path.exists() {
-                match std::fs::remove_file(&old_path) {
-                    Ok(_) => {
-                        info!("[LSM] Cleaned up old SSTable file on startup: level1_{}.dat.old", bucket);
-                    }
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        warn!("[LSM] Failed to cleanup old SSTable file: {:?}", e);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Create a null/empty file for initialization
     fn create_null_file() -> Result<File> {
         // Return a temporary file that will be replaced
@@ -1562,19 +1542,14 @@ impl LSMTree {
                     continue;
                 }
                 if path.extension().map(|ext| ext == "dat").unwrap_or(false) {
-                    // L0 files are now renamed into place once complete (above), so a
-                    // crash no longer leaves a `.dat` too short to hold a header; one
-                    // can still come from a build that wrote L0 in place. Such a file
-                    // is crash debris, not a format mismatch: skip it rather than
-                    // register it, or every later scan would fail header validation on
-                    // it. Its records are still in the WAL — the flush marks them
-                    // persisted only after the file is durable — so replay restores
-                    // them. A file long enough to have a header still goes through
-                    // validation, so a pre-header database is rejected rather than
-                    // quietly skipped, and a `.dat` cut inside a frame fails the open.
+                    // A `.dat` is renamed into place only once complete (above), so
+                    // one too short to hold a header is damage, not a crash's
+                    // leftover: fail the open rather than register it.
                     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < SSTABLE_DATA_START {
-                        warn!("skipping incomplete Level-0 file {} (shorter than an SSTable header)", path.display());
-                        continue;
+                        return Err(LSMError::Corruption(format!(
+                            "Level-0 file {} is shorter than an SSTable header",
+                            path.display()
+                        )));
                     }
                     let summary = Self::level0_file_summary(&path)?;
                     if let Some(seq) = summary.as_ref().map(|s| s.max_seq)
@@ -2567,18 +2542,15 @@ impl LSMTree {
                 // complete SSTable — the old one before this call, the new one after,
                 // never nothing.
                 //
-                // This deliberately does NOT move the old file aside first. Doing so
-                // (`rename(level1 -> .old)` then `rename(.tmp -> level1)`) opened a
-                // crash window in which the L1 path did not exist at all: `LSMTree::open`
-                // would then `create(true)` a 0-byte file, `file_len == 0` would
-                // short-circuit the metadata load into "empty bucket", and
-                // `cleanup_old_files_on_startup` would delete the `.old` holding the only
-                // surviving copy. Every key that lived only in L1 was lost — silently,
-                // and with both a complete `.old` and a complete `.tmp` sitting on disk
-                // unread. Regression test: `test_crash_between_l1_publish_steps_keeps_l1`.
+                // Never move the old file aside first (`rename(level1 -> .old)`,
+                // then `rename(.tmp -> level1)`): between the two renames the L1
+                // path would not exist, `LSMTree::open` after a crash there would
+                // create an empty file and read the bucket as empty, and every key
+                // that lived only in L1 would be lost. Regression test:
+                // `test_crash_between_l1_publish_steps_keeps_l1`.
                 //
-                // Readers holding the previous `Arc<File>` keep reading the old inode
-                // until they drop it, which is unchanged from before.
+                // Readers holding the previous `Arc<File>` keep reading the old
+                // inode until they drop it.
                 std::fs::rename(&temp_path, &level1_path)?;
 
                 // Make the rename itself durable: without an fsync of the containing
@@ -2611,10 +2583,6 @@ impl LSMTree {
             // The sparse index was built from the byte offsets as the file was
             // written, so it matches the file just installed.
             *self.sstable_indexes[bucket_idx].write() = (!index.is_empty()).then(|| Arc::new(index));
-
-            // No `.old` to clean up — the publish above is a single atomic rename and
-            // never creates one. `cleanup_old_files_on_startup` still sweeps any left
-            // by a database written before that change.
         }
 
         for entry in entries {
@@ -4527,16 +4495,12 @@ mod tests {
         }
     }
 
-    // The L1 publish must never leave the bucket's L1 path missing. It used to move the
-    // live file aside (`rename(level1 -> .old)`) before renaming the new one in, and a
-    // crash in between was silent, permanent loss of every key that lived only in L1:
-    // `LSMTree::open` created a 0-byte L1, `file_len == 0` short-circuited the metadata
-    // load into "empty bucket", and `cleanup_old_files_on_startup` then deleted the
-    // `.old` that still held the data.
-    //
-    // The fix is structural — one atomic `rename(2)`, which replaces the destination —
-    // so the property to pin is that no reachable intermediate state has the L1 path
-    // absent or empty while data lives only there.
+    // The L1 publish must never leave the bucket's L1 path missing or empty while
+    // data lives only there: after a crash, `LSMTree::open` would create a 0-byte L1,
+    // read the bucket as empty, and every key that lived only in L1 would be lost.
+    // The publish is one atomic `rename(2)`, which replaces the destination, so this
+    // test watches the path through many compactions and checks no intermediate
+    // state has it absent or empty.
     //
     // Note the setup must call `cleanup_obsolete_level0_files()`: without it the merged
     // L0 file is still on disk and answers the read, masking the loss entirely.
@@ -4645,41 +4609,26 @@ mod tests {
         Ok(())
     }
 
-    // The L0 counterpart of the check above, and the case where the two levels must
-    // behave *differently*. L1 is written to a temp file and renamed, so an L1 file at
-    // its final path is always complete; L0 is written in place, so a crash mid-flush
-    // can leave one shorter than a header. That is incomplete debris, not a stale
-    // format, and the records are still in the WAL — so open must skip it and carry on
-    // rather than refusing to start the database.
+    /// A `.dat` at its final name is always complete (L0 files are renamed into
+    /// place), so one too short to hold a header is damage and fails the open.
     #[test]
-    fn test_open_skips_a_crash_truncated_level0_file() -> Result<()> {
+    fn test_open_rejects_a_level0_file_shorter_than_a_header() -> Result<()> {
         let temp_dir = TempDir::new()?;
         {
             let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
-            lsm.insert_with_seq(b"survivor", 0xAAAA, 1)?;
             lsm.insert_with_seq(b"k", 0xBBBB, 2)?;
             lsm.flush_memtable_to_level0()?;
         }
 
         let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
         let dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), bucket);
-        let torn = std::fs::read_dir(&dir)?.next().expect("setup: an L0 file should exist")?.path();
-        // What a build that wrote L0 in place left after a crash between
-        // `File::create` and the header write: 0 bytes.
-        std::fs::write(&torn, b"")?;
+        let damaged = std::fs::read_dir(&dir)?.next().expect("setup: an L0 file should exist")?.path();
+        std::fs::write(&damaged, b"")?;
 
-        let lsm = match LSMTree::open(temp_dir.path(), test_lsm_config()) {
-            Ok(lsm) => lsm,
-            Err(e) => panic!("open must skip an incomplete L0 file, not fail the whole database: {e:?}"),
-        };
-        // Reads must still work — the torn file must not be registered, or every later
-        // scan would fail header validation on it.
-        assert_eq!(
-            lsm.get(b"k")?,
-            None,
-            "the torn file's records are gone from L0 (WAL replay restores them)"
-        );
-        lsm.scan_prefix(b"")?;
+        match LSMTree::open(temp_dir.path(), test_lsm_config()) {
+            Err(LSMError::Corruption(msg)) => assert!(msg.contains("shorter than an SSTable header"), "{msg}"),
+            other => panic!("expected Corruption, got {:?}", other.map(|_| ())),
+        }
         Ok(())
     }
 

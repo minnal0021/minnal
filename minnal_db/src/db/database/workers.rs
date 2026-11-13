@@ -110,7 +110,6 @@ impl IndexCheckpointTarget for Database {
             if let Some(store) = stores.get(&ns_id) {
                 let ns_index = store.namespace_index.read();
                 if let Some(entry) = ns_index.get(field_id) {
-                    let field_path = self.index_manager.field_path(ns_id, field_id);
                     // Write the field's buffered changes out, crash-ordered and
                     // with no fsync under the write lock:
                     //   1. stage  (write lock): append the changed blobs; no slot
@@ -163,7 +162,7 @@ impl IndexCheckpointTarget for Database {
                     if over_threshold {
                         let mut idx = entry.index.write();
                         if idx.maybe_compact(waste_threshold).map_err(KVError::Io)? {
-                            idx.flush(&field_path).map_err(KVError::Io)?;
+                            idx.flush().map_err(KVError::Io)?;
                             debug!("[IndexCheckpoint] compacted field-index stores ns={ns_id} field={field_id}");
                         }
                     }
