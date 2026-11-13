@@ -84,62 +84,23 @@ impl KVStore {
         Ok(true)
     }
 
-    /// Replay a single WAL entry into this namespace's storage, stamping the
-    /// memtable with the entry's original WAL sequence so recovery reproduces the
-    /// same per-key winner that was live before the crash (highest-sequence-wins).
+    /// Replay a WAL upsert into this namespace's storage under the entry's
+    /// original sequence, so recovery reproduces the per-key winner that was live
+    /// before the crash (highest-sequence-wins).
+    ///
+    /// It is the live put path, not a copy of it: a replayed write can lose (the
+    /// vector index WAL replays before the main WAL, so a main-WAL entry can land
+    /// after a newer write of its key), and a losing write must leave the garbage
+    /// counters and the field indices alone exactly as a live one does.
     pub fn replay_upsert(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
-        let epoch = current_epoch_millis();
-        let mut next_version = 1u32;
-
-        // Read the displaced pointer and decide the winner inside the bucket lock, as
-        // the live put path does — replay reuses that path's accounting exactly.
-        let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-
-        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
-        let displaced = existing_u128.and_then(decode_sharded_pointer);
-        if let Some(existing_ptr) = displaced
-            && let Ok(meta) = self.value_log.read_record_meta(existing_ptr)
-        {
-            next_version = meta.version.saturating_add(1);
-        }
-
-        let record_meta = ValueRecordMeta {
-            version: next_version,
-            epoch,
-            seq,
-        };
-        let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
-        self.lsm.insert_with_seq(key, pointer.to_u128(), seq)?;
-        if wins {
-            if let Some(old) = displaced {
-                self.value_log.note_displaced(old, key.len());
-            }
-        } else {
-            self.value_log.note_displaced(pointer, key.len());
-        }
-        drop(_bucket_guard);
-
-        if wins {
-            self.update_indices_on_put(key, value, None, displaced.is_some());
-        }
-        Ok(())
+        self.put_to_storage_seq(key, value, seq)
     }
 
-    /// Replay a WAL delete into this namespace's storage, under the entry's original
-    /// sequence (see [`replay_upsert`](Self::replay_upsert)).
+    /// Replay a WAL delete into this namespace's storage under the entry's
+    /// original sequence, through the live delete path (see
+    /// [`replay_upsert`](Self::replay_upsert) for why not a copy).
     pub fn replay_delete(&self, key: &[u8], seq: u64) -> Result<()> {
-        let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-        let displaced = self.lsm.get(key).ok().flatten().and_then(decode_sharded_pointer);
-        self.lsm.delete_with_seq(key, seq)?;
-        if let Some(old) = displaced {
-            self.value_log.note_displaced(old, key.len());
-        }
-        drop(_bucket_guard);
-
-        self.update_indices_on_delete(key, None);
-        Ok(())
+        self.delete_from_storage_seq(key, seq)
     }
 
     pub fn flush_and_compact_all(&self) -> Result<()> {

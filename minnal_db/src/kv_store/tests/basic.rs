@@ -96,6 +96,44 @@ fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
     assert_eq!(garbage, loser_len, "the dropped lower-seq record's bytes are the garbage");
 }
 
+/// Replay applies an entry exactly as the live write path does, including when
+/// it loses. The vector index WAL replays before the main WAL, so a main-WAL
+/// delete can be replayed after a newer put of its key from the vector WAL;
+/// that delete loses, and must not count the live record as garbage.
+#[test]
+fn a_replayed_write_that_loses_counts_only_its_own_record_as_garbage() {
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u64(0),
+        "default",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+    )
+    .unwrap();
+
+    let winner = vec![0x11u8; 400];
+    let loser = vec![0x22u8; 900];
+    store.replay_upsert(b"k", &winner, 10).unwrap();
+    store.replay_delete(b"k", 5).unwrap();
+    assert_eq!(store.get(b"k").unwrap(), Some(winner.clone()), "the losing replayed delete is dropped");
+    assert_eq!(
+        store.value_log.total_garbage_bytes(),
+        0,
+        "a losing delete must not charge the live record"
+    );
+
+    store.replay_upsert(b"k", &loser, 7).unwrap();
+    assert_eq!(store.get(b"k").unwrap(), Some(winner), "the losing replayed put is dropped");
+    let loser_len = crate::storage::value_log::ValueRecordHeader::record_len(b"k".len(), loser.len());
+    assert_eq!(
+        store.value_log.total_garbage_bytes(),
+        loser_len,
+        "only the losing put's own record is garbage"
+    );
+}
+
 #[test]
 fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
     // A value-log read error must not read as a missing key. `get` surfaces a hard

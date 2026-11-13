@@ -212,6 +212,10 @@ mod tests {
         store.put_to_storage_seq(b"doc:B", br#"{"status":"idle"}"#, 1_000_200).unwrap();
         store.delete_from_storage_seq(b"doc:B", 1_000_300).unwrap();
         store.put_to_storage_seq(b"doc:B", br#"{"status":"active"}"#, 1_000_250).unwrap();
+        // The same losers again, replayed from a WAL: replay must leave the index
+        // alone just as the live path does.
+        store.replay_delete(b"doc:A", 1_000_060).unwrap();
+        store.replay_upsert(b"doc:B", br#"{"status":"active"}"#, 1_000_260).unwrap();
 
         assert!(store.get(b"doc:A").unwrap().is_some(), "setup: doc:A is live");
         assert!(store.get(b"doc:B").unwrap().is_none(), "setup: doc:B is deleted");
