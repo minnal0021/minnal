@@ -380,3 +380,58 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// GC's relocation is an append then an LSM insert, like a put. If the insert
+/// fails, the pass stops with an error and nothing points at the copy just
+/// appended; it must be counted as garbage, or its segment carries bytes that
+/// look live and are never referenced.
+#[test]
+fn a_gc_copy_whose_lsm_insert_fails_counts_as_garbage() {
+    let lsm = LSMConfig {
+        num_buckets: 1,
+        ..LSMConfig::default()
+    };
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(NamespaceId::from_u64(0), "gc", dir.path(), lsm, SyncConfig::default(), 1024 * 1024).unwrap();
+
+    let keep = vec![b'k'; 300];
+    let junk = vec![b'j'; 200];
+    store.put_to_storage(b"keep", &keep).unwrap();
+    for _ in 0..20 {
+        store.put_to_storage(b"junk", &junk).unwrap(); // 19 of these become garbage
+    }
+    let record_len = |key: &[u8], value: &[u8]| crate::storage::value_log::ValueRecordHeader::record_len(key.len(), value.len());
+    let referenced = record_len(b"keep", &keep) + record_len(b"junk", &junk);
+    let live_bytes = || -> u64 {
+        store
+            .value_log
+            .all_segment_stats()
+            .into_iter()
+            .flat_map(|(_, segs)| segs)
+            .map(|s| s.live_bytes)
+            .sum()
+    };
+    assert_eq!(live_bytes(), referenced, "setup: only the two current records are live");
+
+    let total_bytes = || -> u64 {
+        store
+            .value_log
+            .all_segment_stats()
+            .into_iter()
+            .flat_map(|(_, segs)| segs)
+            .map(|s| s.total_bytes)
+            .sum()
+    };
+    let before = total_bytes();
+    store.lsm.fail_next_insert();
+    // A failed bucket is logged, not returned, so the pass itself reports Ok.
+    store.garbage_collect_with_thresholds(0.01, 0.01).unwrap();
+    assert!(total_bytes() > before, "setup: GC appended a copy before its re-point failed");
+    assert_eq!(live_bytes(), referenced, "the copy that was never re-pointed must be counted as garbage");
+
+    // A later pass completes, and the data is intact.
+    store.garbage_collect_with_thresholds(0.01, 0.01).unwrap();
+    assert_eq!(store.get(b"keep").unwrap(), Some(keep));
+    assert_eq!(store.get(b"junk").unwrap(), Some(junk));
+    assert_eq!(live_bytes(), referenced, "after GC, still exactly the referenced records are live");
+}

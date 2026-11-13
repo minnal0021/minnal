@@ -142,7 +142,13 @@ impl KVStore {
                         continue; // overwritten since phase 1 — do not revert
                     }
                     let new_pointer = self.value_log.append_to_locked_bucket(bucket, key, value, *meta, false)?;
-                    self.lsm.insert_with_seq(key, new_pointer.to_u128(), seq)?;
+                    if let Err(e) = self.lsm.insert_with_seq(key, new_pointer.to_u128(), seq) {
+                        // Nothing points at the copy: count it as garbage, as the put
+                        // path does. The key keeps its old pointer, and this segment
+                        // stays until a later pass relocates it.
+                        self.value_log.note_displaced(new_pointer, key.len());
+                        return Err(e.into());
+                    }
                     result.bytes_rewritten += new_pointer.record_len(key.len());
                 }
             }

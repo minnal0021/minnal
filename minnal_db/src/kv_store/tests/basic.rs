@@ -96,6 +96,42 @@ fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
     assert_eq!(garbage, loser_len, "the dropped lower-seq record's bytes are the garbage");
 }
 
+/// Every appended record is either what the LSM points at or counted as garbage.
+/// A put whose LSM insert fails after its value-log append leaves a record that
+/// nothing points at, and the apply is retried (`apply_with_retry`, then
+/// recovery), each attempt appending afresh. Left counted as live, those bytes
+/// make their segment look cleaner than it is, so GC may never select it.
+#[test]
+fn a_put_whose_lsm_insert_fails_counts_its_record_as_garbage() {
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u64(0),
+        "default",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+    )
+    .unwrap();
+
+    let value = vec![0x33u8; 500];
+    store.lsm.fail_next_insert();
+    assert!(store.put_to_storage_seq(b"k", &value, 10).is_err(), "setup: the insert fails");
+    store.put_to_storage_seq(b"k", &value, 10).unwrap(); // the retry
+    assert_eq!(store.get(b"k").unwrap(), Some(value.clone()));
+
+    let record_len = crate::storage::value_log::ValueRecordHeader::record_len(b"k".len(), value.len());
+    let (mut live, mut garbage) = (0u64, 0u64);
+    for (_bucket, segs) in store.value_log.all_segment_stats() {
+        for s in segs {
+            live += s.live_bytes;
+            garbage += s.garbage_bytes;
+        }
+    }
+    assert_eq!(live, record_len, "only the retry's record is live");
+    assert_eq!(garbage, record_len, "the failed attempt's record, which nothing points at, is garbage");
+}
+
 /// Replay applies an entry exactly as the live write path does, including when
 /// it loses. The vector index WAL replays before the main WAL, so a main-WAL
 /// delete can be replayed after a newer put of its key from the vector WAL;

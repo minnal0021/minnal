@@ -1128,6 +1128,10 @@ pub(crate) struct LSMTree {
     flush_observer: Arc<RwLock<Option<Arc<dyn LsmFlushObserver>>>>,
 
     base_path: PathBuf,
+
+    /// Test-only fault: the next `insert_with_seq` fails before inserting.
+    #[cfg(test)]
+    fail_next_insert: AtomicBool,
 }
 
 impl LSMTree {
@@ -1407,6 +1411,8 @@ impl LSMTree {
             last_l0_stamp: parking_lot::Mutex::new(last_l0_stamp),
             flush_observer: Arc::new(RwLock::new(None)),
             base_path,
+            #[cfg(test)]
+            fail_next_insert: AtomicBool::new(false),
         })
     }
 
@@ -2104,6 +2110,10 @@ impl LSMTree {
     /// makes the in-memory winner for racing same-key writes match the winner
     /// recovery would pick (recovery replays in sequence order).
     pub(crate) fn insert_with_seq(&self, key: &[u8], value: u128, seq: u64) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_insert.swap(false, Ordering::SeqCst) {
+            return Err(LSMError::CapacityExceeded);
+        }
         {
             let memtable = self.memtable.read();
             if memtable.should_flush(self.config.compaction_threshold_percent) {
@@ -3872,6 +3882,13 @@ impl LSMTree {
         self.read_only_memtables
             .write()
             .retain(|ro| ro.version() >= version || !ro.is_flushed_to_level0());
+    }
+
+    /// Test-only: make the next `insert_with_seq` fail without inserting, as a
+    /// memtable arena past `u32::MAX` would.
+    #[cfg(test)]
+    pub(crate) fn fail_next_insert(&self) {
+        self.fail_next_insert.store(true, Ordering::SeqCst);
     }
 
     /// Test-only: hold the active memtable, so a flush of this tree waits.

@@ -64,7 +64,14 @@ impl KVStore {
             seq,
         };
         let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
-        self.lsm.insert_with_seq(key, pointer.to_u128(), seq)?;
+        if let Err(e) = self.lsm.insert_with_seq(key, pointer.to_u128(), seq) {
+            // A failed insert inserts nothing, so nothing points at the record just
+            // appended: count it as garbage now. The apply is retried, each attempt
+            // appending afresh, and bytes left counted as live would make their
+            // segment look cleaner than it is to GC's selection.
+            self.value_log.note_displaced(pointer, key.len());
+            return Err(e.into());
+        }
 
         // Account the record that is now garbage — accounting only, no I/O and no
         // in-place edit (the old record's segment may be sealed and immutable). If this
