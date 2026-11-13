@@ -620,7 +620,6 @@ pub fn quantise(embedding: &[f32], centroid: &[f32], number_of_bits_for_quantisa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic_search::vector_math::{pack, pack_to_signed_64, pack_to_signed_128};
     use approx::assert_relative_eq;
 
     /// Parse a JSON array of `f32` from a `test_data` fixture file.
@@ -631,35 +630,6 @@ mod tests {
     /// Parse a JSON array of `u8` from a `test_data` fixture file.
     fn load_vec_u8(json: &str) -> Vec<u8> {
         serde_json::from_str(json).expect("fixture must be a JSON array of u8")
-    }
-
-    /// Parse a JSON array of `i64` from a `test_data` fixture file.
-    fn load_vec_i64(json: &str) -> Vec<i64> {
-        serde_json::from_str(json).expect("fixture must be a JSON array of i64")
-    }
-
-    /// Parse a JSON array of decimal `u128` strings from a `test_data` fixture file.
-    ///
-    /// 128-bit integers are stored as strings because `serde_json` cannot parse
-    /// numeric literals wider than 64 bits.
-    fn load_vec_u128(json: &str) -> Vec<u128> {
-        serde_json::from_str::<Vec<String>>(json)
-            .expect("fixture must be a JSON array of u128 strings")
-            .iter()
-            .map(|s| s.parse().expect("fixture element must be a valid u128"))
-            .collect()
-    }
-
-    /// Parse a JSON array of decimal `i128` strings from a `test_data` fixture file.
-    ///
-    /// 128-bit integers are stored as strings because `serde_json` cannot parse
-    /// numeric literals wider than 64 bits.
-    fn load_vec_i128(json: &str) -> Vec<i128> {
-        serde_json::from_str::<Vec<String>>(json)
-            .expect("fixture must be a JSON array of i128 strings")
-            .iter()
-            .map(|s| s.parse().expect("fixture element must be a valid i128"))
-            .collect()
     }
 
     #[test]
@@ -935,9 +905,6 @@ mod tests {
         let number_of_bits: usize = 1;
 
         let quantisation = quantise(embedding, centroid, number_of_bits);
-        let packed_quantisation = pack(&quantisation.quantised_embedding).expect("Failed to pack quantisation");
-        let packed_to_signed_quantisation_i128 = pack_to_signed_128(&quantisation.quantised_embedding).expect("Failed to pack signed quantisation");
-        let packed_to_signed_quantisation_i64 = pack_to_signed_64(&quantisation.quantised_embedding).expect("Failed to pack signed quantisation");
         assert_relative_eq!(quantisation.addition_factor, 0.0, epsilon = 0.0001);
         assert_relative_eq!(quantisation.scaling_factor, 0.054529752, epsilon = 0.001);
         assert_relative_eq!(quantisation.error_bound, 0.06784632, epsilon = 0.001);
@@ -945,45 +912,18 @@ mod tests {
             quantisation.quantised_embedding,
             load_vec_u8(include_str!("../../../test_data/rabitq_singlebit_codes.json"))
         );
-        assert_eq!(
-            packed_quantisation,
-            load_vec_u128(include_str!("../../../test_data/rabitq_singlebit_packed_u128.json"))
-        );
-        assert_eq!(
-            packed_to_signed_quantisation_i128,
-            load_vec_i128(include_str!("../../../test_data/rabitq_singlebit_signed_i128.json"))
-        );
-        assert_eq!(
-            packed_to_signed_quantisation_i64,
-            load_vec_i64(include_str!("../../../test_data/rabitq_singlebit_signed_i64.json"))
-        );
     }
 
     fn assert_multi_bit_quantisation(centroid: &[f32], embedding: &[f32]) {
         let number_of_bits: usize = 8;
 
         let quantisation = quantise(embedding, centroid, number_of_bits);
-        let packed_quantisation = pack(&quantisation.quantised_embedding).expect("Failed to pack quantisation");
-        let packed_to_signed_quantisation_i128 = pack_to_signed_128(&quantisation.quantised_embedding).expect("Failed to pack signed quantisation");
-        let packed_to_signed_quantisation_i64 = pack_to_signed_64(&quantisation.quantised_embedding).expect("Failed to pack signed quantisation");
         assert_relative_eq!(quantisation.addition_factor, 0.9996985, epsilon = 0.0001);
         assert_relative_eq!(quantisation.scaling_factor, -0.0012493228, epsilon = 0.0001);
         assert_relative_eq!(quantisation.error_bound, 0.0006662832, epsilon = 0.0001);
         assert_eq!(
             quantisation.quantised_embedding,
             load_vec_u8(include_str!("../../../test_data/rabitq_multibit_codes.json"))
-        );
-        assert_eq!(
-            packed_quantisation,
-            load_vec_u128(include_str!("../../../test_data/rabitq_multibit_packed_u128.json"))
-        );
-        assert_eq!(
-            packed_to_signed_quantisation_i128,
-            load_vec_i128(include_str!("../../../test_data/rabitq_multibit_signed_i128.json"))
-        );
-        assert_eq!(
-            packed_to_signed_quantisation_i64,
-            load_vec_i64(include_str!("../../../test_data/rabitq_multibit_signed_i64.json"))
         );
     }
 

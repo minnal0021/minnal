@@ -730,11 +730,6 @@ impl ValueLog {
         self.stats_need_rebuild.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)] // surfaced through ShardedValueLog
-    pub fn segment_size(&self) -> u64 {
-        self.segment_size
-    }
-
     pub fn set_verify_checksums_on_read(&self, verify: bool) {
         self.verify_checksums_on_read.store(verify, Ordering::Relaxed);
     }

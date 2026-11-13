@@ -46,20 +46,11 @@ impl LsmManifest {
             .map(|buf| buf.to_vec())
     }
 
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        rkyv::from_bytes::<LsmManifest, rkyv::rancor::Error>(bytes).map_err(|e| format!("Failed to deserialize LSM manifest: {}", e))
-    }
-
     pub(crate) fn write_to_path(&self, path: &Path) -> std::io::Result<()> {
         let bytes = self.to_bytes().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // `write_atomic_durable` generates a per-call unique temp name (so
         // concurrent writers don't race on a shared "manifest.tmp"), fsyncs the
         // temp file, renames over `path`, and fsyncs the parent directory.
         crate::support::write_atomic_durable(path, &bytes)
-    }
-
-    pub(crate) fn read_from_path(path: &Path) -> std::io::Result<Self> {
-        let bytes = std::fs::read(path)?;
-        Self::from_bytes(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }

@@ -14,7 +14,9 @@
 //!
 //! ```text
 //! {db_path}/
-//!   ns_{name}/            ← per-namespace data: LSM SSTables and value log
+//!   ns_{name}/            ← per-namespace data
+//!     lsm/                ← LSM SSTables
+//!     value_logs/         ← value-log segments, per bucket
 //!   ns_system_catalog/    ← the system catalog: every namespace's id, TTL and field indexes
 //!   field-index/
 //!     {ns_id}/
@@ -63,6 +65,16 @@ pub(crate) fn namespace_name_problem(name: &str) -> Option<String> {
 /// **name**, not id — this is the one path that is, for historical reasons.
 pub(crate) fn namespace_data_dir(db_path: &Path, name: &str) -> PathBuf {
     db_path.join(format!("{NAMESPACE_DIR_PREFIX}{name}"))
+}
+
+/// A namespace's LSM tree: `{namespace_dir}/lsm`.
+pub(crate) fn namespace_lsm_dir(namespace_dir: &Path) -> PathBuf {
+    namespace_dir.join("lsm")
+}
+
+/// A namespace's value log: `{namespace_dir}/value_logs`.
+pub(crate) fn namespace_value_log_dir(namespace_dir: &Path) -> PathBuf {
+    namespace_dir.join("value_logs")
 }
 
 /// Every namespace data directory under `db_path` (`ns_*`), whether or not

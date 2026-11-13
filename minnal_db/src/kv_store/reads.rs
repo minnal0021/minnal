@@ -156,32 +156,6 @@ impl KVStore {
         self.lsm.keys().map_err(KVError::from)
     }
 
-    /// Return keys in `[start, end)`. Pass `None` for `end` to scan to the last key.
-    pub fn range_keys(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
-        let all = self.lsm.range_keys_bounded(start, usize::MAX)?;
-        match end {
-            Some(end_key) => Ok(all.into_iter().filter(|k| k.as_slice() < end_key).collect()),
-            None => Ok(all),
-        }
-    }
-
-    /// Return keys that start with `prefix`.
-    pub fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        Ok(self.lsm.scan_prefix(prefix)?.into_iter().map(|(k, _, _)| k).collect())
-    }
-
-    pub fn resolve_entries(&self, keys: Vec<Vec<u8>>) -> Result<Vec<ResolvedEntry>> {
-        let mut entries = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(offset_u128) = self.lsm.get(&key)?
-                && let Some(pointer) = decode_sharded_pointer(offset_u128)
-            {
-                entries.push((key, pointer));
-            }
-        }
-        Ok(entries)
-    }
-
     pub fn resolve_entries_from_pointers(&self, key_pointers: Vec<KeyPointer>) -> Result<Vec<ResolvedEntry>> {
         let mut entries = Vec::with_capacity(key_pointers.len());
         for (key, offset_u128, _seq) in key_pointers {

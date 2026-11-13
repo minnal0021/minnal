@@ -144,7 +144,7 @@ mod merge_tests {
         db.put(b"k1", &vec![1u8; 16 * 1024]).unwrap();
         db.put(b"target", b"small").unwrap();
 
-        let vlog_dir = db.get_store(DEFAULT_NAMESPACE_ID).unwrap().value_log_path.clone();
+        let vlog_dir = crate::layout::namespace_value_log_dir(&crate::layout::namespace_data_dir(dir.path(), crate::namespace::DEFAULT_NAMESPACE));
         let original = std::fs::metadata(&vlog_dir).unwrap().permissions();
         let mut readonly = original.clone();
         readonly.set_mode(0o555);

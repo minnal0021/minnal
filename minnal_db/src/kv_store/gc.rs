@@ -311,11 +311,6 @@ impl KVStore {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn garbage_collect(&self) -> Result<GCStats> {
-        self.garbage_collect_with_threshold(crate::defaults::thresholds::VALUE_LOG_WASTE_THRESHOLD)
-    }
-
     /// Does this namespace have value-log garbage GC can actually collect right now?
     ///
     /// The bucket-level waste ratio alone is not enough: garbage sitting in a bucket's
@@ -350,11 +345,6 @@ impl KVStore {
     pub(crate) fn waste_bytes(&self) -> (u64, u64) {
         let garbage = self.value_log.total_garbage_bytes();
         (garbage, garbage.saturating_add(self.value_log.total_live_bytes()))
-    }
-
-    #[allow(dead_code)]
-    pub fn get_garbage_ratio(&self) -> f64 {
-        self.value_log.total_garbage_ratio()
     }
 
     pub(crate) fn aggregate_value_log_stats(&self) -> (u64, u64, u64) {

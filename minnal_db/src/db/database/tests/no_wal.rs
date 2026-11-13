@@ -97,7 +97,7 @@ fn a_failed_flush_keeps_the_no_wal_flag_set() {
     // Make the flush fail by taking write permission off the level-0 tree —
     // it can then neither create a bucket directory nor write an SSTable
     // into an existing one.
-    let level0 = store.lsm_path.join("level0");
+    let level0 = crate::layout::namespace_lsm_dir(&crate::layout::namespace_data_dir(dir.path(), "vectors")).join("level0");
     std::fs::create_dir_all(&level0).unwrap();
     let mut locked: Vec<(std::path::PathBuf, std::fs::Permissions)> = Vec::new();
     for entry in std::fs::read_dir(&level0).unwrap() {

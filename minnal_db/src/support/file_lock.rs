@@ -28,7 +28,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Name of the lock file inside the database directory.
 pub(crate) const LOCK_FILE_NAME: &str = ".lock";
@@ -60,7 +60,6 @@ impl From<std::io::Error> for LockError {
 pub(crate) struct DirLock {
     /// Closing this fd is what releases the lock. Never unlink the path.
     _file: File,
-    path: PathBuf,
 }
 
 impl DirLock {
@@ -89,13 +88,7 @@ impl DirLock {
         // worth failing an otherwise successful open over.
         let _ = write_owner_pid(&mut file);
 
-        Ok(DirLock { _file: file, path })
-    }
-
-    /// Path of the lock file, for logging.
-    #[allow(dead_code)]
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+        Ok(DirLock { _file: file })
     }
 }
 

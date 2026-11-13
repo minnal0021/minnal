@@ -25,7 +25,7 @@ use crate::storage::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRec
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -131,15 +131,11 @@ pub struct KVStore {
 
     // LSM tree for keys
     pub(crate) lsm: Arc<LSMTree>,
-    #[allow(dead_code)]
-    pub(crate) lsm_path: PathBuf,
 
     // Sharded value log: one series of segment files per bucket. The value log owns
     // its own durable metadata (segment inventory + id high-water mark) per bucket,
     // so the store keeps no separate metadata file of its own.
     pub(crate) value_log: ShardedValueLog,
-    #[allow(dead_code)]
-    pub(crate) value_log_path: PathBuf,
 
     // Sync configuration
     pub(crate) sync_config: SyncConfig,
@@ -221,7 +217,7 @@ impl KVStore {
     /// Whether the namespace whose data directory is `base_path` holds any L1
     /// data, without opening it (see `LSMTree::has_level1_data`).
     pub(crate) fn has_level1_data(base_path: &Path) -> std::io::Result<bool> {
-        crate::storage::lsm::tree::LSMTree::has_level1_data(&base_path.join("lsm"))
+        crate::storage::lsm::tree::LSMTree::has_level1_data(&crate::layout::namespace_lsm_dir(base_path))
     }
 
     /// Enable or disable re-verifying each value's CRC32 on read (default off).
@@ -266,8 +262,8 @@ impl KVStore {
     ) -> Result<Self> {
         std::fs::create_dir_all(base_path)?;
 
-        let lsm_path = base_path.join("lsm");
-        let value_log_path = base_path.join("value_logs");
+        let lsm_path = crate::layout::namespace_lsm_dir(base_path);
+        let value_log_path = crate::layout::namespace_value_log_dir(base_path);
 
         let mut lsm_cfg = lsm_config;
         lsm_cfg.data_dir = lsm_path.clone();
@@ -285,9 +281,7 @@ impl KVStore {
             namespace_id,
             name: name.to_string(),
             lsm,
-            lsm_path,
             value_log,
-            value_log_path,
             sync_config,
             write_count: Arc::new(AtomicU64::new(0)),
             unflushed_no_wal_writes: Arc::new(AtomicBool::new(false)),

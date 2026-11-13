@@ -30,7 +30,8 @@ impl Database {
     pub(crate) fn open_with_wal_segment_size(db_path: &Path, mut config: DbConfig, wal_segment_size: u64) -> Result<Self> {
         std::fs::create_dir_all(db_path)?;
 
-        let default_vlog_dir = db_path.join("ns_default").join("value_logs");
+        let default_vlog_dir =
+            crate::layout::namespace_value_log_dir(&crate::layout::namespace_data_dir(db_path, crate::namespace::DEFAULT_NAMESPACE));
         if default_vlog_dir.exists() {
             let existing_count = Self::detect_bucket_count(&default_vlog_dir);
             if existing_count > 0 && existing_count != config.num_buckets {

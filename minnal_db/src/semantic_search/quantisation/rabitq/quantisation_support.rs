@@ -66,14 +66,6 @@ pub fn calculate_error_bound(
     scale_multiplier * sqrt_error
 }
 
-#[allow(dead_code)]
-#[inline]
-pub fn subtract_inplace(a: &mut [f32], b: &[f32]) {
-    for (x, y) in a.iter_mut().zip(b.iter()) {
-        *x -= y;
-    }
-}
-
 /// Pack a binary vector (`true` = 1, `false` = 0) into a `Vec<u64>`.
 /// The first bit of `bits[0]` corresponds to dimension 0.
 /// Dimensions are packed little-endian within each `u64` word.
@@ -91,7 +83,7 @@ pub fn pack_bits(binary: &[u8]) -> Vec<u64> {
 }
 
 /// Unpack a packed bit-vector back to `Vec<bool>` of length `dim`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn unpack_bits(packed: &[u64], dim: usize) -> Vec<bool> {
     let mut out = Vec::with_capacity(dim);
     for i in 0..dim {
@@ -139,17 +131,9 @@ pub fn bit_plane_code(packed: &[u64], dim: usize, bits: usize, i: usize) -> u8 {
     (0..bits).fold(0u8, |code, j| code | ((((packed[j * words + i / 64] >> (i % 64)) & 1) as u8) << j))
 }
 
-/// Unpack a byte-packed `Vec<u64>` back to `Vec<u8>` of length `dim`.
-#[allow(dead_code)]
-pub fn unpack_bytes(packed: &[u64], dim: usize) -> Vec<u8> {
-    let mut out: Vec<u8> = packed.iter().flat_map(|w| w.to_le_bytes()).collect();
-    out.truncate(dim);
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{bit_plane_code, pack_bit_planes, pack_bits, subtract_inplace, unpack_bits};
+    use super::{bit_plane_code, pack_bit_planes, pack_bits, unpack_bits};
 
     #[test]
     fn bit_planes_round_trip_at_every_width() {
@@ -162,46 +146,6 @@ mod tests {
                 assert_eq!(back, codes, "bits {bits} dim {dim}");
             }
         }
-    }
-
-    #[test]
-    fn subtracts_element_wise() {
-        let mut a = vec![5.0_f32, 3.0, 8.0];
-        subtract_inplace(&mut a, &[1.0, 2.0, 3.0]);
-        assert_eq!(a, vec![4.0, 1.0, 5.0]);
-    }
-
-    #[test]
-    fn equal_vectors_produce_zeros() {
-        let mut a = vec![1.5_f32, -2.0, 0.5];
-        let b = a.clone();
-        subtract_inplace(&mut a, &b);
-        for v in &a {
-            assert!(*v == 0.0, "expected 0.0, got {v}");
-        }
-    }
-
-    #[test]
-    fn subtract_zero_vector_is_identity() {
-        let original = vec![1.0_f32, -3.0, 7.5];
-        let mut a = original.clone();
-        subtract_inplace(&mut a, &[0.0, 0.0, 0.0]);
-        assert_eq!(a, original);
-    }
-
-    #[test]
-    fn empty_slices_are_no_op() {
-        let mut a: Vec<f32> = vec![];
-        subtract_inplace(&mut a, &[]);
-        assert!(a.is_empty());
-    }
-
-    #[test]
-    fn stops_at_shorter_slice() {
-        // zip stops at b.len(); a[2] must remain unchanged
-        let mut a = vec![10.0_f32, 20.0, 30.0];
-        subtract_inplace(&mut a, &[1.0, 2.0]);
-        assert_eq!(a, vec![9.0, 18.0, 30.0]);
     }
 
     // pack_bits / unpack_bits tests

@@ -130,16 +130,6 @@ pub(crate) async fn assert_no_open_files_under(dir: &std::path::Path, what: &str
     }
 }
 
-/// Validate that a runtime bucket count is within the u32 limit.
-#[allow(dead_code)]
-pub fn validate_num_buckets(num_buckets: usize) {
-    assert!(
-        num_buckets > 0 && num_buckets <= (u32::MAX as usize + 1),
-        "num_buckets must be between 1 and u32::MAX + 1, got {}",
-        num_buckets,
-    );
-}
-
 const SEED: u32 = 0xFEACBE01;
 
 /// Determine which bucket a key belongs to.

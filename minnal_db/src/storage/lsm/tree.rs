@@ -732,23 +732,12 @@ struct SStableEntry {
 /// In-memory component of LSM tree
 struct MemTable {
     skip_list: SkipList,
-    #[allow(dead_code)]
-    creation_time: std::time::Instant,
 }
 
 impl MemTable {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        Self {
-            skip_list: SkipList::new(),
-            creation_time: std::time::Instant::now(),
-        }
-    }
-
     fn with_capacity(skip_list_capacity: usize) -> Self {
         Self {
             skip_list: SkipList::with_capacity(skip_list_capacity),
-            creation_time: std::time::Instant::now(),
         }
     }
 
@@ -792,8 +781,6 @@ impl MemTable {
 #[derive(Clone)]
 struct ReadOnlyMemTable {
     records: Arc<Vec<KeyValueRecord>>,
-    #[allow(dead_code)]
-    creation_time: std::time::Instant,
     /// Reference count of active readers
     reader_count: Arc<AtomicU64>,
     /// Version number for tracking updates
@@ -816,7 +803,6 @@ impl ReadOnlyMemTable {
         );
         Self {
             records: Arc::new(records),
-            creation_time: std::time::Instant::now(),
             reader_count: Arc::new(AtomicU64::new(0)),
             version,
             flushed_to_level0: Arc::new(AtomicBool::new(false)),
@@ -869,7 +855,6 @@ impl std::fmt::Debug for ReadOnlyMemTable {
         f.debug_struct("ReadOnlyMemTable")
             .field("version", &self.version)
             .field("reader_count", &self.reader_count())
-            .field("creation_time", &self.creation_time)
             .finish()
     }
 }
@@ -2849,16 +2834,6 @@ impl LSMTree {
         manifest.write_to_path(&path).map_err(LSMError::Io)
     }
 
-    #[allow(dead_code)]
-    pub fn load_manifest(&self) -> Result<Option<LsmManifest>> {
-        let path = self.manifest_path();
-        if !path.exists() {
-            return Ok(None);
-        }
-        let manifest = LsmManifest::read_from_path(&path).map_err(LSMError::Io)?;
-        Ok(Some(manifest))
-    }
-
     /// Get statistics about the LSM tree
     pub(crate) fn stats(&self) -> LSMStats {
         let memtable = self.memtable.read();
@@ -3037,7 +3012,7 @@ impl LSMTree {
     /// seeking near `start` via the sparse index and stopping at `end`.
     ///
     /// The shared L1 range primitive behind `scan_l1_range_into`, `scan_prefixes`
-    /// (once per requested prefix), and `range_keys_bounded`. `visit` receives each
+    /// (once per requested prefix), and `range_pointers_bounded`. `visit` receives each
     /// archived entry (borrowed only for the call) so callers extract whatever value
     /// shape they need — pointer+seq, pointer only, or liveness.
     ///
@@ -3979,195 +3954,7 @@ impl LSMTree {
         Ok(kvs)
     }
 
-    /// Returns the first `limit` live keys that are `>= start`, in sorted order.
-    ///
-    /// Unlike `keys()` which loads the entire key space, this method:
-    /// - Uses an O(log N) seek in the memtable skip list (`iter_from`)
-    /// - Filters read-only memtable records by `>= start`
-    /// - Scans SSTable entries but skips those before `start`
-    /// - Stops after collecting `limit` keys
-    ///
-    /// Used by cursor-based `scan()` to avoid O(N_total) work per page fetch.
-    pub(crate) fn range_keys_bounded(&self, start: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
-        // Layers resolve by highest seq (`fold_newest`, oldest→newest: L1 → L0 → RO →
-        // active); only the *capture* order is newest-first so a concurrent
-        // flush/compaction cannot drop a live key. See `scan_prefix`. The
-        // `take(limit)` runs on the fully merged, sorted map, so limiting is
-        // unaffected by the capture order.
-        let mut all_entries = ScanMap::new();
-
-        // Memtable layers (newest) captured first, under one `memtable.read()` guard
-        // so a flush cannot split a key between active and RO.
-        let (active_snapshot, ro_snapshot) = {
-            let memtable = self.memtable.read();
-            let active: Vec<ScanEntry> = memtable
-                .skip_list
-                .iter_raw_from(start)
-                .map(|(key, value, seq, tombstone)| (key.to_vec(), (!tombstone).then_some(value), seq))
-                .collect();
-            let ro = self.read_only_memtables.read().clone();
-            (active, ro)
-        };
-
-        // SSTable handles captured newest-first (L0 before L1); read in merge order.
-        let (l0_guards, l1_files) = self.capture_sstable_layers();
-
-        // Pages ≤ this bound use the limit-bounded serial L1 path; larger scans keep the
-        // parallel read-everything path.
-        const BOUNDED_SCAN_LIMIT: usize = 10_000;
-
-        // Collect the layers NEWER than L1 (L0 oldest-first per bucket → RO → active) into
-        // one list in oldest→newest order — used to bound the L1 scan (over-read by the
-        // newer in-range count, a safe upper bound on same-bucket deletes) and replayed over
-        // L1 afterwards. See `range_pointers_bounded` for the full rationale.
-        let mut newer: Vec<ScanEntry> = Vec::new();
-        let bounded = limit <= BOUNDED_SCAN_LIMIT;
-
-        // Reads one bucket's L0 files (oldest-first, so an exact seq tie goes to the
-        // newer file), range-filtered (`>= start`). L0 has no min/max or sparse index, so files are scanned
-        // in full.
-        let read_l0_bucket = |bucket: usize| -> Result<Vec<ScanEntry>> {
-            let mut bucket_entries = Vec::new();
-            for guard in &l0_guards[bucket] {
-                let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
-                // Bound for `check_frame_len`: a frame can never be longer than its file.
-                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                let mut entry_bytes: Vec<u8> = Vec::new();
-                loop {
-                    let mut size_buf = [0u8; 4];
-                    match file.read_exact(&mut size_buf) {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => return Err(LSMError::Io(e)),
-                    }
-                    let size = u32::from_le_bytes(size_buf) as usize;
-                    check_frame_len(size as u64, file_len)?;
-                    entry_bytes.resize(size, 0);
-                    file.read_exact(&mut entry_bytes[..size])?;
-                    let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-                    if archived.key.as_slice() >= start {
-                        let val = (!archived.tombstone).then(|| archived.value.to_native());
-                        bucket_entries.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
-                    }
-                }
-            }
-            Ok(bucket_entries)
-        };
-
-        // L0 (newer than L1). Bounded page → read busy buckets SERIALLY (L0 is small in the
-        // steady state, so a thread per bucket costs more than it saves); full/large scan →
-        // parallel read-everything. See `range_pointers_bounded`.
-        let busy_l0: Vec<usize> = (0..self.config.num_buckets).filter(|b| !l0_guards[*b].is_empty()).collect();
-        if bounded {
-            for bucket in busy_l0 {
-                newer.extend(read_l0_bucket(bucket)?);
-            }
-        } else {
-            let mut first_err: Option<LSMError> = None;
-            std::thread::scope(|s| {
-                let handles: Vec<_> = busy_l0.into_iter().map(|bucket| s.spawn(move || read_l0_bucket(bucket))).collect();
-                for handle in handles {
-                    match handle
-                        .join()
-                        .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
-                    {
-                        Ok(entries) => newer.extend(entries),
-                        Err(e) => {
-                            if first_err.is_none() {
-                                first_err = Some(e);
-                            }
-                        }
-                    }
-                }
-            });
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-        }
-        for ro_memtable in ro_snapshot.iter() {
-            for record in ro_memtable.records().iter() {
-                if record.key.as_slice() >= start {
-                    newer.push((record.key.clone(), (!record.tombstone).then_some(record.value), record.seq));
-                }
-            }
-        }
-        newer.extend(active_snapshot);
-
-        // L1 SSTables (oldest layer) — only buckets whose min/max reaches `start` (range is
-        // unbounded above). Bounded page → serial, read ≤ `limit + 1 + |newer in THIS bucket|`
-        // LIVE keys per bucket (slack sharded per bucket since only a same-bucket newer entry
-        // can shadow a bucket's L1 key); full/large scan → parallel, read-everything. See
-        // `range_pointers_bounded`.
-        match bounded {
-            true => {
-                let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
-                for (key, _, _) in newer.iter() {
-                    newer_per_bucket[get_bucket_for_key(key, self.config.num_buckets) as usize] += 1;
-                }
-                for (bucket, file) in l1_files.iter().enumerate() {
-                    if !self.l1_overlaps(bucket, start, None) {
-                        continue;
-                    }
-                    let cap = limit.saturating_add(1).saturating_add(newer_per_bucket[bucket]);
-                    let mut entries = Vec::new();
-                    self.scan_l1_range_into(bucket, file, start, None, Some(cap), &mut entries)?;
-                    for (k, v, seq) in entries {
-                        fold_newest(&mut all_entries, k, v, seq);
-                    }
-                }
-            }
-            false => {
-                let mut first_err: Option<LSMError> = None;
-                std::thread::scope(|s| {
-                    let handles: Vec<_> = l1_files
-                        .iter()
-                        .enumerate()
-                        .filter(|(bucket, _)| self.l1_overlaps(*bucket, start, None))
-                        .map(|(bucket, file)| {
-                            s.spawn(move || -> Result<Vec<ScanEntry>> {
-                                let mut entries = Vec::new();
-                                self.scan_l1_range_into(bucket, file, start, None, None, &mut entries)?;
-                                Ok(entries)
-                            })
-                        })
-                        .collect();
-                    for handle in handles {
-                        match handle
-                            .join()
-                            .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
-                        {
-                            Ok(entries) => {
-                                for (k, v, seq) in entries {
-                                    fold_newest(&mut all_entries, k, v, seq);
-                                }
-                            }
-                            Err(e) => {
-                                if first_err.is_none() {
-                                    first_err = Some(e);
-                                }
-                            }
-                        }
-                    }
-                });
-                if let Some(e) = first_err {
-                    return Err(e);
-                }
-            }
-        }
-
-        // Fold the newer layers over L1 (oldest→newest), resolving by seq.
-        for (key, value, seq) in newer {
-            fold_newest(&mut all_entries, key, value, seq);
-        }
-
-        Ok(all_entries
-            .into_iter()
-            .filter_map(|(key, (value, _))| value.map(|_| key))
-            .take(limit)
-            .collect())
-    }
-
-    /// Like `range_keys_bounded` but returns `(key, pointer)` pairs instead of bare keys.
+    /// Returns the first `limit` live `(key, pointer, seq)` entries in `[start, end)`, in sorted order.
     ///
     /// Avoids a redundant per-key `lsm.get()` call in callers that immediately need to
     /// decode the pointer anyway (e.g. `resolve_entries_from_pointers`).
@@ -4472,6 +4259,11 @@ pub struct LSMStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first `limit` live keys `>= start`, through `range_pointers_bounded`.
+    fn range_keys(lsm: &LSMTree, start: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        Ok(lsm.range_pointers_bounded(start, None, limit)?.into_iter().map(|(k, _, _)| k).collect())
+    }
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -6325,7 +6117,7 @@ mod tests {
                     "{label}: range_pointers_bounded, limit 3"
                 );
                 let page_keys: Vec<Vec<u8>> = page.iter().map(|(k, _, _)| k.clone()).collect();
-                assert_eq!(lsm.range_keys_bounded(start, 3)?, page_keys, "{label}: range_keys_bounded, limit 3");
+                assert_eq!(range_keys(&lsm, start, 3)?, page_keys, "{label}: range_keys_bounded, limit 3");
             }
         }
         Ok(())
@@ -7111,15 +6903,15 @@ mod tests {
 
         // Unbounded from a mid start, limited page — seeks to start, min/max keeps
         // only buckets reaching it.
-        let keys = lsm.range_keys_bounded(b"r:000900", 50)?;
+        let keys = range_keys(&lsm, b"r:000900", 50)?;
         assert_eq!(keys.len(), 50);
         assert_eq!(keys[0], b"r:000900".to_vec());
         assert!(keys.iter().all(|k| k.as_slice() >= b"r:000900".as_slice()));
 
         // Start past the max key → every bucket skipped → empty.
-        assert!(lsm.range_keys_bounded(b"zzz", usize::MAX)?.is_empty());
+        assert!(range_keys(&lsm, b"zzz", usize::MAX)?.is_empty());
         // Full range from the front returns everything.
-        assert_eq!(lsm.range_keys_bounded(b"r:", usize::MAX)?.len(), 1000);
+        assert_eq!(range_keys(&lsm, b"r:", usize::MAX)?.len(), 1000);
         Ok(())
     }
 
@@ -7372,7 +7164,7 @@ mod tests {
 
         lsm.delete(b"r:2")?; // tombstone in active memtable
 
-        let keys = lsm.range_keys_bounded(b"r:", 100)?;
+        let keys = range_keys(&lsm, b"r:", 100)?;
         assert!(!keys.contains(&b"r:2".to_vec()), "deleted key must not appear");
         assert!(keys.contains(&b"r:1".to_vec()));
         assert!(keys.contains(&b"r:3".to_vec()));
@@ -7391,7 +7183,7 @@ mod tests {
         lsm.delete(b"m:1")?;
         lsm.flush_memtable()?; // tombstone in ro_memtable
 
-        let keys = lsm.range_keys_bounded(b"m:", 100)?;
+        let keys = range_keys(&lsm, b"m:", 100)?;
         assert!(!keys.contains(&b"m:1".to_vec()), "key tombstoned in ro_memtable must not appear");
         assert!(keys.contains(&b"m:2".to_vec()));
         assert_eq!(keys.len(), 1);
@@ -7409,7 +7201,7 @@ mod tests {
         lsm.flush_memtable()?; // tombstone in ro_memtable
         lsm.insert(b"q:1", 2)?; // re-insert in active memtable
 
-        let keys = lsm.range_keys_bounded(b"q:", 100)?;
+        let keys = range_keys(&lsm, b"q:", 100)?;
         assert_eq!(keys, vec![b"q:1".to_vec()], "re-inserted key must appear exactly once");
         Ok(())
     }
@@ -7493,7 +7285,7 @@ mod tests {
         lsm.flush_memtable_to_level0()?;
         lsm.purge_ro_memtables_for_test();
 
-        let keys = lsm.range_keys_bounded(b"lk:", 100)?;
+        let keys = range_keys(&lsm, b"lk:", 100)?;
         assert_eq!(keys.len(), 2, "both keys must be visible from L0");
         assert!(keys.contains(&b"lk:a".to_vec()));
         assert!(keys.contains(&b"lk:b".to_vec()));
@@ -7533,7 +7325,7 @@ mod tests {
         lsm.flush_memtable_to_level0()?;
         lsm.purge_ro_memtables_for_test();
 
-        let keys = lsm.range_keys_bounded(b"lkt:", 100)?;
+        let keys = range_keys(&lsm, b"lkt:", 100)?;
         assert!(keys.is_empty(), "L0 tombstone must suppress L1 data");
         Ok(())
     }
@@ -7611,7 +7403,7 @@ mod tests {
         lsm.flush_memtable_to_level0()?;
         lsm.purge_ro_memtables_for_test();
 
-        let keys = lsm.range_keys_bounded(b"klim:", 4)?;
+        let keys = range_keys(&lsm, b"klim:", 4)?;
         assert_eq!(keys.len(), 4, "limit must be respected");
         assert_eq!(keys[0], b"klim:00");
         assert_eq!(keys[3], b"klim:03");
@@ -7675,7 +7467,7 @@ mod tests {
         for i in 0u128..10 {
             lsm.delete(format!("k{:02}", i).as_bytes())?;
         }
-        let keys = lsm.range_keys_bounded(b"k", 20)?;
+        let keys = range_keys(&lsm, b"k", 20)?;
         assert_eq!(keys.len(), 20, "keys page must be full despite newer tombstones");
         assert_eq!(keys[0], b"k10");
         assert_eq!(keys[19], b"k29");
@@ -7789,7 +7581,7 @@ mod tests {
             lsm.delete(k)?;
         }
 
-        let keys = lsm.range_keys_bounded(b"a", 15)?;
+        let keys = range_keys(&lsm, b"a", 15)?;
         assert_eq!(keys.len(), 15, "keys page must be full despite clustered tombstones; got {}", keys.len());
         assert_eq!(keys.as_slice(), &bucket0[20..35]);
         Ok(())

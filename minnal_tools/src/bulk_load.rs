@@ -158,8 +158,6 @@ pub(crate) enum DocKeyType {
 /// Minimal projection of a doc-store schema entry in the `GET /stores` list.
 #[derive(Debug, Deserialize)]
 struct DocSchema {
-    #[allow(dead_code)]
-    namespace: String,
     key_type: DocKeyType,
 }
 
@@ -176,8 +174,6 @@ pub(crate) enum KvKeyType {
 /// Minimal projection of a KV-store schema entry in the `GET /stores` list.
 #[derive(Debug, Deserialize)]
 struct KvSchema {
-    #[allow(dead_code)]
-    namespace: String,
     key_type: KvKeyType,
 }
 

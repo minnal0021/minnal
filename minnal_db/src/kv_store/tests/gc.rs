@@ -177,7 +177,9 @@ fn test_kvstore_gc() {
         }
     }
 
-    let _gc_stats = store.garbage_collect().unwrap();
+    let _gc_stats = store
+        .garbage_collect_with_threshold(crate::defaults::thresholds::VALUE_LOG_WASTE_THRESHOLD)
+        .unwrap();
 
     // Verify data still readable
     for i in 0..5 {

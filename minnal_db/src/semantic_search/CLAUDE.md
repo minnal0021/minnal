@@ -23,7 +23,7 @@ Implements IVF (Inverted File Index) clustering with RaBitQ quantisation for two
 | `vector_kv/` | Vector↔KV bridge over raw namespaces: `mod.rs` (namespace names, sparse meta, upsert/delete, `DbVectorStore`), `queue.rs` (embed queue), `partition.rs` (centres, postings), `query_cache.rs`, `crash_point.rs`, `tests/`. The path stays flat: `pub use` keeps everything at `vector_kv::` |
 | `eval/` | `#[cfg(test)]` search-quality evaluations, `#[ignore]`d and run by hand (`eval/mod.rs` lists them): they need crate internals, so they live here, not in `benches/` |
 | `docs/query-embedding-report.md` | BEIR evaluation behind whole-query Pass-1 embedding (vs chunked queries) |
-| `vector_math/mod.rs` | `vector_math` module — L2 normalisation, residuals, RaBitQ quantisation/bit-packing helpers (SIMD via `simsimd`) |
+| `vector_math/mod.rs` | `sq_dist` (squared distance, `simsimd`), `add_to_sum` (summing points into a mean) and `binary_quantize` (a residual's sign code) |
 
 ## How it works
 

@@ -193,6 +193,7 @@ pub mod skip_list {
             Some((n.value, n.sequence, n.tombstone))
         }
 
+        #[cfg(test)]
         pub fn get_value(&self, key: &[u8]) -> Option<u128> {
             match self.entry(key) {
                 Some((v, _, false)) => Some(v),
@@ -299,61 +300,11 @@ pub mod skip_list {
             Ok(())
         }
 
-        /// Physically purges a tombstoned key by unlinking it from the list.
-        /// Returns `true` if a tombstoned key was found and purged.
-        #[allow(dead_code)]
-        pub fn purge_tombstone(&mut self, key: &[u8]) -> bool {
-            let (found, update) = self.find_path(key);
-            let idx = match found {
-                Some(i) => i,
-                None => return false,
-            };
-
-            if !self.nodes[idx as usize].tombstone {
-                return false;
-            }
-
-            #[allow(clippy::needless_range_loop)]
-            for lvl in 0..self.level as usize {
-                let prev = update[lvl];
-                if self.next(prev, lvl) != idx {
-                    break;
-                }
-                let next = self.next(idx, lvl);
-                self.set_next(prev, lvl, next);
-            }
-
-            // Reduce current max level if upper levels are empty.
-            while self.level > 1 {
-                let top = (self.level - 1) as usize;
-                if self.next(self.head, top) != NONE_VALUE {
-                    break;
-                }
-                self.level -= 1;
-            }
-
-            self.no_tombstone_nodes = self.no_tombstone_nodes.saturating_sub(1);
-            true
-        }
-
         #[allow(dead_code)]
         pub fn iter(&self) -> Iter<'_> {
             Iter {
                 list: self,
                 current: self.next(self.head, 0),
-            }
-        }
-
-        /// Returns an iterator over live entries whose keys are `>= start`, in key order.
-        ///
-        /// Performs an O(log N) seek via `lower_bound` then walks level-0 links forward,
-        /// skipping tombstones.  Much faster than `iter().skip_while(|(k, _)| k < start)`
-        /// for large skip lists when the cursor is deep into the key space.
-        #[allow(dead_code)]
-        pub fn iter_from(&self, start: &[u8]) -> Iter<'_> {
-            Iter {
-                list: self,
-                current: self.lower_bound(start),
             }
         }
 
@@ -547,21 +498,6 @@ pub mod skip_list {
                 list: self,
                 current: self.lower_bound(start),
             }
-        }
-
-        /// Returns `true` if the key exists in the skip list.
-        ///
-        /// Note: this returns `true` even if the key is tombstoned.
-        #[allow(dead_code)]
-        pub fn contains_key(&self, key: &[u8]) -> bool {
-            let (found, _) = self.find_path(key);
-            found.is_some()
-        }
-
-        /// Like [`contains_key`], but only returns `true` if the key exists and is live (not tombstoned).
-        #[allow(dead_code)]
-        pub fn contains_live_key(&self, key: &[u8]) -> bool {
-            self.get_value(key).is_some()
         }
 
         /// Collects all entries (including tombstones) into a sorted vector.
