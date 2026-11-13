@@ -10,6 +10,23 @@
 //! keys (newer layers' tombstones deleted the rest), the page is read again with
 //! a window four times larger. A page's work and memory are therefore about its
 //! size times the number of layers, whatever lies after the cursor.
+//!
+//! An example, with a page of 2 keys (so a window of 3) starting from `b`:
+//!
+//! ```text
+//! memtable  b  d(tombstone)  e  h        read: b d e   cut, last key e
+//! L1        a  c  d  f  g                read: c d f   cut, last key f
+//! ```
+//!
+//! The smallest last key of a cut layer is `e`, so every key up to `e` has been
+//! read from both layers. Up to `e` they resolve to `b`, `c`, `d` (deleted: the
+//! memtable's tombstone is newer than L1's copy) and `e`; the live keys are
+//! `b c e`, and the page is `b c`. `f` is not used yet: the memtable may hold a
+//! tombstone for `f` beyond `h`, which this read did not reach.
+//!
+//! A tombstone in a newer layer deletes a key in an older one, so a page cannot
+//! simply take the first keys of each layer and merge them; a key is resolved
+//! only once every layer has been read past it.
 
 use super::*;
 
