@@ -337,7 +337,7 @@ mod tests {
         worker.shutdown().await;
     }
 
-    /// Regression: the worker must not re-run on its own side effects.
+    /// The worker must not re-run on its own side effects.
     ///
     /// `perform_compaction_check` flushes no-WAL memtables; sealing a memtable
     /// fires the flush observer, and the observer sends a `Trigger` — to this

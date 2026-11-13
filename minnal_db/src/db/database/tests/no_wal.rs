@@ -80,7 +80,7 @@ fn periodic_flush_makes_no_wal_writes_survive_a_crash() {
 /// Clearing it on a flush that did not happen drops the namespace out of
 /// `flush_no_wal_memtables` permanently — no later tick retries it — so the
 /// next crash takes the whole memtable, which is exactly the loss the
-/// periodic flush was added to bound.
+/// periodic flush exists to bound.
 #[test]
 fn a_failed_flush_keeps_the_no_wal_flag_set() {
     use std::os::unix::fs::PermissionsExt;

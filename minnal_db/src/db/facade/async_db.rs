@@ -135,7 +135,7 @@ impl AsyncDb {
         tokio::task::spawn_blocking(move || {
             // Flush index state on clean shutdown, now that no worker can race
             // with it. This is also what clears the no-WAL markers, so a clean
-            // shutdown reports no gap on the next open (FR-001).
+            // shutdown reports no gap on the next open.
             if let Err(e) = db.inner.run_index_checkpoint() {
                 log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
             }

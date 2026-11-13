@@ -6,12 +6,12 @@ use crate::namespace::NamespaceId;
 use crate::db::database::Database;
 use crate::db::test_support::create_db_config;
 
-/// Logs and applies one write to `ns`, as step 4's worker will.
+/// Logs and applies one write to `ns`, as the vector worker does.
 fn log_and_apply(db: &Database, ns: NamespaceId, key: &[u8], value: &[u8]) {
     let seq = db.next_seq.fetch_add(1, Ordering::SeqCst);
     let logged = db.vector_index_wal.append(ns, key, value, seq).unwrap();
     // Applied with the logged seq, and synced before the caller goes on,
-    // as step 4's worker will (it completes an entry only after a sync).
+    // as the vector worker does (it completes an entry only after a sync).
     db.get_store(ns).unwrap().replay_upsert(key, value, seq).unwrap();
     drop(logged);
     db.vector_index_wal.sync().unwrap();
@@ -120,7 +120,7 @@ fn a_restart_keeps_records_nobody_flushed() {
     assert_eq!(db.get_ns(v, b"k2").unwrap(), Some(b"y".to_vec()));
 }
 
-/// The timeline from the step 3 review: a chunk key whose delete reached
+/// The timeline this guards: a chunk key whose delete reached
 /// L1 (tombstone dropped) while another vector namespace held the global
 /// cut below the key's record. Replaying from the global cut brings the
 /// key back, with nothing newer left to beat it.

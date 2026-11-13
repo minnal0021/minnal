@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Regression: activating the same field index from several threads must not
+/// Activating the same field index from several threads must not
 /// kill the process.
 ///
 /// `activate_field_index` creates memory-mapped files — the field's `BlobStore`
@@ -15,15 +15,13 @@ use super::*;
 ///
 /// Reachable from an ordinary client: two concurrent `POST /stores` for one
 /// namespace (a timeout plus a retry is enough) each activate the same fields.
-/// Measured before the fix, against the stress server: 8 racing creates killed
-/// it on **every** attempt — `Bus error (core dumped)`, exit 135 — and a
-/// different interleaving surfaced instead as
-/// `range end index 8 out of range for slice of length 0` writing the 64-byte
-/// header into a zero-length map.
+/// Without `index_activate_lock`, 8 racing creates killed the server on
+/// **every** attempt (`Bus error (core dumped)`, exit 135), or, in a different
+/// interleaving, panicked with `range end index 8 out of range for slice of
+/// length 0` writing the 64-byte header into a zero-length map.
 ///
-/// **Reverting the fix does not make this test fail — it makes the test binary
-/// die.** That is the honest reproduction; there is nothing to assert against a
-/// signal. What the assertions below add is that serialising activation did not
+/// **Without the lock this test does not fail: the test binary dies.** There is
+/// nothing to assert against a signal. What the assertions below add is that serialising activation did not
 /// break it: every thread returns `Ok`, and the index answers correctly
 /// afterwards.
 #[test]
@@ -572,7 +570,7 @@ fn test_activate_field_index_replays_wal_after_crash() {
     }
 }
 
-/// Item 13 regression: replaying an **update** (same key, changed field
+/// Replaying an **update** (same key, changed field
 /// value) must reconcile via the targeted O(1) path — during replay
 /// `lsm.get` returns the replay-so-far value, so the second put moves the
 /// row off the old value. A bug here would leave the key matching BOTH the
@@ -626,7 +624,7 @@ fn test_field_index_replays_updates_after_crash() {
     }
 }
 
-/// Regression for the O(1) targeted field-index update/delete (item 13): a
+/// The O(1) targeted field-index update and delete: a
 /// document update must move its row from the old value's bucket to the new
 /// one (the prior value must stop matching), and a delete must remove it —
 /// driven by the prior document bytes read in the put/delete path, not a
@@ -671,7 +669,7 @@ fn test_field_index_targeted_update_and_delete() {
     db.shutdown().unwrap();
 }
 
-/// FR-006: once every field index of a namespace is dropped, its row map can be
+/// Once every field index of a namespace is dropped, its row map can be
 /// reset, freeing every row ID; the rebuilt index then packs the live keys into
 /// IDs 0..live. While any field still exists the reset is refused.
 #[test]

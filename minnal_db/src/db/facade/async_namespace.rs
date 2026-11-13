@@ -99,8 +99,8 @@ impl AsyncNamespace {
     ///
     /// Returns every `(prefix_id, raw_key_bytes, value_bytes)` in key order, packed
     /// into a few buffers (see [`PrefixScan`](crate::PrefixScan)). A storage error is
-    /// returned as such — it used to become an empty map, indistinguishable from
-    /// "no entries under these prefixes".
+    /// returned as such, never as an empty result: a caller must be able to tell
+    /// it from "no entries under these prefixes".
     pub async fn scan_prefixes_batch(&self, prefix_ids: Vec<u32>) -> Result<crate::kv_store::PrefixScan> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_prefixes_batch(&prefix_ids))
@@ -111,8 +111,8 @@ impl AsyncNamespace {
     /// Fetch multiple keys in a single blocking task.
     ///
     /// Returns one `Option<Vec<u8>>` per input key in the same order; `None` means
-    /// absent or deleted. A storage error fails the whole call — it used to be
-    /// mapped to `None`, indistinguishable from a missing key.
+    /// absent or deleted. A storage error fails the whole call, never reads as
+    /// `None`: a caller must be able to tell it from a missing key.
     pub async fn get_multiple(&self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.get_multiple(&keys))

@@ -265,7 +265,8 @@ impl Database {
         let seq = kv_store.alloc_seq();
         let logged = self.vector_index_wal.append(namespace_id, key, value, seq)?;
         // The main WAL never sees this write, so a field index on the namespace
-        // could not replay it from there (FR-001's no-WAL marker).
+        // could not replay it from there: mark the namespace so an unclean
+        // shutdown records a gap (`GapCause::NoWalWrites`).
         self.note_no_wal_index_exposure(namespace_id);
         // Applied with the logged seq; one retry, as the WAL path's apply. On a
         // second failure the caller gets the error and does not complete its

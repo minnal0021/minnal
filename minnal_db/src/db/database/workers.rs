@@ -255,8 +255,8 @@ impl ValueLogGcTarget for Database {
 
     /// `waste_threshold` decides **whether** a namespace is collected; the separate,
     /// lower `segment_gc_threshold` then decides **which sealed segments** get rewritten.
-    /// Passing the trigger through as the selection threshold (as this used to) makes
-    /// garbage sitting just under it uncollectable: those segments read as "clean", are
+    /// Passing the trigger through as the selection threshold would make garbage
+    /// sitting just under it uncollectable: those segments read as "clean", are
     /// left in place with their garbage intact, and keep the bucket over its trigger
     /// forever.
     fn run_gc_if_needed(&self, waste_threshold: f64) {

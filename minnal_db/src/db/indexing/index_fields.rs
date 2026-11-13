@@ -215,7 +215,7 @@ impl Database {
             // incomplete results — `detect_replay_gap` suppresses exactly this
             // shape (`Absent` + empty) as a normal first build. Fail loudly and
             // make the caller re-register, which clears the flag and forces a
-            // rebuild. See `FEATURE-REQUEST.md` (FR-001).
+            // rebuild.
             if meta.dropped {
                 return Err(KVError::Serialization(format!(
                     "Field '{}' (id {}) in namespace {} was dropped; re-register it before activating so the index is rebuilt",
@@ -286,9 +286,11 @@ impl Database {
                     // fully-persisted segments out of order, so a hole can sit in the
                     // middle of the window while `head` is still below the checkpoint.
                     //
-                    // Detection only — the replay below is unchanged, and the missing
-                    // updates are unrecoverable from here. Recording, surfacing and
-                    // repairing this is tracked in `FEATURE-REQUEST.md` (FR-001).
+                    // Detection only: the replay below is unchanged, and the missing
+                    // updates cannot be recovered from here. WAL GC holds the segments
+                    // active fields need and records a gap when its backstop reclaims
+                    // one anyway (`GapCause::BackstopReclaim`); this logs a hole
+                    // however it came about.
                     if let Some(gap) = crate::db::indexing::manager::detect_replay_gap(
                         checkpoint_state,
                         dyn_index.distinct_count() == 0,
@@ -503,7 +505,7 @@ impl Database {
     /// finishes it at the next open. The reverse order — files first — would
     /// leave a live-looking field with no data, which reads as `Absent` + empty
     /// and is suppressed by `detect_replay_gap` as a normal first build: a
-    /// silently incomplete index. See `FEATURE-REQUEST.md` (FR-001).
+    /// silently incomplete index.
     ///
     /// Idempotent: dropping an already-dropped or unregistered field still
     /// deregisters and reclaims any leftover directory.

@@ -1,13 +1,10 @@
-//! Predicate query execution against the field indices.
-//!
-//! Split out of `database/`, which had accumulated fourteen unrelated
-//! responsibilities in one file. This one needs only the namespace registry and
-//! the per-namespace store, so it lifts out cleanly.
+//! Predicate query execution against the field indices. It needs only the
+//! namespace registry and the per-namespace store.
 //!
 //! The whole surface returns [`QueryOutcome`] rather than a bare list of keys:
-//! a field index can be *degraded* -- missing updates it can no longer recover --
-//! while still being queryable, and serving results that look complete over one
-//! is the failure FR-001 exists to remove.
+//! a field index can be *degraded* (missing updates it can no longer recover,
+//! see `db/indexing/health.rs`) while still being queryable, and results served
+//! over one must say so rather than look complete.
 
 use crate::namespace::NamespaceId;
 use std::sync::Arc;
@@ -28,7 +25,7 @@ impl Database {
     /// # How it works
     /// 1. Parses and evaluates `query_str` against the in-memory field indices,
     ///    producing a bitmap of matching row IDs.
-    /// 2. Resolves each matching row ID to its key (see [`keys_for_rows`]).
+    /// 2. Resolves each matching row ID to its key (see `keys_for_rows`).
     ///
     /// # Limitations
     /// Only fields activated via `activate_field_index` are queryable.
@@ -195,12 +192,11 @@ mod tests {
 
     /// A write that loses its seq race must leave the field index alone, because
     /// the LSM drops it: reads keep showing the winner, so the index must too.
-    /// Both halves used to act as if they had won. A delete older than the live
-    /// value stripped that live document's row, so it vanished from every query
-    /// on the field; and a put older than a delete counted the key as "absent,
-    /// so I win" and added a row for a key that reads as deleted. Only TTL expiry
-    /// produced these out-of-order seqs in practice (it now takes the key stripe),
-    /// so they are driven here directly with explicit seqs.
+    /// Otherwise a delete older than the live value would strip that live
+    /// document's row, so it vanished from every query on the field, and a put
+    /// older than a delete would count the key as "absent, so I win" and add a row
+    /// for a key that reads as deleted. Writes take the key stripe, so these
+    /// out-of-order seqs are driven here directly with explicit seqs.
     #[test]
     fn test_a_write_that_loses_its_seq_race_leaves_the_index_alone() {
         let dir = TempDir::new().unwrap();
@@ -306,11 +302,9 @@ mod tests {
         db.shutdown().unwrap();
     }
 
-    /// FR-001 step 4: a query over a degraded index still returns results, but
-    /// says so — and only for the fields *this* predicate touched.
-    ///
-    /// Serving a complete-looking result set over an incomplete index is the
-    /// original bug, so this is the assertion the whole feature turns on.
+    /// A query over a degraded index still returns results, but says so, and
+    /// only for the fields *this* predicate touched. A complete-looking result
+    /// over an incomplete index is the failure this guards against.
     #[test]
     fn a_query_over_a_degraded_index_reports_it() -> Result<()> {
         let temp_dir = TempDir::new()?;

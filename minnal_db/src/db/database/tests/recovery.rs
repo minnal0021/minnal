@@ -157,7 +157,7 @@ fn a_torn_tail_survives_reopen_append_and_gc() {
     db.shutdown().unwrap();
 }
 
-/// Item 1 regression: several single-op writes to one key, laid down in the
+/// Several single-op writes to one key, laid down in the
 /// WAL with sequences *out of physical order*, must resolve to the
 /// highest-sequence value. This directly exercises the sequence sort in
 /// recovery (a naive scan-order replay would pick the physically-last entry,

@@ -141,8 +141,8 @@ pub struct Database {
     ///
     /// Not hypothetical, and not confined to tests: any client that retries a
     /// `POST /stores` after a timeout can produce two concurrent creates of the
-    /// same namespace, and each activates the same field. Measured before this
-    /// lock: 8 racing creates killed the server on every attempt.
+    /// same namespace, and each activates the same field. Without this lock, 8
+    /// racing creates killed the server on every attempt.
     ///
     /// **Lock ordering: taken only AFTER `get_store` returns**, never around it —
     /// `get_store` may wait on `namespace_create_lock`, which is strictly

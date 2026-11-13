@@ -70,7 +70,7 @@ fn a_value_too_big_for_a_segment_is_rejected_before_the_wal() {
 
 #[test]
 fn put_and_delete_accept_normal_sized_keys_and_values() {
-    // Regression: the size guard must not reject ordinary writes.
+    // The size guard must not reject ordinary writes.
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
     db.put(b"k", &vec![0u8; 4096]).unwrap();
@@ -145,9 +145,9 @@ fn test_value_log_physical_and_segment_stats() {
 fn concurrent_same_key_puts_keep_value_log_accounting_exact() {
     // Under real concurrency, racing writers to the same keys must not drift the
     // value-log accounting GC selection relies on: total live bytes must equal
-    // exactly one live record per distinct key. (The deterministic form of the
-    // underlying bug is `a_lower_seq_put_charges_its_own_record_not_the_live_one`
-    // in kv_store; this guards the invariant end-to-end under load.)
+    // exactly one live record per distinct key. (The deterministic form of this
+    // is `a_lower_seq_put_charges_its_own_record_not_the_live_one` in kv_store;
+    // this guards the invariant end-to-end under load.)
     use std::sync::Arc;
     use std::thread;
 
@@ -270,8 +270,8 @@ fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
     assert!(avg < 30.0, "precondition: namespace average must be below the trigger, got {avg:.1}%");
     assert!(store.has_bucket_over_waste(30.0), "precondition: some bucket must be over the trigger");
 
-    // The per-bucket-aware trigger runs GC where the old average-only gate would have
-    // skipped the whole namespace.
+    // The per-bucket-aware trigger runs GC where a gate on the average alone would
+    // skip the whole namespace.
     ValueLogGcTarget::run_gc_if_needed(&db, 30.0);
 
     let after = store.get_waste_ratio();

@@ -121,9 +121,9 @@ pub struct ThresholdConfig {
     /// the WAL would grow without bound — so past this many pinned segments GC
     /// reclaims the oldest of them anyway.
     ///
-    /// Doing so **knowingly strands part of a field index**, which is why
-    /// FR-001 keeps its detection and repair arms: the backstop produces gaps by
-    /// design, just rarely. Counted in segments rather than bytes because it is
+    /// Doing so **knowingly strands part of a field index**: the backstop records
+    /// a gap, which index health reports and a repair fixes (see
+    /// `db/indexing/health.rs`). Counted in segments rather than bytes because it is
     /// GC's own unit of work. `0` disables the backstop, allowing unbounded
     /// pinned WAL — availability over disk, only for callers who know their
     /// checkpoint worker is healthy.
@@ -263,10 +263,9 @@ pub struct DbConfig {
     /// Size at which a value-log segment is sealed and a new one opened
     /// (default 256 MiB).
     ///
-    /// Unlike the page size it replaces, this is **not** fixed at creation: a
-    /// segment's size is not encoded in any value pointer (only its id and a byte
-    /// offset are), so existing segments keep the size they were written at and new
-    /// ones simply use whatever is configured now.
+    /// It is **not** fixed at creation: no value pointer encodes a segment's size
+    /// (only its id and a byte offset), so existing segments keep the size they
+    /// were written at and new ones use whatever is configured now.
     ///
     /// Must be a multiple of 4096, at least 64 KiB, and at most 4 GiB (a record's
     /// offset within its segment is a `u32`).

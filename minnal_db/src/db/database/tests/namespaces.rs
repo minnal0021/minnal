@@ -3,7 +3,7 @@
 use super::*;
 use crate::namespace::NamespaceId;
 
-/// Regression (F6): concurrent first use of a namespace must not fail.
+/// Concurrent first use of a namespace must not fail.
 ///
 /// `create_namespace` publishes the registry entry — and persists it —
 /// before it opens the `KVStore` and inserts it into `stores`. Between those

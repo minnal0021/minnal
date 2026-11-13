@@ -100,8 +100,8 @@ fn test_auto_close_on_drop() -> Result<()> {
     Ok(())
 }
 
-/// Regression: skip list used to reject u128 value 0 (encoding of
-/// ShardedValuePointer { bucket: 0, page_offset: 0, segment_id: 0 }).
+/// The value 0 is a valid pointer encoding (bucket 0, segment 0, offset 0) and
+/// must round-trip: the skip list marks tombstones with a flag, not a value.
 #[test]
 fn test_zero_byte_values_roundtrip() -> Result<()> {
     let temp_dir = TempDir::new()?;
@@ -343,9 +343,9 @@ async fn a_write_after_a_crash_beats_a_flushed_no_wal_value() {
 
 /// The crash tests' simulated crash loses what a process kill loses: a
 /// no-WAL write still in the memtable is gone, a WAL-backed one replays, and
-/// a flushed no-WAL one stays. `KVStore`'s `Drop` used to flush every
-/// memtable even after `crash()`, so no-WAL writes always survived and no
-/// crash test could catch a missing barrier flush.
+/// a flushed no-WAL one stays. If `KVStore`'s `Drop` flushed every memtable
+/// even after `crash()`, no-WAL writes would always survive and no crash test
+/// could catch a missing barrier flush.
 #[tokio::test]
 async fn a_simulated_crash_loses_unflushed_no_wal_writes() {
     let dir = TempDir::new().unwrap();
