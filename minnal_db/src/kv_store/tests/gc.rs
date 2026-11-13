@@ -313,3 +313,76 @@ fn test_gc_after_delete_sequential_stays_deleted() {
     }
     assert_eq!(survivors, 0, "{survivors} keys resurrected by sequential GC-after-delete");
 }
+
+/// A bucket whose value-log metadata file is lost has its live/garbage
+/// accounting rebuilt at open from the LSM's pointers, reading only the buckets
+/// that need it. The rebuilt numbers must equal what the writes tracked, and the
+/// other buckets must keep theirs.
+#[test]
+fn lost_value_log_metadata_is_rebuilt_for_that_bucket_alone() {
+    let dir = TempDir::new().unwrap();
+    let lsm = LSMConfig {
+        num_buckets: 4,
+        ..default_lsm_config()
+    };
+    let open = || {
+        KVStore::open(
+            NamespaceId::from_u64(0),
+            "ns",
+            dir.path(),
+            lsm.clone(),
+            SyncConfig::default(),
+            crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+        )
+        .unwrap()
+    };
+    let accounting = |store: &KVStore| -> Vec<(u64, u64)> {
+        store
+            .value_log
+            .all_bucket_metadata()
+            .into_iter()
+            .map(|(_, m)| (m.live_bytes(), m.garbage_bytes()))
+            .collect()
+    };
+
+    let tracked = {
+        let store = open();
+        for i in 0..200u32 {
+            store.put_to_storage(format!("key{i:04}").as_bytes(), &[1u8; 40]).unwrap();
+        }
+        // Overwrites and deletes leave garbage in every bucket.
+        for i in (0..200u32).step_by(3) {
+            store.put_to_storage(format!("key{i:04}").as_bytes(), &[2u8; 70]).unwrap();
+        }
+        for i in (0..200u32).step_by(5) {
+            store.delete_from_storage(format!("key{i:04}").as_bytes()).unwrap();
+        }
+        store.flush_memtable_to_level0().unwrap();
+        store.value_log.flush_all_metadata().unwrap();
+        accounting(&store)
+    };
+    assert!(tracked.iter().all(|&(live, garbage)| live > 0 && garbage > 0));
+
+    let lost: Vec<std::path::PathBuf> = walk(dir.path())
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "value_log_1.metadata"))
+        .collect();
+    assert_eq!(lost.len(), 1, "one metadata file per bucket");
+    std::fs::remove_file(&lost[0]).unwrap();
+
+    let store = open();
+    assert_eq!(accounting(&store), tracked, "bucket 1 rebuilt exactly, the others kept");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}

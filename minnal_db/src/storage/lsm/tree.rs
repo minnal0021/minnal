@@ -28,7 +28,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::support::metrics::Metrics;
@@ -1080,8 +1080,6 @@ pub(crate) struct LSMTree {
     /// Global version for read-only memtables
     ro_memtable_version: Arc<AtomicU64>,
 
-    memtable_sequence: Arc<AtomicUsize>,
-
     /// Flushed read-only memtables taken off the read path while a reader still
     /// counted itself on them; released by a later compaction tick once their
     /// reader count is zero.
@@ -1375,7 +1373,6 @@ impl LSMTree {
             config,
             compaction_in_progress,
             ro_memtable_version: Arc::new(AtomicU64::new(0)),
-            memtable_sequence: Arc::new(AtomicUsize::new(0)),
             pending_old_memtables: Arc::new(RwLock::new(Vec::new())),
             level0_files,
             last_l0_stamp: parking_lot::Mutex::new(last_l0_stamp),
@@ -2150,7 +2147,6 @@ impl LSMTree {
         }
 
         *memtable = MemTable::with_capacity(self.config.skip_list_capacity);
-        self.memtable_sequence.fetch_add(1, Ordering::SeqCst);
         self.notify_memtable_sealed(version);
         Ok(())
     }
@@ -4280,7 +4276,7 @@ mod tests {
         // would freeze, and the state `LSMTree::open` turns into an empty bucket.
         let lsm = Arc::new(LSMTree::open(temp_dir.path(), test_lsm_config())?);
         let stop = Arc::new(AtomicBool::new(false));
-        let vanished = Arc::new(AtomicUsize::new(0));
+        let vanished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let observer = {
             let (l1, stop, vanished) = (l1.clone(), Arc::clone(&stop), Arc::clone(&vanished));

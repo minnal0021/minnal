@@ -319,7 +319,8 @@ impl KVStore {
     /// bucket whose accounting could not be loaded.
     ///
     /// Exact, not conservative: a record is live iff the LSM still points at it, and
-    /// every other byte in the segment is garbage. Costs one LSM key+pointer scan.
+    /// every other byte in the segment is garbage. Costs one LSM key+pointer scan of
+    /// those buckets alone (the value log and the LSM hash keys to buckets alike).
     fn rebuild_missing_segment_stats(&self) -> Result<()> {
         let buckets = self.value_log.buckets_needing_stat_rebuild();
         if buckets.is_empty() {
@@ -332,7 +333,11 @@ impl KVStore {
         );
 
         let mut live: HashMap<u32, HashMap<u32, u64>> = HashMap::new(); // bucket -> segment -> bytes
-        for (key, offset_u128) in self.lsm.key_pointer_pairs(None)? {
+        let mut rebuild = vec![false; self.value_log.num_buckets()];
+        for &bucket in &buckets {
+            rebuild[bucket as usize] = true;
+        }
+        for (key, offset_u128) in self.lsm.key_pointer_pairs(Some(&rebuild))? {
             if let Some(pointer) = decode_sharded_pointer(offset_u128) {
                 *live.entry(pointer.bucket).or_default().entry(pointer.location.segment_id).or_insert(0) += pointer.record_len(key.len());
             }
