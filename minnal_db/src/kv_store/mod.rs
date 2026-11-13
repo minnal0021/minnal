@@ -1,9 +1,8 @@
-//! KVStore - Per-namespace key-value storage
+//! `KVStore`: one namespace's key-value storage, its LSM tree (keys to value
+//! pointers), its sharded value log (the values) and its live field indexes.
 //!
-//! Each KVStore owns its own LSM tree and sharded value log,
-//! representing an independent namespace within the database.
-//! The WAL is shared across all namespaces and managed by the
-//! Database coordinator.
+//! The WAL is shared by every namespace and owned by the `Database`
+//! coordinator in `db/`; this module sits below `db` and does not import it.
 
 use crate::namespace::NamespaceId;
 mod gc;
@@ -55,8 +54,8 @@ pub(crate) type KeyPage = (Vec<Vec<u8>>, Option<Vec<u8>>);
 /// A scan entry resolved to what is needed to read its value: the key and its
 /// value-log pointer.
 ///
-/// No file handle is pinned any more. Segments are immutable and their ids are
-/// never reused, so a pointer stays meaningful however long it is held: it either
+/// Segments are immutable and their ids are never reused, so a pointer stays
+/// meaningful however long it is held: it either
 /// resolves to the same record or its segment is gone (`SegmentMissing`) and the
 /// key is re-resolved through the LSM.
 pub(crate) type ResolvedEntry = (Vec<u8>, ShardedValuePointer);
@@ -156,8 +155,8 @@ pub struct KVStore {
 
     // Test-only: set by a simulated crash (`AsyncDb::crash`) so that dropping
     // the store skips the flush below, as a process kill would. Without it the
-    // flush made every unflushed memtable durable, no-WAL writes included, and
-    // no crash test could see a write that a real crash loses.
+    // flush would make every unflushed memtable durable, no-WAL writes included,
+    // and no crash test could see a write that a real crash loses.
     #[cfg(test)]
     crashed: AtomicBool,
 
@@ -235,9 +234,9 @@ impl KVStore {
     /// The directory will contain `lsm/` and `value_logs/` subdirectories.
     ///
     /// `segment_size_bytes` is the size at which a value-log segment is sealed and a
-    /// new one opened. Unlike the page size it replaces, it is **not** fixed at
-    /// creation: a segment's size is not encoded in any pointer, so existing segments
-    /// keep theirs and new ones use whatever is configured now.
+    /// new one opened. It is **not** fixed at creation: no pointer encodes a
+    /// segment's size, so existing segments keep theirs and new ones use whatever
+    /// is configured now.
     pub fn open(
         namespace_id: NamespaceId,
         name: &str,
@@ -253,9 +252,8 @@ impl KVStore {
     ///
     /// There is no GC recovery step. GC writes survivors to a *new* segment, re-points
     /// the keys, makes that durable, and only then unlinks the old segment — so at
-    /// every crash point the durable LSM still refers to a segment that exists. There
-    /// is nothing to roll forward or back, which is why the GC journal, its commit
-    /// marker and the `.log.new`/`.log.old` dance are all gone.
+    /// every crash point the durable LSM still refers to a segment that exists, and
+    /// there is nothing to roll forward or back.
     pub fn open_with_ttl(
         namespace_id: NamespaceId,
         name: &str,
@@ -364,21 +362,17 @@ impl KVStore {
         self.metrics.get().map(|m| m.as_ref())
     }
 
-    /// Share a global write-sequence counter with this store (called by the
-    /// `Database` coordinator with its WAL sequence counter, so all writes —
-    /// WAL-backed and non-WAL — draw from one monotonic sequence space).
-    /// Share the database's write-sequence counter, first raising it above
-    /// every sequence this store already holds.
+    /// Share the database's write-sequence counter with this store, first raising
+    /// it above every sequence this store already holds, so all writes (WAL-backed
+    /// and no-WAL) draw from one monotonic sequence space.
     ///
     /// **Load-bearing for no-WAL writes.** The counter is recovered from the WAL
     /// at open, but a no-WAL write takes a sequence the WAL never sees. After a
     /// crash the counter could restart below a no-WAL value already flushed to an
     /// SSTable, and every later write to that key — WAL-backed or not — would
     /// lose to the stale value under highest-sequence-wins: a delete silently
-    /// undone, an update silently reverted. Found by the M3a split crash audit
-    /// while trying no-WAL meta writes (a meta rewritten after a restart never
-    /// became visible). Regression
-    /// test: `a_write_after_a_crash_beats_a_flushed_no_wal_value`.
+    /// undone, an update silently reverted. Test:
+    /// `a_write_after_a_crash_beats_a_flushed_no_wal_value`.
     pub(crate) fn set_seq_counter(&self, counter: Arc<AtomicU64>) {
         counter.fetch_max(self.lsm.max_stored_seq().saturating_add(1), Ordering::SeqCst);
         *self.seq_counter.write() = counter;
@@ -395,7 +389,8 @@ impl KVStore {
         self.seq_counter.read().fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Set the LSM flush observer (used to wire up WAL persistence callbacks)
+    /// Set the LSM flush observer: the database's hook that retires WAL entries
+    /// once a flush makes them durable.
     pub(crate) fn set_flush_observer(&self, observer: Option<Arc<dyn LsmFlushObserver>>) {
         let observer = observer.map(|inner| {
             Arc::new(SyncValueLogBeforePersist {
@@ -444,7 +439,7 @@ impl KVStore {
 /// memtable's L0 files are written, `on_ro_memtable_written` lets both WALs
 /// retire its entries — recovery then skips them and WAL GC deletes them — so
 /// the value-log records those SSTable entries point at must be on stable
-/// storage first. Without this, a power loss after the flush lost up to
+/// storage first. Without this, a power loss after the flush would lose up to
 /// `records_per_sync` acknowledged values (and any segment sealed since its
 /// last fsync) with nothing left to replay them from. If the fsync fails the
 /// flush is undone: the entries stay replayable and the memtable is flushed
