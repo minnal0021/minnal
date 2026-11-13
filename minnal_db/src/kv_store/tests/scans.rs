@@ -344,3 +344,29 @@ fn key_pages_visit_every_live_key_once() {
     }
     assert_eq!(walked, expected);
 }
+
+/// A key whose segment GC reclaimed mid-scan is re-read through `get`, and must
+/// go back in its place: a scan's result is in key order.
+#[test]
+fn keys_re_read_after_a_reclaimed_segment_keep_the_scan_in_key_order() {
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u64(0),
+        "ns",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+    )
+    .unwrap();
+    for key in [b"a", b"b", b"c", b"d"] {
+        store.put_to_storage(key, key).unwrap();
+    }
+
+    // The batch read returned `a` and `d`; `b` and `c` lost their segment.
+    let mut pairs = vec![(b"a".to_vec(), b"a".to_vec()), (b"d".to_vec(), b"d".to_vec())];
+    store.refetch_dropped(&mut pairs, vec![b"b".to_vec(), b"c".to_vec()]).unwrap();
+
+    let keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, [b"a", b"b", b"c", b"d"]);
+}

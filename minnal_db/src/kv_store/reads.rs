@@ -431,12 +431,19 @@ impl KVStore {
     /// value read, through the single-key [`get`](Self::get) (which retries resolve
     /// and read together, and falls back to a read under the bucket lock). A key
     /// that now reads as absent was deleted meanwhile and is left out.
-    fn refetch_dropped(&self, pairs: &mut Vec<KeyValue>, retry: Vec<Vec<u8>>) -> Result<()> {
+    ///
+    /// `pairs` is in key order and stays so: the re-read keys are put back in
+    /// their places, not appended.
+    pub(super) fn refetch_dropped(&self, pairs: &mut Vec<KeyValue>, retry: Vec<Vec<u8>>) -> Result<()> {
+        if retry.is_empty() {
+            return Ok(());
+        }
         for key in retry {
             if let Some(v) = self.get(&key)? {
                 pairs.push((key, v));
             }
         }
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(())
     }
 
