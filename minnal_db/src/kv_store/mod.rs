@@ -84,7 +84,7 @@ fn decode_sharded_pointer(offset_u128: u128) -> Option<ShardedValuePointer> {
 /// (a lone writer never waits). Default 0: rounds already form under load
 /// without one, and a delay lowers throughput when clients wait for each write
 /// before sending the next.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SyncConfig {
     pub records_per_sync: usize,
     pub commit_delay_us: u64,

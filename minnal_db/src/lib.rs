@@ -72,6 +72,7 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("minnal_db supports only Linux and macOS (its storage engine uses Unix pread/pwrite)");
 
+pub mod config_file;
 pub mod db;
 pub mod defaults;
 pub mod error;
@@ -157,8 +158,8 @@ pub use db::config::ScheduledTaskConfig;
 /// Controls how many writes to batch before syncing.
 pub use db::config::SyncConfig;
 
-/// TOML configuration file parser.
-pub use db::config::toml::MinnalTomlConfig;
+/// The config file: its parser and the one mapping to each part's configuration.
+pub use config_file::ConfigFile;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

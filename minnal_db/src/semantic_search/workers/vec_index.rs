@@ -147,7 +147,7 @@ pub(crate) async fn check_entry<H: WorkerHost>(db: &AsyncDb, host: &H, entry: &Q
 /// Pass this to the store's builder,
 /// [`DocStoreBuilder::vector_index_config`](crate::doc_store::DocStoreBuilder::vector_index_config).
 /// Defaults are conservative values suitable for most deployments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VectorIndexConfig {
     /// Seconds to sleep after a pass that contained at least one failure,
     /// before re-scanning the queue.  Default: 2.

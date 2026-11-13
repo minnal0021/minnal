@@ -99,6 +99,22 @@ impl DocStoreBuilder {
         self
     }
 
+    /// Everything the config file sets: the engine, the lifecycle governor,
+    /// the audit retention and, with `semantic-search`, the embedding worker
+    /// and the semantic-search context. The database directory is the one
+    /// given to [`DocStore::builder`].
+    pub fn config_file(self, file: &crate::ConfigFile) -> Self {
+        let builder = self
+            .db_config(file.db_config())
+            .lifecycle(file.lifecycle_config())
+            .audit_retention(file.audit_retention());
+        #[cfg(feature = "semantic-search")]
+        let builder = builder
+            .vector_index_config(file.vector_index_config())
+            .semantic_search(file.semantic_search_context());
+        builder
+    }
+
     /// Test hook: start no vector worker (see the field).
     #[cfg(all(test, feature = "semantic-search"))]
     pub(crate) fn without_vector_worker(mut self) -> Self {

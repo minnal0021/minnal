@@ -1,7 +1,12 @@
 # minnal_db_api.toml — sample configuration
 #
-# This file is a superset of minnal.toml.  Every field has a built-in default,
-# so you only need to specify the values you want to override.
+# One file configures the API server and an embedded database alike: the
+# server reads every table here, and an embedded store (`ConfigFile` in the
+# minnal_db library) reads all but [api] and [logging]. Every key has a
+# built-in default, so set only the values you want to change; every value
+# below is its default unless a comment says otherwise. A key or table that is
+# not listed here is an error at startup, so a misspelt key cannot silently
+# fall back to its default.
 #
 # Start the server with:
 #   minnal_db_api /path/to/this/file.toml
@@ -77,8 +82,10 @@ max_capacity = 100_000
 [sharding]
 
 # Number of independent shards for the value log and LSM tree.
-# Higher values reduce lock contention under concurrent write workloads.
-# Must be a power of two; changing this after data exists is not supported.
+# Higher values reduce lock contention under concurrent write workloads; each
+# store holds two open files per bucket. Between 1 and 2^32. Fixed when the
+# database is created: an existing database keeps the count it was created
+# with, whatever is set here.
 num_buckets = 8
 
 # ---------------------------------------------------------------------------
@@ -281,6 +288,15 @@ segment_size_bytes = 268_435_456   # 256 MiB
 verify_checksums_on_read = false
 
 # ---------------------------------------------------------------------------
+# [recovery] — WAL records that cannot be applied at startup
+# ---------------------------------------------------------------------------
+[recovery]
+
+# Where recovery writes a JSON fail-log file for each WAL record it cannot
+# apply even after one retry. Unset: <db_path>/fail_logs.
+# fail_log_dir = "/var/lib/minnal/fail_logs"
+
+# ---------------------------------------------------------------------------
 # [vector_index] — async vector-index background worker settings
 # ---------------------------------------------------------------------------
 [vector_index]
@@ -288,7 +304,7 @@ verify_checksums_on_read = false
 # Seconds to sleep after a pass that contained at least one embedding failure,
 # before re-scanning the queue.  Lower values retry faster; higher values give
 # the embedding service more time to recover.  Default: 2.
-retry_wait_secs = 5
+retry_wait_secs = 2
 
 # Maximum number of embedding attempts per queue entry.  Once an entry reaches
 # this limit it is skipped on every subsequent pass and left in the queue for

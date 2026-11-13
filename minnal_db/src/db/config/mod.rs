@@ -1,5 +1,3 @@
-pub mod toml;
-
 use crate::defaults;
 use crate::storage::lsm::tree::LSMConfig;
 use std::path::PathBuf;
@@ -7,7 +5,7 @@ use std::time::Duration;
 
 pub use crate::kv_store::SyncConfig;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScheduledTaskConfig {
     pub(crate) value_log_gc_interval: Duration,
     pub(crate) wal_gc_interval: Duration,
@@ -32,7 +30,7 @@ pub struct ScheduledTaskConfig {
     pub(crate) index_checkpoint_interval: Duration,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThresholdConfig {
     /// Percentage (`0..100`) of a **bucket** that may be garbage before GC runs
     /// on it at all. This is the *trigger*: it answers "is this namespace worth
@@ -245,7 +243,7 @@ impl ScheduledTaskConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DbConfig {
     pub threshold_config: ThresholdConfig,
     pub sync_config: SyncConfig,

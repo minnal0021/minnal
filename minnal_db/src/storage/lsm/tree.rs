@@ -98,7 +98,7 @@ pub(crate) const L0_COMPACTION_MAX_FILES: usize = 8;
 pub(crate) const L0_COMPACTION_RATIO_PERCENT: u64 = 10;
 
 /// Configuration for LSM tree compaction behavior
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LSMConfig {
     /// Trigger compaction when skip list reaches this percentage capacity (0-100)
     pub(crate) compaction_threshold_percent: usize,
