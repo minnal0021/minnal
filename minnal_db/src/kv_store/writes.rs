@@ -238,14 +238,15 @@ impl KVStore {
     }
 
     fn delete_from_storage_inner(&self, key: &[u8], seq: u64) -> Result<()> {
-        // Hold the bucket lock across the garbage accounting AND the LSM delete,
-        // for the same reason `put_to_storage` does (see its comment): GC scans
-        // the LSM for live keys under this lock and then re-inserts the pointers
-        // of the records it copied. Without the lock, a delete landing in GC's
-        // scan→reinsert window would be undone — GC would copy the about-to-be
-        // deleted record and re-insert its pointer *after* our `lsm.delete`,
-        // resurrecting the key. Taking the lock serialises us with GC so the
-        // delete is either fully visible to GC's scan or applied after GC ends.
+        // Hold the bucket lock across the pointer read, the LSM delete and the
+        // garbage accounting, for the reason `put_to_storage_inner` gives: it
+        // excludes GC's phase-2 compare-and-set, the one writer without a key
+        // stripe. GC's liveness scan (phase 1) takes no lock; a delete landing
+        // after it is caught by the compare-and-set, which re-reads the key under
+        // this lock and skips a key that is gone. The lock closes the window
+        // inside phase 2, between that re-read and GC's insert of its copy at the
+        // key's old seq: if this delete reached L1 meanwhile (tombstone dropped),
+        // the copy would win and bring the key back.
         let bucket = self.value_log.bucket_for_key(key);
         let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
         self.delete_with_bucket_locked(key, seq, bucket_guard)
