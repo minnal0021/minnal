@@ -39,7 +39,10 @@ impl KVStore {
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
         let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
-        let displaced = existing_u128.and_then(decode_sharded_pointer);
+        // Only a winning write replaces anything. A losing write's record is
+        // garbage the moment it lands, so the winner's record is neither its
+        // previous version nor the old value for the index: read nothing.
+        let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
         let mut old_value: Option<Vec<u8>> = None;
         if let Some(existing_ptr) = displaced {
             if let Ok(meta) = self.value_log.read_record_meta(existing_ptr) {
