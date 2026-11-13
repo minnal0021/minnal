@@ -419,7 +419,6 @@ impl KVStore {
 
     /// Flush and sync all data for this namespace.
     pub fn shutdown(&self) -> Result<()> {
-        self.lsm.cleanup_pending_memtables_on_close();
         // Values before the LSM entries that point at them (see
         // `SyncValueLogBeforePersist`).
         self.value_log.sync_all()?;

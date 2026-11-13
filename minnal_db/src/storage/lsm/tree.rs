@@ -19,7 +19,7 @@ use super::manifest::{LsmManifest, ManifestBucket, ManifestFile, ManifestLevel};
 use super::skip_list::skip_list::{KeyValueRecord, SkipList};
 use super::sparse_index::SparseIndex;
 use crate::support::{get_bucket_for_key, key_prefix_of, prefix_upper_bound};
-use log::{info, warn};
+use log::warn;
 use parking_lot::RwLock;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::fs::{File, OpenOptions};
@@ -558,6 +558,51 @@ fn open_registered_l0_for_scan(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// At most `limit` entries of one registered Level-0 file in `[start, end)`,
+/// in key order. A file whose key range misses `[start, end)` is not opened;
+/// one with a sparse index is read from the block holding `start` (the hint is
+/// checked against the file first), and the read stops at the first key at or
+/// past `end`.
+fn read_l0_range(entry: &L0FileEntry, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<ScanEntry>> {
+    if let Some(summary) = &entry.summary
+        && (summary.max_key.as_slice() < start || end.is_some_and(|e| summary.min_key.as_slice() >= e))
+    {
+        return Ok(Vec::new());
+    }
+    let file = open_registered_l0(&entry.path)?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let hint = entry.scan_start(start);
+    let offset = if hint != 0 && LSMTree::valid_scan_start(&file, hint, file_len, start) {
+        hint
+    } else {
+        SSTABLE_DATA_START
+    };
+    let mut frames = FrameReader::new(&file, offset);
+    let mut entries = Vec::new();
+    while entries.len() < limit
+        && let Some(body) = frames.next_frame(file_len)?
+    {
+        #[cfg(test)]
+        entry.frames_read.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `verify_sstable_payload` checked the frame's CRC, and a
+        // registered L0 file's header was validated when it entered the registry.
+        let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(body)?) };
+        let key = archived.key.as_slice();
+        if end.is_some_and(|e| key >= e) {
+            break;
+        }
+        if key < start {
+            continue;
+        }
+        entries.push((
+            key.to_vec(),
+            (!archived.tombstone).then(|| archived.value.to_native()),
+            archived.seq.to_native(),
+        ));
+    }
+    Ok(entries)
+}
+
 /// On disk, each SSTable entry is framed as:
 ///
 /// ```text
@@ -773,9 +818,9 @@ impl MemTable {
 /// Read-only snapshot of memtable entries pending compaction
 #[derive(Clone)]
 struct ReadOnlyMemTable {
+    /// Shared with every scan that cloned the read-only list, so a memtable
+    /// taken off the list stays readable until the last such scan drops it.
     records: Arc<Vec<KeyValueRecord>>,
-    /// Reference count of active readers
-    reader_count: Arc<AtomicU64>,
     /// Version number for tracking updates
     version: u64,
     /// Whether this memtable has been flushed to Level 0 files
@@ -796,7 +841,6 @@ impl ReadOnlyMemTable {
         );
         Self {
             records: Arc::new(records),
-            reader_count: Arc::new(AtomicU64::new(0)),
             version,
             flushed_to_level0: Arc::new(AtomicBool::new(false)),
             flush_lock: Arc::new(parking_lot::Mutex::new(())),
@@ -818,18 +862,6 @@ impl ReadOnlyMemTable {
             .map(|i| &self.records[i])
     }
 
-    fn increment_reader_count(&self) -> u64 {
-        self.reader_count.fetch_add(1, Ordering::SeqCst)
-    }
-
-    fn decrement_reader_count(&self) {
-        self.reader_count.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    fn reader_count(&self) -> u64 {
-        self.reader_count.load(Ordering::SeqCst)
-    }
-
     fn version(&self) -> u64 {
         self.version
     }
@@ -845,10 +877,7 @@ impl ReadOnlyMemTable {
 
 impl std::fmt::Debug for ReadOnlyMemTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReadOnlyMemTable")
-            .field("version", &self.version)
-            .field("reader_count", &self.reader_count())
-            .finish()
+        f.debug_struct("ReadOnlyMemTable").field("version", &self.version).finish()
     }
 }
 
@@ -902,6 +931,10 @@ struct L0FileEntry {
     summary: Option<L0Summary>,
     reader_count: AtomicU64,
     obsolete: AtomicBool,
+    /// Frames [`read_l0_range`] has read from this file, so a test can check a
+    /// scan seeks instead of reading the whole file.
+    #[cfg(test)]
+    frames_read: AtomicU64,
 }
 
 impl L0FileEntry {
@@ -912,6 +945,8 @@ impl L0FileEntry {
             summary,
             reader_count: AtomicU64::new(0),
             obsolete: AtomicBool::new(false),
+            #[cfg(test)]
+            frames_read: AtomicU64::new(0),
         }
     }
 
@@ -1079,11 +1114,6 @@ pub(crate) struct LSMTree {
 
     /// Global version for read-only memtables
     ro_memtable_version: Arc<AtomicU64>,
-
-    /// Flushed read-only memtables taken off the read path while a reader still
-    /// counted itself on them; released by a later compaction tick once their
-    /// reader count is zero.
-    pending_old_memtables: Arc<RwLock<Vec<ReadOnlyMemTable>>>,
 
     /// Level 0 files tracked per bucket for reader-safe compaction/deletion.
     level0_files: Vec<Arc<RwLock<Vec<Arc<L0FileEntry>>>>>,
@@ -1373,7 +1403,6 @@ impl LSMTree {
             config,
             compaction_in_progress,
             ro_memtable_version: Arc::new(AtomicU64::new(0)),
-            pending_old_memtables: Arc::new(RwLock::new(Vec::new())),
             level0_files,
             last_l0_stamp: parking_lot::Mutex::new(last_l0_stamp),
             flush_observer: Arc::new(RwLock::new(None)),
@@ -2028,9 +2057,7 @@ impl LSMTree {
         {
             let ro_memtables = self.read_only_memtables.read();
             for ro in ro_memtables.iter().rev() {
-                ro.increment_reader_count();
                 let hit = ro.find(key).map(|r| (r.value, r.seq, r.tombstone));
-                ro.decrement_reader_count();
                 if let Some((value, seq, tombstone)) = hit {
                     Self::merge_candidate(&mut best, (!tombstone).then_some(value), seq);
                 }
@@ -2609,7 +2636,6 @@ impl LSMTree {
 
     /// Compact all buckets in parallel
     pub(crate) fn compact_all(&self) -> Result<()> {
-        self.cleanup_pending_memtables();
         self.cleanup_obsolete_level0_files();
 
         let ro_snapshot = self.read_only_memtables.read().clone();
@@ -2631,7 +2657,7 @@ impl LSMTree {
             }
         }
 
-        self.defer_old_memtables_cleanup()?;
+        self.release_flushed_memtables();
         Ok(())
     }
 
@@ -2695,7 +2721,6 @@ impl LSMTree {
     /// [due](Self::compaction_due). [`compact_all`](Self::compact_all) merges
     /// every bucket with any L0 file, for shutdown and explicit requests.
     pub(crate) fn compact_due(&self) -> Result<()> {
-        self.cleanup_pending_memtables();
         self.cleanup_obsolete_level0_files();
 
         let ro_snapshot = self.read_only_memtables.read().clone();
@@ -2717,7 +2742,7 @@ impl LSMTree {
             }
         }
 
-        self.defer_old_memtables_cleanup()?;
+        self.release_flushed_memtables();
         Ok(())
     }
 
@@ -3084,26 +3109,11 @@ impl LSMTree {
     ///
     /// `upper` is the prefix's upper bound (`prefix_upper_bound(prefix)`): the L1
     /// read skips a non-overlapping file via min/max and seeks via the sparse index
-    /// over `[prefix, upper)`. Each L0 file is read in full with a prefix match.
+    /// over `[prefix, upper)`, and each L0 file the same way (`read_l0_range`):
+    /// skipped when its key range misses, seeked through its sparse index
+    /// otherwise.
     fn scan_prefix_in_bucket(&self, bucket: u32, prefix: &[u8], upper: Option<&[u8]>) -> Result<Vec<ScanEntry>> {
         let mut results = Vec::new();
-        let mut entry_bytes = Vec::new();
-
-        // For a prefix of at most 8 bytes, compare the entry's stored 8-byte
-        // `key_prefix` instead of the key. That field is the key ZERO-PADDED to 8
-        // bytes, so a key shorter than the prefix must be rejected first: key "ab"
-        // pads to "ab\0…", which would otherwise match prefix "ab\0".
-        let matches_prefix = |archived: &ArchivedSStableEntry, key_slice: &[u8]| -> bool {
-            if key_slice.len() < prefix.len() {
-                false
-            } else if prefix.len() <= 8 {
-                let prefix_len = prefix.len();
-                let entry_prefix_bytes = archived.key_prefix.to_native().to_be_bytes();
-                &entry_prefix_bytes[..prefix_len] == prefix
-            } else {
-                key_slice.starts_with(prefix)
-            }
-        };
 
         // Capture the SSTable handles newest-first — L0 *before* L1 — so a
         // concurrent L0→L1 merge cannot drop a key in the gap between the two
@@ -3133,32 +3143,12 @@ impl LSMTree {
             self.scan_l1_range_into(bucket as usize, &level1_file, prefix, upper, None, &mut results)?;
         }
 
-        // Then the captured Level 0 files oldest-first.
+        // Then the captured Level 0 files oldest-first. Each is sorted by key,
+        // so the keys with the prefix are its range `[prefix, upper)`: a file
+        // whose key range misses it is skipped, and the rest are read from the
+        // block holding `prefix` to the first key past it.
         for guard in &l0_guards {
-            let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
-            // Bound for `check_frame_len`: a frame can never be longer than its file.
-            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            loop {
-                let mut size_buf = [0u8; 4];
-                match file.read_exact(&mut size_buf) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(LSMError::Io(e)),
-                }
-
-                let size = u32::from_le_bytes(size_buf) as usize;
-                check_frame_len(size as u64, file_len)?;
-                entry_bytes.resize(size, 0);
-                file.read_exact(&mut entry_bytes[..size])?;
-
-                let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-
-                let key_slice = archived.key.as_slice();
-                if matches_prefix(archived, key_slice) {
-                    let val = (!archived.tombstone).then(|| archived.value.to_native());
-                    results.push((key_slice.to_vec(), val, archived.seq.to_native()));
-                }
-            }
+            results.extend(read_l0_range(&guard.entry, prefix, upper, usize::MAX)?);
         }
 
         Ok(results)
@@ -3872,56 +3862,22 @@ impl LSMTree {
         Ok(kvs)
     }
 
-    /// Release the retired read-only memtables that have no readers left.
-    fn cleanup_pending_memtables(&self) {
-        let mut pending = self.pending_old_memtables.write();
-
-        let still_in_use: Vec<ReadOnlyMemTable> = pending.drain(..).filter(|ro| ro.reader_count() > 0).collect();
-
-        pending.extend(still_in_use);
-    }
-
     /// Take the flushed read-only memtables older than the current version off
-    /// the read path: drop those with no readers, and retire the rest until a
-    /// later [`cleanup_pending_memtables`](Self::cleanup_pending_memtables).
-    fn defer_old_memtables_cleanup(&self) -> Result<()> {
+    /// the read path; their records are in L0 files now. A memtable not yet
+    /// flushed stays. Nothing waits for readers: a point read holds the list's
+    /// lock while it reads, and a scan holds its own clone of the records
+    /// (`Arc`), which outlives the removal.
+    fn release_flushed_memtables(&self) {
         let version = self.ro_memtable_version.load(Ordering::SeqCst);
-
-        let mut ro_memtables = self.read_only_memtables.write();
-        let mut pending = self.pending_old_memtables.write();
-
-        let (old, new): (Vec<_>, Vec<_>) = ro_memtables.drain(..).partition(|ro| ro.version() < version);
-
-        for ro in old {
-            if !ro.is_flushed_to_level0() {
-                // Not yet flushed to L0 — keep it in the active list
-                ro_memtables.push(ro);
-            } else if ro.reader_count() == 0 {
-                // drop
-            } else {
-                pending.push(ro);
-            }
-        }
-
-        ro_memtables.extend(new);
-        Ok(())
+        self.read_only_memtables
+            .write()
+            .retain(|ro| ro.version() >= version || !ro.is_flushed_to_level0());
     }
 
     /// Test-only: hold the active memtable, so a flush of this tree waits.
     #[cfg(test)]
     pub(crate) fn hold_memtable(&self) -> impl Sized + '_ {
         self.memtable.write()
-    }
-
-    /// Release every retired read-only memtable, at database close.
-    pub(crate) fn cleanup_pending_memtables_on_close(&self) {
-        let mut pending = self.pending_old_memtables.write();
-        let count = pending.len();
-
-        if count > 0 {
-            info!("[LSM] Cleaning up {} pending read-only memtables on close", count);
-            pending.clear();
-        }
     }
 
     /// Drop all in-memory read-only memtables without compacting them to L1.
@@ -6599,6 +6555,53 @@ mod tests {
 
         let ids: std::collections::HashSet<u32> = probed.into_iter().collect();
         assert_eq!(lsm.scan_prefixes(&ids)?.len(), per as usize);
+        Ok(())
+    }
+
+    /// `scan_prefix` reads an L0 file only near the prefix: a file whose key
+    /// range misses it is not read at all, and one that holds it is read from
+    /// the sparse-index block holding the prefix to the first key past it.
+    #[test]
+    fn scan_prefix_seeks_through_level0_files() -> Result<()> {
+        let temp = TempDir::new()?;
+        let lsm = LSMTree::open(
+            temp.path(),
+            LSMConfig {
+                num_buckets: 1,
+                ..LSMConfig::default()
+            },
+        )?;
+        // One L0 file of `a:` keys, then one of `b:` keys.
+        for i in 0..5_000u32 {
+            lsm.insert(format!("a:{i:05}").as_bytes(), u128::from(i))?;
+        }
+        lsm.flush_memtable_to_level0()?;
+        for i in 0..100u32 {
+            lsm.insert(format!("b:{i:05}").as_bytes(), u128::from(i))?;
+        }
+        lsm.flush_memtable_to_level0()?;
+        lsm.purge_ro_memtables_for_test();
+
+        let frames_read = |lsm: &LSMTree| -> Vec<u64> {
+            let mut files: Vec<_> = lsm.level0_files[0].read().iter().cloned().collect();
+            files.sort_by_key(|f| f.created_at_ms);
+            files.iter().map(|f| f.frames_read.load(Ordering::Relaxed)).collect()
+        };
+
+        let hits = lsm.scan_prefix(b"a:0250")?;
+        assert_eq!(hits.len(), 10, "a:02500..a:02509");
+        let [a_file, b_file] = frames_read(&lsm)[..] else {
+            panic!("two L0 files")
+        };
+        assert!(
+            a_file <= 2 * SparseIndex::SAMPLE_INTERVAL + 10,
+            "read {a_file} of 5,000 frames for ten keys"
+        );
+        assert_eq!(b_file, 0, "a file whose key range misses the prefix is not read");
+
+        // Every key still resolves when the prefix spans the whole file.
+        assert_eq!(lsm.scan_prefix(b"a:")?.len(), 5_000);
+        assert_eq!(lsm.scan_prefix(b"b:")?.len(), 100);
         Ok(())
     }
 

@@ -200,44 +200,10 @@ impl LSMTree {
     }
 }
 
-/// Up to `window` entries of one Level-0 file in `[start, end)`. A file whose
-/// key range misses the window is not opened; one with a sparse index is read
-/// from the block holding `start`.
+/// Up to `window` entries of one Level-0 file in `[start, end)`
+/// ([`read_l0_range`]); the window cut the read short when it filled.
 fn read_l0_window(entry: &L0FileEntry, start: &[u8], end: Option<&[u8]>, window: usize) -> Result<LayerRun> {
-    if let Some(summary) = &entry.summary
-        && (summary.max_key.as_slice() < start || end.is_some_and(|e| summary.min_key.as_slice() >= e))
-    {
-        return Ok(LayerRun::EMPTY);
-    }
-    let file = open_registered_l0(&entry.path)?;
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let hint = entry.scan_start(start);
-    let offset = if hint != 0 && LSMTree::valid_scan_start(&file, hint, file_len, start) {
-        hint
-    } else {
-        SSTABLE_DATA_START
-    };
-    let mut frames = FrameReader::new(&file, offset);
-    let mut entries = Vec::new();
-    while let Some(body) = frames.next_frame(file_len)? {
-        // SAFETY: `verify_sstable_payload` checked the frame's CRC, and a
-        // registered L0 file's header was validated when it entered the registry.
-        let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(body)?) };
-        let key = archived.key.as_slice();
-        if end.is_some_and(|e| key >= e) {
-            break;
-        }
-        if key < start {
-            continue;
-        }
-        entries.push((
-            key.to_vec(),
-            (!archived.tombstone).then(|| archived.value.to_native()),
-            archived.seq.to_native(),
-        ));
-        if entries.len() == window {
-            return Ok(LayerRun { entries, cut: true });
-        }
-    }
-    Ok(LayerRun { entries, cut: false })
+    let entries = read_l0_range(entry, start, end, window)?;
+    let cut = entries.len() == window;
+    Ok(LayerRun { entries, cut })
 }
