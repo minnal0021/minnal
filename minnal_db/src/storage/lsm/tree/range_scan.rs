@@ -1,211 +1,228 @@
 //! The bounded range scan: a page of live `(key, pointer, seq)` entries from a
 //! start key, resolved across every layer of the tree.
+//!
+//! Every layer is read in key order from `start`: the active memtable, each
+//! read-only memtable, each Level-0 file (seeking through its sparse index) and
+//! each bucket's Level-1 file. A page reads at most a *window* of entries from
+//! each layer, not every entry after `start`. Keys up to the smallest last key of
+//! any layer the window cut short are present in full in every layer, so they
+//! resolve exactly ([`fold_newest`]). If those keys hold fewer than `limit` live
+//! keys (newer layers' tombstones deleted the rest), the page is read again with
+//! a window four times larger. A page's work and memory are therefore about its
+//! size times the number of layers, whatever lies after the cursor.
 
 use super::*;
 
+/// Windows above this read each bucket's Level-0 and Level-1 files on a thread
+/// of their own; smaller ones read them in turn, since a thread per bucket costs
+/// more than a small read.
+const PARALLEL_WINDOW: usize = 10_000;
+
+/// One layer's entries from `start`, in key order: at most a window of them.
+struct LayerRun {
+    entries: Vec<ScanEntry>,
+    /// The window ended the read: this layer may hold keys after its last entry.
+    cut: bool,
+}
+
+impl LayerRun {
+    const EMPTY: LayerRun = LayerRun {
+        entries: Vec::new(),
+        cut: false,
+    };
+
+    /// The first `window` entries of a layer already in key order. A layer with
+    /// exactly `window` entries counts as cut: the read cannot tell.
+    fn take(entries: impl Iterator<Item = ScanEntry>, window: usize) -> Self {
+        let entries: Vec<ScanEntry> = entries.take(window).collect();
+        let cut = entries.len() == window;
+        Self { entries, cut }
+    }
+
+    /// The last key read, when the window cut this layer short.
+    fn cut_at(&self) -> Option<&[u8]> {
+        if self.cut { self.entries.last().map(|e| e.0.as_slice()) } else { None }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entries the range scans on this thread have read from every layer, so a
+    /// test can check a page reads about its own size.
+    pub(super) static ENTRIES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl LSMTree {
-    /// Returns the first `limit` live `(key, pointer, seq)` entries in `[start, end)`, in sorted order.
+    /// The first `limit` live `(key, pointer, seq)` entries in `[start, end)`, in
+    /// key order. Each key resolves to its highest-seq copy across the layers,
+    /// so a tombstone in a newer layer hides an older live copy.
     ///
-    /// Avoids a redundant per-key `lsm.get()` call in callers that immediately need to
-    /// decode the pointer anyway (e.g. `resolve_entries_from_pointers`).
-    ///
-    /// Uses the same oldest-first, last-writer-wins `BTreeMap<key, Option<pointer>>`
-    /// pattern as `key_pointer_pairs` so active-memtable tombstones always shadow stale
-    /// SSTable entries — the same guarantee `lsm.keys()` provides.
-    ///
-    /// Same pointer-resolution invariant as [`scan_prefix`](Self::scan_prefix):
-    /// returned pointers are LSM-complete but must be resolved against the value log
-    /// only inside the value-log generation bracket / GC bucket lock.
+    /// Returned pointers are complete as far as the LSM goes, but must be resolved
+    /// against the value log only inside the value-log generation bracket or under
+    /// the GC bucket lock, as for [`scan_prefix`](Self::scan_prefix).
     pub(crate) fn range_pointers_bounded(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, u128, u64)>> {
-        // Layers resolve by highest seq (`fold_newest`, oldest→newest: L1 → L0 → RO →
-        // active); only the *capture* order is newest-first so a concurrent
-        // flush/compaction cannot drop a live key. See `scan_prefix`. `take(limit)`
-        // runs on the fully merged, sorted map.
-        //
-        // `end` (exclusive) bounds the scan to `[start, end)`; entries `>= end` are
-        // never inserted so the merge map and the resulting page stay within the
-        // requested key window.
-        let mut all_entries = ScanMap::new();
-
-        // Memtable layers (newest) captured first, under one `memtable.read()` guard
-        // so a flush cannot split a key between active and RO.
-        let (active_snapshot, ro_snapshot) = {
-            let memtable = self.memtable.read();
-            let active: Vec<ScanEntry> = memtable
-                .skip_list
-                .iter_raw_from(start)
-                .take_while(|(key, _value, _seq, _tombstone)| end.is_none_or(|e| *key < e))
-                .map(|(key, value, seq, tombstone)| (key.to_vec(), (!tombstone).then_some(value), seq))
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut window = limit.saturating_add(1);
+        loop {
+            let layers = self.read_range_window(start, end, window)?;
+            // Keys at or below this are read in full from every layer.
+            let complete_to: Option<Vec<u8>> = layers.iter().filter_map(LayerRun::cut_at).min().map(<[u8]>::to_vec);
+            let mut resolved = ScanMap::new();
+            for run in layers {
+                for (key, value, seq) in run.entries {
+                    if complete_to.as_deref().is_some_and(|c| key.as_slice() > c) {
+                        break;
+                    }
+                    fold_newest(&mut resolved, key, value, seq);
+                }
+            }
+            let page: Vec<(Vec<u8>, u128, u64)> = resolved
+                .into_iter()
+                .filter_map(|(key, (value, seq))| value.map(|v| (key, v, seq)))
+                .take(limit)
                 .collect();
-            let ro = self.read_only_memtables.read().clone();
-            (active, ro)
-        };
+            if page.len() == limit || complete_to.is_none() {
+                return Ok(page);
+            }
+            window = window.saturating_mul(4);
+        }
+    }
 
-        // SSTable handles captured newest-first (L0 before L1); read in merge order.
+    /// Up to `window` entries in `[start, end)` from every layer, oldest layer
+    /// first, so that folding them in order lets an exact seq tie go to the
+    /// newer layer: each bucket's Level 1, each bucket's Level-0 files oldest
+    /// first, the read-only memtables oldest first, the active memtable.
+    ///
+    /// The memtables are captured first, under one guard, so a flush cannot
+    /// move a key from the active memtable to the read-only list unseen; then
+    /// the SSTables, newest first (L0 before L1), so a concurrent flush or merge
+    /// cannot drop a live key between them. The L0 guards keep their files
+    /// readable until the reads are done.
+    fn read_range_window(&self, start: &[u8], end: Option<&[u8]>, window: usize) -> Result<Vec<LayerRun>> {
+        let in_range = |key: &[u8]| end.is_none_or(|e| key < e);
+        let (active, read_only) = {
+            let memtable = self.memtable.read();
+            let active = LayerRun::take(
+                memtable
+                    .skip_list
+                    .iter_raw_from(start)
+                    .take_while(|(key, ..)| in_range(key))
+                    .map(|(key, value, seq, tombstone)| (key.to_vec(), (!tombstone).then_some(value), seq)),
+                window,
+            );
+            (active, self.read_only_memtables.read().clone())
+        };
         let (l0_guards, l1_files) = self.capture_sstable_layers();
 
-        // Pages ≤ this bound use the limit-bounded serial L1 path; larger scans keep the
-        // parallel read-everything path (see the L1 step below).
-        const BOUNDED_SCAN_LIMIT: usize = 10_000;
-
-        // Collect the layers NEWER than L1 — L0 (oldest-first per bucket), then read-only
-        // memtables (oldest-first), then the active memtable (newest) — into one list in
-        // that oldest→newest order. Two uses: (a) bound the L1 scan (a page needs only each
-        // bucket's smallest `limit` live keys, but a newer-layer tombstone can delete one,
-        // so we over-read by the count of newer in-range entries — a safe upper bound on
-        // possible deletes, since keys are bucket-partitioned so only a same-bucket newer
-        // entry can shadow a bucket's L1 key); (b) replay over L1 for identical
-        // tombstone-suppression semantics.
-        let mut newer: Vec<ScanEntry> = Vec::new();
-        let bounded = limit <= BOUNDED_SCAN_LIMIT;
-
-        // Reads one bucket's L0 files (oldest-first, so an exact seq tie goes to the
-        // newer file), range-filtered. L0 has no min/max or sparse index, so files are
-        // scanned in full.
-        let read_l0_bucket = |bucket: usize| -> Result<Vec<ScanEntry>> {
-            let mut bucket_entries = Vec::new();
-            for guard in &l0_guards[bucket] {
-                let mut file = open_registered_l0_for_scan(&guard.entry.path)?;
-                // Bound for `check_frame_len`: a frame can never be longer than its file.
-                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                let mut entry_bytes: Vec<u8> = Vec::new();
-                loop {
-                    let mut size_buf = [0u8; 4];
-                    match file.read_exact(&mut size_buf) {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => return Err(LSMError::Io(e)),
-                    }
-                    let size = u32::from_le_bytes(size_buf) as usize;
-                    check_frame_len(size as u64, file_len)?;
-                    entry_bytes.resize(size, 0);
-                    file.read_exact(&mut entry_bytes[..size])?;
-                    let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
-                    if archived.key.as_slice() >= start && end.is_none_or(|e| archived.key.as_slice() < e) {
-                        let val = (!archived.tombstone).then(|| archived.value.to_native());
-                        bucket_entries.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
-                    }
-                }
-            }
-            Ok(bucket_entries)
+        let read_bucket = |bucket: usize| -> Result<(LayerRun, Vec<LayerRun>)> {
+            let l1 = self.read_l1_window(bucket, &l1_files[bucket], start, end, window)?;
+            let l0 = l0_guards[bucket]
+                .iter()
+                .map(|guard| read_l0_window(&guard.entry, start, end, window))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((l1, l0))
+        };
+        let buckets: Vec<(LayerRun, Vec<LayerRun>)> = if window > PARALLEL_WINDOW {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..self.config.num_buckets).map(|b| s.spawn(move || read_bucket(b))).collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("range scan thread panicked"))))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?
+        } else {
+            (0..self.config.num_buckets).map(read_bucket).collect::<Result<Vec<_>>>()?
         };
 
-        // L0 (newer than L1). Bounded page → read busy buckets SERIALLY: L0 is small in the
-        // steady state, so spawning a thread per bucket costs more than it saves (same
-        // reasoning as the bounded L1 path below). Full/large scan → parallel read-everything.
-        let busy_l0: Vec<usize> = (0..self.config.num_buckets).filter(|b| !l0_guards[*b].is_empty()).collect();
-        if bounded {
-            for bucket in busy_l0 {
-                newer.extend(read_l0_bucket(bucket)?);
-            }
-        } else {
-            let mut first_err: Option<LSMError> = None;
-            std::thread::scope(|s| {
-                let handles: Vec<_> = busy_l0.into_iter().map(|bucket| s.spawn(move || read_l0_bucket(bucket))).collect();
-                for handle in handles {
-                    match handle
-                        .join()
-                        .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
-                    {
-                        Ok(entries) => newer.extend(entries),
-                        Err(e) => {
-                            if first_err.is_none() {
-                                first_err = Some(e);
-                            }
-                        }
-                    }
-                }
-            });
-            if let Some(e) = first_err {
-                return Err(e);
-            }
+        let mut layers = Vec::with_capacity(buckets.len() * 2 + read_only.len() + 1);
+        let mut level0 = Vec::new();
+        for (l1, l0) in buckets {
+            layers.push(l1);
+            level0.extend(l0);
         }
-        for ro_memtable in ro_snapshot.iter() {
-            for record in ro_memtable.records().iter() {
-                if record.key.as_slice() >= start && end.is_none_or(|e| record.key.as_slice() < e) {
-                    newer.push((record.key.clone(), (!record.tombstone).then_some(record.value), record.seq));
-                }
-            }
+        layers.extend(level0);
+        for ro in read_only.iter() {
+            let records = ro.records();
+            let from = records.partition_point(|r| r.key.as_slice() < start);
+            layers.push(LayerRun::take(
+                records[from..]
+                    .iter()
+                    .take_while(|r| in_range(&r.key))
+                    .map(|r| (r.key.clone(), (!r.tombstone).then_some(r.value), r.seq)),
+                window,
+            ));
         }
-        newer.extend(active_snapshot);
+        layers.push(active);
 
-        // L1 SSTables (oldest layer) — only buckets whose min/max overlaps `[start, end)`;
-        // each seeks near `start` via the sparse index and stops at `end`. The L0 guards
-        // captured above make the metadata read race-safe (see `l1_overlaps`). Keys are
-        // hash-sharded so bucket key-sets are disjoint.
-        //
-        // Bounded page: read at most `limit + 1 + |newer in range in THIS bucket|` LIVE keys
-        // per bucket and scan buckets SERIALLY — per-bucket work is tiny, so a thread per
-        // bucket costs more than it saves. Full/large scan: keep the parallel, read-everything
-        // path. Only a same-bucket newer entry can shadow a bucket's L1 key (keys are
-        // hash-sharded), so the slack is sharded per bucket — a global `|newer|` slack would
-        // over-read every bucket by the total newer count. See `get_bucket_for_key`.
-        match bounded {
-            true => {
-                let mut newer_per_bucket = vec![0usize; self.config.num_buckets];
-                for (key, _, _) in newer.iter() {
-                    newer_per_bucket[get_bucket_for_key(key, self.config.num_buckets) as usize] += 1;
-                }
-                for (bucket, file) in l1_files.iter().enumerate() {
-                    if !self.l1_overlaps(bucket, start, end) {
-                        continue;
-                    }
-                    let cap = limit.saturating_add(1).saturating_add(newer_per_bucket[bucket]);
-                    let mut entries = Vec::new();
-                    self.scan_l1_range_into(bucket, file, start, end, Some(cap), &mut entries)?;
-                    for (k, v, seq) in entries {
-                        fold_newest(&mut all_entries, k, v, seq);
-                    }
-                }
-            }
-            false => {
-                let mut first_err: Option<LSMError> = None;
-                std::thread::scope(|s| {
-                    let handles: Vec<_> = l1_files
-                        .iter()
-                        .enumerate()
-                        .filter(|(bucket, _)| self.l1_overlaps(*bucket, start, end))
-                        .map(|(bucket, file)| {
-                            s.spawn(move || -> Result<Vec<ScanEntry>> {
-                                let mut entries = Vec::new();
-                                self.scan_l1_range_into(bucket, file, start, end, None, &mut entries)?;
-                                Ok(entries)
-                            })
-                        })
-                        .collect();
-                    for handle in handles {
-                        match handle
-                            .join()
-                            .unwrap_or_else(|_| Err(LSMError::Io(std::io::Error::other("thread panicked"))))
-                        {
-                            Ok(entries) => {
-                                for (k, v, seq) in entries {
-                                    fold_newest(&mut all_entries, k, v, seq);
-                                }
-                            }
-                            Err(e) => {
-                                if first_err.is_none() {
-                                    first_err = Some(e);
-                                }
-                            }
-                        }
-                    }
-                });
-                if let Some(e) = first_err {
-                    return Err(e);
-                }
-            }
-        }
-
-        // Fold the newer layers over L1 (oldest→newest), resolving by seq.
-        for (key, value, seq) in newer {
-            fold_newest(&mut all_entries, key, value, seq);
-        }
-
-        Ok(all_entries
-            .into_iter()
-            .filter_map(|(key, (value, seq))| value.map(|v| (key, v, seq)))
-            .take(limit)
-            .collect())
+        #[cfg(test)]
+        ENTRIES_READ.with(|n| n.set(n.get() + layers.iter().map(|l| l.entries.len()).sum::<usize>()));
+        Ok(layers)
     }
+
+    /// Up to `window` entries of `bucket`'s Level-1 file in `[start, end)`,
+    /// seeking near `start` through its sparse index.
+    fn read_l1_window(&self, bucket: usize, file: &File, start: &[u8], end: Option<&[u8]>, window: usize) -> Result<LayerRun> {
+        if !self.l1_overlaps(bucket, start, end) {
+            return Ok(LayerRun::EMPTY);
+        }
+        let mut entries = Vec::new();
+        let mut cut = false;
+        // `max_live` stops after `window` live entries; tombstones (which Level 1
+        // does not keep) would not count towards it.
+        self.for_each_l1_entry_in_range(bucket, file, start, end, Some(window), |archived| {
+            let value = (!archived.tombstone).then(|| archived.value.to_native());
+            entries.push((archived.key.as_slice().to_vec(), value, archived.seq.to_native()));
+        })?;
+        if entries.iter().filter(|e| e.1.is_some()).count() >= window {
+            cut = true;
+        }
+        Ok(LayerRun { entries, cut })
+    }
+}
+
+/// Up to `window` entries of one Level-0 file in `[start, end)`. A file whose
+/// key range misses the window is not opened; one with a sparse index is read
+/// from the block holding `start`.
+fn read_l0_window(entry: &L0FileEntry, start: &[u8], end: Option<&[u8]>, window: usize) -> Result<LayerRun> {
+    if let Some(summary) = &entry.summary
+        && (summary.max_key.as_slice() < start || end.is_some_and(|e| summary.min_key.as_slice() >= e))
+    {
+        return Ok(LayerRun::EMPTY);
+    }
+    let file = open_registered_l0(&entry.path)?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let hint = entry.scan_start(start);
+    let offset = if hint != 0 && LSMTree::valid_scan_start(&file, hint, file_len, start) {
+        hint
+    } else {
+        SSTABLE_DATA_START
+    };
+    let mut frames = FrameReader::new(&file, offset);
+    let mut entries = Vec::new();
+    while let Some(body) = frames.next_frame(file_len)? {
+        // SAFETY: `verify_sstable_payload` checked the frame's CRC, and a
+        // registered L0 file's header was validated when it entered the registry.
+        let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(body)?) };
+        let key = archived.key.as_slice();
+        if end.is_some_and(|e| key >= e) {
+            break;
+        }
+        if key < start {
+            continue;
+        }
+        entries.push((
+            key.to_vec(),
+            (!archived.tombstone).then(|| archived.value.to_native()),
+            archived.seq.to_native(),
+        ));
+        if entries.len() == window {
+            return Ok(LayerRun { entries, cut: true });
+        }
+    }
+    Ok(LayerRun { entries, cut: false })
 }

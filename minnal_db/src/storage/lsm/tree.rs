@@ -5835,7 +5835,7 @@ mod tests {
                     truth,
                     "{label}: range_pointers_bounded, unbounded"
                 );
-                // A small page from the middle: exercises the per-bucket L1 read cap.
+                // A small page from the middle: the window cuts every layer short.
                 let start = b"key0_10".as_slice();
                 let page: Vec<_> = truth.iter().filter(|(k, _, _)| k.as_slice() >= start).take(3).cloned().collect();
                 assert_eq!(
@@ -5845,6 +5845,37 @@ mod tests {
                 );
                 let page_keys: Vec<Vec<u8>> = page.iter().map(|(k, _, _)| k.clone()).collect();
                 assert_eq!(range_keys(&lsm, start, 3)?, page_keys, "{label}: range_keys_bounded, limit 3");
+                // Every page size, from several starts, with and without an end,
+                // and a walk through the whole range a page at a time.
+                for limit in [1usize, 2, 7, 50] {
+                    for start in [b"".as_slice(), b"key0_10", b"key1_"] {
+                        for end in [None, Some(b"key1_25".as_slice())] {
+                            let want: Vec<_> = truth
+                                .iter()
+                                .filter(|(k, _, _)| k.as_slice() >= start && end.is_none_or(|e| k.as_slice() < e))
+                                .take(limit)
+                                .cloned()
+                                .collect();
+                            assert_eq!(
+                                lsm.range_pointers_bounded(start, end, limit)?,
+                                want,
+                                "{label}: limit {limit} from {start:?} to {end:?}"
+                            );
+                        }
+                    }
+                    let mut cursor = Vec::new();
+                    let mut walked = Vec::new();
+                    while let Some(last) = lsm
+                        .range_pointers_bounded(&cursor, None, limit)?
+                        .into_iter()
+                        .inspect(|e| walked.push(e.clone()))
+                        .last()
+                    {
+                        cursor = last.0;
+                        cursor.push(0);
+                    }
+                    assert_eq!(walked, truth, "{label}: walk in pages of {limit}");
+                }
             }
         }
         Ok(())
@@ -6875,6 +6906,61 @@ mod tests {
         Ok(())
     }
 
+    /// A page reads about its own size from each layer, however many keys lie
+    /// after the cursor: with 20,000 keys in Level 1 and 20,000 more in the
+    /// memtable, a page of 10 from the start reads a few dozen entries.
+    #[test]
+    fn a_range_page_reads_about_its_own_size() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+        let key = |i: u32| format!("r:{i:06}").into_bytes();
+        for i in 0..20_000 {
+            lsm.insert_with_seq(&key(2 * i), u128::from(i) + 1, u64::from(i) + 1)?;
+        }
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?;
+        for i in 0..20_000 {
+            lsm.insert_with_seq(&key(2 * i + 1), u128::from(i) + 1, 100_000 + u64::from(i))?;
+        }
+
+        range_scan::ENTRIES_READ.with(|n| n.set(0));
+        let page = lsm.range_pointers_bounded(b"r:", None, 10)?;
+        let read = range_scan::ENTRIES_READ.with(|n| n.get());
+        assert_eq!(page.iter().map(|e| e.0.clone()).collect::<Vec<_>>(), (0..10).map(key).collect::<Vec<_>>());
+        assert!(read <= 100, "a page of 10 read {read} entries");
+        Ok(())
+    }
+
+    /// When newer layers delete most of a window, the page is read again with
+    /// a wider one until it fills: 5,000 keys deleted in the memtable ahead of
+    /// the live ones still give the first 10 live keys.
+    #[test]
+    fn a_range_page_past_many_deletes_widens_until_full() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+        let key = |i: u32| format!("d:{i:06}").into_bytes();
+        for i in 0..6_000 {
+            lsm.insert_with_seq(&key(i), u128::from(i) + 1, u64::from(i) + 1)?;
+        }
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?;
+        for i in 0..5_000 {
+            lsm.delete_with_seq(&key(i), 10_000 + u64::from(i))?;
+        }
+
+        range_scan::ENTRIES_READ.with(|n| n.set(0));
+        let page = lsm.range_pointers_bounded(b"d:", None, 10)?;
+        let read = range_scan::ENTRIES_READ.with(|n| n.get());
+        assert_eq!(
+            page.iter().map(|e| e.0.clone()).collect::<Vec<_>>(),
+            (5_000..5_010).map(key).collect::<Vec<_>>()
+        );
+        // Windows of 11, 44, ..., 11,264 entries per layer: bounded by a few
+        // times what the page had to pass over, not by the namespace.
+        assert!(read < 60_000, "read {read} entries");
+        Ok(())
+    }
+
     // ── range_keys_bounded tombstone regressions ──────────────────────────────
 
     #[test]
@@ -7137,13 +7223,12 @@ mod tests {
         Ok(())
     }
 
-    // ── bounded-page L1 scan (limit-bounded merge) ─────────────────────────────
+    // ── bounded range pages: newer tombstones never short a page ───────────────
 
     /// A newer-layer (memtable) tombstone shadowing an L1 key *inside* the first `limit`
-    /// keys must not short the page. The bounded L1 scan over-reads each bucket by the
-    /// count of newer in-range entries, so `limit` live keys still come back. num_buckets=1
-    /// exercises the per-bucket cap tightly. **This would FAIL if L1 were capped at exactly
-    /// `limit`+1** (the page would come back with only ~11 keys).
+    /// keys must not short the page: the window is widened until `limit` live keys come
+    /// back. num_buckets=1 puts every key in one L1 run. Reading L1 only up to
+    /// `limit`+1 entries, without widening, would return about 11 keys.
     #[test]
     fn test_range_pointers_bounded_page_not_shorted_by_newer_tombstones() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -7201,11 +7286,10 @@ mod tests {
         Ok(())
     }
 
-    /// Per-bucket slack teeth: the L1 cap is sized by each bucket's OWN newer-entry count,
-    /// not a global one spread across buckets. Here 20 tombstones all hash to a SINGLE bucket
-    /// and sit at the page head; that bucket's cap must be `limit + 1 + 20` for the page to
-    /// come back full. A bound that undercounts the clustered bucket (e.g. `|newer| /
-    /// num_buckets ≈ 2`) would read only tombstones and short the page to empty.
+    /// Tombstones clustered in one bucket: 20 of them, all hashing to a single bucket,
+    /// sit at the page head. That bucket's window must grow past them for the page to
+    /// come back full; a window that stopped growing would read only tombstones there
+    /// and short the page.
     #[test]
     fn test_range_pointers_bounded_per_bucket_slack_clustered_tombstones() -> Result<()> {
         let num_buckets = 8;
