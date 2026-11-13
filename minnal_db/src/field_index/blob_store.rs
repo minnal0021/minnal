@@ -1129,10 +1129,10 @@ mod tests {
 
     #[test]
     fn logical_bytes_never_below_live_bytes_for_unaligned_blob() {
-        // Regression: a fresh single blob whose length is not a VALUE_ALIGNMENT
-        // multiple used to report logical_bytes (raw write cursor, end-unpadded)
-        // below live_bytes (every blob rounded up to alignment), inverting the
-        // documented `logical ≥ live` invariant (the API surfaced 39 B < 48 B).
+        // A fresh single blob whose length is not a VALUE_ALIGNMENT multiple must
+        // not report logical_bytes (raw write cursor, end-unpadded) below
+        // live_bytes (every blob rounded up to alignment): `logical ≥ live` must
+        // hold, or the API reports, say, 39 B logical against 48 B live.
         let mut store = BlobStore::new_anon();
         let blob = vec![0xab_u8; 39]; // 39 is not a multiple of VALUE_ALIGNMENT (16)
         store.upsert(7, &blob);

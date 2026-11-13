@@ -6,7 +6,7 @@
 //!
 //! | Type | Role |
 //! |------|------|
-//! | [`FieldIndex<V>`] | Single-field index: `BTreeMap<V, RoaringBitmap>` |
+//! | [`FieldIndex<V>`] | Single-field index: each distinct value's `RoaringBitmap` of row IDs |
 //! | [`Predicate<V>`] | Per-field filter (Eq, Ne, Lt, Le, Gt, Ge, Between, In) |
 //!
 //! A [`FieldIndex`] maps each distinct field value to a bitmap of row IDs, and

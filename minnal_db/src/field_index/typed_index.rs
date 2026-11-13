@@ -1,3 +1,11 @@
+//! `FieldIndex<V>`: one field's index, each distinct value of type `V` mapped
+//! to the `RoaringBitmap` of row IDs that hold it.
+//!
+//! The values sit in a heap `BTreeMap<V, slot>`; the bitmaps live off-heap in
+//! a `BlobStore`, stored container by container under a per-bitmap directory.
+//! Writes change an in-memory overlay of the containers they touch, which a
+//! *spill* writes out (see the type's *Changes are buffered in memory until the next spill*).
+
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;

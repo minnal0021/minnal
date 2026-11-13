@@ -13,8 +13,8 @@
 //! frees a slot whose old bitmap is still on disk.
 //!
 //! Bitmap changes are buffered in memory and written by `spill` (see
-//! [`FieldIndex`]'s *Changes are buffered* section); [`DynFieldIndex::flush`]
-//! spills and then syncs both stores.
+//! [`FieldIndex`]'s *Changes are buffered in memory until the next spill*
+//! section); [`DynFieldIndex::flush`] spills and then syncs both stores.
 //!
 //! # Crash safety — each store is crash-ordered, the pair is reconciled at open
 //!
@@ -633,8 +633,7 @@ impl DynFieldIndex {
     /// # Errors
     /// Returns the same type-mismatch error as [`insert`](Self::insert). The row
     /// has already been cleared from all buckets when this returns `Err`, so a
-    /// type mismatch leaves the field with no value for the row (matching the
-    /// clear-then-insert order callers used before this method existed).
+    /// type mismatch leaves the field with no value for the row.
     pub fn set(&mut self, value: &IndexValue, row_id: u128) -> Result<(), String> {
         self.remove_all_for_row(row_id);
         self.insert(value, row_id)
@@ -1106,9 +1105,8 @@ mod tests {
 
     #[test]
     fn writes_between_spills_leave_no_dead_space() {
-        // The case the overlay exists for: 2,000 writes to one value used to
-        // append 2,000 copies of its bitmap. Now they change one in-memory
-        // bitmap, and the spill appends it once.
+        // The case the overlay exists for: 2,000 writes to one value change one
+        // in-memory bitmap, and the spill appends it once, not 2,000 copies.
         let dir = tempfile::TempDir::new().unwrap();
         let mut idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
         for row in 0..2_000u128 {
@@ -1162,7 +1160,7 @@ mod tests {
         assert_eq!(int_rows(&idx, 1).len(), 70_000);
     }
 
-    /// FR-005: once a field's bitmaps are bigger than the hard limit, every
+    /// Once a field's changed bitmaps are bigger than the hard limit, every
     /// write spills. Each spill must append the containers that changed (one
     /// per bucket a write touches) plus their directories, not whole bitmaps.
     #[test]

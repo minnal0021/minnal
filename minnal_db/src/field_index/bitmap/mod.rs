@@ -1,3 +1,11 @@
+//! `RoaringBitmap`: a compressed set of `u128` row IDs.
+//!
+//! A row ID splits into a high key (all but the low 16 bits) and a low 16-bit
+//! part. Each high key owns one container holding its low parts, stored as a
+//! sorted array, a 65,536-bit bitset or a list of runs, whichever is smallest
+//! (`container/`). The containers sit in a sorted map (`container_map`), and
+//! `codec` is their on-disk form.
+
 pub mod codec;
 pub mod container;
 pub(crate) mod container_map;
@@ -1077,7 +1085,7 @@ mod tests {
     #[test]
     fn flip_empty_over_range_sets_all() {
         // Standard complement semantics: an empty bitmap flipped over [0, 10)
-        // becomes {0..=9} (previously a no-op — the bug this fixes).
+        // becomes {0..=9}, not a no-op.
         let mut bm = RoaringBitmap::new();
         bm.flip(0, 10);
         assert_eq!(bm.iter().collect::<Vec<u128>>(), (0u128..10).collect::<Vec<_>>());
