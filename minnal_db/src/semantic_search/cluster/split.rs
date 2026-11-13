@@ -1,4 +1,4 @@
-//! Balanced 2-means: how a posting is split in two (design doc M3, *M3 split
+//! Balanced 2-means: how a posting is split in two (`Dynamic-RaBitQ-Index-Design.md` → M3, *M3 split
 //! algorithm (LIRE)*, step 3).
 //!
 //! This is SPTAG's `KmeansClustering` / `TryClustering` with k = 2, the

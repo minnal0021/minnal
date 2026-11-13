@@ -71,7 +71,7 @@ pub const PASS1_WIDTHS: [u8; 3] = [1, 2, 4];
 /// Code width of Pass-2 (whole-document) codes. Read-only.
 pub const PASS2_BITS: u8 = defaults::schema_vector_index::PASS2_BITS;
 /// What Pass-2 codes are encoded against. Read-only: only the zero centre
-/// (design doc M2c).
+/// (`Dynamic-RaBitQ-Index-Design.md` → M2c).
 pub const PASS2_CENTRE: &str = "zero";
 /// Largest accepted `min_probes` / `max_probes`. A search probes at most the
 /// namespace's posting count, so this is a ceiling, not tied to any centroid
@@ -191,8 +191,8 @@ pub struct SearchSpec {
 }
 
 /// How a namespace's partition is maintained: the split and merge limits, the
-/// reassignment range, and SPTAG's balanced 2-means parameters (design doc M3,
-/// *M3 split algorithm (LIRE)*).
+/// reassignment range, and SPTAG's balanced 2-means parameters
+/// (`Dynamic-RaBitQ-Index-Design.md` → M3, *M3 split algorithm (LIRE)*).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaintenanceSpec {

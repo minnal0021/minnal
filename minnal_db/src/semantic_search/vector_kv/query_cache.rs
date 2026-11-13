@@ -89,7 +89,7 @@ pub async fn put_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &
 }
 
 /// Up to `limit` cached whole-query embeddings of `model` at `dim` dimensions:
-/// real queries recently searched, which the recall check (FR-007) prefers to
+/// real queries recently searched, which the recall check prefers to
 /// queries made from stored chunks. One bounded page read, starting at a point
 /// in the key space chosen by `seed` and wrapping once, so a large cache is not
 /// read in full and the page does not always begin at the same query text.

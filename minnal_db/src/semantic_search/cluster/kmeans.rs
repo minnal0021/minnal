@@ -1,9 +1,10 @@
 //! K-means over a namespace's chunks: how a partition is rebuilt from its codes
-//! (design doc M4).
+//! (`Dynamic-RaBitQ-Index-Design.md` → M4).
 //!
-//! The same procedure as the M3-pre simulation's rebuild (`sim.kmeans`), which
-//! measured a partition fitted on 1-bit reconstructions as good as one fitted
-//! on the floats (FiQA recall@10 0.978 against 0.976):
+//! The same procedure as the design's simulated rebuild (`sim.kmeans`,
+//! `Dynamic-RaBitQ-Index-Design.md` → M3-pre), which measured a partition
+//! fitted on 1-bit reconstructions as good as one fitted on the floats (FiQA
+//! recall@10 0.978 against 0.976):
 //!
 //! 1. **Seed** with k-means++ on a random sample of at most `seeding_sample`
 //!    points: the first centre at random, each next one drawn with probability

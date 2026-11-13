@@ -1,4 +1,4 @@
-//! Rebuilding a namespace's partition from its codes (design doc M4).
+//! Rebuilding a namespace's partition from its codes (`Dynamic-RaBitQ-Index-Design.md` → M4).
 //!
 //! K-means ([`crate::semantic_search::cluster::kmeans`]) runs over the
 //! reconstructions of every chunk in an active posting, and every active

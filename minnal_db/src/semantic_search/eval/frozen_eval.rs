@@ -70,7 +70,7 @@ const INDEX_CONCURRENCY: usize = 8;
 /// `n_probes` values swept (plus the default, [`DEFAULT_PROBE`]); values above
 /// the posting count are skipped.
 const NPROBES: [usize; 13] = [4, 8, 16, 32, 64, 128, 192, 256, 330, 400, 512, 768, 1024];
-/// The fixed probe count gates compare against (the production setting before M2d).
+/// The fixed probe count the gates compare against.
 const PRODUCTION_NPROBES: usize = 64;
 /// Documents indexed between two rounds of splitting in `grow` mode.
 const GROW_BATCH: usize = 256;
@@ -243,7 +243,7 @@ struct QueryResultRow {
     /// nDCG at each of [`NDCG_CUTOFFS`] (absent from results written before it existed).
     #[serde(default)]
     ndcg_at: [f64; NDCG_CUTOFFS.len()],
-    /// Postings probed (absent from results written before M2d).
+    /// Postings probed (absent from older result files).
     #[serde(default)]
     probes: f64,
 }
@@ -765,7 +765,7 @@ async fn eval_frozen() {
     }
     let index_seconds = t.elapsed().as_secs_f64();
     eprintln!("  indexed in {index_seconds:.1}s ({:.0} docs/s)", frozen.n_docs() as f64 / index_seconds);
-    // ── FR-007 calibration: the recall check and centre drift, before and after
+    // ── Recall-check calibration: the recall check and centre drift, before and after
     //    the rebuild ──
     let recall_check = env_or("MINNAL_BENCH_RECALL_CHECK", "0") == "1";
     if recall_check {
@@ -1140,9 +1140,9 @@ fn render(r: &BenchResult) -> String {
 /// twice, and report documents per second (embedding excluded) for each:
 ///
 /// - **complete at once:** each entry completed right after its vectors are
-///   written, as the worker did before M0-1;
+///   written (no durability barrier);
 /// - **flush then complete:** entries completed in batches of
-///   `COMPLETION_BATCH` after one flush of the vector namespaces, as it does now.
+///   `COMPLETION_BATCH` after one flush of the vector namespaces.
 ///
 /// Sequential, one entry at a time, so the difference is the flushes alone.
 #[tokio::test(flavor = "multi_thread")]
@@ -1532,7 +1532,7 @@ fn eval_compare() {
     }
 }
 
-/// Print the FR-007 recall check probing 1%, 5% and 20% of the namespace's
+/// Print the recall check probing 1%, 5% and 20% of the namespace's
 /// postings and at the default, plus centre drift (`MINNAL_BENCH_RECALL_CHECK`).
 async fn recall_check_report(
     when: &str,

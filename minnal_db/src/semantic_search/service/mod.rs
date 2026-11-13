@@ -179,7 +179,7 @@ pub struct QueryEmbeddings {
 
 /// Fetch embeddings for a document and produce its whole-document code and its chunk codes.
 ///
-/// Chunking now happens here (the service no longer chunks). A **single** batch
+/// Chunking happens here (the service never chunks). A **single** batch
 /// call embeds one ordered payload list:
 ///
 /// - **payload\[0\]** — the whole document text → 1 raw embedding → quantised as
@@ -252,8 +252,9 @@ pub fn index_embeddings<L: IvfLayout + ?Sized>(
         number_of_bits: config.number_of_bits_for_dense_quantisation,
     };
     let mut indexes = Vec::with_capacity(1 + chunks.len());
-    // Whole-document codes against the zero centre (design doc M2c); chunks against
-    // their posting's centre.
+    // Whole-document codes against the zero centre
+    // (`Dynamic-RaBitQ-Index-Design.md` → M2c); chunks against their posting's
+    // centre.
     indexes.push(rabitq::index_embedding_zero_centred(layout, dense, multi_bit_style));
     for e in chunks {
         indexes.push(rabitq::index_embedding_rotated(layout, e, QuantisationStyle::pass1(config.pass1_bits))?);
@@ -267,8 +268,8 @@ pub fn index_embeddings<L: IvfLayout + ?Sized>(
 /// both passes. It is Pass 2's dense vector and also Pass 1's single MaxSim
 /// query vector, so `S(q, d) = max_j ⟨q, d_j⟩`, the best-matching document chunk.
 ///
-/// Queries used to be split into 4-word sliding windows, each embedded on its
-/// own. A BEIR evaluation (SciFact, NFCorpus, ArguAna; see
+/// The query is not split into sliding windows, each embedded on its own. A
+/// BEIR evaluation (SciFact, NFCorpus, ArguAna; see
 /// `semantic_search/docs/query-embedding-report.md`) found the whole-query vector
 /// never worse and often better. With a tight first-pass cut it kept more
 /// relevant documents: ArguAna candidate recall 0.991 vs 0.870, nDCG@10 +0.038.
@@ -1035,10 +1036,11 @@ where
         number_of_bits: config.number_of_bits_for_dense_quantisation,
     };
 
-    // Whole-document codes are encoded against the zero centre (design doc M2c), so
-    // `⟨q, c⟩ = 0` and one estimator serves every candidate. A code encoded
-    // against anything else is a write-path bug or corruption: skipped, counted
-    // and logged, never silently scored against the wrong centre.
+    // Whole-document codes are encoded against the zero centre
+    // (`Dynamic-RaBitQ-Index-Design.md` → M2c), so `⟨q, c⟩ = 0` and one estimator
+    // serves every candidate. A code encoded against anything else is a write-path
+    // bug or corruption: skipped, counted and logged, never silently scored against
+    // the wrong centre.
     //
     // Entries are read zero-copy from their rkyv archive (packed words copied into a
     // per-worker buffer via `map_init`); doc_ids are moved (not cloned) into the
@@ -1496,7 +1498,7 @@ mod tests {
 
     // ── QuantisationStyle ─────────────────────────────────────────────────────
 
-    // ── Rotation (design doc M1) ──────────────────────────────────────────────
+    // ── Rotation (`Dynamic-RaBitQ-Index-Design.md` → M1) ─────────────────────
 
     fn unit_vec(dim: usize, seed: u64) -> Vec<f32> {
         let mut st = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -2205,9 +2207,8 @@ mod tests {
         }
     }
 
-    /// A storage failure in either pass must reach the caller. The store's batch
-    /// reads used to turn errors into an empty map or `None`s, so a failed search
-    /// returned fewer (or no) results as if nothing had matched.
+    /// A storage failure in either pass must reach the caller: a failed search
+    /// must not return fewer (or no) results as if nothing had matched.
     #[tokio::test]
     async fn test_search_surfaces_storage_errors_from_either_pass() {
         let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
@@ -2802,7 +2803,7 @@ mod tests {
     ///   MaxSim(doc_b) = score(q1, chunk_c1) + 0.0 (no chunk probed for q2)
     ///                 = 1.0             + 0.0             = 1.0
     ///
-    /// With the old SimMax (max across query tokens):
+    /// With SimMax instead (max across query tokens):
     ///   SimMax(doc_a) = max(1.0, 1.0) = 1.0   ← tied with doc_b
     ///   SimMax(doc_b) = max(1.0, 0.0) = 1.0
     ///
@@ -2966,8 +2967,8 @@ mod tests {
     }
 
     /// With a single query token, MaxSim reduces to a plain per-chunk max.
-    /// This test confirms that the refactored path produces the same result as
-    /// the old single-embedding pass-1 path in the degenerate case.
+    /// This test confirms the MaxSim path gives the plain per-chunk score in
+    /// that case.
     #[tokio::test]
     async fn test_pass1_maxsim_single_query_token_equals_plain_score() {
         // Two docs in two clusters; query probes only cluster 1.

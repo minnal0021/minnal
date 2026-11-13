@@ -640,7 +640,7 @@ async fn e2e_partition_invariants() {
     db.shutdown().await.unwrap();
 }
 
-// ── Reassignment and merges (M3b) ──
+// ── Reassignment and merges ──
 
 /// Maintenance with merges at `merge_limit` and reassignment over `range`
 /// neighbours.
@@ -998,7 +998,7 @@ async fn e2e_oversized_postings() {
     db.shutdown().await.unwrap();
 }
 
-// ── Rebuild (M4) ──
+// ── Rebuild ──
 
 fn rebuild_params(postings: usize) -> rebuild::RebuildParams {
     rebuild::RebuildParams {
@@ -1155,7 +1155,7 @@ async fn a_search_during_a_rebuild_misses_nothing() {
     db.shutdown().await.unwrap();
 }
 
-// ── Review fixes (2026-10-17) ───────────────────────────────────────────────
+// ── Maintenance failures and crashes mid-step ────────────────────────────────
 
 /// A transient error after a split's `Planned` record, then an in-process
 /// retry, then a restart. The retry must not run on top of the failed

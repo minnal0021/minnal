@@ -238,16 +238,12 @@ async fn test_reenqueue_after_retries_resets_count_to_zero() {
     assert_eq!(entries[0].retry_count, 0, "re-enqueue must reset retry_count");
 }
 
-// ── restart regression ────────────────────────────────────────────────────
+// ── Removed entries stay removed after a restart ───────────────────────────
 
-// Regression test for the vec-index queue infinite-loop bug after restart.
-//
-// Before the fix, WAL recovery called flush_and_compact_all(), pushing queue
-// entries from the memtable into SSTables.  remove_queue_entry() then wrote
-// a tombstone into the *active* memtable.  LsmTree::keys() (used by iter())
-// collected SSTable keys last — without tombstone suppression — so the deleted
-// entries re-appeared in every subsequent list_queue_entries() call, causing
-// the worker to loop forever.
+// WAL recovery flushes the queue's entries into SSTables, and removing an entry
+// writes a tombstone into the *active* memtable. A listing must let that
+// tombstone hide the SSTable entry; one that did not would show removed entries
+// again on every call, and the worker would loop forever.
 //
 // This test reproduces that exact sequence: enqueue → graceful shutdown →
 // reopen (triggers WAL recovery + SSTable flush) → cancel → assert queue empty.
@@ -276,8 +272,8 @@ async fn test_queue_empty_after_cancel_following_restart() {
         remove_queue_entry(&db, &entry.namespace, &entry.doc_id_bytes).await.unwrap();
     }
 
-    // Phase 4: the queue must now be empty.  Before the fix, list_queue_entries
-    // returned the SSTable entries ignoring the memtable tombstones.
+    // Phase 4: the queue must now be empty: the memtable tombstones hide the
+    // SSTable entries.
     let remaining = list_queue_entries(&db).await.unwrap();
     assert!(
         remaining.is_empty(),

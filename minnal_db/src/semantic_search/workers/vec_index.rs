@@ -20,7 +20,7 @@
 //! ([`vector_kv::make_vector_writes_durable`]) and then completed. A crash before
 //! that sync leaves the entries queued, and the next pass re-embeds them; writing
 //! the same text's vectors again is harmless. See
-//! `vector_kv::make_vector_writes_durable` for what completing first used to lose.
+//! `vector_kv::make_vector_writes_durable` for what completing first would lose.
 //!
 //! # Checked against the document
 //!

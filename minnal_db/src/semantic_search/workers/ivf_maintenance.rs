@@ -1,4 +1,5 @@
-//! Background maintenance of every namespace's partition (design doc M3a, M3b).
+//! Background maintenance of every namespace's partition
+//! (`Dynamic-RaBitQ-Index-Design.md` → M3a, M3b).
 //!
 //! One task per process. The vector worker wakes it with a namespace's name
 //! whenever a write leaves a posting over its namespace's split limit, or a

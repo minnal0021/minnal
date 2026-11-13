@@ -329,13 +329,14 @@ impl ClusterIndex {
     /// query in input order.
     ///
     /// This is the Pass-1 cluster-probing primitive, called once per search over all
-    /// Pass-1 query vectors (one in production: queries are not chunked). It is exact and exhaustive — every query is compared against every
-    /// centroid — and differs from the historical per-query [`find_top_n_cluster_ids`]
-    /// loop over the `clusters` map only in that each query streams the contiguous,
-    /// row-major `centroids` matrix in order instead of pointer-chasing the map's
-    /// scattered per-`Cluster` `Vec`s. At the cluster counts in use (a few hundred) that
-    /// contiguous layout is a measured ~12% win at 100 query vectors (`bench_distance_estimation`,
-    /// `coarse_assignment`, from when queries were chunked).
+    /// Pass-1 query vectors (one in production: queries are not chunked). It is
+    /// exact and exhaustive, every query compared against every centroid, and
+    /// gives the same answer as the per-query [`find_top_n_cluster_ids`] loop over
+    /// the `clusters` map. It differs only in that each query streams the
+    /// contiguous, row-major `centroids` matrix in order instead of pointer-chasing
+    /// the map's scattered per-`Cluster` `Vec`s: at a few hundred clusters that is
+    /// a measured ~12% win at 100 query vectors (`bench_distance_estimation`,
+    /// `coarse_assignment`).
     ///
     /// The scan is deliberately **serial** across query vectors. Parallelising it with
     /// rayon was benchmarked and *regressed* (~2.4× slower at 100 vectors): each per-query
@@ -617,8 +618,8 @@ mod tests {
 
     #[test]
     fn batch_matches_serial_free_fn_probe_set() {
-        // The batched path must probe exactly the clusters the historical per-query
-        // serial path does, for every query chunk and a range of n. Compared as sets:
+        // The batched path must probe exactly the clusters the per-query serial
+        // path does, for every query chunk and a range of n. Compared as sets:
         // recall depends on *which* clusters are probed, and the caller unions them.
         let clusters = random_clusters(64, 48, 0x1234_5678_9abc_def0);
         let index = ClusterIndex::from_clusters(clusters.clone());

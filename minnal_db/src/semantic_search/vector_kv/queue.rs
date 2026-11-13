@@ -358,7 +358,7 @@ pub async fn get_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8])
 //   removes the entry), so the completing worker sees it and removes the vectors
 //   it just wrote.
 
-/// `MergeAborted` reasons used to report why a conditional update wrote nothing.
+/// `MergeAborted` reasons: why a conditional update wrote nothing.
 const ABORT_SUPERSEDED: &str = "queue entry superseded";
 const ABORT_CLEARED: &str = "queue entry is a clear tombstone";
 
@@ -434,7 +434,7 @@ pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[Ve
 /// nothing queued to replace it: it would stay indexed under its old text, minus
 /// the chunks whose clusters changed. With
 /// completion after this barrier, a crash before it leaves the queue entry in
-/// place and the restarted worker redoes it. Regression test:
+/// place and the restarted worker redoes it. Test:
 /// `crash_before_reembed_is_synced_keeps_new_vectors`.
 pub async fn make_vector_writes_durable(db: &AsyncDb) -> Result<(), crate::KVError> {
     db.sync_vector_index_wal().await

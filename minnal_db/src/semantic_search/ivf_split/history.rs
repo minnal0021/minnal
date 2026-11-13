@@ -1,4 +1,4 @@
-//! A record of what a namespace's partition looked like over time (FR-007).
+//! A record of what a namespace's partition looked like over time.
 //!
 //! Code health (`?codes=true`) and the recall check each read every chunk code
 //! or search many times, so they are too costly to compute on every request.

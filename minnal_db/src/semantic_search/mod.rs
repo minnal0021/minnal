@@ -6,7 +6,7 @@ pub mod context;
 mod eval;
 pub mod index;
 // Partition maintenance: the journal, split, reassign, merge and rebuild
-// executors and their crash recovery (design doc M3a).
+// executors and their crash recovery (`Dynamic-RaBitQ-Index-Design.md` → M3a).
 pub mod ivf_split;
 pub mod metrics;
 pub mod quantisation;
