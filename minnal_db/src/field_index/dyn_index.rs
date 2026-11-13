@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn insert_normal_values_are_within_the_u32_limit() {
-        // Regression: a realistic value must pass the size guard on the real path.
+        // A realistic value must pass the size guard on the real path.
         let mut idx = DynFieldIndex::new(IndexValueType::Str);
         assert!(idx.insert(&IndexValue::Str("active".into()), 1).is_ok());
         assert!(idx.set(&IndexValue::Str("archived".into()), 1).is_ok());

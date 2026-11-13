@@ -284,7 +284,7 @@ fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
     db.shutdown().unwrap();
 }
 
-/// Item 3: `apply_with_retry` rides out transient apply failures and stops
+/// `apply_with_retry` rides out transient apply failures and stops
 /// as soon as one attempt succeeds.
 #[test]
 fn test_apply_with_retry_succeeds_after_transient_failure() {
@@ -299,7 +299,7 @@ fn test_apply_with_retry_succeeds_after_transient_failure() {
     assert_eq!(attempts.get(), 2, "should stop retrying once an attempt succeeds");
 }
 
-/// Item 3: `apply_with_retry` gives up after a bounded number of attempts
+/// `apply_with_retry` gives up after a bounded number of attempts
 /// (it never surfaces the error — the write is durable in the WAL).
 #[test]
 fn test_apply_with_retry_gives_up_after_max_attempts() {

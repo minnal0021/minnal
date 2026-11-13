@@ -223,7 +223,7 @@ mod tests {
         db.shutdown().unwrap();
     }
 
-    /// Item 13: a put that adds/removes the indexed field (absent↔present) must
+    /// A put that adds/removes the indexed field (absent↔present) must
     /// update the index correctly via the targeted path — the row joins the new
     /// value's bucket and leaves whatever it was in (including "nothing").
     #[test]

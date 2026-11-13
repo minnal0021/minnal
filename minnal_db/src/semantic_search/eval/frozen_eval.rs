@@ -1,4 +1,4 @@
-//! Vector-index benchmark on frozen embeddings (design doc M0).
+//! Vector-index benchmark on frozen embeddings (`Dynamic-RaBitQ-Index-Design.md` → M0).
 //!
 //! Indexes a BEIR dataset's saved embeddings through the production write path
 //! ([`index_embeddings`] + [`upsert_vectors`]), runs every judged query through
@@ -296,7 +296,7 @@ struct BenchResult {
 /// run against: the JSONL file named by `MINNAL_BENCH_CENTROIDS` (for example
 /// a static fit from `fit_static.py`), or else k-means on the dataset's own
 /// chunk vectors at [`STUDY_CENTRES`] centres. No centroid file ships with
-/// minnal (design doc M4).
+/// minnal (`Dynamic-RaBitQ-Index-Design.md` → M4).
 pub(super) fn study_centroids(frozen: &Frozen) -> ClusterIndex {
     if let Ok(path) = std::env::var("MINNAL_BENCH_CENTROIDS") {
         let raw = read_clusters_from_file(&path).unwrap_or_else(|e| panic!("load {path}: {e}"));
@@ -1134,7 +1134,7 @@ fn render(r: &BenchResult) -> String {
     md
 }
 
-// ── Worker completion cost (design doc M0-1) ────────────────────────────────
+// ── Worker completion cost (`Dynamic-RaBitQ-Index-Design.md` → M0-1) ───────
 
 /// Index one frozen dataset through the vector worker's write-then-complete path,
 /// twice, and report documents per second (embedding excluded) for each:
@@ -1218,7 +1218,7 @@ async fn eval_worker_completion() {
     eprintln!("\n=== worker completion cost: {dataset}, {} docs ===\n{report}", frozen.n_docs());
 }
 
-// ── How much rotation can help (design doc M1 follow-up) ─────────────────────
+// ── How much rotation can help (`Dynamic-RaBitQ-Index-Design.md` → M1) ───────
 
 /// Whether a dataset's residuals (chunk − nearest centroid) are evenly spread over
 /// dimensions, measured before and after rotation on a sample of chunks:

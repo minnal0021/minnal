@@ -1,4 +1,4 @@
-//! Code width against centre choice (design doc M2c-pre).
+//! Code width against centre choice (`Dynamic-RaBitQ-Index-Design.md` → M2c-pre).
 //!
 //! On the frozen embeddings, with production Pass 1 (1-bit chunk codes, 64
 //! probes, cut 1,000) supplying the candidates:

@@ -2531,7 +2531,7 @@ impl LSMTree {
                 // then `rename(.tmp -> level1)`): between the two renames the L1
                 // path would not exist, `LSMTree::open` after a crash there would
                 // create an empty file and read the bucket as empty, and every key
-                // that lived only in L1 would be lost. Regression test:
+                // that lived only in L1 would be lost. Test:
                 // `test_crash_between_l1_publish_steps_keeps_l1`.
                 //
                 // Readers holding the previous `Arc<File>` keep reading the old
