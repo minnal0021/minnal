@@ -3,6 +3,7 @@ pub mod skip_list {
     use crate::support::key_prefix_of;
     use crate::support::simd_support::simd_support::compare_bytes_simd;
     use core::cmp::Ordering;
+    #[cfg(test)]
     use std::borrow::Cow;
 
     const MAX_LEVEL: usize = 32;
@@ -163,7 +164,7 @@ pub mod skip_list {
             self.no_live_nodes
         }
 
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub fn is_empty(&self) -> bool {
             self.no_live_nodes == 0
         }
@@ -300,7 +301,7 @@ pub mod skip_list {
             Ok(())
         }
 
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub fn iter(&self) -> Iter<'_> {
             Iter {
                 list: self,
@@ -312,7 +313,7 @@ pub mod skip_list {
         ///
         /// Efficient: seeks to the first key `>= prefix` then walks level-0 until
         /// the prefix no longer matches. Accepts both borrowed and owned prefixes.
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub fn scan_prefix<'a>(&'a self, prefix: impl Into<Cow<'a, [u8]>>) -> PrefixIter<'a> {
             let prefix = prefix.into();
             let start = self.lower_bound(prefix.as_ref());
@@ -484,7 +485,6 @@ pub mod skip_list {
         /// Iterates over all entries including tombstones, yielding `(key, value, seq, tombstone)`.
         ///
         /// Intended for merge/compaction logic. Use `iter()` for normal live-entry access.
-        #[allow(dead_code)]
         pub fn iter_raw(&self) -> IterRaw<'_> {
             IterRaw {
                 list: self,
@@ -571,7 +571,6 @@ pub mod skip_list {
     /// Iterates over all nodes (including tombstones) yielding `(key, value, seq, tombstone)`.
     ///
     /// Used by merge/compaction logic. For normal use, prefer `iter()`.
-    #[allow(dead_code)]
     pub struct IterRaw<'a> {
         list: &'a SkipList,
         current: u32,
@@ -614,11 +613,13 @@ pub mod skip_list {
     }
 
     /// Iterates over live entries (tombstones skipped) in key order.
+    #[cfg(test)]
     pub struct Iter<'a> {
         list: &'a SkipList,
         current: u32,
     }
 
+    #[cfg(test)]
     impl<'a> Iterator for Iter<'a> {
         type Item = (&'a [u8], u128);
 
@@ -640,13 +641,14 @@ pub mod skip_list {
     ///
     /// Holds the prefix as `Cow<[u8]>` so it works with both borrowed slices and
     /// owned `Vec<u8>` without duplicating the struct.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub struct PrefixIter<'a> {
         list: &'a SkipList,
         current: u32,
         prefix: Cow<'a, [u8]>,
     }
 
+    #[cfg(test)]
     impl<'a> Iterator for PrefixIter<'a> {
         type Item = (&'a [u8], u128);
 

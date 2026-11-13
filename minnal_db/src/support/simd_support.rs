@@ -16,7 +16,6 @@ pub mod simd_support {
     ///
     /// This function maintains the same semantics as `a.cmp(b)` but may use vector instructions
     /// for faster comparison on supported CPUs.
-    #[allow(dead_code)]
     #[inline]
     pub fn compare_bytes_simd(a: &[u8], b: &[u8]) -> Ordering {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]

@@ -149,6 +149,7 @@ impl Database {
             wal,
             wal_metadata,
             wal_flush_observer,
+            #[cfg(test)]
             pending_wal_flushes,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             vector_index_wal,

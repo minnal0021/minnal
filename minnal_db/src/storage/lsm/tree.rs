@@ -122,7 +122,6 @@ impl Default for LSMConfig {
 }
 
 impl LSMConfig {
-    #[allow(dead_code)]
     pub fn new(compaction_threshold_percent: usize, data_dir: PathBuf) -> Self {
         Self {
             compaction_threshold_percent,

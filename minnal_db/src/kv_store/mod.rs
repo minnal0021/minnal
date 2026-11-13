@@ -125,7 +125,6 @@ pub enum LsmCompactionCommand {
 /// Per-namespace key-value store with its own LSM tree and value log.
 pub struct KVStore {
     /// Namespace identifier (0 = "default")
-    #[allow(dead_code)]
     pub(crate) namespace_id: NamespaceId,
     pub(crate) name: String,
 

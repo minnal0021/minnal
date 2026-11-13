@@ -20,12 +20,12 @@
 
 pub(crate) mod quantisation_support;
 
-use crate::semantic_search::cluster::{Cluster, ClusterIndexError, find_closest_cluster_id};
+use crate::semantic_search::cluster::{Cluster, ClusterIndexError};
 use crate::semantic_search::simd_support::{reconstruct_bit_planes_best, reconstruct_single_bit_best};
 use log::debug;
 use simsimd::SpatialSimilarity;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use crate::semantic_search::cluster::IvfLayout;
 use crate::semantic_search::index::vector_index::VectorIndex;
@@ -125,12 +125,13 @@ impl Ord for QueueItem {
 /// pick from, which is a configuration error, not a panic. Startup validation
 /// ([`ClusterIndex::load`](crate::semantic_search::cluster::ClusterIndex::load)) normally rules
 /// this out, so this is a defence-in-depth guard for direct callers.
+#[cfg(test)]
 pub fn index_embedding(
-    cluster_map: &HashMap<u32, Cluster>,
+    cluster_map: &std::collections::HashMap<u32, Cluster>,
     embeddings: &[f32],
     style: crate::semantic_search::index::vector_index::QuantisationStyle,
 ) -> Result<VectorIndex, ClusterIndexError> {
-    let closest_cluster_id = find_closest_cluster_id(cluster_map, embeddings);
+    let closest_cluster_id = crate::semantic_search::cluster::find_closest_cluster_id(cluster_map, embeddings);
     let cluster = cluster_map.get(&closest_cluster_id).ok_or(ClusterIndexError::EmptyClusterMap)?;
     Ok(index_embedding_to_cluster(embeddings, cluster, style))
 }
@@ -621,6 +622,7 @@ pub fn quantise(embedding: &[f32], centroid: &[f32], number_of_bits_for_quantisa
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use std::collections::HashMap;
 
     /// Parse a JSON array of `f32` from a `test_data` fixture file.
     fn load_vec_f32(json: &str) -> Vec<f32> {

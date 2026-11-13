@@ -98,7 +98,7 @@ pub struct Database {
     pub(crate) wal: Arc<Wal>,
     pub(crate) wal_metadata: Arc<RwLock<WalMetadata>>,
     pub(crate) wal_flush_observer: Arc<WalPersistObserver>,
-    #[allow(dead_code)]
+    #[cfg(test)]
     pending_wal_flushes: Arc<RwLock<BTreeMap<(NamespaceId, u64), WalFlushState>>>,
     pub(crate) wal_gc_in_progress: Arc<AtomicBool>,
 

@@ -104,8 +104,8 @@ impl LsmCompactionWorker {
         Self { tx, shutdown_notify }
     }
 
-    /// Send a command to trigger immediate compaction
-    #[allow(dead_code)]
+    /// Run a compaction pass now.
+    #[cfg(test)]
     pub fn trigger_compaction(&self) -> std::result::Result<(), mpsc::error::SendError<LsmCompactionCommand>> {
         self.tx.send(LsmCompactionCommand::Trigger)
     }

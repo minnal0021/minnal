@@ -201,7 +201,6 @@ impl KVStore {
         self.unflushed_no_wal_writes.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)]
     pub fn stats(&self) -> Stats {
         let mut total_gc_runs = 0u64;
         let mut total_bytes_reclaimed = 0u64;

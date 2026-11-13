@@ -1,6 +1,5 @@
 // Statistics about garbage collection
 #[derive(Debug, Clone, serde::Serialize)]
-#[allow(dead_code)]
 pub struct GCStats {
     pub bytes_reclaimed: u64,
     pub bytes_live: u64,
@@ -10,7 +9,6 @@ pub struct GCStats {
 }
 
 #[derive(Debug, serde::Serialize)]
-#[allow(dead_code)]
 pub struct Stats {
     /// Value-log segment files currently on disk across all buckets.
     pub segment_count: u64,
