@@ -1,3 +1,6 @@
+//! The engine's configuration (`DbConfig` and its parts). Defaults come from
+//! `crate::defaults`; a config file maps onto it through `crate::config_file`.
+
 use crate::defaults;
 use crate::storage::lsm::tree::LSMConfig;
 use std::path::PathBuf;

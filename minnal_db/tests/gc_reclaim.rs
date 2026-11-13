@@ -174,12 +174,12 @@ async fn gc_stays_bounded_across_repeated_cycles() {
     db.shutdown().await.unwrap();
 }
 
-/// Regression: GC used to leave sub-threshold garbage on disk **forever**.
+/// GC must not leave sub-threshold garbage on disk **forever**.
 ///
-/// `value_log_waste_threshold` (the bucket trigger — "is this namespace worth
-/// collecting?") was passed straight through as the per-*page* dirty threshold, so
-/// garbage spread just under it could never be collected. The page threshold is now a
-/// separate, lower knob (`segment_gc_threshold`) that selects **segments**.
+/// `value_log_waste_threshold` is the bucket trigger ("is this namespace worth
+/// collecting?"). Used as the threshold that selects segments too, garbage spread
+/// just under it could never be collected. So segments are selected by a separate,
+/// lower knob (`segment_gc_threshold`).
 #[tokio::test]
 async fn gc_reclaims_garbage_below_the_bucket_trigger() {
     let dir = tempfile::tempdir().unwrap();
@@ -406,17 +406,17 @@ async fn segment_accounting_is_rebuilt_from_the_lsm_when_metadata_is_lost() {
     assert_eq!(db.get(b"hot".to_vec()).await.unwrap(), Some(value));
     db.shutdown().await.unwrap();
 }
-/// Regression: garbage in a bucket's **active tail** used to be uncollectable forever.
+/// Garbage in a bucket's **active tail** must be collectable.
 ///
 /// The tail is normally off-limits to GC — it is still being appended to — which is fine
 /// while it keeps filling, because it seals on its own and becomes collectable. But a
 /// small or idle namespace may never fill a 256 MiB segment. So a store whose keys were
 /// all deleted or overwritten would sit at 100% waste with nothing GC could touch: the
-/// bucket trigger fired on every 60s tick, GC found no candidate, reclaimed 0 bytes, and
-/// logged "starting GC" again a minute later. Forever.
+/// bucket trigger would fire on every 60s tick, GC would find no candidate, reclaim 0
+/// bytes, and log "starting GC" again a minute later, for good.
 ///
-/// GC now seals a tail that is mostly garbage (`TAIL_GC_MIN_GARBAGE_PCT`) so it can be
-/// collected in the same pass.
+/// So GC seals a tail that is mostly garbage (`TAIL_GC_MIN_GARBAGE_PCT`) and collects it
+/// in the same pass.
 #[tokio::test]
 async fn garbage_in_the_active_tail_is_reclaimed() {
     let dir = tempfile::tempdir().unwrap();

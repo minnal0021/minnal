@@ -1,3 +1,7 @@
+//! The `minnal_db_api` server: reads the config file, sets up logging, opens
+//! the document store with every background worker, serves the REST routes and
+//! shuts the store down cleanly on SIGINT or SIGTERM.
+
 mod config;
 mod config_report;
 mod error;

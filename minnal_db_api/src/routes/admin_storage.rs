@@ -75,8 +75,8 @@ pub struct StatsResponse {
 /// `GET /admin/storage/stats` — value-log statistics aggregated across **all**
 /// namespaces.
 ///
-/// (It used to report only the *default* namespace while being documented as
-/// engine-wide, which made a busy database look empty.)
+/// Every namespace counts, not only the default one: a figure from the default
+/// namespace alone would make a busy database look empty.
 pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     let disk_bytes: u64 = state
         .db

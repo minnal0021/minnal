@@ -51,8 +51,8 @@ fn subsystem_errors_convert_into_kv_error() {
 /// An invalid predicate is reported as `KVError::Query`, carrying the parser's
 /// own error rather than a stringified one.
 ///
-/// It used to be flattened into `KVError::Serialization(String)`, which the API
-/// layer could only treat as a generic engine failure — every bad query became a
+/// Flattened into `KVError::Serialization(String)`, the API layer could only
+/// treat it as a generic engine failure: every bad query would become a
 /// `500 {"error":"internal server error"}` with the useful text dropped. The
 /// variant is what lets a caller distinguish "your query is wrong" from "the
 /// database broke", so these assertions are on the *type*, not just the text.

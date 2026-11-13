@@ -4,13 +4,11 @@
 //! should call `join("field-index")` or `format!("ns_{}", ..)` — not the engine, not
 //! the document store, and not the API server.
 //!
-//! This is not tidiness. The layout used to be spelled out in three layers, and
-//! it caused a real defect: `doc_store::drop_index` built the field-index path
-//! itself and deleted the directory *before* saving its schema, which is the
-//! opposite of the order the layer that owns the path uses. A crash in that
-//! window left a registered field with no data — an index that came up silently
-//! incomplete. Duplicated layout knowledge means duplicated (and diverging)
-//! rules about how to use it.
+//! This is not tidiness. A layer that built a path itself would also need the
+//! rules for using it, and they diverge: one that deleted a field index's
+//! directory *before* saving its schema (the opposite of the owning layer's
+//! order) would, after a crash in between, leave a registered field with no
+//! data, an index that comes up silently incomplete.
 //!
 //! ```text
 //! {db_path}/
@@ -22,7 +20,7 @@
 //!     {ns_id}/
 //!       {field_id}/       ← field index: bitmap blob, keymap, checkpoint, gap.json
 //!       rowmap/           ← dense row-ID map sidecar
-//!       no_wal_pending    ← marker: uncheckpointed no-WAL writes (FR-001)
+//!       no_wal_pending    ← marker: uncheckpointed no-WAL writes
 //!   wal/                  ← the main WAL's segments ({segment_id}.log) and metadata
 //!   vector_index_wal/     ← the vector index WAL's segments ({segment_id}.log) and retired_cut
 //!   fail_logs/            ← recovery failures
@@ -61,8 +59,8 @@ pub(crate) fn namespace_name_problem(name: &str) -> Option<String> {
 
 /// A namespace's data directory: `{db_path}/ns_{name}`.
 ///
-/// Holds the LSM SSTables and the value-log segments. Keyed by
-/// **name**, not id — this is the one path that is, for historical reasons.
+/// Holds the LSM SSTables and the value-log segments. Keyed by **name**, not
+/// id, unlike every other per-namespace path.
 pub(crate) fn namespace_data_dir(db_path: &Path, name: &str) -> PathBuf {
     db_path.join(format!("{NAMESPACE_DIR_PREFIX}{name}"))
 }

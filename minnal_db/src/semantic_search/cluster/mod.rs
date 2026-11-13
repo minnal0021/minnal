@@ -1,3 +1,7 @@
+//! Clusters and partitions: `Cluster` and `ClusterIndex` (a fixed centroid set,
+//! for tests, benches and raw `vector_kv` users), probe selection, and the
+//! namespace partition (`layout`), split (`split`) and k-means (`kmeans`).
+
 use log::info;
 pub mod kmeans;
 pub mod layout;

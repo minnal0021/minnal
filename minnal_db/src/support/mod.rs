@@ -1,3 +1,7 @@
+//! Shared utilities with no better home: key bucketing and prefixes, durable
+//! file writes, running a worker's blocking pass, and the `file_lock`, `hex`,
+//! `metrics` and SIMD helpers.
+
 use mm3h::Murmur3Hasher;
 use std::hash::Hasher;
 use std::io::Write;
@@ -16,11 +20,11 @@ pub(crate) mod simd_support;
 /// without holding up the async runtime.
 ///
 /// On a multi-thread runtime, `block_in_place` hands this thread's queued tasks
-/// to another thread for the duration. Run plainly, the pass held up every task
-/// scheduled behind it: M5 traced every get over 15 ms to an index checkpoint
-/// (~55 ms of fsyncs every 1.75 s; get p99 4-10 ms against a 1.3 ms median).
-/// The pass still runs inside the worker's own task, so nothing it uses lives
-/// longer than before (`spawn_blocking` would keep the database alive past its
+/// to another thread for the duration. Run plainly, the pass holds up every
+/// task scheduled behind it: the system benchmark traced every get over 15 ms
+/// to an index checkpoint (~55 ms of fsyncs every 1.75 s; get p99 4-10 ms
+/// against a 1.3 ms median). The pass still runs inside the worker's own task,
+/// so nothing it uses outlives it (`spawn_blocking` would keep the database alive past its
 /// last handle while a pass ran). A current-thread runtime cannot hand its tasks
 /// off, so there the pass runs inline.
 pub(crate) fn run_blocking_pass<R>(pass: impl FnOnce() -> R) -> R {

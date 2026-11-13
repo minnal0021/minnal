@@ -141,10 +141,10 @@ mod tests {
         DirLock::acquire(dir.path()).expect("lock should be free once the guard is dropped");
     }
 
-    /// The regression test for the reported bug: a crash leaves the lock file on
-    /// disk with no live owner, and that must not block the next open. The old
-    /// existence check failed exactly here, making every crash need a manual
-    /// `rm` before recovery could run.
+    /// A crash leaves the lock file on disk with no live owner, and that must not
+    /// block the next open. A lock that checked only whether the file exists
+    /// would fail here, and every crash would need a manual `rm` before recovery
+    /// could run.
     #[test]
     fn a_stale_lock_file_from_a_crashed_process_does_not_block_acquisition() {
         let dir = TempDir::new().unwrap();

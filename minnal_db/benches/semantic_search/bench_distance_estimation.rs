@@ -220,8 +220,8 @@ fn full_sort_top_n(cluster_map: &HashMap<u32, Cluster>, embedding: &[f32], n: us
     distances.into_iter().map(|(id, _)| id).collect()
 }
 
-/// Compares the current selection-based `find_top_n_cluster_ids` against the old
-/// full-sort baseline over the bench centres, at a few `n_probes` values. This
+/// Compares the selection-based `find_top_n_cluster_ids` against a full-sort
+/// baseline over the bench centres, at a few `n_probes` values. This
 /// is the Pass-1 cluster-probing cost, paid once per query vector (production
 /// queries are not chunked, so once per query).
 fn bench_top_n_cluster_selection(c: &mut Criterion) {
@@ -248,7 +248,7 @@ fn bench_top_n_cluster_selection(c: &mut Criterion) {
 /// Generate `t` synthetic Pass-1 query vectors of `DIM` via a seeded XorShift64 PRNG.
 ///
 /// Production queries are a single whole-query vector (`t = 1`); `t > 1` exercises
-/// `search()`'s general multi-vector path (and mirrors the old chunked-query cost).
+/// `search()`'s general multi-vector path (the cost chunked queries would have).
 fn synthetic_query_chunks(t: usize) -> Vec<Vec<f32>> {
     let mut s = 0x00c0_ffee_1234_5678_u64;
     let mut next_f32 = move || -> f32 {
@@ -285,11 +285,11 @@ fn union_dedup(per_query: Vec<Vec<u32>>) -> Vec<u32> {
 
 /// The full Pass-1 coarse-assignment cost (`T·C·D` + union), paid once per query.
 ///
-/// `serial_hashmap` is the historical path — a serial loop of `find_top_n_cluster_ids`
-/// over the scattered `HashMap<u32, Cluster>`. `batched_matrix` is the replacement —
-/// `ClusterIndex::find_top_n_cluster_ids_batch`, parallel over chunks over a contiguous
-/// centroid matrix. Both produce the same probe set; this measures the speed-up as the
-/// query grows (the `T` factor the old serial loop scaled linearly with).
+/// `serial_hashmap` is the baseline: a serial loop of `find_top_n_cluster_ids` over
+/// the scattered `HashMap<u32, Cluster>`. `batched_matrix` is what production runs:
+/// `ClusterIndex::find_top_n_cluster_ids_batch` over a contiguous centroid matrix.
+/// Both produce the same probe set; this measures the speed-up as the query grows
+/// (the `T` factor the serial loop scales linearly with).
 fn bench_coarse_assignment(c: &mut Criterion) {
     let raw = bench_centroids();
     let cluster_map: HashMap<u32, Cluster> = raw.into_iter().map(|(id, c)| (id, Cluster::new(id, c))).collect();
@@ -538,9 +538,9 @@ fn bench_end_to_end_multichunk(c: &mut Criterion) {
 //   plus_grouping   + the production MaxSim state: each entry scored into its own row
 //                   of a flat matrix, then entries grouped per doc by sorting their
 //                   indices on doc_id and folding each run. This layer == real Pass-1.
-//   plus_hashmap    the fold `search()` used before `e414cdb`: accumulate into a
-//                   `HashMap<doc_id, Vec<f32>>`. Kept as the baseline plus_grouping
-//                   replaced — not what production pays any more.
+//   plus_hashmap    a per-document fold into a `HashMap<doc_id, Vec<f32>>`, kept as
+//                   the baseline plus_grouping is measured against; production
+//                   does not pay it.
 //
 // Read the attribution as:
 //   dot_arithmetic                 → the dot products themselves

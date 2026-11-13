@@ -1,3 +1,6 @@
+//! `KVError`, the engine's error type, which wraps the storage layers' errors
+//! (LSM, value log, both WALs) so every engine call returns one type.
+
 use crate::db::wal::WalError;
 use crate::db::wal::vector_index_wal::VectorIndexWalError;
 use crate::storage::lsm::tree::LSMError;

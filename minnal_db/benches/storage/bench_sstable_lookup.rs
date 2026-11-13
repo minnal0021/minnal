@@ -6,15 +6,12 @@
 // against keys pushed down to L1, using the same key/value shape and the
 // same `num_keys` sweep for both, so the two tiers are directly comparable
 // in one report/chart rather than scattered across separate benchmarks with
-// different setups. This also isolates the cost of `LSMTree::lookup_level1`,
-// the L1 lookup path originally flagged by the review item "LSM point
-// lookups scan SSTables linearly". That review item has since been
-// addressed: `lookup_level1` now fast-rejects via the L1 min/max key range,
-// then a bloom filter (exact negative), then a sparse-index binary search
-// that bounds the residual linear scan to ~SAMPLE_INTERVAL entries instead
-// of the whole file — see its doc comment in `lsm/tree.rs`. This benchmark
-// is no longer measuring a naive O(N) scan; it's the regression baseline
-// for the accelerated path.
+// different setups. This also isolates the cost of `LSMTree::lookup_level1`:
+// it rejects a key outside the L1 min/max range, then one its bloom filter
+// rules out (an exact negative), then binary-searches the sparse index, so the
+// remaining linear scan covers ~SAMPLE_INTERVAL entries, not the whole file
+// (see its doc comment in `lsm/tree.rs`). This benchmark is the baseline that
+// shows if any of those shortcuts stops working.
 //
 // L0 is deliberately NOT measured as its own tier: there is no public API
 // path to observe an on-disk "flushed but not yet compacted" L0 state — the

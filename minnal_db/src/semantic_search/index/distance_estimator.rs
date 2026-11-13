@@ -1,3 +1,7 @@
+//! Estimating a query's dot product with a stored code: one estimator per
+//! code width (single-bit and bit-plane chunk codes for Pass 1, multi-bit
+//! whole-document codes for Pass 2).
+
 use crate::semantic_search::index::vector_index::VectorIndex;
 
 /// Compute an estimated dot-product distance between a query embedding and a stored

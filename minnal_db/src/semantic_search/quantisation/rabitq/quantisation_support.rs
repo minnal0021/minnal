@@ -1,3 +1,6 @@
+//! Helpers for RaBitQ codes: packing bits and bit planes, reading a code back,
+//! and the error bound of an estimate.
+
 use simsimd::SpatialSimilarity;
 
 /// RaBitQ's error-bound confidence multiplier ε₀ for the **multi-bit** path: the
