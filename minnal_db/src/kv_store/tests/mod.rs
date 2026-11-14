@@ -1,6 +1,7 @@
 //! Tests for `KVStore`, with the fixtures they share.
 
 mod basic;
+mod garbage;
 mod gc;
 mod gc_concurrency;
 mod gc_crash;

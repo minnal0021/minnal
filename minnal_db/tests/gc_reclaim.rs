@@ -236,7 +236,13 @@ async fn gc_reclaims_garbage_below_the_bucket_trigger() {
 #[tokio::test]
 async fn segment_ids_never_repeat_across_restarts() {
     let dir = tempfile::tempdir().unwrap();
-    let mut seen: Vec<u32> = Vec::new();
+    // A segment can outlive a round (its garbage is counted only once a merge
+    // drops the entries pointing at it), so "seen before" is not "reused". Reuse
+    // is an id that comes back after its segment was deleted, or a new segment
+    // whose id is not above every id handed out before it.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut previous = std::collections::BTreeSet::new();
+    let mut gone = std::collections::BTreeSet::new();
 
     for round in 0u8..4 {
         let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
@@ -252,21 +258,33 @@ async fn segment_ids_never_repeat_across_restarts() {
         }
         db.garbage_collect().await.unwrap();
 
-        for (_, segments) in db.value_log_segment_stats("default").unwrap() {
-            for s in segments {
+        let current: std::collections::BTreeSet<u32> = db
+            .value_log_segment_stats("default")
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, segments)| segments.into_iter().map(|s| s.id))
+            .collect();
+        for &id in &current {
+            assert!(
+                !gone.contains(&id),
+                "segment id {id} was reused after its segment was deleted; \
+                 ids must come from a persisted monotone counter, never max(files)+1. seen={seen:?}"
+            );
+            if !previous.contains(&id) {
                 assert!(
-                    !seen.contains(&s.id),
-                    "segment id {} was reused (already seen in an earlier round); \
-                     ids must come from a persisted monotone counter, never max(files)+1. seen={seen:?}",
-                    s.id
+                    seen.iter().all(|&old| old < id),
+                    "new segment id {id} is not above every earlier id; seen={seen:?}"
                 );
-                seen.push(s.id);
             }
         }
+        gone.extend(previous.difference(&current).copied());
+        seen.extend(current.iter().copied());
+        previous = current;
         db.shutdown().await.unwrap();
     }
 
     assert!(seen.len() > 4, "expected several segments across the rounds, saw {seen:?}");
+    assert!(!gone.is_empty(), "GC never deleted a segment, so reuse was never tested");
 }
 
 /// The segment size is **not** fixed at creation (unlike `num_buckets`): it is not
@@ -430,6 +448,12 @@ async fn garbage_in_the_active_tail_is_reclaimed() {
     for i in 0..8 {
         db.delete(format!("k{i}").into_bytes()).await.unwrap();
     }
+    // A delete counts its record as garbage at once only if the memtable still
+    // holds the key; the WAL GC worker's first pass can flush it in between, and
+    // then the count waits for the merge. A restart flushes and merges (and the
+    // tail, not full, stays the active tail), so the count is complete either way.
+    db.shutdown().await.unwrap();
+    let db = AsyncDb::open_with_config(dir.path().to_path_buf(), config(SEGMENT_SIZE)).await.unwrap();
 
     let before = db.stats();
     assert!(before.garbage_size > 0 && before.live_bytes == 0, "expected an all-garbage tail");

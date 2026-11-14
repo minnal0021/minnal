@@ -19,7 +19,7 @@ pub use reads::PrefixScan;
 
 use self::stats::{GCStats, Stats};
 use crate::error::{KVError, Result};
-use crate::storage::lsm::tree::{LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
+use crate::storage::lsm::tree::{Applied, Displaced, DisplacedSink, LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
 use crate::storage::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
 use crate::storage::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
 
@@ -279,6 +279,9 @@ impl KVStore {
                 name, e
             )))
         })?;
+        lsm.set_displaced_sink(Arc::new(MergeGarbage {
+            logs: value_log.bucket_logs(),
+        }));
 
         let store = Self {
             namespace_id,
@@ -316,9 +319,13 @@ impl KVStore {
     /// Recompute per-segment live/garbage byte counts from the LSM's pointers, for any
     /// bucket whose accounting could not be loaded.
     ///
-    /// Exact, not conservative: a record is live iff the LSM still points at it, and
-    /// every other byte in the segment is garbage. Costs one LSM key+pointer scan of
-    /// those buckets alone (the value log and the LSM hash keys to buckets alike).
+    /// Exact, not conservative: a record is live iff some LSM entry still points at
+    /// it, the key's newest or an older one a merge has not dropped yet, and every
+    /// other byte in the segment is garbage. That is the definition the running
+    /// counts keep (garbage is counted when the last entry pointing at a record
+    /// goes: see `MergeGarbage`), so the two agree. Costs one read of every layer
+    /// of those buckets alone (the value log and the LSM hash keys to buckets
+    /// alike).
     fn rebuild_missing_segment_stats(&self) -> Result<()> {
         let buckets = self.value_log.buckets_needing_stat_rebuild();
         if buckets.is_empty() {
@@ -335,9 +342,9 @@ impl KVStore {
         for &bucket in &buckets {
             rebuild[bucket as usize] = true;
         }
-        for (key, offset_u128) in self.lsm.key_pointer_pairs(Some(&rebuild))? {
-            if let Some(pointer) = decode_sharded_pointer(offset_u128) {
-                *live.entry(pointer.bucket).or_default().entry(pointer.location.segment_id).or_insert(0) += pointer.record_len(key.len());
+        for Displaced { key_len, pointer } in self.lsm.referenced_pointers(Some(&rebuild))? {
+            if let Some(pointer) = decode_sharded_pointer(pointer) {
+                *live.entry(pointer.bucket).or_default().entry(pointer.location.segment_id).or_insert(0) += pointer.record_len(key_len);
             }
         }
         let empty = HashMap::new();
@@ -428,6 +435,51 @@ impl KVStore {
         // across restarts; the counters keep GC from under-triggering after a reopen.
         self.value_log.flush_all_metadata()?;
         Ok(())
+    }
+}
+
+/// Counts the records an L0→L1 merge stopped referencing as value-log garbage.
+///
+/// With the memtable's own report ([`Applied`]), this is the only place garbage
+/// is counted for an overwrite or a delete: the writer does not look up the
+/// pointer it replaces. A record shadowed by a newer write therefore stays live
+/// in the counters until the merge drops its entry. The counters only choose
+/// which segments GC rewrites; GC reads liveness from the LSM. A record in a
+/// segment GC has already deleted is not counted anywhere.
+struct MergeGarbage {
+    logs: Vec<Arc<crate::storage::value_log::ValueLog>>,
+}
+
+impl DisplacedSink for MergeGarbage {
+    fn on_displaced(&self, records: &[Displaced]) {
+        for record in records {
+            if let Some(pointer) = decode_sharded_pointer(record.pointer)
+                && let Some(log) = self.logs.get(pointer.bucket as usize)
+            {
+                log.note_displaced(pointer.location, record.key_len);
+            }
+        }
+    }
+}
+
+impl KVStore {
+    /// Count as garbage what a memtable write left unreferenced: the live
+    /// pointer it replaced in place, or, if it was stale, its own record.
+    /// `pointer` is the write's own record (`None` for a delete).
+    pub(super) fn note_applied(&self, applied: Applied, pointer: Option<ShardedValuePointer>, key_len: usize) {
+        match applied {
+            Applied::Won { displaced: Some(old) } => {
+                if let Some(old) = decode_sharded_pointer(old) {
+                    self.value_log.note_displaced(old, key_len);
+                }
+            }
+            Applied::Won { displaced: None } => {}
+            Applied::Stale => {
+                if let Some(own) = pointer {
+                    self.value_log.note_displaced(own, key_len);
+                }
+            }
+        }
     }
 }
 

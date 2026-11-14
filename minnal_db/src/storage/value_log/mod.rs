@@ -35,11 +35,12 @@
 //! # Liveness and garbage
 //!
 //! Records carry **no tombstone/updated flags** — the LSM is the sole authority on
-//! what is live. When a write displaces an older record the writer just adds that
-//! record's size to its segment's garbage counter: it already holds the
-//! displaced pointer, and the pointer carries `value_len`, so the accounting
-//! costs **zero I/O** and no record on disk is ever touched again. The counters
-//! are a *hint* for GC selection; the exact live set always comes from the LSM.
+//! what is live. When the last LSM entry pointing at a record goes (a memtable
+//! write replaces it, or the L0→L1 merge drops it), that record's size is added to
+//! its segment's garbage counter ([`ValueLog::note_displaced`]): the pointer
+//! carries `value_len`, so the accounting costs **zero I/O** and no record on disk
+//! is ever touched again. The counters are a *hint* for GC selection; the exact
+//! live set always comes from the LSM.
 
 pub mod sharded;
 
@@ -884,8 +885,9 @@ impl ValueLog {
         })
     }
 
-    /// Account for a record a newer write (or a delete) has just displaced.
-    /// Costs **no I/O** — the caller holds the old pointer, which carries `value_len`.
+    /// Account for a record no LSM entry points at any more (see
+    /// `storage/lsm/tree/displaced.rs`). Costs **no I/O**: the pointer carries
+    /// `value_len`. A segment GC has already deleted is not charged.
     pub fn note_displaced(&self, location: ValueLocation, key_len: usize) {
         if location.segment_id == 0 {
             return;

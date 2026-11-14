@@ -64,11 +64,17 @@ fn stale_value_log_metadata_is_rebuilt_from_the_lsm_at_open() {
 
     let store = open();
     use crate::storage::value_log::SegmentStats;
-    let stats: Vec<SegmentStats> = store.value_log.all_segment_stats().into_iter().flat_map(|(_, s)| s).collect();
-    let sum = |f: fn(&SegmentStats) -> u64| stats.iter().map(f).sum::<u64>();
-    assert_eq!(sum(|s| s.total_bytes), 12 * rec);
-    assert_eq!(sum(|s| s.live_bytes), 2 * rec, "only k0 and the newest k1 are live");
-    assert_eq!(sum(|s| s.garbage_bytes), 10 * rec, "the overwritten copies are garbage");
+    let sums = || {
+        let stats: Vec<SegmentStats> = store.value_log.all_segment_stats().into_iter().flat_map(|(_, s)| s).collect();
+        let sum = |f: fn(&SegmentStats) -> u64| stats.iter().map(f).sum::<u64>();
+        (sum(|s| s.total_bytes), sum(|s| s.live_bytes), sum(|s| s.garbage_bytes))
+    };
+    // A record is live while any LSM entry points at it: k0, the newest k1, and
+    // the first k1, whose entry sits in the first L0 file until a merge drops it.
+    // The nine overwrites in between were replaced in the memtable.
+    assert_eq!(sums(), (12 * rec, 3 * rec, 9 * rec), "the rebuild counts what the LSM references");
+    store.lsm.compact_all().unwrap();
+    assert_eq!(sums(), (12 * rec, 2 * rec, 10 * rec), "the merge drops the first k1 and counts it");
 }
 
 /// A crash between GC's re-point and its unlink must lose nothing: the old segment

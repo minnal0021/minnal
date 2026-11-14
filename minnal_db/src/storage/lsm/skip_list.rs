@@ -23,6 +23,19 @@ pub mod skip_list {
         pub seq: u64,
     }
 
+    /// What a seq-aware write did to the skip list. The value-log garbage
+    /// accounting depends on it: the pointer a write replaced here is referenced
+    /// by nothing any more, and a stale write's own pointer never was.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Applied {
+        /// The write is now the key's entry in this skip list. `displaced` is the
+        /// live value it replaced in place; `None` when the key was absent here
+        /// or held a tombstone.
+        Won { displaced: Option<u128> },
+        /// The key already held a newer write, so this one was dropped.
+        Stale,
+    }
+
     #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
     pub enum InsertError {
         #[error("capacity exceeded (nodes/links/keys)")]
@@ -199,17 +212,17 @@ pub mod skip_list {
         /// write sequence), with **highest-sequence-wins** conflict resolution.
         ///
         /// If the key already exists with a *newer* sequence, the write is
-        /// dropped (returns `Ok(None)`). So the in-memory winner of two racing
+        /// dropped ([`Applied::Stale`]). So the in-memory winner of two racing
         /// writes to one key is the one recovery picks (it replays in sequence
         /// order), and a value seen live survives a crash.
-        pub fn try_insert_with_seq(&mut self, key: &[u8], value: u128, seq: u64) -> Result<Option<u128>, InsertError> {
+        pub fn try_insert_with_seq(&mut self, key: &[u8], value: u128, seq: u64) -> Result<Applied, InsertError> {
             let (found, update) = self.find_path(key);
 
             if let Some(idx) = found {
                 let node = &mut self.nodes[idx as usize];
                 if !Self::seq_is_newer_or_equal(seq, node.sequence) {
                     // A newer write already won for this key; drop this stale one.
-                    return Ok(None);
+                    return Ok(Applied::Stale);
                 }
                 let old = node.value;
                 let was_tombstone = node.tombstone;
@@ -219,14 +232,14 @@ pub mod skip_list {
                 if was_tombstone {
                     self.no_tombstone_nodes = self.no_tombstone_nodes.saturating_sub(1);
                     self.no_live_nodes += 1;
-                    return Ok(None);
+                    return Ok(Applied::Won { displaced: None });
                 }
-                return Ok(Some(old));
+                return Ok(Applied::Won { displaced: Some(old) });
             }
 
             self.splice_new_node(key, value, false, seq, update)?;
             self.no_live_nodes += 1;
-            Ok(None)
+            Ok(Applied::Won { displaced: None })
         }
 
         /// Insert a tombstone for `key` using an explicit sequence, with
@@ -241,27 +254,30 @@ pub mod skip_list {
         ///   in place; its stored value is left untouched.
         /// - Key present with a newer sequence → this delete is stale (a newer
         ///   write superseded it) and is dropped.
-        pub fn insert_tombstone_with_seq(&mut self, key: &[u8], seq: u64) -> Result<(), InsertError> {
+        ///
+        /// [`Applied::Won`] carries the live value a flip displaced.
+        pub fn insert_tombstone_with_seq(&mut self, key: &[u8], seq: u64) -> Result<Applied, InsertError> {
             let (found, update) = self.find_path(key);
 
             if let Some(idx) = found {
                 let node = &mut self.nodes[idx as usize];
                 if !Self::seq_is_newer_or_equal(seq, node.sequence) {
                     // A newer write already won for this key; drop the stale delete.
-                    return Ok(());
+                    return Ok(Applied::Stale);
                 }
                 node.sequence = seq;
                 if !node.tombstone {
                     node.tombstone = true;
                     self.no_live_nodes -= 1;
                     self.no_tombstone_nodes += 1;
+                    return Ok(Applied::Won { displaced: Some(node.value) });
                 }
-                return Ok(());
+                return Ok(Applied::Won { displaced: None });
             }
 
             self.splice_new_node(key, 0, true, seq, update)?;
             self.no_tombstone_nodes += 1;
-            Ok(())
+            Ok(Applied::Won { displaced: None })
         }
 
         /// Allocate a node with a freshly drawn height and splice it in at every
@@ -680,7 +696,10 @@ pub mod skip_list {
         }
 
         pub fn try_insert(&mut self, key: &[u8], value: u128) -> Result<Option<u128>, InsertError> {
-            self.try_insert_with_seq(key, value, Self::next_test_seq())
+            Ok(match self.try_insert_with_seq(key, value, Self::next_test_seq())? {
+                Applied::Won { displaced } => displaced,
+                Applied::Stale => None,
+            })
         }
 
         pub fn remove(&mut self, key: &[u8]) -> Option<u128> {
@@ -698,8 +717,24 @@ pub mod skip_list {
     #[cfg(test)]
     mod tests {
 
-        use super::{KeyValueRecord, SkipList};
+        use super::{Applied, KeyValueRecord, SkipList};
         use std::collections::BTreeMap;
+
+        /// Every outcome the garbage accounting relies on: a replaced live value
+        /// is reported once, a stale write is reported as stale, and a write over
+        /// a tombstone or into an absent key displaces nothing.
+        #[test]
+        fn writes_report_what_they_displaced() {
+            let mut sl = SkipList::new();
+            assert_eq!(sl.try_insert_with_seq(b"k", 100, 5).unwrap(), Applied::Won { displaced: None });
+            assert_eq!(sl.try_insert_with_seq(b"k", 200, 6).unwrap(), Applied::Won { displaced: Some(100) });
+            assert_eq!(sl.try_insert_with_seq(b"k", 300, 4).unwrap(), Applied::Stale);
+            assert_eq!(sl.insert_tombstone_with_seq(b"k", 3).unwrap(), Applied::Stale);
+            assert_eq!(sl.insert_tombstone_with_seq(b"k", 7).unwrap(), Applied::Won { displaced: Some(200) });
+            assert_eq!(sl.insert_tombstone_with_seq(b"k", 8).unwrap(), Applied::Won { displaced: None });
+            assert_eq!(sl.try_insert_with_seq(b"k", 400, 9).unwrap(), Applied::Won { displaced: None });
+            assert_eq!(sl.insert_tombstone_with_seq(b"absent", 10).unwrap(), Applied::Won { displaced: None });
+        }
 
         #[test]
         fn try_insert_with_seq_keeps_highest_sequence() {

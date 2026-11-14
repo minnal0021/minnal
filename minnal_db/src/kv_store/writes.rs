@@ -24,65 +24,62 @@ impl KVStore {
 
     fn put_to_storage_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         let epoch = current_epoch_millis();
-        // Capture the prior value's bytes so field-index updates can be O(1)
-        // (targeted at the old value's bucket) instead of scanning every bucket.
-        // Only worth a value-log read when the namespace actually has indexes.
-        let want_old_for_index = !self.namespace_index.read().is_empty();
+        // Only field indexes need to know what this write replaces: its previous
+        // value (for an `O(1)` targeted update instead of a scan of every value)
+        // and whether this write is the key's newest at all. A namespace without
+        // them writes blind: no LSM lookup, no value-log read.
+        let indexed = !self.namespace_index.read().is_empty();
 
-        // Hold the bucket lock across the existing-pointer read, the value-log append,
-        // AND the LSM insert: it is what excludes value-log GC, the one writer that
-        // takes no key stripe. GC's phase 2 is a compare-and-set (the key still points
-        // at the record it copied → insert the copy at the key's OLD seq) under this
-        // lock. A write landing inside it could be undone: a delete that reaches L1
-        // (tombstone dropped) before GC's insert lets the old seq win, bringing the key
-        // back. Reading the displaced pointer inside the lock also keeps the garbage
-        // counters right (otherwise GC's fresh copy is dead but never counted).
-        // Same-key writers are already serialised by the key stripe, which every
-        // caller holds (`Database::key_locks`).
+        // Hold the bucket lock across the value-log append and the LSM insert (and
+        // an indexed namespace's lookup): it is what excludes value-log GC, the one
+        // writer that takes no key stripe. GC's phase 2 is a compare-and-set (the
+        // key still points at the record it copied → insert the copy at the key's
+        // OLD seq) under this lock. A write landing inside it could be undone: a
+        // delete that reaches L1 (tombstone dropped) before GC's insert lets the old
+        // seq win, bringing the key back. Same-key writers are already serialised
+        // by the key stripe, which every caller holds (`Database::key_locks`).
         let bucket = self.value_log.bucket_for_key(key);
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
-        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
-        // Only a winning write replaces anything. A losing write is garbage the
-        // moment it lands and leaves the index alone, so it reads nothing. A winner
-        // reads the old value only when the namespace has indexes, for a targeted
-        // index update. Which write is newest is decided by `seq` alone, never by
-        // anything in the record.
-        let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
-        let old_value: Option<Vec<u8>> = match displaced {
-            Some(existing_ptr) if want_old_for_index => self.value_log.read_value(existing_ptr).ok(),
-            _ => None,
+        // A losing write (older than the key's current copy, which only replay
+        // produces) leaves the index alone, so it reads nothing. Which write is
+        // newest is decided by `seq` alone, never by anything in the record.
+        let (wins, key_existed, old_value) = if indexed {
+            let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
+            let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
+            let old_value = displaced.and_then(|old| self.value_log.read_value(old).ok());
+            (wins, displaced.is_some(), old_value)
+        } else {
+            // Unknown, so assume the key existed: should a field index appear
+            // mid-write, the update below then clears the row's old value instead
+            // of leaving it beside the new one.
+            (true, true, None)
         };
 
         let record_meta = ValueRecordMeta { epoch, seq };
         let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
-        if let Err(e) = self.lsm.insert_with_seq(key, pointer.to_u128(), seq) {
-            // A failed insert inserts nothing, so nothing points at the record just
-            // appended: count it as garbage now. The apply is retried, each attempt
-            // appending afresh, and bytes left counted as live would make their
-            // segment look cleaner than it is to GC's selection.
-            self.value_log.note_displaced(pointer, key.len());
-            return Err(e.into());
-        }
-
-        // Account the record that is now garbage — accounting only, no I/O and no
-        // in-place edit (the old record's segment may be sealed and immutable). If this
-        // write won, that is the record it displaced; if it *lost* to a concurrent
-        // higher-sequence write (so the LSM dropped our insert), our own just-appended
-        // record is the dead one instead.
-        if wins {
-            if let Some(old) = displaced {
-                self.value_log.note_displaced(old, key.len());
+        let applied = match self.lsm.insert_with_seq(key, pointer.to_u128(), seq) {
+            Ok(applied) => applied,
+            Err(e) => {
+                // A failed insert inserts nothing, so nothing points at the record
+                // just appended: count it as garbage now. The apply is retried, each
+                // attempt appending afresh, and bytes left counted as live would make
+                // their segment look cleaner than it is to GC's selection.
+                self.value_log.note_displaced(pointer, key.len());
+                return Err(e.into());
             }
-        } else {
-            self.value_log.note_displaced(pointer, key.len());
-        }
+        };
+
+        // Garbage accounting, no I/O: the pointer this write replaced in the
+        // memtable, or its own record if it was stale there. A copy in a lower
+        // layer is counted when the L0→L1 merge drops its entry (`MergeGarbage`).
+        self.note_applied(applied, Some(pointer), key.len());
         drop(_bucket_guard);
 
-        // Update in-memory field indices. A lost write is not the key's current value,
-        // so it must not touch the indices.
+        // A lost write is not the key's current value, so it must not touch the
+        // indices. (With no index this returns at once.)
         if wins {
-            self.update_indices_on_put(key, value, old_value.as_deref(), displaced.is_some());
+            self.update_indices_on_put(key, value, old_value.as_deref(), key_existed);
         }
 
         Ok(())
@@ -237,8 +234,8 @@ impl KVStore {
     }
 
     fn delete_from_storage_inner(&self, key: &[u8], seq: u64) -> Result<()> {
-        // Hold the bucket lock across the pointer read, the LSM delete and the
-        // garbage accounting, for the reason `put_to_storage_inner` gives: it
+        // Hold the bucket lock across the LSM delete (and an indexed namespace's
+        // pointer read), for the reason `put_to_storage_inner` gives: it
         // excludes GC's phase-2 compare-and-set, the one writer without a key
         // stripe. GC's liveness scan (phase 1) takes no lock; a delete landing
         // after it is caught by the compare-and-set, which re-reads the key under
@@ -255,30 +252,30 @@ impl KVStore {
     /// already held (`bucket_guard`, released before the field indices are
     /// touched).
     ///
-    /// Like the put path, it asks whether this delete actually **wins**: a delete
-    /// older than the key's current copy is dropped by the LSM, so it must not
-    /// strip that live document's rows from the field indices or charge its record
-    /// as garbage. Doing both regardless would leave a live document missing from
-    /// every query on the field whenever a delete loses its race.
+    /// In a namespace with field indexes it asks whether this delete actually
+    /// **wins**: a delete older than the key's current copy is dropped by the LSM,
+    /// so it must not strip that live document's rows from the field indices.
+    /// Doing so regardless would leave a live document missing from every query
+    /// on the field whenever a delete loses its race. A namespace without them
+    /// deletes blind, as it writes.
     pub(super) fn delete_with_bucket_locked(&self, key: &[u8], seq: u64, bucket_guard: parking_lot::MutexGuard<'_, ()>) -> Result<()> {
         // Read the prior value (under the bucket lock, so GC can't relocate it)
         // so index removal can target the old value's bucket instead of scanning
-        // every bucket. Only when the namespace has indexes to update.
-        let want_old_for_index = !self.namespace_index.read().is_empty();
-        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
-        let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
-        let old_value = match displaced {
-            Some(existing_ptr) if want_old_for_index => self.value_log.read_value(existing_ptr).ok(),
-            _ => None,
+        // every bucket.
+        let indexed = !self.namespace_index.read().is_empty();
+        let (displaced, old_value) = if indexed {
+            let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
+            let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
+            (displaced, displaced.and_then(|old| self.value_log.read_value(old).ok()))
+        } else {
+            (None, None)
         };
-        self.lsm.delete_with_seq(key, seq)?;
+        let applied = self.lsm.delete_with_seq(key, seq)?;
 
-        // The deleted key's record is garbage now. Accounting only — the record itself
-        // is never touched (its segment may be sealed and immutable), and liveness was
-        // never read from the record anyway: the LSM is the authority.
-        if let Some(old) = displaced {
-            self.value_log.note_displaced(old, key.len());
-        }
+        // The deleted key's record is garbage now. Accounting only: the record
+        // itself is never touched (its segment may be sealed and immutable). Counted
+        // here if the memtable held it, else when the merge drops its entry.
+        self.note_applied(applied, None, key.len());
         drop(bucket_guard);
 
         // Remove the row from the field indices only if this delete removed a value
@@ -286,8 +283,9 @@ impl KVStore {
         // nothing indexed, as the put path assumes for a new key, so skip the
         // `O(distinct values)` scan `update_indices_on_delete` falls back to
         // without old bytes; a row a lost update left behind is for gap records
-        // and repair, not for every delete of an absent key.
-        if displaced.is_some() {
+        // and repair, not for every delete of an absent key. Without indexes this
+        // is a no-op, unless one appeared mid-delete: then it clears the row.
+        if displaced.is_some() || !indexed {
             self.update_indices_on_delete(key, old_value.as_deref());
         }
 

@@ -46,7 +46,7 @@ def steps():
 
     snap("Values live in numbered segment files. Only the active tail is appended to; sealed segments never change.", GREY)
     seg[14][1].append(["k2′", LIVE]); mark(12, "k2", GARBAGE); lsm["k2"] = "seg 14"
-    snap("put(k2) appends the new value to the tail. The old record is not touched; its size is added to segment 12's garbage count.", GREEN)
+    snap("put(k2) appends the new value to the tail. The old record is not touched; once the LSM drops its entry, it counts as garbage.", GREEN)
     mark(12, "k3", GARBAGE); lsm["k3"] = "deleted"
     snap("delete(k3) removes the key from the LSM. Its record becomes garbage too: segment 12 is now half garbage.", ORANGE)
     snap("GC picks the segment with the most garbage, 12. Segment 13 has none, so GC never reads it.", GREY, 0)

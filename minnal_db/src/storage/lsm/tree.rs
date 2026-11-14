@@ -33,7 +33,12 @@ use thiserror::Error;
 
 use crate::support::metrics::Metrics;
 
+mod displaced;
 mod range_scan;
+
+pub(crate) use super::skip_list::skip_list::Applied;
+use displaced::DisplacedCollector;
+pub(crate) use displaced::{Displaced, DisplacedSink};
 
 /// An L0 file written and fsynced by a flush, not yet registered.
 struct WrittenLevel0File {
@@ -767,6 +772,13 @@ struct SStableEntry {
     seq: u64,
 }
 
+impl SStableEntry {
+    /// The value-log pointer this entry holds, or `None` for a tombstone.
+    fn live_pointer(&self) -> Option<u128> {
+        (!self.tombstone).then_some(self.value)
+    }
+}
+
 /// In-memory component of LSM tree
 struct MemTable {
     skip_list: SkipList,
@@ -1106,6 +1118,9 @@ pub(crate) struct LSMTree {
     /// [`set_metrics`](Self::set_metrics). `None` until set (e.g. a standalone
     /// tree in tests), in which case metric updates are no-ops.
     metrics: OnceLock<Arc<Metrics>>,
+    /// Told which records each L0→L1 merge stopped referencing. Unset for a
+    /// standalone tree.
+    displaced_sink: OnceLock<Arc<dyn DisplacedSink>>,
 
     config: LSMConfig,
 
@@ -1404,6 +1419,7 @@ impl LSMTree {
             sstable_indexes,
             max_lower_seq: AtomicU64::new(max_lower_seq_init.unwrap_or(0)),
             metrics: OnceLock::new(),
+            displaced_sink: OnceLock::new(),
             config,
             compaction_in_progress,
             ro_memtable_version: Arc::new(AtomicU64::new(0)),
@@ -1879,7 +1895,7 @@ impl LSMTree {
     }
 
     /// Perform 2-way merge of existing entries and new records
-    fn two_way_merge(&self, existing: Vec<SStableEntry>, new_records: Vec<KeyValueRecord>) -> Vec<SStableEntry> {
+    fn two_way_merge(&self, existing: Vec<SStableEntry>, new_records: Vec<KeyValueRecord>, displaced: &mut DisplacedCollector) -> Vec<SStableEntry> {
         let mut result = Vec::new();
         let mut i = 0;
         let mut j = 0;
@@ -1903,7 +1919,9 @@ impl LSMTree {
                     // recency here. On an exact tie prefer the L0 record (newer
                     // layer). A winning tombstone drops the key (L1 is the bottom
                     // level, so there is nothing below for it to shadow).
+                    let new_pointer = (!new_record.tombstone).then_some(new_record.value);
                     if seq_newer_or_eq(new_record.seq, existing_entry.seq) {
+                        displaced.lost(existing_entry.key.len(), existing_entry.live_pointer(), new_pointer);
                         if !new_record.tombstone {
                             result.push(SStableEntry {
                                 key: new_record.key.clone(),
@@ -1913,8 +1931,11 @@ impl LSMTree {
                                 seq: new_record.seq,
                             });
                         }
-                    } else if !existing_entry.tombstone {
-                        result.push(existing_entry.clone());
+                    } else {
+                        displaced.lost(new_record.key.len(), new_pointer, existing_entry.live_pointer());
+                        if !existing_entry.tombstone {
+                            result.push(existing_entry.clone());
+                        }
                     }
                     i += 1;
                     j += 1;
@@ -1995,6 +2016,66 @@ impl LSMTree {
     /// Attach the engine-wide operational counters (called once by `KVStore`).
     pub(crate) fn set_metrics(&self, metrics: Arc<Metrics>) {
         let _ = self.metrics.set(metrics);
+    }
+
+    /// Attach the receiver of the records each L0→L1 merge stops referencing
+    /// (called once by `KVStore`, before any merge can run).
+    pub(crate) fn set_displaced_sink(&self, sink: Arc<dyn DisplacedSink>) {
+        let _ = self.displaced_sink.set(sink);
+    }
+
+    /// Every distinct value-log pointer held by any entry in any layer, newest
+    /// or not, with its key's length, for the buckets `qualifying_buckets` marks
+    /// (all when `None`). This is what the value-log counters call live (see
+    /// `tree/displaced.rs`), so rebuilding them from it agrees with the running
+    /// count. Reads every layer of those buckets in full; meant for open, with
+    /// no writes running.
+    pub(crate) fn referenced_pointers(&self, qualifying_buckets: Option<&[bool]>) -> Result<Vec<Displaced>> {
+        let wanted = |key: &[u8]| qualifying_buckets.is_none_or(|qb| qb[get_bucket_for_key(key, self.config.num_buckets) as usize]);
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut add = |key: &[u8], pointer: u128| {
+            if seen.insert(pointer) {
+                out.push(Displaced { key_len: key.len(), pointer });
+            }
+        };
+        {
+            let memtable = self.memtable.read();
+            for (key, value, _seq, tombstone) in memtable.skip_list.iter_raw() {
+                if !tombstone && wanted(key) {
+                    add(key, value);
+                }
+            }
+        }
+        for ro in self.read_only_memtables.read().iter() {
+            for r in ro.records().iter() {
+                if !r.tombstone && wanted(&r.key) {
+                    add(&r.key, r.value);
+                }
+            }
+        }
+        for bucket in 0..self.config.num_buckets as u32 {
+            if qualifying_buckets.is_some_and(|qb| !qb[bucket as usize]) {
+                continue;
+            }
+            for l0 in self.level0_entries_snapshot(bucket) {
+                if l0.is_obsolete() {
+                    continue;
+                }
+                let _guard = L0ReadGuard::new(Arc::clone(&l0));
+                for e in self.read_sstable_entries_from_path(&l0.path)? {
+                    if let Some(pointer) = e.live_pointer() {
+                        add(&e.key, pointer);
+                    }
+                }
+            }
+            for e in self.read_sstable_entries(bucket)? {
+                if let Some(pointer) = e.live_pointer() {
+                    add(&e.key, pointer);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The operational counters, if attached. `None` for a standalone tree.
@@ -2109,7 +2190,11 @@ impl LSMTree {
     /// [`SkipList::try_insert_with_seq`]). This is the production write path; it
     /// makes the in-memory winner for racing same-key writes match the winner
     /// recovery would pick (recovery replays in sequence order).
-    pub(crate) fn insert_with_seq(&self, key: &[u8], value: u128, seq: u64) -> Result<()> {
+    ///
+    /// The result says what the write did to the active memtable: the live
+    /// pointer it replaced there, or that it was stale. A copy of the key in a
+    /// lower layer is not consulted; the L0→L1 merge reports it when it drops it.
+    pub(crate) fn insert_with_seq(&self, key: &[u8], value: u128, seq: u64) -> Result<Applied> {
         #[cfg(test)]
         if self.fail_next_insert.swap(false, Ordering::SeqCst) {
             return Err(LSMError::CapacityExceeded);
@@ -2124,7 +2209,7 @@ impl LSMTree {
 
         let mut memtable = self.memtable.write();
         match memtable.skip_list.try_insert_with_seq(key, value, seq) {
-            Ok(_) => Ok(()),
+            Ok(applied) => Ok(applied),
             Err(super::skip_list::skip_list::InsertError::CapacityExceeded) => Err(LSMError::CapacityExceeded),
         }
     }
@@ -2132,7 +2217,8 @@ impl LSMTree {
     /// Tombstone a key carrying an explicit global write sequence, with
     /// highest-sequence-wins resolution: a delete older than a concurrent write
     /// to the same key is dropped, matching recovery's sequence-ordered replay.
-    pub(crate) fn delete_with_seq(&self, key: &[u8], seq: u64) -> Result<()> {
+    /// The result is as for [`insert_with_seq`](Self::insert_with_seq).
+    pub(crate) fn delete_with_seq(&self, key: &[u8], seq: u64) -> Result<Applied> {
         {
             let memtable = self.memtable.read();
             if memtable.should_flush(self.config.compaction_threshold_percent) {
@@ -2146,7 +2232,7 @@ impl LSMTree {
         // currently in the memtable, so the delete still shadows lower layers.
         // Honours the sequence guard: a newer write to this key is left untouched.
         match memtable.skip_list.insert_tombstone_with_seq(key, seq) {
-            Ok(()) => Ok(()),
+            Ok(applied) => Ok(applied),
             Err(super::skip_list::skip_list::InsertError::CapacityExceeded) => Err(LSMError::CapacityExceeded),
         }
     }
@@ -2492,6 +2578,7 @@ impl LSMTree {
         entries.sort_by_key(|a| a.created_at_ms);
 
         let mut by_key: std::collections::BTreeMap<Vec<u8>, SStableEntry> = std::collections::BTreeMap::new();
+        let mut displaced = DisplacedCollector::default();
         let mut any_read = false;
         for entry in &entries {
             if entry.is_obsolete() {
@@ -2505,7 +2592,10 @@ impl LSMTree {
                 match by_key.entry(record.key.clone()) {
                     std::collections::btree_map::Entry::Occupied(mut e) => {
                         if seq_newer_or_eq(record.seq, e.get().seq) {
-                            e.insert(record);
+                            let old = e.insert(record);
+                            displaced.lost(old.key.len(), old.live_pointer(), e.get().live_pointer());
+                        } else {
+                            displaced.lost(record.key.len(), record.live_pointer(), e.get().live_pointer());
                         }
                     }
                     std::collections::btree_map::Entry::Vacant(e) => {
@@ -2532,7 +2622,7 @@ impl LSMTree {
         let level1_path = Self::level1_path_from(&self.base_path, bucket);
         let level1_entries = self.read_sstable_entries(bucket)?;
 
-        let merged_entries = self.two_way_merge(level1_entries, level0_records);
+        let merged_entries = self.two_way_merge(level1_entries, level0_records, &mut displaced);
 
         if merged_entries.is_empty() {
             let bucket_idx = bucket as usize;
@@ -2609,6 +2699,14 @@ impl LSMTree {
 
         for entry in entries {
             entry.mark_obsolete();
+        }
+
+        // Only now, with the merged file installed, are the dropped entries gone.
+        if let Some(sink) = self.displaced_sink.get() {
+            let records = displaced.into_records();
+            if !records.is_empty() {
+                sink.on_displaced(&records);
+            }
         }
 
         if let Some(m) = self.metrics() {
@@ -3921,11 +4019,11 @@ impl LSMTree {
     }
 
     pub(crate) fn insert(&self, key: &[u8], value: u128) -> Result<()> {
-        self.insert_with_seq(key, value, Self::next_test_seq())
+        self.insert_with_seq(key, value, Self::next_test_seq()).map(|_| ())
     }
 
     pub(crate) fn delete(&self, key: &[u8]) -> Result<()> {
-        self.delete_with_seq(key, Self::next_test_seq())
+        self.delete_with_seq(key, Self::next_test_seq()).map(|_| ())
     }
 }
 
@@ -5464,8 +5562,12 @@ mod tests {
                 // writes often carry lower seqs than earlier ones.
                 let seq = clock - rng.below(40);
                 match rng.below(100) {
-                    0..=54 => lsm.insert_with_seq(key, u128::from(rng.next()), seq)?,
-                    55..=79 => lsm.delete_with_seq(key, seq)?,
+                    0..=54 => {
+                        lsm.insert_with_seq(key, u128::from(rng.next()), seq)?;
+                    }
+                    55..=79 => {
+                        lsm.delete_with_seq(key, seq)?;
+                    }
                     80..=86 => {
                         // GC re-point: same seq as the current winner, new pointer.
                         if let Some((_, cur)) = lsm.get_with_seq(key)? {
@@ -5729,8 +5831,12 @@ mod tests {
                 let key = &keys[next(keys.len() as u64) as usize];
                 let seq = clock - next(40);
                 match next(100) {
-                    0..=54 => lsm.insert_with_seq(key, u128::from(next(1 << 30)) + 1, seq)?,
-                    55..=81 => lsm.delete_with_seq(key, seq)?,
+                    0..=54 => {
+                        lsm.insert_with_seq(key, u128::from(next(1 << 30)) + 1, seq)?;
+                    }
+                    55..=81 => {
+                        lsm.delete_with_seq(key, seq)?;
+                    }
                     82..=88 => lsm.flush_memtable()?,
                     89..=94 => lsm.flush_memtable_to_level0()?,
                     95..=98 => lsm.compact_all()?,
