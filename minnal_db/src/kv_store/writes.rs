@@ -11,7 +11,7 @@ impl KVStore {
     /// uses [`put_to_storage_seq`](Self::put_to_storage_seq) so the conflict-
     /// resolution sequence equals the WAL append order (live == recovery).
     pub fn put_to_storage(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_to_storage_inner(key, value, self.alloc_seq())
+        self.put_to_storage_inner(key, value, self.alloc_seq(), false)
     }
 
     /// Put a key-value pair carrying an explicit global write sequence, so
@@ -19,10 +19,17 @@ impl KVStore {
     /// (live == recovery). `seq` is the full global `u64` sequence, stored at full
     /// width in both the LSM and the value record.
     pub fn put_to_storage_seq(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
-        self.put_to_storage_inner(key, value, seq)
+        self.put_to_storage_inner(key, value, seq, false)
     }
 
-    fn put_to_storage_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
+    /// A put replayed from a log at its original `seq` (see
+    /// [`replay_upsert`](Self::replay_upsert)): dropped unless it is newer than
+    /// every stored copy of the key.
+    pub(super) fn put_replayed(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
+        self.put_to_storage_inner(key, value, seq, true)
+    }
+
+    fn put_to_storage_inner(&self, key: &[u8], value: &[u8], seq: u64, replayed: bool) -> Result<()> {
         let epoch = current_epoch_millis();
         // Only field indexes need to know what this write replaces: its previous
         // value (for an `O(1)` targeted update instead of a scan of every value)
@@ -31,18 +38,21 @@ impl KVStore {
         let indexed = !self.namespace_index.read().is_empty();
 
         // Hold the bucket lock across the value-log append and the LSM insert (and
-        // an indexed namespace's lookup): it is what excludes value-log GC, the one
-        // writer that takes no key stripe. GC's phase 2 is a compare-and-set (the
-        // key still points at the record it copied → insert the copy at the key's
-        // OLD seq) under this lock. A write landing inside it could be undone: a
-        // delete that reaches L1 (tombstone dropped) before GC's insert lets the old
-        // seq win, bringing the key back. Same-key writers are already serialised
-        // by the key stripe, which every caller holds (`Database::key_locks`).
+        // an indexed namespace's lookup). GC's batched compare-and-set runs under
+        // it (the key still points at the record GC copied → insert the copy),
+        // so no write applies between GC's check and its insert. Same-key writers
+        // are serialised by the key stripe, which every live caller holds
+        // (`KVStore::lock_key`).
         let bucket = self.value_log.bucket_for_key(key);
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
-        // A losing write (older than the key's current copy, which only replay
-        // produces) leaves the index alone, so it reads nothing. Which write is
+        if replayed && !self.replay_wins(key, seq)? {
+            return Ok(());
+        }
+
+        // A losing write (older than the key's current copy) leaves the index
+        // alone, so it reads nothing. Live writes never lose (the stripe), and a
+        // losing replay was dropped above; the check stays as the index's guard. Which write is
         // newest is decided by `seq` alone, never by anything in the record.
         let (wins, key_existed, old_value) = if indexed {
             let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
@@ -224,28 +234,54 @@ impl KVStore {
     /// store's counter (used by TTL expiry / standalone tests); the WAL-backed
     /// path uses [`delete_from_storage_seq`](Self::delete_from_storage_seq).
     pub fn delete_from_storage(&self, key: &[u8]) -> Result<()> {
-        self.delete_from_storage_inner(key, self.alloc_seq())
+        self.delete_from_storage_inner(key, self.alloc_seq(), false)
     }
 
     /// Delete carrying an explicit global write sequence, so a delete racing a
     /// write to the same key resolves highest-sequence-wins (live == recovery).
     pub fn delete_from_storage_seq(&self, key: &[u8], seq: u64) -> Result<()> {
-        self.delete_from_storage_inner(key, seq)
+        self.delete_from_storage_inner(key, seq, false)
     }
 
-    fn delete_from_storage_inner(&self, key: &[u8], seq: u64) -> Result<()> {
+    /// A delete replayed from a log at its original `seq` (see
+    /// [`replay_delete`](Self::replay_delete)): dropped unless it is newer than
+    /// every stored copy of the key.
+    pub(super) fn delete_replayed(&self, key: &[u8], seq: u64) -> Result<()> {
+        self.delete_from_storage_inner(key, seq, true)
+    }
+
+    fn delete_from_storage_inner(&self, key: &[u8], seq: u64, replayed: bool) -> Result<()> {
         // Hold the bucket lock across the LSM delete (and an indexed namespace's
-        // pointer read), for the reason `put_to_storage_inner` gives: it
-        // excludes GC's phase-2 compare-and-set, the one writer without a key
-        // stripe. GC's liveness scan (phase 1) takes no lock; a delete landing
-        // after it is caught by the compare-and-set, which re-reads the key under
-        // this lock and skips a key that is gone. The lock closes the window
-        // inside phase 2, between that re-read and GC's insert of its copy at the
-        // key's old seq: if this delete reached L1 meanwhile (tombstone dropped),
-        // the copy would win and bring the key back.
+        // pointer read), for the reason `put_to_storage_inner` gives: GC's
+        // batched compare-and-set runs under it. GC's liveness scan (phase 1)
+        // takes no lock; a delete landing after it is caught by the
+        // compare-and-set, which re-reads the key under this lock and skips a
+        // key that is gone.
         let bucket = self.value_log.bucket_for_key(key);
         let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        if replayed && !self.replay_wins(key, seq)? {
+            return Ok(());
+        }
         self.delete_with_bucket_locked(key, seq, bucket_guard)
+    }
+
+    /// Whether a write replayed at `seq` is newer than every stored copy of
+    /// `key`, in any layer, tombstones included. Called with the key's bucket
+    /// lock held.
+    ///
+    /// Replay is the only path that applies a write at an old seq. Live writers
+    /// draw their seq under the key's stripe, so theirs is always the newest;
+    /// a replayed record can be older than a copy already stored: a namespace's
+    /// safe offset is only a lower bound (records past it may be in L0 files
+    /// already, at the same seq), the other log may hold a newer write of the
+    /// key that is flushed and not replayed, and a no-WAL write (TTL expiry,
+    /// `put_no_wal`, `merge_no_wal`) is in no log at all. Applied anyway, such a
+    /// record would land in the memtable, a newer layer, holding an older
+    /// version. An equal seq is the same write, already stored. So both are
+    /// dropped: nothing is appended to the value log and nothing changes.
+    fn replay_wins(&self, key: &[u8], seq: u64) -> Result<bool> {
+        let (_pointer, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
+        Ok(wins)
     }
 
     /// The body of a delete, entered with `key`'s value-log bucket write lock

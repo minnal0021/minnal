@@ -106,7 +106,7 @@ impl Database {
         let Ok(store) = self.get_store(namespace_id) else {
             return Ok(FieldReindexOutcome::FieldNotActive);
         };
-        self.reindex_key(&store, namespace_id, field_id, key)
+        self.reindex_key(&store, field_id, key)
     }
 
     /// [`KVStore::reindex_field`] under `key`'s stripe — the only way anything
@@ -117,8 +117,8 @@ impl Database {
     /// without the stripe the two interleave: reindex reads v1, the put applies v2
     /// and moves the row v1→v2, then reindex sets it back to v1 — the index now
     /// disagrees with the store until something rewrites the key.
-    pub(crate) fn reindex_key(&self, store: &KVStore, namespace_id: NamespaceId, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
-        let _stripe = self.key_locks.guard(namespace_id, key);
+    pub(crate) fn reindex_key(&self, store: &KVStore, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+        let _stripe = store.lock_key(key);
         store.reindex_field(field_id, key)
     }
 

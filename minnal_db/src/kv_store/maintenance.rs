@@ -4,13 +4,10 @@ use super::*;
 use std::ops::ControlFlow;
 
 impl KVStore {
-    /// Delete records whose creation epoch is older than `ttl`, for a store with
-    /// no concurrent same-key writers to exclude (tests and standalone use). The
-    /// database's TTL worker uses [`expire_records_locked`](Self::expire_records_locked)
-    /// with its key stripe.
-    #[cfg(test)]
+    /// Delete records whose creation epoch is older than `ttl`; see
+    /// [`expire_records_with`](Self::expire_records_with).
     pub(crate) fn expire_records(&self, ttl: Duration, max_deletes_per_run: usize) -> Result<usize> {
-        self.expire_records_locked(ttl, max_deletes_per_run, |_| ())
+        self.expire_records_with(ttl, max_deletes_per_run, |_| ())
     }
 
     /// Delete records whose creation epoch is older than `ttl`.
@@ -28,13 +25,14 @@ impl KVStore {
     /// to a writer, is left alone. A pointer the page holds that GC has since
     /// moved fails the compare too, and the next pass judges the key afresh.
     ///
-    /// The delete runs under `lock_key(key)`, which the database supplies as the
-    /// key stripe: a WAL-backed write holds that stripe from allocating its seq
-    /// to applying it, so no same-key write can sit between the two while TTL
-    /// allocates its own seq. Without it a TTL delete could carry a lower seq than
-    /// a concurrent put that lands in an older layer, and the read paths resolve
-    /// a key by highest seq.
-    pub(crate) fn expire_records_locked<G>(&self, ttl: Duration, max_deletes_per_run: usize, lock_key: impl Fn(&[u8]) -> G) -> Result<usize> {
+    /// The delete runs under the key's stripe ([`lock_key`](Self::lock_key)):
+    /// every write holds that stripe from allocating its seq to applying it, so
+    /// no same-key write can sit between the two while TTL allocates its own
+    /// seq. Without it a TTL delete could carry a lower seq than a concurrent
+    /// put that lands in an older layer, putting an older version above a newer
+    /// one. `after_lock` runs with the stripe held, before the compare-and-set:
+    /// a test hook for landing a write in exactly that window.
+    pub(crate) fn expire_records_with(&self, ttl: Duration, max_deletes_per_run: usize, after_lock: impl Fn(&[u8])) -> Result<usize> {
         let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ttl_millis = ttl.as_millis() as u64;
 
@@ -53,7 +51,8 @@ impl KVStore {
                     continue;
                 };
                 if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
-                    let _key_guard = lock_key(&key);
+                    let _key_guard = self.lock_key(&key);
+                    after_lock(&key);
                     if self.delete_if_current(&key, pointer)? {
                         deleted += 1;
                     }
@@ -88,19 +87,20 @@ impl KVStore {
     /// original sequence, so recovery reproduces the per-key winner that was live
     /// before the crash (highest-sequence-wins).
     ///
-    /// It is the live put path, not a copy of it: a replayed write can lose (the
-    /// vector index WAL replays before the main WAL, so a main-WAL entry can land
-    /// after a newer write of its key), and a losing write must leave the garbage
-    /// counters and the field indices alone exactly as a live one does.
+    /// Unlike a live write, a replayed one is applied only if it is newer than
+    /// every stored copy of the key (see `replay_wins`): otherwise the memtable,
+    /// the newest layer, would hold an older version than a layer below it. A
+    /// dropped record touches nothing: no value-log append, no garbage count, no
+    /// field-index change. Past that check it is the live put path, not a copy.
     pub fn replay_upsert(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
-        self.put_to_storage_seq(key, value, seq)
+        self.put_replayed(key, value, seq)
     }
 
     /// Replay a WAL delete into this namespace's storage under the entry's
     /// original sequence, through the live delete path (see
     /// [`replay_upsert`](Self::replay_upsert) for why not a copy).
     pub fn replay_delete(&self, key: &[u8], seq: u64) -> Result<()> {
-        self.delete_from_storage_seq(key, seq)
+        self.delete_replayed(key, seq)
     }
 
     pub fn flush_and_compact_all(&self) -> Result<()> {

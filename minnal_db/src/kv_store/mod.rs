@@ -7,6 +7,7 @@
 use crate::namespace::NamespaceId;
 mod gc;
 pub mod index_set;
+pub(crate) mod key_locks;
 mod maintenance;
 mod reads;
 mod row_ids;
@@ -204,6 +205,11 @@ pub struct KVStore {
     // gets its own fresh counter, which is internally consistent.
     pub(crate) seq_counter: RwLock<Arc<AtomicU64>>,
 
+    /// This namespace's key stripes, the outermost write lock: every writer
+    /// holds its key's stripe from drawing its sequence to applying the write.
+    /// See [`key_locks`].
+    pub(crate) key_locks: key_locks::KeyLocks,
+
     /// Engine-wide operational counters, shared from `Database` via
     /// [`set_metrics`](Self::set_metrics). `None` for a standalone store (tests).
     pub(crate) metrics: OnceLock<Arc<crate::support::metrics::Metrics>>,
@@ -303,6 +309,7 @@ impl KVStore {
             row_to_key_fn: Arc::new(RwLock::new(None)),
             rowmap: Arc::new(RwLock::new(None)),
             seq_counter: RwLock::new(Arc::new(AtomicU64::new(1))),
+            key_locks: key_locks::KeyLocks::new(),
             metrics: OnceLock::new(),
             #[cfg(test)]
             gc_crash_after_unlink: AtomicBool::new(false),
@@ -394,6 +401,18 @@ impl KVStore {
     /// `seq_newer`.
     pub(crate) fn alloc_seq(&self) -> u64 {
         self.seq_counter.read().fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Lock `key`'s stripe (see [`key_locks`]). Every write to this namespace
+    /// takes it before it draws its sequence and holds it until the write is
+    /// applied.
+    pub(crate) fn lock_key(&self, key: &[u8]) -> parking_lot::MutexGuard<'_, ()> {
+        self.key_locks.guard(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stripe_of(&self, key: &[u8]) -> usize {
+        self.key_locks.stripe_of(key)
     }
 
     /// Set the LSM flush observer: the database's hook that retires WAL entries

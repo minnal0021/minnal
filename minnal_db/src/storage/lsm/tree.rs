@@ -38,6 +38,8 @@ mod compaction;
 mod displaced;
 mod flush;
 mod key_scan;
+#[cfg(test)]
+mod layer_order;
 mod level0;
 mod memtable;
 mod open;
@@ -110,6 +112,11 @@ pub enum LSMError {
     CapacityExceeded,
     #[error("SSTable corruption: {0}")]
     Corruption(String),
+    /// A read-only memtable was flushed while an older one was still in
+    /// memory. Level 0 must receive memtables in the order they were frozen,
+    /// so that a newer layer always holds newer versions; nothing was written.
+    #[error("read-only memtable {version} flushed before the older memtable {older}")]
+    FlushOutOfOrder { version: u64, older: u64 },
 }
 
 pub(crate) type Result<T> = std::result::Result<T, LSMError>;
@@ -401,8 +408,7 @@ fn seq_newer_or_eq(a: u64, b: u64) -> bool {
 
 /// Outcome of looking a key up in a single SSTable layer, carrying the matched
 /// entry's write sequence so resolution can pick the newest version across all
-/// layers (a GC re-point can place a low-sequence value in a *newer* layer, so
-/// layer order alone is not a safe proxy for recency).
+/// layers by sequence rather than by layer.
 #[derive(Debug, Clone, Copy)]
 enum SsLookup {
     /// Live value pointer found in this layer, with its stored sequence.
@@ -452,10 +458,9 @@ pub(crate) struct LSMTree {
     /// (read-only memtables + L0 + L1). Read resolution is highest-sequence-wins
     /// across all layers, but an active-memtable hit whose sequence is `>=` this
     /// bound dominates everything below it and can be returned without scanning
-    /// the lower layers, which is the common case: a normal write carries the
-    /// newest sequence. Only a GC re-point (a low sequence re-inserted into the
-    /// active memtable) fails the bound and falls through to the full seq-aware
-    /// search. Raised to the newest sequence of every memtable flushed and of the
+    /// the lower layers, which is the common case: every write, GC copies
+    /// included, carries the newest sequence. An entry that fails the bound falls
+    /// through to the full seq-aware search. Raised to the newest sequence of every memtable flushed and of the
     /// L1 files loaded at open.
     max_lower_seq: AtomicU64,
 

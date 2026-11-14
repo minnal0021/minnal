@@ -406,3 +406,31 @@ fn a_write_too_large_for_a_wal_segment_is_refused() {
     db.put(b"small", b"v").unwrap();
     assert_eq!(db.get(b"small").unwrap(), Some(b"v".to_vec()));
 }
+
+/// Key stripes are per namespace: a stripe held in one namespace (by a GC pass,
+/// a TTL pass or a slow merge closure) never holds up a write to another, even
+/// for the same key bytes.
+#[test]
+fn a_held_stripe_does_not_block_writes_to_another_namespace() {
+    let dir = TempDir::new().unwrap();
+    let db = std::sync::Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+    let held_ns = db.create_namespace("held").unwrap();
+    let other_ns = db.create_namespace("other").unwrap();
+
+    let held_store = db.get_store(held_ns).unwrap();
+    let _stripe = held_store.lock_key(b"k");
+
+    let (done, finished) = std::sync::mpsc::channel();
+    let writer = {
+        let db = std::sync::Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.put_ns(other_ns, b"k", b"v").unwrap();
+            done.send(()).unwrap();
+        })
+    };
+    finished
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("a write to another namespace waited on this namespace's stripe");
+    writer.join().unwrap();
+    assert_eq!(db.get_ns(other_ns, b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+}

@@ -73,7 +73,7 @@ impl Database {
                 let mut reindexed = 0usize;
                 let mut absent = 0usize;
                 for key in &decoded {
-                    match self.reindex_key(&store, namespace_id, field_id, key)? {
+                    match self.reindex_key(&store, field_id, key)? {
                         FieldReindexOutcome::Reindexed => reindexed += 1,
                         // The key has no current value. `reindex_field` has
                         // already cleared its row, which is the repair when it
@@ -99,7 +99,7 @@ impl Database {
                 let mut live_rows: std::collections::HashSet<u128> = std::collections::HashSet::new();
                 store.for_each_key_page(&[], None, |page| {
                     for (key, ..) in &page {
-                        if self.reindex_key(&store, namespace_id, field_id, key)? == FieldReindexOutcome::FieldNotActive {
+                        if self.reindex_key(&store, field_id, key)? == FieldReindexOutcome::FieldNotActive {
                             return Err(deactivated());
                         }
                         live_rows.extend(store.resolve_row_id_get(key));
@@ -128,7 +128,7 @@ impl Database {
                 for row in orphan_rows {
                     match store.key_for_row(row) {
                         Some(key) => {
-                            if self.reindex_key(&store, namespace_id, field_id, &key)? == FieldReindexOutcome::FieldNotActive {
+                            if self.reindex_key(&store, field_id, &key)? == FieldReindexOutcome::FieldNotActive {
                                 return Err(deactivated());
                             }
                         }

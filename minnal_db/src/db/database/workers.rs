@@ -337,9 +337,8 @@ impl TtlTarget for Database {
             let Some(store) = self.stores.read().get(&ns_id).cloned() else {
                 continue;
             };
-            // The key stripe keeps expiry out of every same-key write's
-            // seq-to-apply window (see `KVStore::expire_records_locked`).
-            match store.expire_records_locked(ttl, max_deletes, |key| self.key_locks.guard(ns_id, key)) {
+            // Expiry takes each key's stripe itself (see `KVStore::expire_records_with`).
+            match store.expire_records(ttl, max_deletes) {
                 Ok(deleted) => {
                     if deleted > 0 {
                         info!("[TtlWorker] ns_id={} expired {} record(s)", ns_id, deleted);

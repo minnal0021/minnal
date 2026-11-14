@@ -91,8 +91,8 @@ impl KVStore {
     /// Two steps: ask the LSM where the value is, then read it there. GC can relocate
     /// a value between those steps — but it cannot make this read *wrong*. Segments
     /// are immutable and their ids are never reused, so a pointer GC has superseded
-    /// still resolves to **this key's own bytes** (GC re-points under the key's
-    /// existing sequence, so the relocated record is the same write). The only thing
+    /// still resolves to **this key's own bytes** (GC's copy holds the same value).
+    /// The only thing
     /// that can go wrong is arriving after GC unlinked the segment, which fails
     /// loudly as [`crate::ValueLogError::SegmentMissing`] — never silently as another key's
     /// record. So the read simply re-resolves through the LSM (which by then holds the

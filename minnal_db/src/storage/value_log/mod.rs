@@ -173,8 +173,8 @@ pub struct ValueLocation {
 pub struct ValueRecordMeta {
     /// Creation time in Unix millis. TTL expiry reads this straight from the record.
     pub epoch: u64,
-    /// The global write sequence that produced this record. GC preserves it when it
-    /// relocates a record. Reads do not check it: a segment id is never reused,
+    /// The global write sequence that produced this record. A GC copy carries the
+    /// fresh seq GC wrote it under. Reads do not check it: a segment id is never reused,
     /// so a pointer can never resolve to a different write.
     pub seq: u64,
 }

@@ -139,12 +139,11 @@ impl LSMTree {
 
         // Collapse same-key conflicts across L0 files by highest write `seq`
         // (globally ordered, one counter for WAL and internal/test/bulk writes
-        // alike), NOT by file recency. File `created_at_ms` is assigned at ro→L0
-        // *flush* time, which can run out of seal/seq order (a higher-version
-        // memtable can flush to L0 before a lower one, inverting recency relative
-        // to seq); a GC re-point likewise preserves a low seq into a newer file.
-        // Resolving by recency would let a lower-seq value beat a higher-seq
-        // tombstone and resurrect deleted keys. Point reads (`get_with_seq`)
+        // alike), NOT by file recency. The writers keep newer versions in newer
+        // files (`docs/Layer-Order-Design.md`), but the merge does not rely on it:
+        // resolved by recency, a writer that broke that rule would let a lower-seq
+        // value beat a higher-seq tombstone, and the merge would bake the
+        // resurrected key into L1 for good. Point reads (`get_with_seq`)
         // already resolve by seq, so seq-aware resolution here keeps the merge
         // consistent with them. The oldest-first sort only breaks exact seq ties
         // (prefer the newer file).
@@ -319,13 +318,10 @@ impl LSMTree {
     pub(crate) fn compact_all(&self) -> Result<()> {
         self.cleanup_obsolete_level0_files();
 
-        let ro_snapshot = self.read_only_memtables.read().clone();
-        if ro_snapshot.is_empty() && !self.has_level0_files() {
+        if self.read_only_memtables.read().is_empty() && !self.has_level0_files() {
             return Ok(());
         }
-        for ro in ro_snapshot.iter() {
-            self.flush_ro_memtable_to_level0(ro)?;
-        }
+        self.flush_read_only_memtables()?;
 
         for bucket in 0u32..self.config.num_buckets as u32 {
             if let Err(err) = self.compact_bucket(bucket) {
@@ -404,10 +400,7 @@ impl LSMTree {
     pub(crate) fn compact_due(&self) -> Result<()> {
         self.cleanup_obsolete_level0_files();
 
-        let ro_snapshot = self.read_only_memtables.read().clone();
-        for ro in ro_snapshot.iter() {
-            self.flush_ro_memtable_to_level0(ro)?;
-        }
+        self.flush_read_only_memtables()?;
 
         for bucket in 0u32..self.config.num_buckets as u32 {
             if !self.compaction_due(bucket) {

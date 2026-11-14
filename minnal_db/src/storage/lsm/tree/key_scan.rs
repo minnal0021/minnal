@@ -78,12 +78,10 @@ impl LSMTree {
         //
         // Liveness is resolved by highest write `seq` (globally ordered), matching
         // the seq-resolved point reads (`get_with_seq`) and the seq-aware L0→L1
-        // merge. Layer/file recency is NOT used to pick the winner: an out-of-order
-        // ro→L0 flush (file `created_at_ms` is set at flush time, which can run out
-        // of seal/seq order) or a GC re-point can leave a lower-seq value in a
-        // "newer" file above a higher-seq tombstone. Resolving by recency would read
-        // a higher-seq live value as dead (a newer-file lower-seq tombstone
-        // shadowing it). The
+        // merge. Layer/file recency is NOT used to pick the winner: the writers keep
+        // newer versions in newer layers (`docs/Layer-Order-Design.md`), but GC's
+        // liveness decision must not depend on that — read as dead, a live value's
+        // segment is unlinked for good. The
         // map carries each key's best `(value-or-tombstone, seq)`; a later insert
         // wins only if its seq is newer-or-equal. The *capture* order stays
         // newest-first (memtables before SSTables) so a concurrent flush/compaction

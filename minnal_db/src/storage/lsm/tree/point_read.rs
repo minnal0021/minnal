@@ -31,11 +31,10 @@ impl LSMTree {
     /// is this with tombstones read as absent; the write path needs the
     /// tombstone's seq to tell whether a write is newer than the delete.
     pub(super) fn newest_copy(&self, key: &[u8]) -> Result<Candidate> {
-        // Resolve by highest write sequence across ALL layers. Layer order does
-        // not imply recency (a GC re-point can re-insert a value at its old, low
-        // sequence into a newer layer, above a deleting tombstone in an older
-        // layer), so we cannot return at the first layer holding the key. We
-        // inspect every layer and keep the newest-sequence entry; a tombstone
+        // Resolve by highest write sequence across ALL layers. The writers keep
+        // newer versions in newer layers (`docs/Layer-Order-Design.md`), but this
+        // read does not rely on it: past the fast path below it inspects every
+        // layer and keep the newest-sequence entry; a tombstone
         // winning means the key is deleted. Layers are visited newest-first so an
         // exact sequence tie resolves to the newer copy.
         let mut best: Candidate = None;
@@ -49,8 +48,7 @@ impl LSMTree {
             if let Some((value, seq, tombstone)) = memtable.skip_list.entry(key) {
                 // Fast path: if this active-memtable entry is at least as new as
                 // everything in the lower layers, it is authoritative — no buried
-                // tombstone can be newer — so return without scanning below. Only
-                // a GC re-point's low sequence fails this and falls through.
+                // tombstone can be newer — so return without scanning below.
                 if seq_newer_or_eq(seq, self.max_lower_seq.load(Ordering::Relaxed)) {
                     if let Some(m) = self.metrics() {
                         Metrics::bump(&m.fast_path_hits);
@@ -85,22 +83,21 @@ impl LSMTree {
     /// layers), and whether a write carrying `new_seq` would become that key's
     /// winner under highest-sequence-wins resolution.
     ///
-    /// The write path needs both, under the bucket write lock, to account value-log
-    /// garbage correctly when same-key writes race: the winner displaces the existing
-    /// record, but a **loser** (a lower-sequence write that arrived at the lock after a
-    /// higher-sequence one) does not — its own freshly-appended record is the garbage
-    /// instead. Deciding this from a read taken before the lock would let two writers
-    /// see the same displaced pointer and both mark it, counting it twice while
-    /// leaking the loser's record.
+    /// An indexed namespace's write path needs both, under the bucket write lock:
+    /// the displaced pointer to read the old value for a targeted index update,
+    /// and whether the write wins, since a losing write must leave the index
+    /// alone. Replay asks too, and drops a write that would lose.
     ///
     /// A winning **tombstone** counts: the pointer is `None` (nothing to displace),
     /// but a write older than the delete still loses to it. Reading that case as
     /// "absent, so any write wins" would make a lost put add a field-index row for
     /// a key that reads as deleted. `true` only when no layer holds the key at all,
-    /// or the write is at least as new as whatever does.
+    /// or the write is strictly newer than whatever does: seqs are unique, so a
+    /// stored copy at `new_seq` is this same write, already applied (a replayed
+    /// record whose memtable was flushed).
     pub(crate) fn current_pointer_and_wins(&self, key: &[u8], new_seq: u64) -> Result<(Option<u128>, bool)> {
         match self.newest_copy(key)? {
-            Some((ptr, existing_seq)) => Ok((ptr, seq_newer_or_eq(new_seq, existing_seq))),
+            Some((ptr, existing_seq)) => Ok((ptr, seq_newer(new_seq, existing_seq))),
             None => Ok((None, true)),
         }
     }
@@ -115,9 +112,7 @@ impl LSMTree {
     /// caller merges it with its own candidate.
     pub(super) fn lookup_sstable(&self, bucket: u32, key: &[u8], floor: Option<u64>) -> Result<SsLookup> {
         // L0 is newer than L1, so an exact sequence tie resolves to L0 (take L1
-        // only if strictly newer). Layer order is not assumed to imply recency — a
-        // GC re-point or an out-of-order flush can leave a lower-sequence value
-        // above a deleting tombstone.
+        // only if strictly newer). Layer order is not assumed to imply recency.
         let l0 = self.search_level0_files(bucket, key, floor)?;
         let floor = match (floor, l0.seq()) {
             (Some(f), Some(s)) => Some(if seq_newer(s, f) { s } else { f }),
@@ -189,11 +184,9 @@ impl LSMTree {
     /// sequence (a value or a tombstone), or [`SsLookup::Missing`] if no L0 file
     /// mentions it.
     ///
-    /// Resolution is by sequence, not file recency: a GC re-point can land a
-    /// low-sequence value in a newer L0 file while the deleting tombstone sits in
-    /// an older one, so no hit settles the key on its own. Files are visited
-    /// newest-first only so an exact sequence tie resolves to the newer file (the
-    /// relocation, whose old copy is stale).
+    /// Resolution is by sequence, not file recency, so no hit settles the key on
+    /// its own. Files are visited newest-first only so an exact sequence tie
+    /// resolves to the newer file.
     ///
     /// A file is skipped unread when its summary proves it cannot matter: the key
     /// is outside its range or bloom-negative, or its newest entry is `<=` the best

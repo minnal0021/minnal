@@ -203,10 +203,10 @@ impl PrefixScanKeys {
 /// go to the newer layer — the same rule `get_with_seq` applies.
 ///
 /// Every multi-key read resolves through this, never by "the newer layer
-/// overwrites": nothing in the LSM keeps a newer layer's copies at higher seqs
-/// (a GC re-point, for one, writes a key's existing seq into the active
-/// memtable), and overwriting by layer would then hide a live key or surface a
-/// deleted one (`test_scans_agree_with_brute_force_resolution`).
+/// overwrites". The writers keep newer versions in newer layers
+/// (`docs/Layer-Order-Design.md`), but the scans do not rely on it; were a writer
+/// to break it, overwriting by layer would hide a live key or surface a deleted
+/// one (`test_scans_agree_with_brute_force_resolution`).
 pub(super) fn fold_newest(map: &mut ScanMap, key: Vec<u8>, value: Option<u128>, seq: u64) {
     match map.entry(key) {
         std::collections::btree_map::Entry::Occupied(mut e) => {

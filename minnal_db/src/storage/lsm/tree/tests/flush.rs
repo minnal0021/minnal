@@ -207,11 +207,11 @@ fn test_concurrent_flushes_of_one_memtable_write_it_once() -> Result<()> {
     Ok(())
 }
 
-// GC relocation re-inserts a key at its existing seq with a new pointer, so the
-// old and relocated copies tie on seq and only L0 file order says which is
-// newer. Were file order taken from the raw wall clock, a clock step backwards
-// between the two flushes would invert it: every read (and the L0→L1 merge)
-// would choose the stale pointer, whose segment GC then unlinks. Simulated here by moving
+// L0 file order is layer order, and it breaks exact seq ties. The test ties two
+// copies of a key on seq (no writer does; it isolates file order) so only file
+// order says which is newer. Were file order taken from the raw wall clock, a
+// clock step backwards between the two flushes would invert it: every read (and
+// the L0→L1 merge) would choose the older file's pointer. Simulated here by moving
 // the first file's stamp into the future — the state a clock step leaves
 // behind — and reopening, which also checks the stamp floor is seeded from
 // disk.
@@ -251,5 +251,39 @@ fn test_l0_order_survives_the_wall_clock_stepping_back() -> Result<()> {
     // still issued above everything before it.
     let before = *lsm.last_l0_stamp.lock();
     assert!(lsm.next_l0_stamp(before - hour) > before, "a stamp went backwards");
+    Ok(())
+}
+
+// Level 0 takes memtables in the order they were frozen, so a newer layer
+// always holds newer versions: flushed out of order, the older memtable's file
+// would get the newer stamp. A caller that picks a newer memtable while an older
+// one is still in memory is refused, with nothing written, and the ordered flush
+// then writes both.
+#[test]
+fn a_newer_memtable_cannot_reach_level0_before_an_older_one() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let lsm = LSMTree::open(
+        temp_dir.path(),
+        LSMConfig {
+            num_buckets: 1,
+            ..LSMConfig::default()
+        },
+    )?;
+    lsm.insert_with_seq(b"k", 1, 1)?;
+    lsm.flush_memtable()?;
+    lsm.insert_with_seq(b"k", 2, 2)?;
+    lsm.flush_memtable()?;
+
+    let newer = lsm.read_only_memtables.read()[1].clone();
+    match lsm.flush_ro_memtable_to_level0(&newer) {
+        Err(LSMError::FlushOutOfOrder { version, older }) => assert!(older < version),
+        other => panic!("expected FlushOutOfOrder, got {other:?}"),
+    }
+    assert!(lsm.level0_entries_snapshot(0).is_empty(), "a refused flush must write nothing");
+
+    lsm.flush_memtable_to_level0()?;
+    assert_eq!(lsm.level0_entries_snapshot(0).len(), 2);
+    assert!(lsm.layer_order_violations()?.is_empty());
+    assert_eq!(lsm.get_with_seq(b"k")?, Some((2, 2)));
     Ok(())
 }

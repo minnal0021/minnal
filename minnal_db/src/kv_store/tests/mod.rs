@@ -5,6 +5,7 @@ mod garbage;
 mod gc;
 mod gc_concurrency;
 mod gc_crash;
+mod layer_order;
 mod scans;
 
 use super::*;

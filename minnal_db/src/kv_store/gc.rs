@@ -13,6 +13,17 @@ pub(super) struct BucketGCResult {
     pub(super) pending_unlink: Vec<u32>,
 }
 
+/// A record phase 1 found live: what phase 2 needs to copy and re-point it.
+struct Survivor {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    /// The record's creation time, carried over to the copy: TTL expiry judges
+    /// a value by when it was written, not by when GC last moved it.
+    epoch: u64,
+    /// Where the LSM pointed when phase 1 found the record live.
+    old_pointer: u128,
+}
+
 impl KVStore {
     /// GC one bucket: rewrite the survivors of its worst segments, and hand back the
     /// segments that become safe to unlink *once the re-point is durable*.
@@ -23,12 +34,13 @@ impl KVStore {
     /// proportional to the segment rather than to the whole bucket or the whole key
     /// set. The segment is sealed and immutable, so nothing can change it under us.
     ///
-    /// **Phase 2 (bucket lock):** relocate each survivor as a **compare-and-set** —
-    /// append it to the active tail and update the LSM only if the key *still* maps to
-    /// the old location. Phase 1 runs without the lock, so a key deleted since then
-    /// must stay deleted and one overwritten since then must keep
-    /// its newer value. The relocation re-inserts under the key's **existing sequence**,
-    /// so moving a record never changes its version.
+    /// **Phase 2 (key stripe + bucket lock):** relocate each survivor as a
+    /// **compare-and-set** — append it to the active tail and update the LSM only if
+    /// the key *still* maps to the old location. Phase 1 runs without the lock, so a
+    /// key deleted since then must stay deleted and one overwritten since then must
+    /// keep its newer value. The copy is written as a **new version** of the key, at a
+    /// fresh seq drawn under the key's stripe, so it lands in the newest layer as the
+    /// newest version, like any other write.
     ///
     /// The old segment is deliberately **not** unlinked here — see
     /// [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold).
@@ -102,7 +114,7 @@ impl KVStore {
             // Note this yields at most ONE survivor per key: two records for the
             // same key in this segment have different locations, so only the one
             // whose pointer matches can match. Phase 2 relies on that.
-            let mut survivors: Vec<(Vec<u8>, Vec<u8>, ValueRecordMeta, u128)> = Vec::new();
+            let mut survivors: Vec<Survivor> = Vec::new();
             log.for_each_record(segment.id, |key, value, meta, location| {
                 let Ok(pointer) = ShardedValuePointer::new(bucket, location, self.value_log.num_buckets()) else {
                     return;
@@ -110,61 +122,106 @@ impl KVStore {
                 let old_u128 = pointer.to_u128();
                 // Live iff the LSM still points at exactly this record.
                 if live.get(key) == Some(&old_u128) {
-                    survivors.push((key.to_vec(), value, meta, old_u128));
+                    survivors.push(Survivor {
+                        key: key.to_vec(),
+                        value,
+                        epoch: meta.epoch,
+                        old_pointer: old_u128,
+                    });
                 }
             })?;
 
             // ── Phase 2: relocate survivors, re-point by compare-and-set ──────
+            //
+            // Each copy is written as a NEW version of its key: a fresh seq, drawn
+            // under the key's stripe after checking the key still points at the
+            // record copied. Every writer holds its key's stripe from drawing its
+            // seq to applying the write, so with the stripe held no write to the
+            // key is half-done, and the fresh seq is newer than every copy of the
+            // key already stored and older than every write still to come. The
+            // copy therefore goes into the newest layer as the newest version,
+            // and a newer layer always holds a newer version.
+            //
+            // The lock order is stripe → bucket, but the batched check below
+            // needs the bucket lock first. So under the bucket lock GC only
+            // *tries* each stripe: a writer holding it may be waiting for this
+            // very bucket lock, and waiting for it here would deadlock. A key
+            // whose stripe is busy is deferred and re-pointed afterwards, taking
+            // the two locks in order.
+            let mut deferred: Vec<&Survivor> = Vec::new();
             {
                 let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
                 // Batched for the same reason as phase 1 — a per-survivor
-                // `get_with_seq` pays the same full L0 scan, and here it is paid
-                // while holding the bucket write lock, which blocks every writer
-                // to this bucket (`put_to_storage` / `delete_from_storage` hold
-                // it across their value-log append *and* their LSM update): writes
-                // to the bucket would starve while reads, which take no such lock,
-                // run at full speed.
+                // lookup pays the same full L0 scan, and here it is paid while
+                // holding the bucket write lock, which blocks every writer to
+                // this bucket (`put_to_storage` / `delete_from_storage` hold it
+                // across their value-log append *and* their LSM update).
                 //
                 // Still a compare-and-set: holding that lock excludes every
-                // writer, so one batched read under it sees exactly what
-                // per-key reads under it would. The appends below do mutate the
-                // LSM as we go, but survivors carry no duplicate keys (see phase
-                // 1), so no entry can invalidate another's resolved answer.
-                let survivor_keys: Vec<Vec<u8>> = survivors.iter().map(|(key, _, _, _)| key.clone()).collect();
+                // writer's apply, so one batched read under it sees exactly what
+                // per-key reads under it would. The re-points below do mutate
+                // the LSM as we go, but survivors carry no duplicate keys (see
+                // phase 1), so no re-point can invalidate another's answer.
+                let survivor_keys: Vec<Vec<u8>> = survivors.iter().map(|s| s.key.clone()).collect();
                 let current_pointers = self.lsm.get_multiple(&survivor_keys)?;
 
-                for ((key, value, meta, old_u128), current) in survivors.iter().zip(current_pointers) {
-                    let Some((current, seq)) = current else {
-                        continue; // deleted since phase 1 — do not resurrect
-                    };
-                    if current != *old_u128 {
-                        continue; // overwritten since phase 1 — do not revert
+                for (survivor, current) in survivors.iter().zip(current_pointers) {
+                    if current.map(|(pointer, _seq)| pointer) != Some(survivor.old_pointer) {
+                        continue; // deleted or overwritten since phase 1
                     }
-                    let new_pointer = self.value_log.append_to_locked_bucket(bucket, key, value, *meta, false)?;
-                    let applied = match self.lsm.insert_with_seq(key, new_pointer.to_u128(), seq) {
-                        Ok(applied) => applied,
-                        Err(e) => {
-                            // Nothing points at the copy: count it as garbage, as the put
-                            // path does. The key keeps its old pointer, and this segment
-                            // stays until a later pass relocates it.
-                            self.value_log.note_displaced(new_pointer, key.len());
-                            return Err(e.into());
-                        }
+                    let Some(_stripe) = self.key_locks.try_guard(&survivor.key) else {
+                        deferred.push(survivor);
+                        continue;
                     };
-                    // The old record, if the memtable held it, is now unreferenced
-                    // (it lives in this segment, which is about to go). Held in a
-                    // lower layer, it is dropped by the next merge: counting it then
-                    // finds no segment to charge once this one is deleted.
-                    self.note_applied(applied, Some(new_pointer), key.len());
-                    result.bytes_rewritten += new_pointer.record_len(key.len());
+                    result.bytes_rewritten += self.relocate_locked(bucket, survivor)?;
                 }
+            }
+
+            // The keys whose stripe was busy: stripe, then bucket, then the
+            // compare-and-set again (the key may have changed meanwhile).
+            for survivor in deferred {
+                let _stripe = self.lock_key(&survivor.key);
+                let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+                if self.lsm.get(&survivor.key)? != Some(survivor.old_pointer) {
+                    continue;
+                }
+                result.bytes_rewritten += self.relocate_locked(bucket, survivor)?;
             }
 
             result.pending_unlink.push(segment.id);
         }
 
         Ok(result)
+    }
+
+    /// Copy `survivor` to the active tail and point its key at the copy, at a
+    /// fresh seq. The caller holds the key's stripe and `bucket`'s write lock and
+    /// has checked the key still points at `survivor.old_pointer`. Returns the
+    /// bytes written.
+    fn relocate_locked(&self, bucket: u32, survivor: &Survivor) -> Result<u64> {
+        let key = survivor.key.as_slice();
+        // Drawn here, with the stripe held: newer than every stored copy of the
+        // key, older than any write to it still to come.
+        let seq = self.alloc_seq();
+        let meta = ValueRecordMeta { epoch: survivor.epoch, seq };
+        let new_pointer = self.value_log.append_to_locked_bucket(bucket, key, &survivor.value, meta, false)?;
+        let applied = match self.lsm.insert_with_seq(key, new_pointer.to_u128(), seq) {
+            Ok(applied) => applied,
+            Err(e) => {
+                // Nothing points at the copy: count it as garbage, as the put
+                // path does. The key keeps its old pointer, and this segment
+                // stays until a later pass relocates it.
+                self.value_log.note_displaced(new_pointer, key.len());
+                return Err(e.into());
+            }
+        };
+        // The old record, if the memtable held it, is now unreferenced (it lives
+        // in a segment about to go). Held in a lower layer, it is dropped by the
+        // next merge: counting it then finds no segment to charge once this one
+        // is deleted.
+        self.note_applied(applied, Some(new_pointer), key.len());
+        Ok(new_pointer.record_len(key.len()))
     }
 
     /// Run value-log GC across every bucket.

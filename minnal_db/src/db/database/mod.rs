@@ -5,7 +5,6 @@
 
 use crate::namespace::NamespaceId;
 mod flush_observers;
-pub(crate) mod key_locks;
 mod open;
 mod shutdown;
 mod stats;
@@ -18,7 +17,6 @@ mod writes;
 pub(crate) use flush_observers::*;
 
 use crate::db::config::DbConfig;
-use crate::db::database::key_locks::KeyLocks;
 use crate::db::error::{KVError, Result};
 use crate::db::indexing::manager::IndexManager;
 use crate::db::stats::{GCStats, Stats};
@@ -195,16 +193,6 @@ pub struct Database {
 
     // Global monotonic sequence counter. Seeded from the WAL on open.
     pub(crate) next_seq: Arc<AtomicU64>,
-
-    // Striped per-key write locks — the OUTERMOST lock on every WAL-backed
-    // write path. `merge_ns` needs read-modify-write to be indivisible, and the
-    // two locks the write path already takes cannot provide that: the WAL
-    // metadata lock is global (so a user closure under it stalls every
-    // namespace), and the value-log bucket lock is taken only *after* the WAL
-    // lock is released, so making the merge atomic with it would invert the
-    // established order. The stripe sits above both, giving one uniform order
-    // `stripe -> wal_metadata -> (released) -> bucket`. See `key_locks`.
-    pub(in crate::db) key_locks: KeyLocks,
 
     // Directory for recovery fail-log files.
     pub(in crate::db) fail_log_dir: PathBuf,

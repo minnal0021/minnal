@@ -98,7 +98,6 @@ impl Database {
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_checkpoints: Default::default(),
             next_seq,
-            key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics,
             #[cfg(test)]
@@ -111,7 +110,7 @@ impl Database {
     /// Test hook: the key-stripe lock `key` takes in `namespace_id`.
     #[cfg(test)]
     pub(crate) fn stripe_of(&self, namespace_id: NamespaceId, key: &[u8]) -> usize {
-        self.key_locks.stripe_of(namespace_id, key)
+        self.get_store(namespace_id).expect("namespace is open").stripe_of(key)
     }
 
     /// Test hook: copy this database's directory to `to` as a power loss

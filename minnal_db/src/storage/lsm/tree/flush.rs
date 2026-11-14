@@ -49,16 +49,34 @@ impl LSMTree {
             return Ok(());
         }
 
+        // Level 0 takes memtables in the order they were frozen: each memtable's
+        // files must be registered before a newer one's, so that every layer
+        // holds newer versions of a key than the layers below it (and the stamp,
+        // which orders L0 files, is drawn after this check). Every caller goes
+        // through `flush_read_only_memtables`, which flushes oldest first and
+        // stops at a failure, so this never fires; it is the guard should a new
+        // caller pick one memtable out of order.
+        let version = ro_memtable.version();
+        let older = self
+            .read_only_memtables
+            .read()
+            .iter()
+            .find(|ro| ro.version() < version && !ro.is_flushed_to_level0())
+            .map(ReadOnlyMemTable::version);
+        if let Some(older) = older {
+            return Err(LSMError::FlushOutOfOrder { version, older });
+        }
+
         // Nothing is on disk yet, so a veto leaves nothing to undo: the
         // memtable stays read-only and unflushed, and a later flush retries it.
-        self.notify_ro_memtable_flushing(ro_memtable.version()).map_err(LSMError::Io)?;
+        self.notify_ro_memtable_flushing(version).map_err(LSMError::Io)?;
 
         let records = ro_memtable.records();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let timestamp = self.next_l0_stamp(now_ms.saturating_mul(1_000_000).saturating_add(ro_memtable.version() as u128));
+        let timestamp = self.next_l0_stamp(now_ms.saturating_mul(1_000_000).saturating_add(version as u128));
 
         // Write and fsync every bucket's file first, register them after. Between
         // the two, observers learn the files are durable while nothing can yet
@@ -82,7 +100,7 @@ impl LSMTree {
             }
         }
 
-        if let Err(e) = self.notify_ro_memtable_written(ro_memtable.version()) {
+        if let Err(e) = self.notify_ro_memtable_written(version) {
             // An observer could not record the flush (the vector index WAL's
             // progress marker, or the value-log fsync before it). Registering
             // anyway would make the files mergeable while that progress is not
@@ -97,7 +115,7 @@ impl LSMTree {
         }
 
         ro_memtable.mark_flushed_to_level0();
-        self.notify_ro_memtable_flushed_to_level0(ro_memtable.version());
+        self.notify_ro_memtable_flushed_to_level0(version);
         Ok(())
     }
 
@@ -247,8 +265,17 @@ impl LSMTree {
                 self.flush_memtable()?;
             }
         }
-        let ro_memtables = self.read_only_memtables.read();
-        for ro in ro_memtables.iter() {
+        self.flush_read_only_memtables()
+    }
+
+    /// Flush every read-only memtable to Level 0, oldest first, stopping at the
+    /// first failure — the one way memtables reach L0, so they arrive in the
+    /// order they were frozen. A memtable another thread is flushing is waited
+    /// for (its flush lock), so on return every memtable in the snapshot is on
+    /// disk.
+    pub(super) fn flush_read_only_memtables(&self) -> Result<()> {
+        let snapshot = self.read_only_memtables.read().clone();
+        for ro in snapshot.iter() {
             self.flush_ro_memtable_to_level0(ro)?;
         }
         Ok(())

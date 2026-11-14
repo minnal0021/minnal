@@ -30,7 +30,7 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
 - **Sequence (seq)** — the global write counter every write draws from,
   whichever log it uses; the highest seq for a key wins everywhere (memtable,
   L0, L1, replay).
-- **Key stripe lock** (`db/database/key_locks.rs`) — 1,024 locks, each key hashed to one
+- **Key stripe lock** (`kv_store/key_locks.rs`) — 1,024 locks per namespace, each key hashed to one
   (its *stripe*). Every write takes its key's stripe before anything else and
   holds it until the write is applied, so one key's writes apply in seq order
   whichever log they use.

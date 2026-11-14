@@ -150,7 +150,7 @@ Because the same key can exist in several tiers at once, a read must decide whic
 2. **Full resolution.** Otherwise, gather the key's entry from *every* layer — the active MemTable, each sealed read-only MemTable, the bucket's L0 files, and its L1 SSTable — and keep the one with the **highest sequence**. A tombstone winning means "not found".
 3. Follow the winning pointer into the value log to fetch the actual bytes.
 
-Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. L0 files are also ordered by when they were flushed, and sealed MemTables can finish flushing out of order. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
+Every writer keeps a newer layer holding newer versions: live writes and GC's re-points draw their sequence under the key's stripe, replay drops a record that is not newer than what is stored, and MemTables reach L0 in the order they were frozen ([Layer-Order-Design.md](docs/Layer-Order-Design.md)). Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) gives the right answer without relying on that rule, at a cost of roughly 5–10% on reads.
 
 Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash of their first 8 bytes**, so any given lookup only ever touches one bucket's L1 file — a single 1/8th-sized slice of the data rather than the whole tree.
 
@@ -234,7 +234,7 @@ GC's unit is a **segment**, never the whole bucket:
 
 1. **Pick** the sealed segments whose garbage ratio is over the per-segment selection bar, worst first. The active tail is never a candidate.
 2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so GC looks all of the segment's keys up in the LSM in one batched lookup: a record survives if the LSM still points at exactly this location.
-3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. The re-insert keeps the key's existing sequence, so relocating a record never makes it look like a newer write.
+3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. Each copy is a new version of its key, at a fresh sequence drawn under the key's stripe, so it is the newest version like any other write; a key whose stripe a writer holds is re-pointed after the batch, taking its stripe first.
 4. **Flush** the memtable to L0, making the re-point durable.
 5. **Unlink** the old segment file.
 
@@ -246,7 +246,7 @@ The cost of a pass is therefore proportional to *one segment's survivors*, not t
 
 A read is two steps — ask the LSM where the value is, then read it there — and GC can relocate the value in between. It cannot, however, make the read *wrong*:
 
-- A pointer GC has already superseded still resolves to **that key's own bytes**. The record is still sitting in the old segment, and GC re-points under the key's existing sequence, so the relocated copy is the same write.
+- A pointer GC has already superseded still resolves to **that key's own bytes**. The record is still sitting in the old segment, and the relocated copy holds the same value.
 - A pointer into a segment GC has already **unlinked** fails loudly (`SegmentMissing`) — never silently against some other key's record, because that id will never be handed out again. The reader re-resolves through the LSM, which by then holds the new pointer, and retries.
 
 That is the whole protocol. There is **no seqlock, no generation counter, and no per-record sequence check on the read path** — a stale pointer is *stale*, never *wrong*. A read that keeps losing the race falls back, after a few attempts, to a read holding the bucket write lock, which excludes GC entirely and guarantees progress.
@@ -409,7 +409,7 @@ The design and its measurements are in `src/semantic_search/docs/Vector-Index-WA
 - **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
 - **Commit round** — one fsync and the callers it releases, in either log (`db/wal/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
 - **Sequence (seq)** — the global write counter (`next_seq`) every write draws from, whichever log it uses. The highest seq for a key wins everywhere: memtable, L0, L1, and replay of either log.
-- **Key stripe lock** (`db/database/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
+- **Key stripe lock** (`kv_store/key_locks.rs`) — a fixed array of 1,024 locks per namespace; each key hashes to one, its *stripe*, so two keys of a namespace may share one. Every write takes its key's stripe first, before any log lock, and holds it until the write is in the memtable; value-log GC takes it to re-point a key. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
 - **Memtable** — a namespace's in-memory sorted buffer of recent writes (a skip list). **Seal:** turning a full one read-only so it can be flushed. **Flush:** writing a sealed memtable to L0 files and fsyncing them.
 - **L0 / L1** — the LSM tree's on-disk levels: L0 holds one file per flush per bucket, L1 one merged file per bucket. **Compaction** merges L0 into L1 and may drop tombstones there.
 - **Tombstone** — the record a delete leaves, so the key reads as absent until compaction removes both.
@@ -628,7 +628,7 @@ get(key)
         └──► no candidate → return None
 ```
 
-Layer order is deliberately *not* the tie-breaker: value-log GC re-points a relocated key under its original sequence, so a newer layer can legitimately hold an older version. See [LSM Tree](#lsm-tree) for why first-hit-wins would resurrect deleted keys.
+Every writer keeps newer versions in newer layers ([Layer-Order-Design.md](docs/Layer-Order-Design.md)), but the read does not depend on it: it compares sequences across every layer. See [LSM Tree](#lsm-tree).
 
 ---
 

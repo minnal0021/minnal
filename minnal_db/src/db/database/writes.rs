@@ -100,12 +100,13 @@ impl Database {
 
     pub fn put_ns(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
-        // The key stripe is the outermost write lock (see `key_locks`). A blind
+        // The key stripe is the outermost write lock (see `crate::kv_store::key_locks`). A blind
         // put does not need it for itself, but taking it is what lets `merge_ns`
         // read-modify-write without a concurrent put slipping in between its
         // read and its write. It costs an uncontended mutex acquire on a path
         // that already serialises globally on the WAL fsync.
-        let _stripe = self.key_locks.guard(namespace_id, key);
+        let store = self.get_store(namespace_id)?;
+        let _stripe = store.lock_key(key);
         // Discarded: `put`'s contract is that a WAL-durable write is a success,
         // whether or not it is readable yet. See `WriteOutcome`.
         self.put_ns_locked(namespace_id, key, value, "put").map(|_| ())
@@ -227,7 +228,8 @@ impl Database {
         self.check_closed()?;
         // Outermost write lock — see `put_ns`. No-WAL writes take it too, so a
         // merge is serialised against bulk loading as well as against `put`.
-        let _stripe = self.key_locks.guard(namespace_id, key);
+        let store = self.get_store(namespace_id)?;
+        let _stripe = store.lock_key(key);
         self.put_ns_no_wal_locked(namespace_id, key, value)
     }
 
@@ -260,8 +262,8 @@ impl Database {
     pub fn put_ns_logged(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_closed()?;
         self.check_write_size(key, value)?;
-        let _stripe = self.key_locks.guard(namespace_id, key);
         let kv_store = self.get_store(namespace_id)?;
+        let _stripe = kv_store.lock_key(key);
         let seq = kv_store.alloc_seq();
         let logged = self.vector_index_wal.append(namespace_id, key, value, seq)?;
         // The main WAL never sees this write, so a field index on the namespace
@@ -287,8 +289,8 @@ impl Database {
     pub fn delete_ns_logged(&self, namespace_id: NamespaceId, key: &[u8]) -> Result<()> {
         self.check_closed()?;
         self.check_write_size(key, &[])?;
-        let _stripe = self.key_locks.guard(namespace_id, key);
         let kv_store = self.get_store(namespace_id)?;
+        let _stripe = kv_store.lock_key(key);
         let seq = kv_store.alloc_seq();
         let logged = self.vector_index_wal.append_delete(namespace_id, key, seq)?;
         self.note_no_wal_index_exposure(namespace_id);
@@ -320,7 +322,8 @@ impl Database {
     pub fn delete_ns_no_wal(&self, namespace_id: NamespaceId, key: &[u8]) -> Result<()> {
         self.check_closed()?;
         // Outermost write lock — see `put_ns`.
-        let _stripe = self.key_locks.guard(namespace_id, key);
+        let store = self.get_store(namespace_id)?;
+        let _stripe = store.lock_key(key);
         self.delete_ns_no_wal_locked(namespace_id, key)
     }
 
@@ -384,9 +387,9 @@ impl Database {
         // apply. This is the whole atomicity argument: no other WAL-backed write
         // to this key can be durable-but-unapplied while we hold it, so the
         // closure never sees a stale base.
-        let _stripe = self.key_locks.guard(namespace_id, key);
-
         let kv_store = self.get_store(namespace_id)?;
+        let _stripe = kv_store.lock_key(key);
+
         if let Some(m) = kv_store.metrics() {
             crate::support::metrics::Metrics::bump(&m.merges);
         }
@@ -436,9 +439,9 @@ impl Database {
     {
         self.check_closed()?;
         // Held across the read, the closure and the write: see `merge_ns`.
-        let _stripe = self.key_locks.guard(namespace_id, key);
-
         let kv_store = self.get_store(namespace_id)?;
+        let _stripe = kv_store.lock_key(key);
+
         if let Some(m) = kv_store.metrics() {
             crate::support::metrics::Metrics::bump(&m.merges);
         }
@@ -483,7 +486,8 @@ impl Database {
     pub fn delete_ns(&self, namespace_id: NamespaceId, key: &[u8]) -> Result<()> {
         self.check_closed()?;
         // Outermost write lock — see `put_ns`.
-        let _stripe = self.key_locks.guard(namespace_id, key);
+        let store = self.get_store(namespace_id)?;
+        let _stripe = store.lock_key(key);
         // Discarded, as in `put_ns`.
         self.delete_ns_locked(namespace_id, key, "delete").map(|_| ())
     }

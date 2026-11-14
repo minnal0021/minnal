@@ -189,13 +189,13 @@ fn test_lsm_basic_operations() -> Result<()> {
     Ok(())
 }
 
-// A relocated value re-inserted at the key's OLD sequence into the newest
-// layer must NOT shadow a higher-sequence tombstone that has flushed to an
-// older layer. A `get` that returned at the first layer holding the key would
-// resolve this to the value and resurrect a deleted key. The test builds the
-// inverted state directly; production also prevents it at the GC re-point
-// (seq-aware `get_with_seq` under the bucket lock), so this guards the read
-// path as a second line of defence.
+// A value re-inserted at an OLD sequence into the newest layer must NOT shadow
+// a higher-sequence tombstone that has flushed to an older layer. A `get` that
+// returned at the first layer holding the key would resolve this to the value
+// and resurrect a deleted key. No writer produces this state any more (GC
+// writes its copies at a fresh seq, replay drops older records:
+// `docs/Layer-Order-Design.md`); the test builds it directly, so it guards the
+// read path as a second line of defence.
 #[test]
 fn test_repoint_at_old_seq_does_not_resurrect_across_layers() -> Result<()> {
     let temp_dir = TempDir::new()?;
@@ -208,10 +208,10 @@ fn test_repoint_at_old_seq_does_not_resurrect_across_layers() -> Result<()> {
     lsm.flush_memtable_to_level0()?; // tombstone @ seq 5 → L0
     assert_eq!(lsm.get(b"k")?, None, "deleted after flush");
 
-    // GC re-point: re-insert the relocated value at the OLD seq into the
-    // now-empty active memtable. The key is still logically deleted.
+    // Re-insert a value at the OLD seq into the now-empty active memtable. The
+    // key is still logically deleted.
     lsm.insert_with_seq(b"k", 0xBBBB, 1)?;
-    assert_eq!(lsm.get(b"k")?, None, "GC re-point at old seq resurrected a deleted key");
+    assert_eq!(lsm.get(b"k")?, None, "a re-insert at an old seq resurrected a deleted key");
     Ok(())
 }
 
@@ -350,7 +350,7 @@ fn test_keys_excludes_sstable_entry_tombstoned_in_memtable() -> Result<()> {
 // path, RO binary search, L0 summaries (range/bloom/max-seq) and L1 max-seq
 // pruning — in both `get_with_seq` and `get_multiple`. Random writes carry
 // OUT-OF-ORDER sequences (so lower-seq copies land in newer layers, the case
-// every shortcut must respect) plus GC-style re-points at an existing seq, with
+// every shortcut must respect) plus re-points at an existing seq (ties), with
 // flushes, compactions and reopens mixed in. After every step both lookup paths
 // must agree with `reference_get` for every key, including never-written ones.
 #[test]
@@ -404,7 +404,7 @@ fn test_read_shortcuts_agree_with_brute_force_resolution() -> Result<()> {
                     lsm.delete_with_seq(key, seq)?;
                 }
                 80..=86 => {
-                    // GC re-point: same seq as the current winner, new pointer.
+                    // A re-point at the same seq as the current winner, new pointer.
                     if let Some((_, cur)) = lsm.get_with_seq(key)? {
                         lsm.insert_with_seq(key, u128::from(rng.next()), cur)?;
                     }

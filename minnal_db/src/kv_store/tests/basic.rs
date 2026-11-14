@@ -137,7 +137,7 @@ fn a_put_whose_lsm_insert_fails_counts_its_record_as_garbage() {
 /// delete can be replayed after a newer put of its key from the vector WAL;
 /// that delete loses, and must not count the live record as garbage.
 #[test]
-fn a_replayed_write_that_loses_counts_only_its_own_record_as_garbage() {
+fn a_replayed_write_that_loses_is_dropped_and_charges_nothing() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),
@@ -162,11 +162,10 @@ fn a_replayed_write_that_loses_counts_only_its_own_record_as_garbage() {
 
     store.replay_upsert(b"k", &loser, 7).unwrap();
     assert_eq!(store.get(b"k").unwrap(), Some(winner), "the losing replayed put is dropped");
-    let loser_len = crate::storage::value_log::ValueRecordHeader::record_len(b"k".len(), loser.len());
     assert_eq!(
         store.value_log.total_garbage_bytes(),
-        loser_len,
-        "only the losing put's own record is garbage"
+        0,
+        "a losing put is dropped before its value is appended, so it leaves no garbage"
     );
 }
 

@@ -144,16 +144,13 @@ impl LSMTree {
     /// The stamp for the next L0 flush: `candidate` (wall-clock based, so file names
     /// stay readable), but never at or below any stamp already issued or on disk.
     ///
-    /// L0 file order breaks **exact seq ties**, and GC's relocation makes them: it
-    /// re-inserts a key at its existing seq with a new pointer, so the old and the
-    /// relocated copy can sit in two L0 files with the same seq, and only file
-    /// order says the relocation is newer. Ordered by raw wall time, a clock that
-    /// steps backwards (NTP, a VM or WSL resume) between the two flushes would put
-    /// the relocation *first*: every read would return the pre-relocation pointer,
-    /// the L0→L1 merge would keep it in L1, and once GC unlinked its segment the key
-    /// would read `SegmentMissing` for good (and the next GC pass would judge the
-    /// real record dead). Stamps are taken after the per-memtable flush lock, and
-    /// memtables flush in version order, so a later flush always gets a larger stamp.
+    /// L0 file order is layer order: a newer file must hold newer versions than an
+    /// older one (`docs/Layer-Order-Design.md`), and it breaks exact seq ties.
+    /// Ordered by raw wall time, a clock that steps backwards (NTP, a VM or WSL
+    /// resume) between two flushes would put the newer memtable's files *first*.
+    /// Stamps are taken after the per-memtable flush lock, and memtables flush in
+    /// version order (`flush_read_only_memtables`), so a later flush always gets a
+    /// larger stamp.
     pub(super) fn next_l0_stamp(&self, candidate: u128) -> u128 {
         let mut last = self.last_l0_stamp.lock();
         let stamp = candidate.max(last.saturating_add(1));
