@@ -193,5 +193,19 @@ The measurement is `first_hit_against_seq_resolution`
 Scans and the L0→L1 merge compare one seq per entry they already read, so
 resolving them by layer would save no I/O.
 
-GC's cost with the stripe has still to be measured: GC throughput, and writers'
-p99 latency during a GC pass.
+## What the stripe costs GC
+
+Taking each key's stripe and drawing a fresh seq costs GC and the writers beside
+it nothing measurable. `gc_cost_under_writers` (`db/database/tests/gc_cost.rs`,
+`#[ignore]`d; run in release with `TMPDIR` on a real disk) runs a GC pass over
+300,000 keys of 1 KiB values in 4 MiB segments, alone and with 8 writers doing
+WAL-backed puts of random keys. Three runs of each, on NVMe, against the same
+harness on the commit before this design:
+
+| | Without the stripe (old seq) | With it (fresh seq) |
+|---|---|---|
+| GC alone, 720 MiB reclaimed | 488–505 MiB/s | 490–503 MiB/s |
+| GC with writers, 632 MiB reclaimed | 463–467 MiB/s | 459–461 MiB/s |
+| Writers during GC: p50 / p99 | 4.6–4.7 / 9.8–12.1 ms | 4.6–4.7 / 9.8–9.9 ms |
+| Writers during GC: p99.9 / max | 18.3–20.8 / 18.8–20.8 ms | 17.9–20.8 / 17.9–21.5 ms |
+| Writers without GC: p99 | 6.8–7.0 ms | 6.9–7.0 ms |
