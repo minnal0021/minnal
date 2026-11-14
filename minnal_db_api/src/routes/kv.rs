@@ -262,7 +262,7 @@ async fn kv_key_type_for(state: &AppState, ns: &str) -> Result<KvKeyType, AppErr
 ///
 /// This is also where reserved route segments are rejected. It only needs to
 /// happen on the write path: `GET`/`DELETE /stores/{ns}/kv/prefix` never reach
-/// a handler (the static prefix-scan route wins), so the fix is to refuse to
+/// a handler (the static prefix-scan route wins), so the write refuses to
 /// *create* a record that could never be read back. Length validation happens
 /// one layer down, in `KvKeyType::serialize_key`.
 async fn key_to_json(state: &AppState, ns: &str, raw: &str) -> Result<serde_json::Value, AppError> {

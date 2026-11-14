@@ -128,7 +128,7 @@ async fn a_semantic_store_has_its_vector_namespaces_from_the_start() {
     assert!(names.contains(&vector_kv::sparse_vectors_ns("g")), "open restores it: {names:?}");
     store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
     wait_for_empty_queue(&store).await;
-    assert_eq!(store.count_indexed_docs("g").await, 1);
+    assert_eq!(store.count_indexed_docs("g").await.unwrap(), 1);
     store.shutdown().await.unwrap();
 }
 
@@ -283,7 +283,7 @@ async fn a_semantic_store_missing_its_partition_gets_one_at_open() {
     partition(&store, "g").await;
     store.put("g", DocId::U64(1), serde_json::json!({"text": TEXT})).await.unwrap();
     wait_for_empty_queue(&store).await;
-    assert_eq!(store.count_indexed_docs("g").await, 1);
+    assert_eq!(store.count_indexed_docs("g").await.unwrap(), 1);
     store.shutdown().await.unwrap();
 }
 
@@ -294,7 +294,7 @@ async fn counting_indexed_documents_of_an_unknown_store_creates_nothing() {
     let (url, _seen) = spawn_service();
     let db_dir = TempDir::new().unwrap();
     let store = open_with(db_dir.path(), |b| b.semantic_search(context(&url))).await;
-    assert_eq!(store.count_indexed_docs("nope").await, 0);
+    assert_eq!(store.count_indexed_docs("nope").await.unwrap(), 0);
     let left = companions_left(&store, "nope");
     assert!(left.is_empty(), "{left:?}");
     store.shutdown().await.unwrap();

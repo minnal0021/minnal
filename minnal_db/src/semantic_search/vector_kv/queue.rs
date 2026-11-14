@@ -47,12 +47,9 @@ pub struct QueueEntry {
     pub last_error: Option<String>,
 }
 
-/// Version `0x01`: `[version] [retry_count: 4B BE] [text bytes]`
-const QUEUE_VALUE_V1: u8 = 0x01;
-/// Version `0x02`: `[version] [retry_count: 4B BE] [error_len: 4B BE] [error bytes] [text bytes]`
-const QUEUE_VALUE_V2: u8 = 0x02;
-/// Version `0x03`: `[version] [kind: 1B] [retry_count: 4B BE] [error_len: 4B BE] [error bytes] [text bytes]`
-/// — v2 plus the entry kind (`0` = embed, `1` = clear). v1/v2 entries decode as embed.
+/// The queue value's format version, its first byte. The value is
+/// `[version] [kind: 1B] [retry_count: 4B BE] [error_len: 4B BE] [error bytes] [text bytes]`,
+/// where `kind` is `0` (embed) or `1` (clear).
 const QUEUE_VALUE_VERSION: u8 = 0x03;
 
 const KIND_EMBED: u8 = 0;
@@ -106,35 +103,17 @@ impl QueueValue {
     }
 }
 
-/// Decode any on-disk queue value version (v1, v2, v3).
+/// Decode a queue value; `None` for an unknown version or a damaged value.
 pub(super) fn decode_queue_value(value: &[u8]) -> Option<QueueValue> {
-    let version = *value.first()?;
-    // v1 has no error field; v2 and v3 share the retry/error/text tail, v3 behind a kind byte.
-    let (kind, tail) = match version {
-        v if v == QUEUE_VALUE_V1 => {
-            if value.len() < 5 {
-                return None;
-            }
-            let retry_count = u32::from_be_bytes(value[1..5].try_into().ok()?);
-            let text = std::str::from_utf8(&value[5..]).ok()?.to_owned();
-            return Some(QueueValue {
-                kind: QueueEntryKind::Embed,
-                text,
-                retry_count,
-                last_error: None,
-            });
-        }
-        v if v == QUEUE_VALUE_V2 => (QueueEntryKind::Embed, &value[1..]),
-        v if v == QUEUE_VALUE_VERSION => {
-            let kind = match *value.get(1)? {
-                KIND_EMBED => QueueEntryKind::Embed,
-                KIND_CLEAR => QueueEntryKind::Clear,
-                _ => return None,
-            };
-            (kind, &value[2..])
-        }
+    if *value.first()? != QUEUE_VALUE_VERSION {
+        return None;
+    }
+    let kind = match *value.get(1)? {
+        KIND_EMBED => QueueEntryKind::Embed,
+        KIND_CLEAR => QueueEntryKind::Clear,
         _ => return None,
     };
+    let tail = &value[2..];
     if tail.len() < 8 {
         return None;
     }
@@ -284,18 +263,42 @@ pub async fn list_queue_entries(db: &AsyncDb) -> Result<Vec<QueueEntry>, crate::
     Ok(result)
 }
 
+/// How many entries the embedding queue holds, counted from the keys alone.
+pub async fn count_queue_entries(db: &AsyncDb) -> Result<usize, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    queue_ns.count().await
+}
+
 /// The namespaces that have entries in the embedding queue, read from the keys
 /// alone. The queue key carries the namespace and the value carries the text, so
 /// this never reads a value: after a crash mid bulk-load the queue can hold every
 /// document's text, and the startup drop sweep needs only the namespaces.
+///
+/// Queue keys start with their namespace, so one namespace's entries are
+/// contiguous: the walk reads one key, then jumps past that namespace's entries.
+/// It reads about one key per queued namespace, however long the queue.
 pub async fn queued_namespaces(db: &AsyncDb) -> Result<std::collections::BTreeSet<String>, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
-    Ok(queue_ns
-        .keys()
-        .await?
-        .iter()
-        .filter_map(|key| decode_queue_key(key).map(|(namespace, _)| namespace.to_owned()))
-        .collect())
+    let mut namespaces = std::collections::BTreeSet::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let (keys, next) = queue_ns.key_page(cursor.clone(), None, 1).await?;
+        let Some(key) = keys.into_iter().next() else {
+            return Ok(namespaces);
+        };
+        cursor = match decode_queue_key(&key) {
+            Some((namespace, _)) => {
+                let past = crate::support::prefix_upper_bound(&queue_prefix(namespace));
+                namespaces.insert(namespace.to_owned());
+                past
+            }
+            // Not a queue key: step over it.
+            None => next,
+        };
+        if cursor.is_none() {
+            return Ok(namespaces);
+        }
+    }
 }
 
 /// The key prefix every queue entry of `namespace` starts with, for paging
@@ -355,7 +358,7 @@ pub async fn get_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8])
 //   removes the entry), so the completing worker sees it and removes the vectors
 //   it just wrote.
 
-/// `MergeAborted` reasons used to report why a conditional update wrote nothing.
+/// `MergeAborted` reasons: why a conditional update wrote nothing.
 const ABORT_SUPERSEDED: &str = "queue entry superseded";
 const ABORT_CLEARED: &str = "queue entry is a clear tombstone";
 
@@ -431,7 +434,7 @@ pub async fn finish_embed(db: &AsyncDb, entry: &QueueEntry, vector_indexes: &[Ve
 /// nothing queued to replace it: it would stay indexed under its old text, minus
 /// the chunks whose clusters changed. With
 /// completion after this barrier, a crash before it leaves the queue entry in
-/// place and the restarted worker redoes it. Regression test:
+/// place and the restarted worker redoes it. Test:
 /// `crash_before_reembed_is_synced_keeps_new_vectors`.
 pub async fn make_vector_writes_durable(db: &AsyncDb) -> Result<(), crate::KVError> {
     db.sync_vector_index_wal().await

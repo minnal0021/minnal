@@ -1,3 +1,6 @@
+//! `AppError`: what a route can fail with, and the HTTP status and JSON body
+//! each error becomes.
+
 use axum::{
     Json,
     http::StatusCode,

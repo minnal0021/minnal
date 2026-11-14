@@ -146,30 +146,12 @@ fn test_clear_entry_roundtrip() {
 }
 
 #[test]
-fn test_v1_backward_compat() {
-    // Simulate an on-disk v1 value: [0x01] [retry_count: 4B] [text bytes]
-    let mut v1 = vec![0x01u8, 0x00, 0x00, 0x00, 0x02];
-    v1.extend_from_slice(b"old text");
-    let v = decode_queue_value(&v1).unwrap();
-    assert_eq!((v.kind, v.text.as_str(), v.retry_count, v.last_error), (E, "old text", 2, None));
-}
-
-/// Entries written before the kind byte existed are embed entries.
-#[test]
-fn test_v2_backward_compat() {
-    // [0x02] [retry_count: 4B] [error_len: 4B] [error] [text]
-    let mut v2 = vec![0x02u8, 0, 0, 0, 1, 0, 0, 0, 3];
-    v2.extend_from_slice(b"errold text");
-    let v = decode_queue_value(&v2).unwrap();
-    assert_eq!((v.kind, v.text.as_str(), v.retry_count), (E, "old text", 1));
-    assert_eq!(v.last_error.as_deref(), Some("err"));
-}
-
-#[test]
 fn test_value_decoding_rejects_unknown_version() {
-    // 0x04 is not a known version.
-    let bad = b"\x04\x00\x00\x00\x00\x00\x00\x00\x00hello";
-    assert!(decode_queue_value(bad).is_none());
+    for version in [0x01u8, 0x02, 0x04] {
+        let mut bad = encode_queue_value(QueueEntryKind::Embed, "hello", 0, None);
+        bad[0] = version;
+        assert!(decode_queue_value(&bad).is_none(), "version {version}");
+    }
 }
 
 #[test]
@@ -256,16 +238,12 @@ async fn test_reenqueue_after_retries_resets_count_to_zero() {
     assert_eq!(entries[0].retry_count, 0, "re-enqueue must reset retry_count");
 }
 
-// ── restart regression ────────────────────────────────────────────────────
+// ── Removed entries stay removed after a restart ───────────────────────────
 
-// Regression test for the vec-index queue infinite-loop bug after restart.
-//
-// Before the fix, WAL recovery called flush_and_compact_all(), pushing queue
-// entries from the memtable into SSTables.  remove_queue_entry() then wrote
-// a tombstone into the *active* memtable.  LsmTree::keys() (used by iter())
-// collected SSTable keys last — without tombstone suppression — so the deleted
-// entries re-appeared in every subsequent list_queue_entries() call, causing
-// the worker to loop forever.
+// WAL recovery flushes the queue's entries into SSTables, and removing an entry
+// writes a tombstone into the *active* memtable. A listing must let that
+// tombstone hide the SSTable entry; one that did not would show removed entries
+// again on every call, and the worker would loop forever.
 //
 // This test reproduces that exact sequence: enqueue → graceful shutdown →
 // reopen (triggers WAL recovery + SSTable flush) → cancel → assert queue empty.
@@ -294,12 +272,33 @@ async fn test_queue_empty_after_cancel_following_restart() {
         remove_queue_entry(&db, &entry.namespace, &entry.doc_id_bytes).await.unwrap();
     }
 
-    // Phase 4: the queue must now be empty.  Before the fix, list_queue_entries
-    // returned the SSTable entries ignoring the memtable tombstones.
+    // Phase 4: the queue must now be empty: the memtable tombstones hide the
+    // SSTable entries.
     let remaining = list_queue_entries(&db).await.unwrap();
     assert!(
         remaining.is_empty(),
         "queue must be empty after cancellation; {} entries remain",
         remaining.len()
     );
+}
+
+/// `queued_namespaces` reads one key per namespace and jumps past the rest of
+/// that namespace's entries. Names where one is a prefix of another (`ab`,
+/// `abc`) must both be found, as must a namespace after a long run of another's
+/// entries, and the count must cover every entry.
+#[tokio::test]
+async fn queued_namespaces_finds_each_namespace_once() {
+    let dir = TempDir::new().unwrap();
+    let db = open_db(&dir).await;
+
+    for doc in 0..50u32 {
+        enqueue_embed(&db, "ab", &doc.to_be_bytes(), "t").await.unwrap();
+    }
+    enqueue_embed(&db, "abc", b"d", "t").await.unwrap();
+    enqueue_embed(&db, "b", b"d", "t").await.unwrap();
+    enqueue_embed(&db, "a", b"\xff\xff", "t").await.unwrap();
+
+    let namespaces: Vec<String> = queued_namespaces(&db).await.unwrap().into_iter().collect();
+    assert_eq!(namespaces, ["a", "ab", "abc", "b"]);
+    assert_eq!(count_queue_entries(&db).await.unwrap(), 53);
 }

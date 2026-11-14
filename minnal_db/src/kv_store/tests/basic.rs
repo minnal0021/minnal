@@ -12,7 +12,7 @@ fn test_kvstore_basic_operations() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -35,7 +35,7 @@ fn test_kvstore_update() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -50,12 +50,12 @@ fn test_kvstore_update() {
 fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
     // A put that loses to a higher-sequence write for the same key (the LSM drops
     // its insert under highest-sequence-wins) must account ITS OWN freshly-appended
-    // record as garbage — not displace the record that is still live. This is the
-    // deterministic form of the concurrent-put accounting race: the old code read
-    // the displaced pointer before the bucket lock and always marked it displaced,
-    // so this lower-seq put marked the LIVE record garbage (accounting would call the
-    // live value dead — GC could then reclaim it, losing data) and left its own dead
-    // record counted live.
+    // record as garbage, not displace the record that is still live. This is the
+    // deterministic form of the concurrent-put accounting race: a put that read the
+    // displaced pointer before the bucket lock and always marked it displaced would
+    // mark the LIVE record garbage here (accounting would call the live value dead,
+    // and GC could reclaim it, losing data) and leave its own dead record counted
+    // live.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),
@@ -63,7 +63,7 @@ fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -96,13 +96,13 @@ fn a_lower_seq_put_charges_its_own_record_not_the_live_one() {
     assert_eq!(garbage, loser_len, "the dropped lower-seq record's bytes are the garbage");
 }
 
+/// Every appended record is either what the LSM points at or counted as garbage.
+/// A put whose LSM insert fails after its value-log append leaves a record that
+/// nothing points at, and the apply is retried (`apply_with_retry`, then
+/// recovery), each attempt appending afresh. Left counted as live, those bytes
+/// make their segment look cleaner than it is, so GC may never select it.
 #[test]
-fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
-    // A value-log read error in the batch path used to be swallowed by
-    // `.get(..).ok().flatten()`, making genuine corruption indistinguishable from a
-    // missing key. Now `get` surfaces a hard error (only a reclaimed segment retries),
-    // and so does `get_multiple`: the batch fails rather than reporting the corrupt
-    // key absent.
+fn a_put_whose_lsm_insert_fails_counts_its_record_as_garbage() {
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),
@@ -110,7 +110,78 @@ fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+    )
+    .unwrap();
+
+    let value = vec![0x33u8; 500];
+    store.lsm.fail_next_insert();
+    assert!(store.put_to_storage_seq(b"k", &value, 10).is_err(), "setup: the insert fails");
+    store.put_to_storage_seq(b"k", &value, 10).unwrap(); // the retry
+    assert_eq!(store.get(b"k").unwrap(), Some(value.clone()));
+
+    let record_len = crate::storage::value_log::ValueRecordHeader::record_len(b"k".len(), value.len());
+    let (mut live, mut garbage) = (0u64, 0u64);
+    for (_bucket, segs) in store.value_log.all_segment_stats() {
+        for s in segs {
+            live += s.live_bytes;
+            garbage += s.garbage_bytes;
+        }
+    }
+    assert_eq!(live, record_len, "only the retry's record is live");
+    assert_eq!(garbage, record_len, "the failed attempt's record, which nothing points at, is garbage");
+}
+
+/// Replay applies an entry exactly as the live write path does, including when
+/// it loses. The vector index WAL replays before the main WAL, so a main-WAL
+/// delete can be replayed after a newer put of its key from the vector WAL;
+/// that delete loses, and must not count the live record as garbage.
+#[test]
+fn a_replayed_write_that_loses_is_dropped_and_charges_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u64(0),
+        "default",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+    )
+    .unwrap();
+
+    let winner = vec![0x11u8; 400];
+    let loser = vec![0x22u8; 900];
+    store.replay_upsert(b"k", &winner, 10).unwrap();
+    store.replay_delete(b"k", 5).unwrap();
+    assert_eq!(store.get(b"k").unwrap(), Some(winner.clone()), "the losing replayed delete is dropped");
+    assert_eq!(
+        store.value_log.total_garbage_bytes(),
+        0,
+        "a losing delete must not charge the live record"
+    );
+
+    store.replay_upsert(b"k", &loser, 7).unwrap();
+    assert_eq!(store.get(b"k").unwrap(), Some(winner), "the losing replayed put is dropped");
+    assert_eq!(
+        store.value_log.total_garbage_bytes(),
+        0,
+        "a losing put is dropped before its value is appended, so it leaves no garbage"
+    );
+}
+
+#[test]
+fn get_and_get_multiple_surface_corruption_instead_of_hiding_it_as_a_miss() {
+    // A value-log read error must not read as a missing key. `get` surfaces a hard
+    // error (only a reclaimed segment retries), and so does `get_multiple`: the
+    // batch fails rather than reporting the corrupt key absent.
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u64(0),
+        "default",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -164,7 +235,7 @@ fn test_kvstore_recovery_replay() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -190,7 +261,7 @@ fn test_active_memtable_tombstone_shadows_sstable() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -214,7 +285,7 @@ fn test_put_to_storage_seq_keeps_highest_sequence() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -232,7 +303,7 @@ fn test_delete_from_storage_seq_respects_sequence() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 

@@ -104,8 +104,8 @@ impl LsmCompactionWorker {
         Self { tx, shutdown_notify }
     }
 
-    /// Send a command to trigger immediate compaction
-    #[allow(dead_code)]
+    /// Run a compaction pass now.
+    #[cfg(test)]
     pub fn trigger_compaction(&self) -> std::result::Result<(), mpsc::error::SendError<LsmCompactionCommand>> {
         self.tx.send(LsmCompactionCommand::Trigger)
     }
@@ -337,7 +337,7 @@ mod tests {
         worker.shutdown().await;
     }
 
-    /// Regression: the worker must not re-run on its own side effects.
+    /// The worker must not re-run on its own side effects.
     ///
     /// `perform_compaction_check` flushes no-WAL memtables; sealing a memtable
     /// fires the flush observer, and the observer sends a `Trigger` — to this

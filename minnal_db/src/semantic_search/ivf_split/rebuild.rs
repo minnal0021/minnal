@@ -1,4 +1,4 @@
-//! Rebuilding a namespace's partition from its codes (design doc M4).
+//! Rebuilding a namespace's partition from its codes (`Dynamic-RaBitQ-Index-Design.md` → M4).
 //!
 //! K-means ([`crate::semantic_search::cluster::kmeans`]) runs over the
 //! reconstructions of every chunk in an active posting, and every active
@@ -37,6 +37,8 @@ use crate::semantic_search::cluster::kmeans::{KmeansParams, kmeans};
 
 /// The most threads a rebuild's k-means may use.
 pub const MAX_REBUILD_THREADS: usize = 2;
+
+const _: () = assert!(crate::defaults::semantic_search::maintenance::REBUILD_THREADS <= MAX_REBUILD_THREADS);
 
 /// How a rebuild runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

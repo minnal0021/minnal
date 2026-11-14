@@ -13,15 +13,13 @@ use crate::namespace::NamespaceId;
 // the WAL lock and applies to the memtable *after* releasing it, so in between,
 // an entry is visible in the tail while its key is nowhere. The three tests
 // cover the two places that read the tail, plus the path that put the bug in
-// front of a user.
-//
-// Found by the 2026-08-02 stress run: 1 acknowledged write lost in 34,538, then
-// 4 lost in one round of `work/stress/repro/drop_loses_a_write.py`.
+// front of a user. Without the in-flight barrier, a stress run lost about 1
+// acknowledged write in 35,000.
 
 /// The cut must not pass a write that is in the WAL but not yet in a memtable.
 ///
-/// `compute_cut` cut at the **live tail** whenever no namespace
-/// reported un-flushed writes — which is exactly the state this test sets up.
+/// A `compute_cut` that cut at the **live tail** whenever no namespace reported
+/// un-flushed writes would fail here: that is exactly the state this test sets up.
 #[test]
 fn an_in_flight_write_holds_the_persisted_watermark_back() {
     let dir = TempDir::new().unwrap();
@@ -63,8 +61,8 @@ fn an_in_flight_write_holds_the_persisted_watermark_back() {
 /// memtable I am sealing". That is false for an in-flight write: its apply goes
 /// into the **next** memtable, while its offset sits below the recorded tail —
 /// so `advance_namespace` would push `safe_offset` past an entry no SSTable
-/// holds. This needs no namespace drop, which is why guarding only the cut
-/// would have left the bug live.
+/// holds. This needs no namespace drop, so guarding only the cut would not
+/// be enough.
 #[test]
 fn a_memtable_seal_does_not_claim_an_unapplied_write() {
     let dir = TempDir::new().unwrap();
@@ -98,10 +96,9 @@ fn a_memtable_seal_does_not_claim_an_unapplied_write() {
 /// `forget_namespace` calls `compute_cut` the instant it removes the
 /// dropped namespace from `ns_progress` — deliberately, to unpin the cut — and
 /// that is precisely when the set of namespaces reporting un-flushed writes can
-/// go empty while a survivor is mid-write. Measured before the fix: 4
-/// acknowledged writes lost in one round of the repro script, and the surviving
-/// namespace's key was gone after a SIGKILL with **no recovery pass at all**
-/// (`persisted == total` short-circuits it).
+/// go empty while a survivor is mid-write. Were the cut to pass the in-flight
+/// write then, the surviving namespace's key would be gone after a SIGKILL with
+/// **no recovery pass at all** (`persisted == total` short-circuits it).
 #[test]
 fn dropping_a_store_does_not_persist_a_survivors_in_flight_write() {
     let dir = TempDir::new().unwrap();
@@ -177,8 +174,8 @@ fn the_cut_respects_the_barrier_even_when_no_seal_enforces_it() {
     db.get_store(ns_b).unwrap().flush_memtable_to_level0().unwrap();
 
     // Dropping `b` removes the last namespace that reports un-flushed writes,
-    // so the cut falls through to the `None` branch — the one that used to take
-    // the live tail.
+    // so the cut falls through to the `None` branch, which must not take the
+    // live tail.
     db.remove_namespace("b").unwrap();
 
     let watermark = db.wal_metadata.read().cut;
@@ -193,8 +190,8 @@ fn the_cut_respects_the_barrier_even_when_no_seal_enforces_it() {
 
 /// The barrier must not leak: a registration outliving its write pins the
 /// watermark forever, so WAL GC's `persisted >= total` gate never fires again
-/// and the WAL grows without bound — the failure mode `17a8a0c` fixed for
-/// dropped namespaces, reached a different way.
+/// and the WAL grows without bound, as it would if a dropped namespace kept
+/// holding the cut.
 #[test]
 fn the_in_flight_barrier_is_released_when_the_write_finishes() {
     let dir = TempDir::new().unwrap();
@@ -218,7 +215,7 @@ fn the_in_flight_barrier_is_released_when_the_write_finishes() {
     assert_eq!(watermark, tail, "watermark stalled at {watermark} with tail {tail}");
 }
 
-/// Regression: syncing the value log must NOT advance the WAL persisted
+/// Syncing the value log must NOT advance the WAL persisted
 /// watermark.
 ///
 /// A value-log fsync makes the *value* durable, but the key → pointer
@@ -226,10 +223,9 @@ fn the_in_flight_barrier_is_released_when_the_write_finishes() {
 /// flushed to an SSTable. Recovery skips `Persisted` entries, so marking
 /// them at sync time tells recovery to skip keys that exist nowhere on disk:
 /// the writes are lost and their values sit orphaned in the value log.
-/// Measured before the fix, against a stock-config server over the REST API:
-/// **0 of 3000** acknowledged writes survived a `kill -9`, with
-/// `persisted_entries` already equal to `total_entries` so recovery did not
-/// even run.
+/// After a `kill -9`, recovery would not even run (`persisted_entries` already
+/// equal to `total_entries`), so every acknowledged write since the last flush
+/// would be lost.
 ///
 /// `records_per_sync = 1` puts every single write through the sync path, and
 /// the memtable is left far from full so nothing legitimately flushes — any
@@ -262,7 +258,7 @@ fn test_value_log_sync_does_not_mark_wal_entries_persisted() {
     );
 }
 
-/// Regression: `pending` flush records must be keyed by `(namespace,
+/// `pending` flush records must be keyed by `(namespace,
 /// version)`, not by version alone.
 ///
 /// Memtable versions are allocated per `KVStore` from a counter created as
@@ -273,10 +269,9 @@ fn test_value_log_sync_does_not_mark_wal_entries_persisted() {
 /// `or_insert` silently drops the second, and A's flush then satisfies B's
 /// record, advancing the watermark past writes B has not flushed.
 ///
-/// This is the second of the two mechanisms behind the cross-namespace
-/// data-loss bug. The per-namespace `safe_offset` minimum masks it today, so
-/// nothing else fails if the key is collapsed back — which is exactly why it
-/// needs pinning here.
+/// The per-namespace `safe_offset` minimum also prevents this loss, so nothing
+/// else fails if the key is collapsed to the version alone: this test is what
+/// pins it.
 #[test]
 fn test_pending_flush_records_are_keyed_by_namespace_not_just_version() {
     let dir = TempDir::new().unwrap();
@@ -309,16 +304,14 @@ fn test_pending_flush_records_are_keyed_by_namespace_not_just_version() {
     assert!(!b_state.flushed, "A's flush must not mark B's memtable flushed");
 }
 
-/// Regression: one namespace's memtable flush must not mark ANOTHER
-/// namespace's WAL entries persisted.
+/// One namespace's memtable flush must not mark ANOTHER namespace's WAL
+/// entries persisted.
 ///
-/// The WAL is global, memtables are per-namespace. The observer used to
-/// record the global WAL tail at seal time and, on flush, mark every entry
-/// below it persisted — including entries owned by namespaces that had not
-/// flushed. Recovery skips persisted entries, so those acknowledged writes
-/// were silently lost on the next crash. Measured against a live server
-/// before the fix: 0 of 200 keys in the quiet namespace survived a SIGKILL
-/// after a second namespace flushed repeatedly.
+/// The WAL is global, memtables are per-namespace. An observer that recorded
+/// the global WAL tail at seal time and, on flush, marked every entry below it
+/// persisted would include entries of namespaces that had not flushed.
+/// Recovery skips persisted entries, so those acknowledged writes would be
+/// lost on the next crash.
 ///
 /// Asserting on the saved progress rather than on post-crash reads keeps this
 /// a unit test: an entry below its namespace's `replay_from` is exactly the
@@ -341,7 +334,7 @@ fn test_one_namespace_flush_does_not_persist_anothers_wal_entries() {
         db.put_ns(quiet, format!("q{i}").as_bytes(), b"quiet-value").unwrap();
     }
 
-    // `busy` writes, then flushes to level 0 — the event that used to mark
+    // `busy` writes, then flushes to level 0: the event that must not mark
     // everything below the global WAL tail persisted. Flushed explicitly
     // rather than by capacity so the test does not depend on the background
     // workers running.
@@ -397,8 +390,8 @@ fn concurrent_flushes_leave_the_saved_progress_equal_to_the_live_one() {
 /// Retiring entries never writes into the log: a flush moves the cut by
 /// saving the WAL metadata, and the log's bytes stay exactly as appended.
 ///
-/// The log is append-only on purpose. Rewriting a record in place (as marking
-/// each entry persisted once did) costs a random write and an fsync per touched
+/// The log is append-only on purpose. Rewriting a record in place (to mark it
+/// persisted, say) would cost a random write and an fsync per touched
 /// segment inside the flush, and means a frame can change after it is written.
 #[test]
 fn a_flush_retires_entries_without_writing_into_the_log() {
@@ -421,10 +414,10 @@ fn a_flush_retires_entries_without_writing_into_the_log() {
 
 /// The index checkpoint must never claim an offset past a write whose index
 /// update has not happened. A write is in flight from its WAL append until its
-/// apply (index update included) returns; the checkpoint used the raw WAL tail,
-/// which includes such a write, so after a crash replay started past it and the
-/// document stayed out of every field index with no gap recorded. Found by the
-/// SIGKILL stress harness (1–2 documents per crash).
+/// apply (index update included) returns. A checkpoint at the raw WAL tail
+/// would include such a write, so after a crash replay would start past it and
+/// the document would stay out of every field index with no gap recorded (the
+/// SIGKILL stress harness saw 1–2 such documents per crash).
 #[test]
 fn index_checkpoint_stops_below_an_in_flight_write() {
     use crate::db::indexing::manager::CheckpointState;

@@ -1,13 +1,14 @@
-pub mod toml;
+//! The engine's configuration (`DbConfig` and its parts). Defaults come from
+//! `crate::defaults`; a config file maps onto it through `crate::config_file`.
 
+use crate::defaults;
 use crate::storage::lsm::tree::LSMConfig;
-use crate::support::DEFAULT_NUM_BUCKETS;
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub use crate::kv_store::SyncConfig;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScheduledTaskConfig {
     pub(crate) value_log_gc_interval: Duration,
     pub(crate) wal_gc_interval: Duration,
@@ -32,50 +33,7 @@ pub struct ScheduledTaskConfig {
     pub(crate) index_checkpoint_interval: Duration,
 }
 
-/// Default percentage of a field-index bitmap value region that may be dead
-/// space before checkpoint compacts it.
-pub const DEFAULT_INDEX_BLOB_WASTE_THRESHOLD: f64 = 50.0;
-
-/// Default absolute cap (bytes) on a single field index's reclaimable dead blob
-/// bytes before the write path requests an early index checkpoint. 64 MiB. See
-/// [`ThresholdConfig::index_blob_backpressure_bytes`].
-pub const DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Default soft limit (bytes) on memory held by field-index write buffers,
-/// across all fields of a database: crossing it requests an early index
-/// checkpoint. 32 MiB. See [`ThresholdConfig::index_overlay_soft_bytes`].
-pub const DEFAULT_INDEX_OVERLAY_SOFT_BYTES: u64 = crate::field_index::overlay_budget::DEFAULT_INDEX_OVERLAY_SOFT_BYTES;
-
-/// Default hard limit (bytes) on memory held by field-index write buffers,
-/// across all fields of a database: a write that crosses it writes its field's
-/// buffer out before returning. 64 MiB. See
-/// [`ThresholdConfig::index_overlay_hard_bytes`].
-pub const DEFAULT_INDEX_OVERLAY_HARD_BYTES: u64 = crate::field_index::overlay_budget::DEFAULT_INDEX_OVERLAY_HARD_BYTES;
-
-/// Default cap on how many fully-persisted WAL segments the index-replay
-/// watermark may hold back. See
-/// [`ThresholdConfig::max_pinned_wal_segments`].
-pub const DEFAULT_MAX_PINNED_WAL_SEGMENTS: u32 = 32;
-
-/// Default interval between index checkpoints: **1750 ms**.
-///
-/// Deliberately short. The interval is the crash-replay window, and replay costs
-/// roughly 0.1 ms per distinct key in that window, so a long interval turns a
-/// crash into minutes of restart. It also caps WAL retention, since the
-/// index-replay watermark holds segments until a checkpoint advances.
-///
-/// The per-tick cost is a flush of each field index plus one marker write
-/// (tmp + rename + two fsyncs) per field — small beside the WAL's fsync on every
-/// write.
-pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(1750);
-
-/// Default percentage of a *value-log segment* that may be garbage before GC
-/// rewrites it. Deliberately **lower** than the bucket-level
-/// [`value_log_waste_threshold`](ThresholdConfig::value_log_waste_threshold) —
-/// see [`ThresholdConfig::segment_gc_threshold`] for why.
-pub const DEFAULT_SEGMENT_GC_THRESHOLD: f64 = 10.0;
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThresholdConfig {
     /// Percentage (`0..100`) of a **bucket** that may be garbage before GC runs
     /// on it at all. This is the *trigger*: it answers "is this namespace worth
@@ -166,9 +124,9 @@ pub struct ThresholdConfig {
     /// the WAL would grow without bound — so past this many pinned segments GC
     /// reclaims the oldest of them anyway.
     ///
-    /// Doing so **knowingly strands part of a field index**, which is why
-    /// FR-001 keeps its detection and repair arms: the backstop produces gaps by
-    /// design, just rarely. Counted in segments rather than bytes because it is
+    /// Doing so **knowingly strands part of a field index**: the backstop records
+    /// a gap, which index health reports and a repair fixes (see
+    /// `db/indexing/health.rs`). Counted in segments rather than bytes because it is
     /// GC's own unit of work. `0` disables the backstop, allowing unbounded
     /// pinned WAL — availability over disk, only for callers who know their
     /// checkpoint worker is healthy.
@@ -179,13 +137,7 @@ impl ThresholdConfig {
     pub fn new(waste_threshold: f64) -> Self {
         Self {
             value_log_waste_threshold: waste_threshold,
-            segment_gc_threshold: DEFAULT_SEGMENT_GC_THRESHOLD,
-            tail_gc_min_garbage_pct: None,
-            index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
-            index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
-            index_overlay_soft_bytes: DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
-            index_overlay_hard_bytes: DEFAULT_INDEX_OVERLAY_HARD_BYTES,
-            max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
+            ..Self::default()
         }
     }
 
@@ -241,14 +193,14 @@ impl ThresholdConfig {
 impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
-            value_log_waste_threshold: crate::kv_store::DEFAULT_VALUE_LOG_WASTE_THRESHOLD,
-            segment_gc_threshold: DEFAULT_SEGMENT_GC_THRESHOLD,
-            tail_gc_min_garbage_pct: None,
-            index_blob_waste_threshold: DEFAULT_INDEX_BLOB_WASTE_THRESHOLD,
-            index_blob_backpressure_bytes: DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
-            index_overlay_soft_bytes: DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
-            index_overlay_hard_bytes: DEFAULT_INDEX_OVERLAY_HARD_BYTES,
-            max_pinned_wal_segments: DEFAULT_MAX_PINNED_WAL_SEGMENTS,
+            value_log_waste_threshold: defaults::thresholds::VALUE_LOG_WASTE_THRESHOLD,
+            segment_gc_threshold: defaults::thresholds::SEGMENT_GC_THRESHOLD,
+            tail_gc_min_garbage_pct: defaults::thresholds::TAIL_GC_MIN_GARBAGE_PCT,
+            index_blob_waste_threshold: defaults::thresholds::INDEX_BLOB_WASTE_THRESHOLD,
+            index_blob_backpressure_bytes: defaults::thresholds::INDEX_BLOB_BACKPRESSURE_BYTES,
+            index_overlay_soft_bytes: defaults::thresholds::INDEX_OVERLAY_SOFT_BYTES,
+            index_overlay_hard_bytes: defaults::thresholds::INDEX_OVERLAY_HARD_BYTES,
+            max_pinned_wal_segments: defaults::thresholds::MAX_PINNED_WAL_SEGMENTS,
         }
     }
 }
@@ -256,11 +208,11 @@ impl Default for ThresholdConfig {
 impl Default for ScheduledTaskConfig {
     fn default() -> Self {
         Self {
-            value_log_gc_interval: Duration::from_secs(60),
-            wal_gc_interval: Duration::from_secs(60),
-            lsm_compaction_interval: Duration::from_secs(60),
-            ttl_cleanup_interval: Duration::from_secs(3600),
-            index_checkpoint_interval: DEFAULT_INDEX_CHECKPOINT_INTERVAL,
+            value_log_gc_interval: defaults::scheduled_tasks::VALUE_LOG_GC_INTERVAL,
+            wal_gc_interval: defaults::scheduled_tasks::WAL_GC_INTERVAL,
+            lsm_compaction_interval: defaults::scheduled_tasks::LSM_COMPACTION_INTERVAL,
+            ttl_cleanup_interval: defaults::scheduled_tasks::TTL_CLEANUP_INTERVAL,
+            index_checkpoint_interval: defaults::scheduled_tasks::INDEX_CHECKPOINT_INTERVAL,
         }
     }
 }
@@ -271,8 +223,7 @@ impl ScheduledTaskConfig {
             value_log_gc_interval,
             wal_gc_interval,
             lsm_compaction_interval,
-            ttl_cleanup_interval: Duration::from_secs(3600),
-            index_checkpoint_interval: DEFAULT_INDEX_CHECKPOINT_INTERVAL,
+            ..Self::default()
         }
     }
 
@@ -295,7 +246,7 @@ impl ScheduledTaskConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DbConfig {
     pub threshold_config: ThresholdConfig,
     pub sync_config: SyncConfig,
@@ -315,10 +266,9 @@ pub struct DbConfig {
     /// Size at which a value-log segment is sealed and a new one opened
     /// (default 256 MiB).
     ///
-    /// Unlike the page size it replaces, this is **not** fixed at creation: a
-    /// segment's size is not encoded in any value pointer (only its id and a byte
-    /// offset are), so existing segments keep the size they were written at and new
-    /// ones simply use whatever is configured now.
+    /// It is **not** fixed at creation: no value pointer encodes a segment's size
+    /// (only its id and a byte offset), so existing segments keep the size they
+    /// were written at and new ones use whatever is configured now.
     ///
     /// Must be a multiple of 4096, at least 64 KiB, and at most 4 GiB (a record's
     /// offset within its segment is a `u32`).
@@ -344,12 +294,12 @@ impl Default for DbConfig {
             sync_config: SyncConfig::default(),
             scheduled_task_config: ScheduledTaskConfig::default(),
             lsm_config: LSMConfig::default(),
-            num_buckets: DEFAULT_NUM_BUCKETS,
-            skip_list_capacity: 100_000,
-            wal_segment_size: crate::db::wal::DEFAULT_SEGMENT_SIZE as u64,
-            segment_size_bytes: crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
-            fail_log_dir: None,
-            verify_checksums_on_read: false,
+            num_buckets: defaults::sharding::NUM_BUCKETS,
+            skip_list_capacity: defaults::memtable::MAX_CAPACITY,
+            wal_segment_size: defaults::wal::SEGMENT_SIZE_BYTES,
+            segment_size_bytes: defaults::value_log::SEGMENT_SIZE_BYTES,
+            fail_log_dir: defaults::recovery::FAIL_LOG_DIR.map(PathBuf::from),
+            verify_checksums_on_read: defaults::value_log::VERIFY_CHECKSUMS_ON_READ,
         }
     }
 }
@@ -366,12 +316,7 @@ impl DbConfig {
             sync_config,
             scheduled_task_config,
             lsm_config,
-            num_buckets: DEFAULT_NUM_BUCKETS,
-            skip_list_capacity: 100_000,
-            wal_segment_size: crate::db::wal::DEFAULT_SEGMENT_SIZE as u64,
-            segment_size_bytes: crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
-            fail_log_dir: None,
-            verify_checksums_on_read: false,
+            ..Self::default()
         }
     }
 }

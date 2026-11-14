@@ -78,7 +78,8 @@ impl Database {
         std::fs::create_dir_all(db_path)?;
 
         // Detect existing bucket count from the default namespace's value logs
-        let default_vlog_dir = db_path.join("ns_default").join("value_logs");
+        let default_vlog_dir =
+            crate::layout::namespace_value_log_dir(&crate::layout::namespace_data_dir(db_path, crate::namespace::DEFAULT_NAMESPACE));
         if default_vlog_dir.exists() {
             let existing_count = Self::detect_bucket_count(&default_vlog_dir);
             if existing_count > 0 && existing_count != config.num_buckets {
@@ -119,18 +120,6 @@ impl Database {
         let mut stores = HashMap::new();
         stores.insert(NamespaceId::CATALOG, Arc::new(Self::open_catalog_store(db_path, &config)?));
 
-        // Cleanup old WAL file
-        let old_wal = db_path.join("wal.log.old");
-        if old_wal.exists() {
-            match std::fs::remove_file(&old_wal) {
-                Ok(_) => info!("[STARTUP] Cleaned up old WAL file"),
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    warn!("[STARTUP] Failed to cleanup old WAL file: {:?}", e);
-                }
-                _ => {}
-            }
-        }
-
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
         // The engine-wide counters, shared with the vector index WAL.
@@ -148,6 +137,7 @@ impl Database {
             wal,
             wal_metadata,
             wal_flush_observer,
+            #[cfg(test)]
             pending_wal_flushes,
             wal_gc_in_progress: Arc::new(AtomicBool::new(false)),
             vector_index_wal,
@@ -169,7 +159,6 @@ impl Database {
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_checkpoints: Default::default(),
             next_seq,
-            key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics,
             #[cfg(test)]

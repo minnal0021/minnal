@@ -75,8 +75,8 @@ pub struct StatsResponse {
 /// `GET /admin/storage/stats` — value-log statistics aggregated across **all**
 /// namespaces.
 ///
-/// (It used to report only the *default* namespace while being documented as
-/// engine-wide, which made a busy database look empty.)
+/// Every namespace counts, not only the default one: a figure from the default
+/// namespace alone would make a busy database look empty.
 pub async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     let disk_bytes: u64 = state
         .db
@@ -139,7 +139,6 @@ pub struct LsmLookupMetrics {
     l1_probes: u64,
     bloom_rejects: u64,
     l0_bloom_rejects: u64,
-    seq_prunes: u64,
     sparse_hint_rejects: u64,
 }
 
@@ -275,7 +274,6 @@ fn ops_metrics_body(m: &minnal_db::MetricsSnapshot) -> OpsMetricsBody {
             l1_probes: m.l1_probes,
             bloom_rejects: m.bloom_rejects,
             l0_bloom_rejects: m.l0_bloom_rejects,
-            seq_prunes: m.seq_prunes,
             sparse_hint_rejects: m.sparse_hint_rejects,
         },
         writes: WriteMetrics {
@@ -396,7 +394,7 @@ pub struct LsmFileInfo {
     size_bytes: u64,
 }
 
-/// In-memory LSM state (active + sealed memtables) that the on-disk manifest
+/// In-memory LSM state (active + sealed memtables) that the manifest of SSTable files
 /// does not capture.
 #[derive(Serialize)]
 pub struct LsmInMemoryInfo {
@@ -495,7 +493,7 @@ pub fn build_lsm_namespace_info(ns: String, m: LsmManifest) -> LsmNamespaceInfo 
 
 pub async fn lsm(State(state): State<AppState>) -> impl IntoResponse {
     // In-memory stats (active + sealed memtables) keyed by namespace, to enrich
-    // the on-disk manifest view.
+    // the manifest of SSTable files.
     let runtime: HashMap<String, minnal_db::LSMStats> = state.db.lsm_runtime_stats().into_iter().collect();
     let result: Vec<LsmNamespaceInfo> = state
         .db

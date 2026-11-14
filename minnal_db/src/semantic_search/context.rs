@@ -64,7 +64,7 @@ pub enum ContextError {
 /// a namespace's vector-index settings start from, and optionally the models
 /// this server allows (each with its dimension). A namespace that enables semantic search starts with one root
 /// posting ([`init_namespace`]) and grows its own partition by splitting
-/// (design doc M3); it is loaded once into a registry of
+/// (`Dynamic-RaBitQ-Index-Design.md` → M3); it is loaded once into a registry of
 /// [`PartitionHandle`]s. Everything that shapes a namespace's index comes from
 /// its schema; [`for_namespace`] combines the two into the per-call
 /// [`SemanticSearchConfig`] and the namespace's partition.
@@ -128,8 +128,8 @@ impl SemanticSearchContext {
             config,
             supported_models: std::collections::BTreeMap::new(),
             index_defaults: crate::vector_index::vector_settings::IndexDefaults::default(),
-            maintenance_threads: crate::semantic_search::workers::ivf_maintenance::DEFAULT_MAINTENANCE_THREADS,
-            rebuild_threads: crate::semantic_search::ivf_split::rebuild::MAX_REBUILD_THREADS,
+            maintenance_threads: crate::defaults::semantic_search::maintenance::THREADS,
+            rebuild_threads: crate::defaults::semantic_search::maintenance::REBUILD_THREADS,
             maintenance_tx: std::sync::OnceLock::new(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
             dropping: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -178,8 +178,8 @@ impl SemanticSearchContext {
     }
 
     /// Give `namespace` its starting partition, one root posting at the zero
-    /// centre, unless it already holds one (a re-enable, or a namespace seeded
-    /// from a centroid file before M3). Checks the model first. Durable on
+    /// centre, unless it already holds one (a re-enable, or a namespace a test
+    /// or bench seeded with fixed centres). Checks the model first. Durable on
     /// return.
     pub async fn init_namespace(&self, db: &crate::AsyncDb, namespace: &str, settings: &VectorIndexSettings) -> Result<(), ContextError> {
         self.check_model(settings)?;

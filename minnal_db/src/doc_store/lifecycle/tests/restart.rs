@@ -213,7 +213,7 @@ fn rewind_index_checkpoints(db_dir: &Path) {
     }
 }
 
-/// Regression: the custom (key-type-derived) row-ID function must be
+/// The custom (key-type-derived) row-ID function must be
 /// installed *before* field indexes are activated, so the activation-time
 /// WAL-tail replay resolves row IDs the same way prior writes did. If the
 /// index is activated first, replay falls back to the dense `RowMap` and

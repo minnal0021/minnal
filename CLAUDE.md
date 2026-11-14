@@ -74,6 +74,8 @@ src/namespace_lifecycle/ — a namespace's lifecycle: `NamespaceState` (creating
 src/field_index/       — RoaringBitmap field indexes, the row map and the predicate language (always compiled)
 src/db/                — the engine: facade/ (`AsyncDb` and `AsyncNamespace`, the public entry points; `Db`, the crate-internal synchronous engine handle `AsyncDb` wraps; `typed.rs`, the rkyv layer of the typed methods), database/ (the coordinator; tests/ holds its tests, one file per topic), namespace/ (`namespace_ops`: create, look up and remove a namespace), config/, wal/ (both logs, on `segmented_log.rs`), indexing/ (field-index upkeep, health, queries), workers/ (the engine's background workers)
 src/support/           — SIMD helpers and shared utilities (incl. test_db_config)
+src/defaults.rs        — every configurable setting's default, one constant per config key (imports nothing, so any layer may use it)
+src/config_file/       — the config file: its tables (`engine`, `lifecycle`, `semantic_search`) and the one mapping from them to each part's configuration
 src/vector_index/      — each store's vector-index settings (`vector_settings`), in its schema with or without semantic search   #[cfg(doc-store)]
 src/semantic_search/   — folded ANN module, incl. vector_kv/ (vector↔KV storage bridge), partition_admin.rs, context.rs and workers/ (with doc-store; they reach the stores above through `WorkerHost`)   #[cfg(semantic-search)]
 src/doc_store/         — JSON document stores and typed KV stores: schema/, indexing/ (the field_build, field_drop and reindex_all job bodies and their progress), lifecycle/ (incl. jobs.rs: starting, running, listing and cancelling index jobs), vector/ (each store's vector index: admin and lifecycle), queries   #[cfg(doc-store)]
@@ -96,8 +98,7 @@ finds where something lives from file and folder names alone.
   file past the limit splits it in that change, by responsibility, with the moves
   in a commit of their own so the review sees no behaviour change mixed in.
 - **New code follows this from the start**, in every crate. Files already over
-  the limit (`storage/lsm/tree.rs`, `semantic_search/service/mod.rs` and about
-  twenty others) are split when they are next changed substantially, not all at
+  the limit (`semantic_search/service/mod.rs` and about twenty others) are split when they are next changed substantially, not all at
   once.
 - **Keep layering visible in the tree:** a lower module never imports a higher
   one (`kv_store` does not import `db`; `db` does not import `doc_store` or
@@ -165,8 +166,21 @@ Do not add new dependencies without discussion.
 
 ## Configuration
 
-`minnal_db` is a library crate (embed it and build a `DbConfig` in code). The
-API server binary accepts a TOML config file:
+`minnal_db` is a library crate (embed it and build a `DbConfig` in code, or read
+a config file with `ConfigFile`). **One parser, one set of defaults:**
+`minnal_db/src/config_file/` is the only code that reads the config file and the
+only mapping from its keys to `DbConfig`, `LifecycleConfig`, `VectorIndexConfig`
+and the semantic-search context (`DocStoreBuilder::config_file` applies them all);
+the API server adds only `[api]` and `[logging]`, and the benches and
+`AsyncDb::open_with_config_file` use the same parser. Every table rejects unknown
+keys. Every default is a constant in `minnal_db/src/defaults.rs` (one submodule
+per table, one constant per key); `Default` impls and the parser read it, and
+nothing else defines a default. A new key needs: a constant there, a field in its
+section, a line in its mapping, a row in `minnal_db_api/src/config_report.rs` and
+an entry in `config/sample.toml`. The tests in `config_file/tests.rs` destructure
+every config struct without `..`, so a new field fails to compile until it is
+mapped and tested, and `the_sample_config_is_the_default_config` keeps the sample
+equal to the defaults. The API server binary accepts a TOML config file:
 
 ```sh
 # Full API server
@@ -178,7 +192,7 @@ MINNAL_CONFIG_FILE=/path/to/config.toml minnal_db_api
 Reference config:
 - `config/sample.toml` — full API server config (covers all KV engine options plus `[api]`, `[logging]`, `[semantic_search]`)
 
-Key knobs: `sharding.num_buckets` (cannot change after data exists), `value_log.segment_size_bytes` (value-log segment size, default 256 MiB — GC's unit of work; NOT fixed at creation), `thresholds.page_gc_threshold` (which segments GC rewrites; keep below the bucket trigger), `sync.records_per_sync` (value-log fsync cadence — every write still returns only once a WAL fsync covers it), `sync.commit_delay_us` (main-WAL commit delay: a round's leader waits this long for more writers, only when others are already waiting; default 0, chosen by measurement), `thresholds.value_log_waste_threshold` (GC trigger), `thresholds.index_overlay_soft_bytes` / `index_overlay_hard_bytes` (memory for field-index write buffers, shared by all fields of a database, default 32 / 64 MiB: soft requests a checkpoint, hard makes the writer spill its field), `thresholds.index_blob_waste_threshold` (field-index bitmap compaction trigger at checkpoint; dead space comes from old bitmap copies left by each spill), `thresholds.max_pinned_wal_segments` (backstop on WAL held by the index-replay watermark, default 32; exceeding it knowingly strands part of a field index), `recovery.fail_log_dir` (where fail-log JSON files are written; defaults to `<db_path>/fail_logs`).
+Key knobs: `sharding.num_buckets` (default 8; cannot change after data exists), `value_log.segment_size_bytes` (value-log segment size, default 256 MiB — GC's unit of work; NOT fixed at creation), `thresholds.segment_gc_threshold` (which segments GC rewrites; keep below the bucket trigger), `sync.records_per_sync` (value-log fsync cadence — every write still returns only once a WAL fsync covers it), `sync.commit_delay_us` (main-WAL commit delay: a round's leader waits this long for more writers, only when others are already waiting; default 0, chosen by measurement), `thresholds.value_log_waste_threshold` (GC trigger), `thresholds.index_overlay_soft_bytes` / `index_overlay_hard_bytes` (memory for field-index write buffers, shared by all fields of a database, default 32 / 64 MiB: soft requests a checkpoint, hard makes the writer spill its field), `thresholds.index_blob_waste_threshold` (field-index bitmap compaction trigger at checkpoint; dead space comes from old bitmap copies left by each spill), `thresholds.max_pinned_wal_segments` (backstop on WAL held by the index-replay watermark, default 32; exceeding it knowingly strands part of a field index), `recovery.fail_log_dir` (where fail-log JSON files are written; defaults to `<db_path>/fail_logs`).
 
 ## Semantic search
 

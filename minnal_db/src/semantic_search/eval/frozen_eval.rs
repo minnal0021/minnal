@@ -1,4 +1,4 @@
-//! Vector-index benchmark on frozen embeddings (design doc M0).
+//! Vector-index benchmark on frozen embeddings (`Dynamic-RaBitQ-Index-Design.md` → M0).
 //!
 //! Indexes a BEIR dataset's saved embeddings through the production write path
 //! ([`index_embeddings`] + [`upsert_vectors`]), runs every judged query through
@@ -70,7 +70,7 @@ const INDEX_CONCURRENCY: usize = 8;
 /// `n_probes` values swept (plus the default, [`DEFAULT_PROBE`]); values above
 /// the posting count are skipped.
 const NPROBES: [usize; 13] = [4, 8, 16, 32, 64, 128, 192, 256, 330, 400, 512, 768, 1024];
-/// The fixed probe count gates compare against (the production setting before M2d).
+/// The fixed probe count the gates compare against.
 const PRODUCTION_NPROBES: usize = 64;
 /// Documents indexed between two rounds of splitting in `grow` mode.
 const GROW_BATCH: usize = 256;
@@ -243,7 +243,7 @@ struct QueryResultRow {
     /// nDCG at each of [`NDCG_CUTOFFS`] (absent from results written before it existed).
     #[serde(default)]
     ndcg_at: [f64; NDCG_CUTOFFS.len()],
-    /// Postings probed (absent from results written before M2d).
+    /// Postings probed (absent from older result files).
     #[serde(default)]
     probes: f64,
 }
@@ -296,7 +296,7 @@ struct BenchResult {
 /// run against: the JSONL file named by `MINNAL_BENCH_CENTROIDS` (for example
 /// a static fit from `fit_static.py`), or else k-means on the dataset's own
 /// chunk vectors at [`STUDY_CENTRES`] centres. No centroid file ships with
-/// minnal (design doc M4).
+/// minnal (`Dynamic-RaBitQ-Index-Design.md` → M4).
 pub(super) fn study_centroids(frozen: &Frozen) -> ClusterIndex {
     if let Ok(path) = std::env::var("MINNAL_BENCH_CENTROIDS") {
         let raw = read_clusters_from_file(&path).unwrap_or_else(|e| panic!("load {path}: {e}"));
@@ -644,7 +644,7 @@ async fn eval_frozen() {
         other => panic!("unknown MINNAL_BENCH_PARTITION '{other}' (grow | file)"),
     }
     let handle = Arc::new(crate::semantic_search::PartitionHandle::new(
-        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::defaults::schema_vector_index::ROTATION_SEED)
             .await
             .unwrap()
             .expect("just made"),
@@ -765,7 +765,7 @@ async fn eval_frozen() {
     }
     let index_seconds = t.elapsed().as_secs_f64();
     eprintln!("  indexed in {index_seconds:.1}s ({:.0} docs/s)", frozen.n_docs() as f64 / index_seconds);
-    // ── FR-007 calibration: the recall check and centre drift, before and after
+    // ── Recall-check calibration: the recall check and centre drift, before and after
     //    the rebuild ──
     let recall_check = env_or("MINNAL_BENCH_RECALL_CHECK", "0") == "1";
     if recall_check {
@@ -808,7 +808,7 @@ async fn eval_frozen() {
     // Loaded again as a restarted store loads it: its entry counts come from the
     // stored keys.
     let ivf = Arc::new(
-        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+        crate::semantic_search::vector_kv::load_ivf(&db, NS, crate::defaults::schema_vector_index::ROTATION_SEED)
             .await
             .unwrap()
             .expect("seeded"),
@@ -1134,15 +1134,15 @@ fn render(r: &BenchResult) -> String {
     md
 }
 
-// ── Worker completion cost (design doc M0-1) ────────────────────────────────
+// ── Worker completion cost (`Dynamic-RaBitQ-Index-Design.md` → M0-1) ───────
 
 /// Index one frozen dataset through the vector worker's write-then-complete path,
 /// twice, and report documents per second (embedding excluded) for each:
 ///
 /// - **complete at once:** each entry completed right after its vectors are
-///   written, as the worker did before M0-1;
+///   written (no durability barrier);
 /// - **flush then complete:** entries completed in batches of
-///   `COMPLETION_BATCH` after one flush of the vector namespaces, as it does now.
+///   `COMPLETION_BATCH` after one flush of the vector namespaces.
 ///
 /// Sequential, one entry at a time, so the difference is the flushes alone.
 #[tokio::test(flavor = "multi_thread")]
@@ -1218,7 +1218,7 @@ async fn eval_worker_completion() {
     eprintln!("\n=== worker completion cost: {dataset}, {} docs ===\n{report}", frozen.n_docs());
 }
 
-// ── How much rotation can help (design doc M1 follow-up) ─────────────────────
+// ── How much rotation can help (`Dynamic-RaBitQ-Index-Design.md` → M1) ───────
 
 /// Whether a dataset's residuals (chunk − nearest centroid) are evenly spread over
 /// dimensions, measured before and after rotation on a sample of chunks:
@@ -1532,7 +1532,7 @@ fn eval_compare() {
     }
 }
 
-/// Print the FR-007 recall check probing 1%, 5% and 20% of the namespace's
+/// Print the recall check probing 1%, 5% and 20% of the namespace's
 /// postings and at the default, plus centre drift (`MINNAL_BENCH_RECALL_CHECK`).
 async fn recall_check_report(
     when: &str,

@@ -5,7 +5,7 @@ use crate::namespace::NamespaceId;
 
 #[test]
 fn test_gc_concurrent_writes_no_data_loss() {
-    // Regression: concurrent writes and GC must not lose any data.
+    // Concurrent writes and GC must not lose any data.
     // Writer thread writes 200 unique keys while GC runs 5 times in parallel.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
@@ -14,7 +14,7 @@ fn test_gc_concurrent_writes_no_data_loss() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -60,13 +60,11 @@ fn test_gc_concurrent_writes_no_data_loss() {
 
 #[test]
 fn test_gc_concurrent_reads_never_error_or_return_stale() {
-    // Item 6 regression: a reader must get a *generation-stable* snapshot.
-    // GC swaps the value-log file and the LSM pointers as a pair under the
-    // bucket lock; a lock-free reader could otherwise pair a stale pointer
-    // with the freshly swapped file, which previously surfaced as a transient
-    // CorruptedLog (and was only papered over by a single retry). With the
-    // per-bucket generation guard, reads must always succeed and return the
-    // last-written value while GC churns the same buckets continuously.
+    // A read racing GC must always succeed and return the last-written value
+    // while GC churns the same buckets continuously. Reads take no lock: a
+    // pointer GC has superseded still reads the key's own bytes (segment ids are
+    // never reused), and one whose segment GC unlinked is re-resolved through
+    // the LSM.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),
@@ -74,7 +72,7 @@ fn test_gc_concurrent_reads_never_error_or_return_stale() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -123,12 +121,11 @@ fn test_gc_concurrent_reads_never_error_or_return_stale() {
 
 #[test]
 fn test_gc_concurrent_deletes_are_not_resurrected() {
-    // Item 5 regression: a delete that lands in GC's scan→reinsert window
-    // must not be undone. GC scans live LSM keys under the bucket lock and
-    // then re-inserts the pointers of the records it copied; without the
-    // delete path taking the same bucket lock, GC could copy an
-    // about-to-be-deleted record and re-insert its pointer *after* the
-    // delete removed it, resurrecting the key.
+    // A delete that lands while GC relocates the key's record must not be
+    // undone. GC re-points by compare-and-set under the bucket lock, and the
+    // delete takes the same lock; without it GC could copy an about-to-be-deleted
+    // record and re-insert its pointer *after* the delete removed it,
+    // resurrecting the key.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),
@@ -136,7 +133,7 @@ fn test_gc_concurrent_deletes_are_not_resurrected() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -219,7 +216,7 @@ fn scan_during_gc_round() {
         dir.path(),
         cfg,
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -338,8 +335,9 @@ fn test_scan_completeness_during_concurrent_flush_compaction_and_gc() {
     //     a flush/compaction performs; and
     //   * pair each key with its EXACT value, across the relocation, LSM re-point
     //     and segment unlink a GC pass performs.
-    // One bucket so every flush, merge, and GC pass races every scan. Live keys are never deleted and are overwritten with
-    // their SAME value, so any wrong value is a race bug; active-churn
+    // One bucket so every flush, merge, and GC pass races every scan. Live keys
+    // are never deleted and are overwritten with their SAME value, so any wrong
+    // value is a race bug; active-churn
     // transient misses from APIs that document `None` for I/O races are
     // checked strictly only after the churn threads stop.
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -354,7 +352,7 @@ fn test_scan_completeness_during_concurrent_flush_compaction_and_gc() {
         dir.path(),
         cfg,
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -410,7 +408,7 @@ fn test_scan_completeness_during_concurrent_flush_compaction_and_gc() {
         });
         // Scanner.
         //
-        // (1) LSM-layer COMPLETENESS — the scan-completeness fix. Each of the
+        // (1) LSM-layer COMPLETENESS. Each of the
         //     three pointer-returning scans must return EVERY never-deleted key
         //     while flush/compaction relocate them active→RO→L0→L1. Asserted on
         //     the key set straight off the LSM, independent of value-log GC.

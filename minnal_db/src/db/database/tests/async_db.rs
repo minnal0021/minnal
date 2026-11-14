@@ -53,11 +53,9 @@ async fn async_db_wal_gc_worker_reclaims_and_stops() {
 
 /// `AsyncDb::shutdown` must stop the index checkpoint worker.
 ///
-/// It did not: the shutdown sequence stopped the TTL, WAL GC, LSM compaction
-/// and value-log GC workers but silently skipped this one. The gap was
-/// invisible because a since-deleted second async wrapper *did* stop it, so
-/// nothing flagged the worker's shutdown path as unused. A checkpoint tick
-/// could therefore land after the database was closed.
+/// Otherwise a checkpoint tick could land after the database was closed. The
+/// shutdown sequence stops every worker by name, so one left out of it is
+/// easy to miss.
 #[tokio::test]
 async fn async_db_shutdown_stops_the_index_checkpoint_worker() {
     let dir = TempDir::new().unwrap();

@@ -104,8 +104,9 @@ pattern `get_multiple` already uses (`scan_sorted_candidates`). When the probed
 postings cover most of a file, the jumps disappear and the walk becomes one
 sequential read.
 
-Correctness does not change: layers still fold by highest sequence
-(`fold_newest`), and a hint is used only after `valid_scan_start` accepts it.
+Correctness does not change: layers still fold oldest first, the newer
+layer's copy of a key winning (`fold_newest`), and a hint is used only after
+`valid_scan_start` accepts it.
 
 Expected: 11.4 → 2–3 ms at 1,024 probes. Guard: the existing scan-versus-brute-
 force tests, plus a test that the per-posting and single-cursor scans return
@@ -456,7 +457,7 @@ L0 file is found by seeking (it fails if the hints are ignored).
 
 ## Part C — contiguous per-posting blocks (if still needed)
 
-After Part A, each entry still carries a key in the LSM, a 36-byte value-log
+After Part A, each entry still carries a key in the LSM, a 32-byte value-log
 record header plus its key, an rkyv list wrapper and per-entry validation.
 That is about half the bytes at 1 bit. Part C removes them from the search
 path without changing what is stored.

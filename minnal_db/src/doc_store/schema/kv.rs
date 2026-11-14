@@ -426,7 +426,7 @@ mod tests {
 
     /// Both encoders must enforce the cap: `serialize_key` covers `kv_put`,
     /// `serialize_key_from_str` covers get/delete/scan-bounds. An unbounded key
-    /// used to reach the row map, where the length check *panics*.
+    /// would reach the row map, where the length check *panics*.
     #[test]
     fn kv_str_keys_are_length_capped_by_both_encoders() {
         let over = "x".repeat(crate::doc_store::key::MAX_STR_KEY_LEN + 1);

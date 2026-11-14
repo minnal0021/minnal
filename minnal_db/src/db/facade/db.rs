@@ -18,10 +18,7 @@ pub struct Db {
     pub(super) dir_lock: parking_lot::Mutex<Option<crate::support::file_lock::DirLock>>,
 }
 
-// Gated on `semantic-search` as well as `test` because that is the only feature
-// combination with a test that needs it; an unconditional `cfg(test)` is dead
-// code under the other combinations, which clippy rejects at `-D warnings`.
-#[cfg(all(test, feature = "semantic-search"))]
+#[cfg(test)]
 impl Db {
     /// Test-only access to the internal coordinator.
     ///

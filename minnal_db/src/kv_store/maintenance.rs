@@ -1,59 +1,63 @@
 //! Flush, compaction, TTL expiry, WAL replay and stats.
 
 use super::*;
+use std::ops::ControlFlow;
 
 impl KVStore {
-    /// Delete records whose creation epoch is older than `ttl`, for a store with
-    /// no concurrent same-key writers to exclude (tests and standalone use). The
-    /// database's TTL worker uses [`expire_records_locked`](Self::expire_records_locked)
-    /// with its key stripe.
-    #[cfg(test)]
+    /// Delete records whose creation epoch is older than `ttl`; see
+    /// [`expire_records_with`](Self::expire_records_with).
     pub(crate) fn expire_records(&self, ttl: Duration, max_deletes_per_run: usize) -> Result<usize> {
-        self.expire_records_locked(ttl, max_deletes_per_run, |_| ())
+        self.expire_records_with(ttl, max_deletes_per_run, |_| ())
     }
 
     /// Delete records whose creation epoch is older than `ttl`.
     ///
-    /// Scans live keys and reads each record's `epoch` straight from the value log
-    /// (a 36-byte header read — no value bytes). At most `max_deletes_per_run`
-    /// records are removed per call so a single pass can't stall on a huge backlog;
-    /// value-log GC reclaims the physical space afterwards. Returns the number
-    /// deleted.
+    /// Walks the live keys a page at a time ([`for_each_key_page`](Self::for_each_key_page)),
+    /// so a pass holds one page of keys, and reads each record's `epoch` straight
+    /// from the value log (a 32-byte header read, no value bytes). At most
+    /// `max_deletes_per_run` records are removed per call so a single pass cannot
+    /// stall on a huge backlog; value-log GC reclaims the physical space
+    /// afterwards. Returns the number deleted.
     ///
     /// Each expired key is deleted by **compare-and-set**: only if it still points
     /// at the exact record judged expired ([`delete_if_current`](Self::delete_if_current)).
-    /// A key rewritten after the check — its fresh value just acknowledged to a
-    /// writer — is left alone; the old code deleted whatever was current. And the
-    /// delete runs under `lock_key(key)`, which the database supplies as the key
-    /// stripe: a WAL-backed write holds that stripe from allocating its seq to
-    /// applying it, so no same-key write can sit between the two while TTL
-    /// allocates its own seq. Without it TTL deletes carried seqs out of order
-    /// with concurrent puts, the one source of "lower-seq copy in a newer layer"
-    /// that the read paths (and the L1 tombstone-drop contract) had to tolerate.
-    pub(crate) fn expire_records_locked<G>(&self, ttl: Duration, max_deletes_per_run: usize, lock_key: impl Fn(&[u8]) -> G) -> Result<usize> {
+    /// A key rewritten after the page was read, its fresh value just acknowledged
+    /// to a writer, is left alone. A pointer the page holds that GC has since
+    /// moved fails the compare too, and the next pass judges the key afresh.
+    ///
+    /// Expiry is a system action, not a user write: its tombstone keeps the
+    /// expired copy's user seq and takes the next system seq
+    /// ([`Version::next_system`]), so it needs no key stripe. A user write that
+    /// drew its seq before the delete and has not applied yet is newer, and wins
+    /// whenever it lands, after a crash too. `before_delete` runs between the
+    /// verdict and the compare-and-set: a test hook for landing a write there.
+    pub(crate) fn expire_records_with(&self, ttl: Duration, max_deletes_per_run: usize, before_delete: impl Fn(&[u8])) -> Result<usize> {
         let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ttl_millis = ttl.as_millis() as u64;
 
         let mut deleted = 0usize;
-        for key in self.keys()? {
-            if deleted >= max_deletes_per_run {
-                break;
-            }
-            // Resolved per key as the pass reaches it, not all up front: the
-            // compare-and-set below only holds off writes after this point.
-            let Some(pointer) = self.lsm.get(&key)?.and_then(decode_sharded_pointer) else {
-                continue; // deleted since the key list was taken
-            };
-            let Ok(meta) = self.value_log.read_record_meta(pointer) else {
-                continue;
-            };
-            if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
-                let _key_guard = lock_key(&key);
-                if self.delete_if_current(&key, pointer)? {
-                    deleted += 1;
+        self.for_each_key_page(&[], None, |page| {
+            for (key, pointer, _seq) in page {
+                if deleted >= max_deletes_per_run {
+                    return Ok(ControlFlow::Break(()));
+                }
+                let Some(pointer) = decode_sharded_pointer(pointer) else {
+                    continue;
+                };
+                // A segment GC reclaimed since the page was read: the key has
+                // moved, and the next pass reads it where it is now.
+                let Ok(meta) = self.value_log.read_record_meta(pointer) else {
+                    continue;
+                };
+                if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
+                    before_delete(&key);
+                    if self.delete_if_current(&key, pointer)? {
+                        deleted += 1;
+                    }
                 }
             }
-        }
+            Ok(ControlFlow::Continue(()))
+        })?;
 
         Ok(deleted)
     }
@@ -63,88 +67,52 @@ impl KVStore {
     /// GC) since is left for the next pass to judge afresh; pointers are unique for
     /// the life of the database, so pointer equality means "the same write".
     ///
-    /// The seq is allocated only after the check, under the bucket lock and the
-    /// caller's key lock, so the delete is newer than anything already applied to
-    /// the key and — with the key stripe held — than anything about to be.
+    /// The tombstone's version is the expired copy's next system version, decided
+    /// under the bucket lock with the compare. A copy whose system seq is used up
+    /// is deleted as a user write instead: stripe, then bucket, a fresh user seq.
     fn delete_if_current(&self, key: &[u8], expected: ShardedValuePointer) -> Result<bool> {
         let bucket = self.value_log.bucket_for_key(key);
+        {
+            let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+            let Some((pointer, version)) = self.lsm.get_with_seq(key)? else {
+                return Ok(false);
+            };
+            if decode_sharded_pointer(pointer) != Some(expected) {
+                return Ok(false);
+            }
+            if let Some(expiry) = version.next_system() {
+                self.delete_with_bucket_locked(key, expiry, bucket_guard)?;
+                return Ok(true);
+            }
+        }
+        let _stripe = self.lock_key(key);
         let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
         if self.lsm.get(key)?.and_then(decode_sharded_pointer) != Some(expected) {
             return Ok(false);
         }
         let seq = self.alloc_seq();
-        self.delete_with_bucket_locked(key, seq, bucket_guard)?;
+        self.delete_with_bucket_locked(key, Version::user(seq), bucket_guard)?;
         Ok(true)
     }
 
-    /// Remove stale LSM files left by an interrupted compaction.
+    /// Replay a WAL upsert into this namespace's storage under the entry's
+    /// original sequence, so recovery reproduces the per-key winner that was live
+    /// before the crash (highest-sequence-wins).
     ///
-    /// The value log needs no startup cleanup any more: GC never writes a shadow file
-    /// and never swaps one in, so there is nothing half-finished to roll forward or
-    /// back. Its only mutation of existing state is unlinking a segment, which only
-    /// happens after the re-point is durable.
-    pub fn cleanup_old_files_on_startup(&self) -> Result<()> {
-        self.lsm
-            .cleanup_old_files_on_startup()
-            .map_err(|e| KVError::Io(std::io::Error::other(format!("Failed to cleanup LSM old files: {:?}", e))))
-    }
-
-    /// Replay a single WAL entry into this namespace's storage, stamping the
-    /// memtable with the entry's original WAL sequence so recovery reproduces the
-    /// same per-key winner that was live before the crash (highest-sequence-wins).
+    /// Unlike a live write, a replayed one is applied only if it is newer than
+    /// every stored copy of the key (see `replay_wins`): otherwise the memtable,
+    /// the newest layer, would hold an older version than a layer below it. A
+    /// dropped record touches nothing: no value-log append, no garbage count, no
+    /// field-index change. Past that check it is the live put path, not a copy.
     pub fn replay_upsert(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
-        let epoch = current_epoch_millis();
-        let mut next_version = 1u32;
-
-        // Read the displaced pointer and decide the winner inside the bucket lock, as
-        // the live put path does — replay reuses that path's accounting exactly.
-        let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-
-        let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
-        let displaced = existing_u128.and_then(decode_sharded_pointer);
-        if let Some(existing_ptr) = displaced
-            && let Ok(meta) = self.value_log.read_record_meta(existing_ptr)
-        {
-            next_version = meta.version.saturating_add(1);
-        }
-
-        let record_meta = ValueRecordMeta {
-            version: next_version,
-            epoch,
-            seq,
-        };
-        let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
-        self.lsm.insert_with_seq(key, pointer.to_u128(), seq)?;
-        if wins {
-            if let Some(old) = displaced {
-                self.value_log.note_displaced(old, key.len());
-            }
-        } else {
-            self.value_log.note_displaced(pointer, key.len());
-        }
-        drop(_bucket_guard);
-
-        if wins {
-            self.update_indices_on_put(key, value, None, displaced.is_some());
-        }
-        Ok(())
+        self.put_replayed(key, value, seq)
     }
 
-    /// Replay a WAL delete into this namespace's storage, under the entry's original
-    /// sequence (see [`replay_upsert`](Self::replay_upsert)).
+    /// Replay a WAL delete into this namespace's storage under the entry's
+    /// original sequence, through the live delete path (see
+    /// [`replay_upsert`](Self::replay_upsert) for why not a copy).
     pub fn replay_delete(&self, key: &[u8], seq: u64) -> Result<()> {
-        let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-        let displaced = self.lsm.get(key).ok().flatten().and_then(decode_sharded_pointer);
-        self.lsm.delete_with_seq(key, seq)?;
-        if let Some(old) = displaced {
-            self.value_log.note_displaced(old, key.len());
-        }
-        drop(_bucket_guard);
-
-        self.update_indices_on_delete(key, None);
-        Ok(())
+        self.delete_replayed(key, seq)
     }
 
     pub fn flush_and_compact_all(&self) -> Result<()> {
@@ -201,7 +169,6 @@ impl KVStore {
         self.unflushed_no_wal_writes.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)]
     pub fn stats(&self) -> Stats {
         let mut total_gc_runs = 0u64;
         let mut total_bytes_reclaimed = 0u64;

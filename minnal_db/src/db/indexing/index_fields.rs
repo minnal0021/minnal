@@ -28,13 +28,12 @@ impl Database {
         Ok(field_id)
     }
 
-    /// Register a custom row-ID function (and optionally its inverse) for a namespace.
+    /// Register a custom row-ID function and its exact inverse for a namespace.
     ///
-    /// When set, every key written to or deleted from `namespace_id` will be
-    /// assigned a row ID produced by `row_id_fn` rather than the default
-    /// dense row-ID map.  Providing `row_to_key_fn` (the exact inverse) additionally
-    /// enables O(|hits|) query resolution with zero memory overhead: each matching
-    /// key is reconstructed directly from its row ID without any in-memory map.
+    /// When set, every key written to or deleted from `namespace_id` is
+    /// assigned the row ID `row_id_fn` gives it rather than one from the dense
+    /// row map, and a query turns each matching row ID back into its key with
+    /// `row_to_key_fn`, with no map in memory.
     ///
     /// This must be called **before** [`activate_field_index`] so that the WAL
     /// replay during activation uses the same row IDs that future writes will
@@ -46,7 +45,7 @@ impl Database {
         &self,
         namespace_id: NamespaceId,
         row_id_fn: crate::kv_store::index_set::RowIdFn,
-        row_to_key_fn: Option<crate::kv_store::index_set::RowToKeyFn>,
+        row_to_key_fn: crate::kv_store::index_set::RowToKeyFn,
     ) -> Result<()> {
         self.get_store(namespace_id)?.set_row_id_fn(row_id_fn, row_to_key_fn)
     }
@@ -107,7 +106,7 @@ impl Database {
         let Ok(store) = self.get_store(namespace_id) else {
             return Ok(FieldReindexOutcome::FieldNotActive);
         };
-        self.reindex_key(&store, namespace_id, field_id, key)
+        self.reindex_key(&store, field_id, key)
     }
 
     /// [`KVStore::reindex_field`] under `key`'s stripe — the only way anything
@@ -118,8 +117,8 @@ impl Database {
     /// without the stripe the two interleave: reindex reads v1, the put applies v2
     /// and moves the row v1→v2, then reindex sets it back to v1 — the index now
     /// disagrees with the store until something rewrites the key.
-    pub(crate) fn reindex_key(&self, store: &KVStore, namespace_id: NamespaceId, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
-        let _stripe = self.key_locks.guard(namespace_id, key);
+    pub(crate) fn reindex_key(&self, store: &KVStore, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
+        let _stripe = store.lock_key(key);
         store.reindex_field(field_id, key)
     }
 
@@ -216,7 +215,7 @@ impl Database {
             // incomplete results — `detect_replay_gap` suppresses exactly this
             // shape (`Absent` + empty) as a normal first build. Fail loudly and
             // make the caller re-register, which clears the flag and forces a
-            // rebuild. See `FEATURE-REQUEST.md` (FR-001).
+            // rebuild.
             if meta.dropped {
                 return Err(KVError::Serialization(format!(
                     "Field '{}' (id {}) in namespace {} was dropped; re-register it before activating so the index is rebuilt",
@@ -287,9 +286,11 @@ impl Database {
                     // fully-persisted segments out of order, so a hole can sit in the
                     // middle of the window while `head` is still below the checkpoint.
                     //
-                    // Detection only — the replay below is unchanged, and the missing
-                    // updates are unrecoverable from here. Recording, surfacing and
-                    // repairing this is tracked in `FEATURE-REQUEST.md` (FR-001).
+                    // Detection only: the replay below is unchanged, and the missing
+                    // updates cannot be recovered from here. WAL GC holds the segments
+                    // active fields need and records a gap when its backstop reclaims
+                    // one anyway (`GapCause::BackstopReclaim`); this logs a hole
+                    // however it came about.
                     if let Some(gap) = crate::db::indexing::manager::detect_replay_gap(
                         checkpoint_state,
                         dyn_index.distinct_count() == 0,
@@ -379,7 +380,7 @@ impl Database {
                     // the write path, and an unbounded replay leaves the database
                     // unopenable rather than merely slow.
                     let cap = match self.config.threshold_config.index_blob_backpressure_bytes {
-                        0 => crate::db::config::DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES,
+                        0 => crate::defaults::thresholds::INDEX_BLOB_BACKPRESSURE_BYTES,
                         n => n,
                     };
                     let mut compactions = 0usize;
@@ -425,9 +426,9 @@ impl Database {
 
                     for (value, row_ids) in rows_by_value {
                         if dyn_index.reclaimable_dead_bytes() >= cap {
-                            dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                            dyn_index.flush().map_err(KVError::Io)?;
                             if dyn_index.maybe_compact(waste_threshold).map_err(KVError::Io)? {
-                                dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                                dyn_index.flush().map_err(KVError::Io)?;
                                 compactions += 1;
                             }
                         }
@@ -439,7 +440,7 @@ impl Database {
                             );
                         }
                     }
-                    dyn_index.flush(&field_path).map_err(KVError::Io)?;
+                    dyn_index.flush().map_err(KVError::Io)?;
                     if compactions > 0 {
                         debug!(
                             "[activate_field_index] ns={namespace_id} field={field_id}: \
@@ -504,7 +505,7 @@ impl Database {
     /// finishes it at the next open. The reverse order — files first — would
     /// leave a live-looking field with no data, which reads as `Absent` + empty
     /// and is suppressed by `detect_replay_gap` as a normal first build: a
-    /// silently incomplete index. See `FEATURE-REQUEST.md` (FR-001).
+    /// silently incomplete index.
     ///
     /// Idempotent: dropping an already-dropped or unregistered field still
     /// deregisters and reclaims any leftover directory.

@@ -1,7 +1,7 @@
 //! Raw HTTP client for the external embedding service (batch interface).
 //!
-//! The service no longer chunks text — chunking/tokenisation lives in
-//! [`crate::semantic_search::chunking`].  Each call posts a list of already-prepared payload
+//! The service never chunks text: chunking lives in
+//! [`crate::semantic_search::chunking`]. Each call posts a list of already-prepared payload
 //! strings to the endpoint for the configured model and gets back one embedding
 //! per payload:
 //!

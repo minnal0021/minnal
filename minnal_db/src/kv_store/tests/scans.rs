@@ -12,7 +12,7 @@ fn test_get_multiple_matches_individual_get() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -40,7 +40,7 @@ fn test_get_multiple_missing_keys_are_none() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -62,7 +62,7 @@ fn test_get_multiple_after_flush_to_sstable() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -97,7 +97,7 @@ fn test_scan_prefixes_batch_basic() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -134,7 +134,7 @@ fn test_scan_page_batch_limit_zero_still_advances() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
     for i in 0..3u8 {
@@ -166,7 +166,7 @@ fn test_scan_page_batch_end_bound_excludes_upper() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
     for i in 0u32..10 {
@@ -189,7 +189,7 @@ fn test_scan_page_batch_cursor_walk_is_complete_and_ordered() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
     for i in 0u32..10 {
@@ -221,7 +221,7 @@ fn test_scan_prefixes_batch_missing_prefix_absent() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -240,7 +240,7 @@ fn test_scan_prefixes_batch_after_flush() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -260,4 +260,113 @@ fn test_scan_prefixes_batch_after_flush() {
     let found: Vec<(Vec<u8>, Vec<u8>)> = result.iter().map(|(_, k, v)| (k.to_vec(), v.to_vec())).collect();
     let expected: Vec<(Vec<u8>, Vec<u8>)> = (0u32..8).map(|sid| (u32_prefixed_key(2, sid), vec![sid as u8; 16])).collect();
     assert_eq!(found, expected);
+}
+
+/// A whole-namespace pass reads the keys a page at a time. Every live key must
+/// be visited exactly once, in order, across page boundaries, whichever layer it
+/// is in, and a deleted key not at all. The keys include `k` followed by `k\0`:
+/// the next page starts at the last key plus a zero byte, so a page ending at `k`
+/// must still visit `k\0`.
+#[test]
+fn key_pages_visit_every_live_key_once() {
+    use crate::kv_store::KEY_PAGE;
+    use std::ops::ControlFlow;
+
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u64(0),
+        "ns",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+    )
+    .unwrap();
+
+    let n = KEY_PAGE * 3;
+    let key = |i: usize| format!("key{i:06}").into_bytes();
+    // Half on disk, half in the memtable; every seventh key deleted afterwards.
+    for i in 0..n / 2 {
+        store.put_to_storage(&key(i), b"v").unwrap();
+    }
+    store.flush_memtable_to_level0().unwrap();
+    for i in n / 2..n {
+        store.put_to_storage(&key(i), b"v").unwrap();
+    }
+    for i in (0..n).step_by(7) {
+        store.delete_from_storage(&key(i)).unwrap();
+    }
+    // The first page ends at the `KEY_PAGE`th live key; its zero-byte successor
+    // sorts straight after it, so it is the first key of the second page.
+    let mut zero_successor = store.keys().unwrap()[KEY_PAGE - 1].clone();
+    zero_successor.push(0);
+    store.put_to_storage(&zero_successor, b"v").unwrap();
+
+    let expected = store.keys().unwrap();
+    assert!(expected.len() > 2 * KEY_PAGE, "the test needs at least three pages");
+    assert!(expected.contains(&zero_successor));
+
+    let mut visited = Vec::new();
+    let mut pages = 0;
+    store
+        .for_each_key_page(&[], None, |page| {
+            assert!(page.len() <= KEY_PAGE);
+            pages += 1;
+            visited.extend(page.into_iter().map(|(k, ..)| k));
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+    assert_eq!(visited, expected, "a paged pass must visit every live key once, in order");
+    assert_eq!(pages, expected.len().div_ceil(KEY_PAGE));
+    assert_eq!(store.count_keys().unwrap(), expected.len());
+
+    // A visitor that breaks stops the pass after that page.
+    let mut pages = 0;
+    store
+        .for_each_key_page(&[], None, |_| {
+            pages += 1;
+            Ok(ControlFlow::Break(()))
+        })
+        .unwrap();
+    assert_eq!(pages, 1);
+
+    // The cursor-paginated form returns the same keys.
+    let mut walked = Vec::new();
+    let mut cursor = None;
+    loop {
+        let (keys, next) = store.key_page(cursor.as_deref(), None, 100).unwrap();
+        assert!(keys.len() <= 100);
+        walked.extend(keys);
+        match next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(walked, expected);
+}
+
+/// A key whose segment GC reclaimed mid-scan is re-read through `get`, and must
+/// go back in its place: a scan's result is in key order.
+#[test]
+fn keys_re_read_after_a_reclaimed_segment_keep_the_scan_in_key_order() {
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(
+        NamespaceId::from_u64(0),
+        "ns",
+        dir.path(),
+        default_lsm_config(),
+        SyncConfig::default(),
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+    )
+    .unwrap();
+    for key in [b"a", b"b", b"c", b"d"] {
+        store.put_to_storage(key, key).unwrap();
+    }
+
+    // The batch read returned `a` and `d`; `b` and `c` lost their segment.
+    let mut pairs = vec![(b"a".to_vec(), b"a".to_vec()), (b"d".to_vec(), b"d".to_vec())];
+    store.refetch_dropped(&mut pairs, vec![b"b".to_vec(), b"c".to_vec()]).unwrap();
+
+    let keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, [b"a", b"b", b"c", b"d"]);
 }

@@ -1,6 +1,12 @@
 //! Reads: point gets, key iteration, batch reads and scans.
 
 use super::*;
+use std::ops::ControlFlow;
+
+/// Keys per page of a whole-namespace pass ([`KVStore::for_each_key_page`]):
+/// large enough that a page's fixed cost is small beside its reads, small enough
+/// that a page's keys take little memory.
+pub(crate) const KEY_PAGE: usize = 1024;
 
 /// What a prefix-batch scan (`scan_prefixes_batch`) returns: every live entry
 /// under the requested 4-byte prefixes, in key order, so grouped by prefix.
@@ -85,15 +91,12 @@ impl KVStore {
     /// Two steps: ask the LSM where the value is, then read it there. GC can relocate
     /// a value between those steps — but it cannot make this read *wrong*. Segments
     /// are immutable and their ids are never reused, so a pointer GC has superseded
-    /// still resolves to **this key's own bytes** (GC re-points under the key's
-    /// existing sequence, so the relocated record is the same write). The only thing
+    /// still resolves to **this key's own bytes** (GC's copy holds the same value).
+    /// The only thing
     /// that can go wrong is arriving after GC unlinked the segment, which fails
     /// loudly as [`crate::ValueLogError::SegmentMissing`] — never silently as another key's
     /// record. So the read simply re-resolves through the LSM (which by then holds the
-    /// new pointer) and retries.
-    ///
-    /// This is what replaced the old generation seqlock, the per-record sequence
-    /// validity check, and their retry ladder.
+    /// new pointer) and retries. No lock or sequence check is needed on the read.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let result = self.get_inner(key);
         if let Some(m) = self.metrics() {
@@ -156,30 +159,61 @@ impl KVStore {
         self.lsm.keys().map_err(KVError::from)
     }
 
-    /// Return keys in `[start, end)`. Pass `None` for `end` to scan to the last key.
-    pub fn range_keys(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
-        let all = self.lsm.range_keys_bounded(start, usize::MAX)?;
-        match end {
-            Some(end_key) => Ok(all.into_iter().filter(|k| k.as_slice() < end_key).collect()),
-            None => Ok(all),
-        }
-    }
-
-    /// Return keys that start with `prefix`.
-    pub fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        Ok(self.lsm.scan_prefix(prefix)?.into_iter().map(|(k, _, _)| k).collect())
-    }
-
-    pub fn resolve_entries(&self, keys: Vec<Vec<u8>>) -> Result<Vec<ResolvedEntry>> {
-        let mut entries = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(offset_u128) = self.lsm.get(&key)?
-                && let Some(pointer) = decode_sharded_pointer(offset_u128)
-            {
-                entries.push((key, pointer));
+    /// Calls `visit` with successive pages of at most [`KEY_PAGE`] live
+    /// `(key, pointer, seq)` entries in `[start, end)`, in key order, until
+    /// `visit` breaks or the range ends. Each page is read on its own, so a pass
+    /// over a whole namespace holds one page of keys, not all of them.
+    ///
+    /// The pages are not one snapshot: a key written behind the cursor during
+    /// the pass is not visited, and one written ahead of it is. The pointers are
+    /// as current as the page; resolve them as for
+    /// [`scan_prefix_batch`](Self::scan_prefix_batch).
+    pub(crate) fn for_each_key_page(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        mut visit: impl FnMut(Vec<KeyPointer>) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        let mut from = start.to_vec();
+        loop {
+            let page = self.lsm.range_pointers_bounded(&from, end, KEY_PAGE)?;
+            let last_page = page.len() < KEY_PAGE;
+            // The next page starts just after this page's last key: the key
+            // followed by a zero byte is the smallest key greater than it.
+            if let Some((last, ..)) = page.last() {
+                from.clone_from(last);
+                from.push(0);
+            }
+            if visit(page)?.is_break() || last_page {
+                return Ok(());
             }
         }
-        Ok(entries)
+    }
+
+    /// The number of live keys, counted a page at a time (`for_each_key_page`):
+    /// every key is read, but only one page is held.
+    pub fn count_keys(&self) -> Result<usize> {
+        let mut count = 0;
+        self.for_each_key_page(&[], None, |page| {
+            count += page.len();
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(count)
+    }
+
+    /// At most `limit` live keys in `[cursor, end)`, in key order, and the key the
+    /// next page starts at (`None` after the last page). No value is read.
+    pub fn key_page(&self, cursor: Option<&[u8]>, end: Option<&[u8]>, limit: usize) -> Result<KeyPage> {
+        // `limit` 0 would return the cursor as its own next cursor, forever.
+        let limit = limit.max(1);
+        let mut keys: Vec<Vec<u8>> = self
+            .lsm
+            .range_pointers_bounded(cursor.unwrap_or(&[]), end, limit + 1)?
+            .into_iter()
+            .map(|(key, ..)| key)
+            .collect();
+        let next_cursor = if keys.len() > limit { keys.pop() } else { None };
+        Ok((keys, next_cursor))
     }
 
     pub fn resolve_entries_from_pointers(&self, key_pointers: Vec<KeyPointer>) -> Result<Vec<ResolvedEntry>> {
@@ -194,15 +228,14 @@ impl KVStore {
 
     /// Fetch multiple keys in parallel by grouping I/O across value-log buckets.
     ///
-    /// Uses `lsm.get_multiple` to resolve all key→pointer mappings in a single pass
-    /// per SSTable bucket (reads each level1 file once into memory), then reads
-    /// values from the value-log with `num_buckets` parallel threads.
+    /// Uses `lsm.get_multiple` to resolve all key→pointer mappings in one forward
+    /// pass per SSTable bucket, reading near the keys, then reads values from the
+    /// value log with one thread per bucket.
     ///
     /// Returns one `Option<Vec<u8>>` per input key in the same order; `None` means
     /// the key is absent or deleted. A storage error (an LSM read failure,
-    /// corruption, an IO fault) is an `Err` for the whole call — it used to become
-    /// `None` for the affected keys (or for *every* key, when the LSM lookup
-    /// failed), which a caller could not tell apart from a missing key.
+    /// corruption, an IO fault) is an `Err` for the whole call, never `None`: a
+    /// caller must be able to tell a failed read from a missing key.
     pub fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         let (mut results, retry) = self.get_multiple_inner(keys)?;
 
@@ -394,32 +427,35 @@ impl KVStore {
         Ok((pairs, retry))
     }
 
-    /// Re-resolve keys whose segment was reclaimed between the LSM scan and the value
-    /// read, through the single-key [`get`](Self::get). A key that now reads as absent
-    /// was concurrently deleted and is correctly left out.
-    /// Re-resolve keys a batch read dropped due to a transient GC race, via the
-    /// single-key [`get`](Self::get) (which retries resolve+read together and
-    /// falls back to a lock-held read). Must be called OUTSIDE the generation
-    /// bracket — `get` may take a bucket lock that would deadlock against the
-    /// bracket's lock-all fallback. A key that `get` now reports absent was
-    /// concurrently deleted and is correctly left out.
-    fn refetch_dropped(&self, pairs: &mut Vec<KeyValue>, retry: Vec<Vec<u8>>) -> Result<()> {
+    /// Re-resolve keys whose segment GC reclaimed between the LSM scan and the
+    /// value read, through the single-key [`get`](Self::get) (which retries resolve
+    /// and read together, and falls back to a read under the bucket lock). A key
+    /// that now reads as absent was deleted meanwhile and is left out.
+    ///
+    /// `pairs` is in key order and stays so: the re-read keys are put back in
+    /// their places, not appended.
+    pub(super) fn refetch_dropped(&self, pairs: &mut Vec<KeyValue>, retry: Vec<Vec<u8>>) -> Result<()> {
+        if retry.is_empty() {
+            return Ok(());
+        }
         for key in retry {
             if let Some(v) = self.get(&key)? {
                 pairs.push((key, v));
             }
         }
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(())
     }
 
     /// Scan keys with prefix and return `(key, value)` pairs using batched I/O.
     ///
-    /// One LSM pass returns `(key, pointer)` pairs directly — no per-key
-    /// `lsm.get()` re-lookup — then values are read in parallel per bucket.
+    /// One LSM pass returns `(key, pointer)` pairs directly (no per-key
+    /// `lsm.get()`), then values are read in parallel per bucket. The whole result
+    /// is held in memory.
     ///
-    /// INVARIANT: the LSM scan, the file-handle capture, and the value reads MUST all
-    /// closed in 420ac8e — the LSM scan's own snapshot does not protect against
-    /// value-log GC.
+    /// A pointer can go stale between the LSM scan and the value read (GC relocates
+    /// the value and unlinks its segment); such keys are re-read through
+    /// [`get`](Self::get), so the result is complete.
     pub fn scan_prefix_batch(&self, prefix: &[u8]) -> Result<Vec<KeyValue>> {
         let key_pointers = self.lsm.scan_prefix(prefix)?;
         let entries = self.resolve_entries_from_pointers(key_pointers)?;
@@ -433,10 +469,12 @@ impl KVStore {
 
     /// Scan keys in `[start, end)` and return `(key, value)` pairs using batched I/O.
     ///
-    /// One LSM pass via `range_pointers_bounded` avoids the redundant per-key
-    /// `lsm.get()` that the old `range_keys` + `collect_kv_pairs` path performed.
+    /// One LSM pass (`range_pointers_bounded`) gives each key's pointer, so no key
+    /// is looked up twice. The whole result is held in memory.
     ///
-    /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
+    /// A pointer can go stale between the LSM scan and the value read (GC relocates
+    /// the value and unlinks its segment); such keys are re-read through
+    /// [`get`](Self::get), so the result is complete.
     pub fn scan_range_batch(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<KeyValue>> {
         let key_pointers = self.lsm.range_pointers_bounded(start, end, usize::MAX)?;
         let entries = self.resolve_entries_from_pointers(key_pointers)?;
@@ -457,11 +495,13 @@ impl KVStore {
     /// last key; a prefix scan supplies the prefix's upper bound here so only the
     /// page's keys (not the whole tail of the keyspace) are resolved.
     ///
-    /// Same bracket invariant as [`scan_prefix_batch`](Self::scan_prefix_batch): the
+    /// A pointer can go stale between the LSM scan and the value read (GC relocates
+    /// the value and unlinks its segment); such keys are re-read through
+    /// [`get`](Self::get), so the result is complete.
     pub fn scan_page_batch(&self, cursor: Option<&[u8]>, end: Option<&[u8]>, limit: usize) -> Result<ScanPage> {
         // An empty page cannot carry a cursor that advances: with `limit = 0` the
-        // next cursor was the first key at or after this one — the cursor itself —
-        // so a caller following `next_cursor` looped forever. Treat 0 as 1.
+        // next cursor would be the cursor itself, and a caller following
+        // `next_cursor` would loop forever. Treat 0 as 1.
         let limit = limit.max(1);
         let start = cursor.unwrap_or(&[]);
         let key_pointers = self.lsm.range_pointers_bounded(start, end, limit + 1)?;

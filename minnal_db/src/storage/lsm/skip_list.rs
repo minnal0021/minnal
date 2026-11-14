@@ -1,11 +1,17 @@
+//! The memtable's sorted map: a skip list from byte keys to `u128` value-log
+//! pointers, where every entry carries the write sequence that produced it and
+//! a tombstone flag. Conflicting writes to one key resolve to the higher
+//! sequence, so the winner in memory is the one WAL replay would pick.
+
 #[allow(clippy::module_inception)]
 pub mod skip_list {
+    use crate::storage::lsm::version::Version;
     use crate::support::key_prefix_of;
     use crate::support::simd_support::simd_support::compare_bytes_simd;
     use core::cmp::Ordering;
+    #[cfg(test)]
     use std::borrow::Cow;
 
-    const DEFAULT_MAX_CAPACITY: usize = 100_000; // Default max number of nodes (including tombstones)
     const MAX_LEVEL: usize = 32;
     const NONE_VALUE: u32 = u32::MAX;
 
@@ -15,7 +21,20 @@ pub mod skip_list {
         pub key: Vec<u8>,
         pub value: u128,
         pub tombstone: bool,
-        pub seq: u64,
+        pub version: Version,
+    }
+
+    /// What a seq-aware write did to the skip list. The value-log garbage
+    /// accounting depends on it: the pointer a write replaced here is referenced
+    /// by nothing any more, and a stale write's own pointer never was.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Applied {
+        /// The write is now the key's entry in this skip list. `displaced` is the
+        /// live value it replaced in place; `None` when the key was absent here
+        /// or held a tombstone.
+        Won { displaced: Option<u128> },
+        /// The key already held a newer write, so this one was dropped.
+        Stale,
     }
 
     #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -24,34 +43,26 @@ pub mod skip_list {
         CapacityExceeded,
     }
 
-    // key_index_offset is the offset (start index) into the skip list’s keys: Vec<u8> arena where this node’s key bytes are stored.
-    // In this implementation, keys aren’t stored as Vec<u8> per node (which would allocate per entry).
-    // Instead, all key bytes are appended into one contiguous buffer (SkipList.keys), and each node stores a slice descriptor:
-    // key_index_offset: u32 → start position in self.keys
-    // key_length: u32 → length of the key
-    // Then the real key for a node is obtained via:
-    // key_slice(node):
-    // start = n.key_index_offset as usize
-    // end = start + n.key_length as usize
-    // returns &self.keys[start..end]
-
-    ///links_index_offset is the start offset (index) into the skip list’s links: Vec<u32> arena where this node’s forward pointers (“tower”) are stored.
-    // The implementation stores all forward-links for all nodes in one contiguous Vec<u32> (an arena), instead of Vec<u32> per node. Each node then needs two things to locate its links:
-    // links_index_offset: u32 → the first index in self.links for this node
-    // height: u8 → how many levels this node actually has (how many forward pointers it owns)
-    // So for a given node:
-    // the forward pointer at level lvl lives at:
-    // self.links[node.links_index_offset as usize + lvl]
-    // but only if lvl < node.height (otherwise that node has no link at that level)
+    /// One entry. A node owns no allocation: its key bytes live in the list's
+    /// shared key arena (`SkipList::keys`) and its forward links in the shared
+    /// link arena (`SkipList::links`), so an insert appends to three vectors
+    /// instead of allocating per entry.
     #[derive(Clone, Debug)]
     struct Node {
+        /// Where the key starts in the key arena: the key is
+        /// `keys[key_index_offset..key_index_offset + key_length]`.
         key_index_offset: u32,
         key_length: u32,
+        /// The key's first 8 bytes as an integer, so most comparisons are
+        /// settled without reading the arena.
         key_prefix: u64,
         value: u128,
         tombstone: bool,
-        sequence: u64,
+        version: Version,
+        /// How many levels the node is linked at (its number of forward links).
         height: u8,
+        /// Where the node's forward links start in the link arena: the link at
+        /// level `l` (for `l < height`) is `links[links_index_offset + l]`.
         links_index_offset: u32,
     }
 
@@ -63,7 +74,7 @@ pub mod skip_list {
             key_prefix: u64,
             value: u128,
             tombstone: bool,
-            sequence: u64,
+            version: Version,
             height: u8,
             links_index_offset: u32,
         ) -> Self {
@@ -73,7 +84,7 @@ pub mod skip_list {
                 key_prefix,
                 value,
                 tombstone,
-                sequence,
+                version,
                 height,
                 links_index_offset,
             }
@@ -107,7 +118,7 @@ pub mod skip_list {
 
     impl SkipList {
         pub fn new() -> Self {
-            Self::with_capacity(DEFAULT_MAX_CAPACITY)
+            Self::with_capacity(crate::defaults::memtable::MAX_CAPACITY)
         }
 
         pub fn with_capacity(max_capacity: usize) -> Self {
@@ -118,7 +129,7 @@ pub mod skip_list {
             links.resize(MAX_LEVEL, NONE_VALUE);
 
             // Sentinel head node at index 0.
-            nodes.push(Node::new(0, 0, 0u64, 0, true, 0, MAX_LEVEL as u8, 0));
+            nodes.push(Node::new(0, 0, 0u64, 0, true, Version::default(), MAX_LEVEL as u8, 0));
 
             Self {
                 nodes,
@@ -140,17 +151,13 @@ pub mod skip_list {
         /// to the higher sequence.
         ///
         /// The sequence is carried at its full `u64` width, so this is a plain
-        /// comparison. It previously stored a `u32` truncation and compared with
-        /// wrapping serial-number ("RFC 1982") arithmetic, which is only valid
-        /// while the two values are within 2^31 of each other. That held for the
-        /// memtable (it flushes long before 2 billion writes accumulate) but the
-        /// same comparison also governed the SSTable levels, where it does *not*
-        /// hold: an L1 entry keeps its original sequence for the lifetime of the
-        /// database, so the gap to a later write of the same key is unbounded.
-        /// **Do not narrow the sequence again** — see
+        /// comparison. **Do not narrow it** to a smaller, wrapping type: an L1
+        /// entry keeps its sequence for the life of the database, so the gap to a
+        /// later write of the same key is unbounded, and a wrapping comparison
+        /// would rank that newer write as older. See
         /// `tree::test_write_after_huge_seq_gap_beats_cold_l1_entry`.
         #[inline]
-        fn seq_is_newer_or_equal(new: u64, existing: u64) -> bool {
+        fn seq_is_newer_or_equal(new: Version, existing: Version) -> bool {
             new >= existing
         }
 
@@ -164,7 +171,7 @@ pub mod skip_list {
             self.no_live_nodes
         }
 
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub fn is_empty(&self) -> bool {
             self.no_live_nodes == 0
         }
@@ -182,18 +189,19 @@ pub mod skip_list {
             self.nodes.len() >= half || self.links.len() >= half || self.keys.len() >= half
         }
 
-        /// Returns the raw entry for a key as `(value, sequence, tombstone)`, or
+        /// Returns the raw entry for a key as `(value, version, tombstone)`, or
         /// `None` if the key is absent from this skip list. Crucially this
         /// distinguishes a **tombstone** (present but deleted) from **absent**,
         /// which a caller searching layered storage needs so that a tombstone in
         /// a newer layer shadows a live value in an older one.
-        pub fn entry(&self, key: &[u8]) -> Option<(u128, u64, bool)> {
+        pub fn entry(&self, key: &[u8]) -> Option<(u128, Version, bool)> {
             let (found, _) = self.find_path(key);
             let idx = found?;
             let n = &self.nodes[idx as usize];
-            Some((n.value, n.sequence, n.tombstone))
+            Some((n.value, n.version, n.tombstone))
         }
 
+        #[cfg(test)]
         pub fn get_value(&self, key: &[u8]) -> Option<u128> {
             match self.entry(key) {
                 Some((v, _, false)) => Some(v),
@@ -205,35 +213,35 @@ pub mod skip_list {
         /// write sequence), with **highest-sequence-wins** conflict resolution.
         ///
         /// If the key already exists with a *newer* sequence, the write is
-        /// dropped (returns `Ok(None)`) — this is what makes the in-memory winner
-        /// for two racing writes to one key identical to the winner recovery
-        /// would pick (it replays in sequence order), closing the live-vs-recovery
-        /// divergence for concurrent same-key writes.
-        pub fn try_insert_with_seq(&mut self, key: &[u8], value: u128, seq: u64) -> Result<Option<u128>, InsertError> {
+        /// dropped ([`Applied::Stale`]). So the in-memory winner of two racing
+        /// writes to one key is the one recovery picks (it replays in sequence
+        /// order), and a value seen live survives a crash.
+        pub fn try_insert_with_seq(&mut self, key: &[u8], value: u128, seq: impl Into<Version>) -> Result<Applied, InsertError> {
+            let seq = seq.into();
             let (found, update) = self.find_path(key);
 
             if let Some(idx) = found {
                 let node = &mut self.nodes[idx as usize];
-                if !Self::seq_is_newer_or_equal(seq, node.sequence) {
+                if !Self::seq_is_newer_or_equal(seq, node.version) {
                     // A newer write already won for this key; drop this stale one.
-                    return Ok(None);
+                    return Ok(Applied::Stale);
                 }
                 let old = node.value;
                 let was_tombstone = node.tombstone;
                 node.value = value;
                 node.tombstone = false;
-                node.sequence = seq;
+                node.version = seq;
                 if was_tombstone {
                     self.no_tombstone_nodes = self.no_tombstone_nodes.saturating_sub(1);
                     self.no_live_nodes += 1;
-                    return Ok(None);
+                    return Ok(Applied::Won { displaced: None });
                 }
-                return Ok(Some(old));
+                return Ok(Applied::Won { displaced: Some(old) });
             }
 
             self.splice_new_node(key, value, false, seq, update)?;
             self.no_live_nodes += 1;
-            Ok(None)
+            Ok(Applied::Won { displaced: None })
         }
 
         /// Insert a tombstone for `key` using an explicit sequence, with
@@ -248,33 +256,44 @@ pub mod skip_list {
         ///   in place; its stored value is left untouched.
         /// - Key present with a newer sequence → this delete is stale (a newer
         ///   write superseded it) and is dropped.
-        pub fn insert_tombstone_with_seq(&mut self, key: &[u8], seq: u64) -> Result<(), InsertError> {
+        ///
+        /// [`Applied::Won`] carries the live value a flip displaced.
+        pub fn insert_tombstone_with_seq(&mut self, key: &[u8], seq: impl Into<Version>) -> Result<Applied, InsertError> {
+            let seq = seq.into();
             let (found, update) = self.find_path(key);
 
             if let Some(idx) = found {
                 let node = &mut self.nodes[idx as usize];
-                if !Self::seq_is_newer_or_equal(seq, node.sequence) {
+                if !Self::seq_is_newer_or_equal(seq, node.version) {
                     // A newer write already won for this key; drop the stale delete.
-                    return Ok(());
+                    return Ok(Applied::Stale);
                 }
-                node.sequence = seq;
+                node.version = seq;
                 if !node.tombstone {
                     node.tombstone = true;
                     self.no_live_nodes -= 1;
                     self.no_tombstone_nodes += 1;
+                    return Ok(Applied::Won { displaced: Some(node.value) });
                 }
-                return Ok(());
+                return Ok(Applied::Won { displaced: None });
             }
 
             self.splice_new_node(key, 0, true, seq, update)?;
             self.no_tombstone_nodes += 1;
-            Ok(())
+            Ok(Applied::Won { displaced: None })
         }
 
         /// Allocate a node with a freshly drawn height and splice it in at every
         /// level it owns. `update` is the predecessor array from `find_path` for
         /// the same key; the caller is responsible for the live/tombstone counters.
-        fn splice_new_node(&mut self, key: &[u8], value: u128, tombstone: bool, seq: u64, mut update: [u32; MAX_LEVEL]) -> Result<(), InsertError> {
+        fn splice_new_node(
+            &mut self,
+            key: &[u8],
+            value: u128,
+            tombstone: bool,
+            seq: Version,
+            mut update: [u32; MAX_LEVEL],
+        ) -> Result<(), InsertError> {
             let node_level = self.random_level();
             if node_level > self.level {
                 #[allow(clippy::needless_range_loop)]
@@ -300,44 +319,7 @@ pub mod skip_list {
             Ok(())
         }
 
-        /// Physically purges a tombstoned key by unlinking it from the list.
-        /// Returns `true` if a tombstoned key was found and purged.
-        #[allow(dead_code)]
-        pub fn purge_tombstone(&mut self, key: &[u8]) -> bool {
-            let (found, update) = self.find_path(key);
-            let idx = match found {
-                Some(i) => i,
-                None => return false,
-            };
-
-            if !self.nodes[idx as usize].tombstone {
-                return false;
-            }
-
-            #[allow(clippy::needless_range_loop)]
-            for lvl in 0..self.level as usize {
-                let prev = update[lvl];
-                if self.next(prev, lvl) != idx {
-                    break;
-                }
-                let next = self.next(idx, lvl);
-                self.set_next(prev, lvl, next);
-            }
-
-            // Reduce current max level if upper levels are empty.
-            while self.level > 1 {
-                let top = (self.level - 1) as usize;
-                if self.next(self.head, top) != NONE_VALUE {
-                    break;
-                }
-                self.level -= 1;
-            }
-
-            self.no_tombstone_nodes = self.no_tombstone_nodes.saturating_sub(1);
-            true
-        }
-
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub fn iter(&self) -> Iter<'_> {
             Iter {
                 list: self,
@@ -345,24 +327,11 @@ pub mod skip_list {
             }
         }
 
-        /// Returns an iterator over live entries whose keys are `>= start`, in key order.
-        ///
-        /// Performs an O(log N) seek via `lower_bound` then walks level-0 links forward,
-        /// skipping tombstones.  Much faster than `iter().skip_while(|(k, _)| k < start)`
-        /// for large skip lists when the cursor is deep into the key space.
-        #[allow(dead_code)]
-        pub fn iter_from(&self, start: &[u8]) -> Iter<'_> {
-            Iter {
-                list: self,
-                current: self.lower_bound(start),
-            }
-        }
-
         /// Returns an iterator over all live entries whose keys start with `prefix`.
         ///
         /// Efficient: seeks to the first key `>= prefix` then walks level-0 until
         /// the prefix no longer matches. Accepts both borrowed and owned prefixes.
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub fn scan_prefix<'a>(&'a self, prefix: impl Into<Cow<'a, [u8]>>) -> PrefixIter<'a> {
             let prefix = prefix.into();
             let start = self.lower_bound(prefix.as_ref());
@@ -393,7 +362,7 @@ pub mod skip_list {
             &self.keys[start..end]
         }
 
-        fn allocate_node(&mut self, key: &[u8], value: u128, tombstone: bool, seq: u64, height: u8) -> Option<u32> {
+        fn allocate_node(&mut self, key: &[u8], value: u128, tombstone: bool, seq: Version, height: u8) -> Option<u32> {
             let idx = self.nodes.len();
 
             let links_base = self.links.len();
@@ -533,8 +502,7 @@ pub mod skip_list {
 
         /// Iterates over all entries including tombstones, yielding `(key, value, seq, tombstone)`.
         ///
-        /// Intended for merge/compaction logic. Use `iter()` for normal live-entry access.
-        #[allow(dead_code)]
+        /// Flushes and scans use it: a tombstone must reach the older layers it shadows.
         pub fn iter_raw(&self) -> IterRaw<'_> {
             IterRaw {
                 list: self,
@@ -548,21 +516,6 @@ pub mod skip_list {
                 list: self,
                 current: self.lower_bound(start),
             }
-        }
-
-        /// Returns `true` if the key exists in the skip list.
-        ///
-        /// Note: this returns `true` even if the key is tombstoned.
-        #[allow(dead_code)]
-        pub fn contains_key(&self, key: &[u8]) -> bool {
-            let (found, _) = self.find_path(key);
-            found.is_some()
-        }
-
-        /// Like [`contains_key`], but only returns `true` if the key exists and is live (not tombstoned).
-        #[allow(dead_code)]
-        pub fn contains_live_key(&self, key: &[u8]) -> bool {
-            self.get_value(key).is_some()
         }
 
         /// Collects all entries (including tombstones) into a sorted vector.
@@ -587,7 +540,7 @@ pub mod skip_list {
                     key: self.key_slice(cur).to_vec(),
                     value: n.value,
                     tombstone: n.tombstone,
-                    seq: n.sequence,
+                    version: n.version,
                 });
 
                 cur = self.next(cur, 0);
@@ -634,16 +587,13 @@ pub mod skip_list {
     }
 
     /// Iterates over all nodes (including tombstones) yielding `(key, value, seq, tombstone)`.
-    ///
-    /// Used by merge/compaction logic. For normal use, prefer `iter()`.
-    #[allow(dead_code)]
     pub struct IterRaw<'a> {
         list: &'a SkipList,
         current: u32,
     }
 
     impl<'a> Iterator for IterRaw<'a> {
-        type Item = (&'a [u8], u128, u64, bool);
+        type Item = (&'a [u8], u128, Version, bool);
 
         fn next(&mut self) -> Option<Self::Item> {
             if self.current == NONE_VALUE {
@@ -652,7 +602,7 @@ pub mod skip_list {
             let idx = self.current;
             self.current = self.list.next(idx, 0);
             let n = &self.list.nodes[idx as usize];
-            Some((self.list.key_slice(idx), n.value, n.sequence, n.tombstone))
+            Some((self.list.key_slice(idx), n.value, n.version, n.tombstone))
         }
     }
 
@@ -679,11 +629,13 @@ pub mod skip_list {
     }
 
     /// Iterates over live entries (tombstones skipped) in key order.
+    #[cfg(test)]
     pub struct Iter<'a> {
         list: &'a SkipList,
         current: u32,
     }
 
+    #[cfg(test)]
     impl<'a> Iterator for Iter<'a> {
         type Item = (&'a [u8], u128);
 
@@ -705,13 +657,14 @@ pub mod skip_list {
     ///
     /// Holds the prefix as `Cow<[u8]>` so it works with both borrowed slices and
     /// owned `Vec<u8>` without duplicating the struct.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub struct PrefixIter<'a> {
         list: &'a SkipList,
         current: u32,
         prefix: Cow<'a, [u8]>,
     }
 
+    #[cfg(test)]
     impl<'a> Iterator for PrefixIter<'a> {
         type Item = (&'a [u8], u128);
 
@@ -753,7 +706,10 @@ pub mod skip_list {
         }
 
         pub fn try_insert(&mut self, key: &[u8], value: u128) -> Result<Option<u128>, InsertError> {
-            self.try_insert_with_seq(key, value, Self::next_test_seq())
+            Ok(match self.try_insert_with_seq(key, value, Self::next_test_seq())? {
+                Applied::Won { displaced } => displaced,
+                Applied::Stale => None,
+            })
         }
 
         pub fn remove(&mut self, key: &[u8]) -> Option<u128> {
@@ -770,10 +726,25 @@ pub mod skip_list {
 
     #[cfg(test)]
     mod tests {
-        use crate::storage::lsm::skip_list::skip_list::DEFAULT_MAX_CAPACITY;
 
-        use super::{KeyValueRecord, SkipList};
+        use super::{Applied, KeyValueRecord, SkipList, Version};
         use std::collections::BTreeMap;
+
+        /// Every outcome the garbage accounting relies on: a replaced live value
+        /// is reported once, a stale write is reported as stale, and a write over
+        /// a tombstone or into an absent key displaces nothing.
+        #[test]
+        fn writes_report_what_they_displaced() {
+            let mut sl = SkipList::new();
+            assert_eq!(sl.try_insert_with_seq(b"k", 100, 5).unwrap(), Applied::Won { displaced: None });
+            assert_eq!(sl.try_insert_with_seq(b"k", 200, 6).unwrap(), Applied::Won { displaced: Some(100) });
+            assert_eq!(sl.try_insert_with_seq(b"k", 300, 4).unwrap(), Applied::Stale);
+            assert_eq!(sl.insert_tombstone_with_seq(b"k", 3).unwrap(), Applied::Stale);
+            assert_eq!(sl.insert_tombstone_with_seq(b"k", 7).unwrap(), Applied::Won { displaced: Some(200) });
+            assert_eq!(sl.insert_tombstone_with_seq(b"k", 8).unwrap(), Applied::Won { displaced: None });
+            assert_eq!(sl.try_insert_with_seq(b"k", 400, 9).unwrap(), Applied::Won { displaced: None });
+            assert_eq!(sl.insert_tombstone_with_seq(b"absent", 10).unwrap(), Applied::Won { displaced: None });
+        }
 
         #[test]
         fn try_insert_with_seq_keeps_highest_sequence() {
@@ -798,7 +769,11 @@ pub mod skip_list {
             // the node is created directly as a tombstone, never live.
             let mut sl = SkipList::new();
             sl.insert_tombstone_with_seq(b"k", 4).unwrap();
-            assert_eq!(sl.entry(b"k"), Some((0, 4, true)), "tombstone node carrying the delete's seq");
+            assert_eq!(
+                sl.entry(b"k"),
+                Some((0, Version::user(4), true)),
+                "tombstone node carrying the delete's seq"
+            );
             assert_eq!(sl.get_value(b"k"), None);
             assert_eq!(sl.number_of_live_nodes(), 0);
             assert_eq!(sl.number_of_tombstone_nodes(), 1);
@@ -812,7 +787,7 @@ pub mod skip_list {
             sl.insert_tombstone_with_seq(b"k", 7).unwrap();
             // Tombstoned in place: the stored value bits are untouched (they are
             // meaningless for a tombstone), the sequence is the delete's.
-            assert_eq!(sl.entry(b"k"), Some((100, 7, true)));
+            assert_eq!(sl.entry(b"k"), Some((100, Version::user(7), true)));
             assert_eq!(sl.get_value(b"k"), None);
             assert_eq!(sl.number_of_live_nodes(), 0);
             assert_eq!(sl.number_of_tombstone_nodes(), 1);
@@ -825,7 +800,7 @@ pub mod skip_list {
             let mut sl = SkipList::new();
             sl.try_insert_with_seq(b"k", 100, 5).unwrap();
             sl.insert_tombstone_with_seq(b"k", 3).unwrap();
-            assert_eq!(sl.entry(b"k"), Some((100, 5, false)), "stale delete must not tombstone");
+            assert_eq!(sl.entry(b"k"), Some((100, Version::user(5), false)), "stale delete must not tombstone");
             assert_eq!(sl.number_of_live_nodes(), 1);
             assert_eq!(sl.number_of_tombstone_nodes(), 0);
         }
@@ -837,7 +812,11 @@ pub mod skip_list {
             let mut sl = SkipList::new();
             sl.insert_tombstone_with_seq(b"k", 10).unwrap();
             sl.try_insert_with_seq(b"k", 999, 5).unwrap();
-            assert_eq!(sl.entry(b"k"), Some((0, 10, true)), "stale write must not resurrect a tombstone");
+            assert_eq!(
+                sl.entry(b"k"),
+                Some((0, Version::user(10), true)),
+                "stale write must not resurrect a tombstone"
+            );
             assert_eq!(sl.get_value(b"k"), None);
         }
 
@@ -846,7 +825,7 @@ pub mod skip_list {
             let mut sl = SkipList::new();
             sl.insert_tombstone_with_seq(b"k", 3).unwrap();
             sl.try_insert_with_seq(b"k", 42, 5).unwrap();
-            assert_eq!(sl.entry(b"k"), Some((42, 5, false)));
+            assert_eq!(sl.entry(b"k"), Some((42, Version::user(5), false)));
             assert_eq!(sl.number_of_live_nodes(), 1);
             assert_eq!(sl.number_of_tombstone_nodes(), 0);
         }
@@ -857,10 +836,10 @@ pub mod skip_list {
             sl.insert_tombstone_with_seq(b"k", 2).unwrap();
             // Deleting an already-deleted key advances the tombstone's sequence...
             sl.insert_tombstone_with_seq(b"k", 6).unwrap();
-            assert_eq!(sl.entry(b"k"), Some((0, 6, true)));
+            assert_eq!(sl.entry(b"k"), Some((0, Version::user(6), true)));
             // ...and an older re-delete is dropped.
             sl.insert_tombstone_with_seq(b"k", 4).unwrap();
-            assert_eq!(sl.entry(b"k"), Some((0, 6, true)));
+            assert_eq!(sl.entry(b"k"), Some((0, Version::user(6), true)));
             assert_eq!(sl.number_of_live_nodes(), 0);
             assert_eq!(sl.number_of_tombstone_nodes(), 1);
             // The seq bump matters: a write between the two delete seqs stays dead.
@@ -872,12 +851,11 @@ pub mod skip_list {
         fn insert_tombstone_seq_comparison_spans_the_whole_sequence_space() {
             // Sequences are compared at full u64 width, so an arbitrarily large
             // gap between a tombstone and a later write still resolves correctly.
-            // (This replaced a u32-wraparound test: the truncation it tolerated is
-            // exactly what let a newer write lose to an older entry.)
+            // A truncated, wrapping comparison would let the newer write lose.
             let mut sl = SkipList::new();
             let old = 1_000u64;
             sl.insert_tombstone_with_seq(b"k", old).unwrap();
-            // Far beyond the old 2^31 serial-comparison window.
+            // Further apart than 2^31, where a wrapping 32-bit comparison inverts.
             sl.try_insert_with_seq(b"k", 1, old + 3_000_000_000).unwrap();
             assert_eq!(sl.get_value(b"k"), Some(1), "a much-later write must beat the tombstone");
             sl.insert_tombstone_with_seq(b"k", old + 6_000_000_000).unwrap();
@@ -953,8 +931,8 @@ pub mod skip_list {
 
         #[test]
         fn seq_comparison_spans_the_whole_sequence_space() {
-            // The comparison must hold across a gap far wider than the 2^31 window
-            // the old truncated-u32 serial arithmetic could represent.
+            // The comparison must hold across a gap far wider than 2^31, the most
+            // a wrapping 32-bit comparison can order.
             let mut sl = SkipList::new();
             sl.try_insert_with_seq(b"k", 1, 1_000).unwrap();
             sl.try_insert_with_seq(b"k", 2, 1_000 + 3_000_000_000).unwrap();
@@ -969,9 +947,9 @@ pub mod skip_list {
             let mut sl = SkipList::new();
             assert_eq!(sl.entry(b"k"), None, "absent key");
             sl.try_insert_with_seq(b"k", 7, 1).unwrap();
-            assert_eq!(sl.entry(b"k"), Some((7, 1, false)));
+            assert_eq!(sl.entry(b"k"), Some((7, Version::user(1), false)));
             sl.insert_tombstone_with_seq(b"k", 2).unwrap();
-            assert_eq!(sl.entry(b"k"), Some((7, 2, true)), "tombstone must be reported, not None");
+            assert_eq!(sl.entry(b"k"), Some((7, Version::user(2), true)), "tombstone must be reported, not None");
         }
 
         #[test]
@@ -1011,7 +989,7 @@ pub mod skip_list {
 
         #[test]
         fn randomized_against_btreemap() {
-            let max_capacity = DEFAULT_MAX_CAPACITY;
+            let max_capacity = crate::defaults::memtable::MAX_CAPACITY;
             let mut sl = SkipList::new();
             let mut model = BTreeMap::<Vec<u8>, u128>::new();
 
@@ -1062,7 +1040,7 @@ pub mod skip_list {
         fn zero_value_is_valid() {
             let mut sl = SkipList::new();
 
-            // value=0 is now a valid data value
+            // 0 is a valid value: a tombstone is a flag, not a reserved value.
             assert!(sl.insert(b"a", 0));
             assert_eq!(sl.get_value(b"a"), Some(0));
 
@@ -1170,7 +1148,7 @@ pub mod skip_list {
                 key: vec![],
                 value: 0,
                 tombstone: true,
-                seq: 0,
+                version: Version::default(),
             };
         }
     }

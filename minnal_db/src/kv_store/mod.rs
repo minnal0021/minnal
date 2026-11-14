@@ -1,31 +1,33 @@
-//! KVStore - Per-namespace key-value storage
+//! `KVStore`: one namespace's key-value storage, its LSM tree (keys to value
+//! pointers), its sharded value log (the values) and its live field indexes.
 //!
-//! Each KVStore owns its own LSM tree and sharded value log,
-//! representing an independent namespace within the database.
-//! The WAL is shared across all namespaces and managed by the
-//! Database coordinator.
+//! The WAL is shared by every namespace and owned by the `Database`
+//! coordinator in `db/`; this module sits below `db` and does not import it.
 
 use crate::namespace::NamespaceId;
 mod gc;
 pub mod index_set;
+pub(crate) mod key_locks;
 mod maintenance;
 mod reads;
 mod row_ids;
 pub mod stats;
 mod writes;
 
+#[cfg(any(test, feature = "semantic-search"))]
+pub(crate) use reads::KEY_PAGE;
 pub use reads::PrefixScan;
 
 use self::stats::{GCStats, Stats};
 use crate::error::{KVError, Result};
-use crate::storage::lsm::tree::{LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
+use crate::storage::lsm::tree::{Applied, Displaced, DisplacedSink, LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys, Version};
 use crate::storage::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
 use crate::storage::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
 
 use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,17 +42,21 @@ use std::time::Duration;
 pub(crate) type KeyValue = (Vec<u8>, Vec<u8>);
 
 /// A key paired with its encoded value-log pointer and the full-width LSM write `seq`.
-pub(crate) type KeyPointer = (Vec<u8>, u128, u64);
+pub(crate) type KeyPointer = (Vec<u8>, u128, crate::storage::lsm::tree::Version);
 
 /// One page of a cursor scan: the resolved pairs plus the next cursor
 /// (`None` when the scan is exhausted).
 pub(crate) type ScanPage = (Vec<KeyValue>, Option<Vec<u8>>);
 
+/// One page of a key-only cursor scan: the keys plus the next cursor (`None`
+/// when the scan is exhausted).
+pub(crate) type KeyPage = (Vec<Vec<u8>>, Option<Vec<u8>>);
+
 /// A scan entry resolved to what is needed to read its value: the key and its
 /// value-log pointer.
 ///
-/// No file handle is pinned any more. Segments are immutable and their ids are
-/// never reused, so a pointer stays meaningful however long it is held: it either
+/// Segments are immutable and their ids are never reused, so a pointer stays
+/// meaningful however long it is held: it either
 /// resolves to the same record or its segment is gone (`SegmentMissing`) and the
 /// key is re-resolved through the LSM.
 pub(crate) type ResolvedEntry = (Vec<u8>, ShardedValuePointer);
@@ -64,10 +70,6 @@ fn decode_sharded_pointer(offset_u128: u128) -> Option<ShardedValuePointer> {
     let p = ShardedValuePointer::from_u128(offset_u128);
     (p.location.segment_id != 0).then_some(p)
 }
-
-/// Value-log waste percentage at which a namespace is due for GC, unless
-/// configured otherwise (`ThresholdConfig::value_log_waste_threshold`).
-pub const DEFAULT_VALUE_LOG_WASTE_THRESHOLD: f64 = 30.0;
 
 /// How many insert/update/delete operations to batch between fsyncs of the
 /// value log.
@@ -88,7 +90,7 @@ pub const DEFAULT_VALUE_LOG_WASTE_THRESHOLD: f64 = 30.0;
 /// (a lone writer never waits). Default 0: rounds already form under load
 /// without one, and a delay lowers throughput when clients wait for each write
 /// before sending the next.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SyncConfig {
     pub records_per_sync: usize,
     pub commit_delay_us: u64,
@@ -97,8 +99,8 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            records_per_sync: 1000,
-            commit_delay_us: 0,
+            records_per_sync: crate::defaults::sync::RECORDS_PER_SYNC,
+            commit_delay_us: crate::defaults::sync::COMMIT_DELAY_US,
         }
     }
 }
@@ -107,7 +109,7 @@ impl SyncConfig {
     pub fn new(records_per_sync: usize) -> Self {
         Self {
             records_per_sync,
-            commit_delay_us: 0,
+            ..Self::default()
         }
     }
 
@@ -129,21 +131,16 @@ pub enum LsmCompactionCommand {
 /// Per-namespace key-value store with its own LSM tree and value log.
 pub struct KVStore {
     /// Namespace identifier (0 = "default")
-    #[allow(dead_code)]
     pub(crate) namespace_id: NamespaceId,
     pub(crate) name: String,
 
     // LSM tree for keys
     pub(crate) lsm: Arc<LSMTree>,
-    #[allow(dead_code)]
-    pub(crate) lsm_path: PathBuf,
 
     // Sharded value log: one series of segment files per bucket. The value log owns
     // its own durable metadata (segment inventory + id high-water mark) per bucket,
     // so the store keeps no separate metadata file of its own.
     pub(crate) value_log: ShardedValueLog,
-    #[allow(dead_code)]
-    pub(crate) value_log_path: PathBuf,
 
     // Sync configuration
     pub(crate) sync_config: SyncConfig,
@@ -159,8 +156,8 @@ pub struct KVStore {
 
     // Test-only: set by a simulated crash (`AsyncDb::crash`) so that dropping
     // the store skips the flush below, as a process kill would. Without it the
-    // flush made every unflushed memtable durable, no-WAL writes included, and
-    // no crash test could see a write that a real crash loses.
+    // flush would make every unflushed memtable durable, no-WAL writes included,
+    // and no crash test could see a write that a real crash loses.
     #[cfg(test)]
     crashed: AtomicBool,
 
@@ -208,6 +205,19 @@ pub struct KVStore {
     // gets its own fresh counter, which is internally consistent.
     pub(crate) seq_counter: RwLock<Arc<AtomicU64>>,
 
+    /// This namespace's key stripes, the outermost write lock: every writer
+    /// holds its key's stripe from drawing its sequence to applying the write.
+    /// See [`key_locks`].
+    pub(crate) key_locks: key_locks::KeyLocks,
+
+    /// Keys whose last WAL-backed write is durable but failed to apply on every
+    /// retry, with that write's seq: until a later user write to the key, a read
+    /// still sees the value before it. `merge` logs an ERROR when it reads such a
+    /// key (see [`take_unapplied_write`](Self::take_unapplied_write)). Empty in
+    /// normal operation; `any_unapplied` lets the write path skip the lock.
+    unapplied_writes: parking_lot::Mutex<HashMap<Vec<u8>, u64>>,
+    any_unapplied: AtomicBool,
+
     /// Engine-wide operational counters, shared from `Database` via
     /// [`set_metrics`](Self::set_metrics). `None` for a standalone store (tests).
     pub(crate) metrics: OnceLock<Arc<crate::support::metrics::Metrics>>,
@@ -225,7 +235,7 @@ impl KVStore {
     /// Whether the namespace whose data directory is `base_path` holds any L1
     /// data, without opening it (see `LSMTree::has_level1_data`).
     pub(crate) fn has_level1_data(base_path: &Path) -> std::io::Result<bool> {
-        crate::storage::lsm::tree::LSMTree::has_level1_data(&base_path.join("lsm"))
+        crate::storage::lsm::tree::LSMTree::has_level1_data(&crate::layout::namespace_lsm_dir(base_path))
     }
 
     /// Enable or disable re-verifying each value's CRC32 on read (default off).
@@ -238,9 +248,9 @@ impl KVStore {
     /// The directory will contain `lsm/` and `value_logs/` subdirectories.
     ///
     /// `segment_size_bytes` is the size at which a value-log segment is sealed and a
-    /// new one opened. Unlike the page size it replaces, it is **not** fixed at
-    /// creation: a segment's size is not encoded in any pointer, so existing segments
-    /// keep theirs and new ones use whatever is configured now.
+    /// new one opened. It is **not** fixed at creation: no pointer encodes a
+    /// segment's size, so existing segments keep theirs and new ones use whatever
+    /// is configured now.
     pub fn open(
         namespace_id: NamespaceId,
         name: &str,
@@ -256,9 +266,8 @@ impl KVStore {
     ///
     /// There is no GC recovery step. GC writes survivors to a *new* segment, re-points
     /// the keys, makes that durable, and only then unlinks the old segment — so at
-    /// every crash point the durable LSM still refers to a segment that exists. There
-    /// is nothing to roll forward or back, which is why the GC journal, its commit
-    /// marker and the `.log.new`/`.log.old` dance are all gone.
+    /// every crash point the durable LSM still refers to a segment that exists, and
+    /// there is nothing to roll forward or back.
     pub fn open_with_ttl(
         namespace_id: NamespaceId,
         name: &str,
@@ -270,8 +279,8 @@ impl KVStore {
     ) -> Result<Self> {
         std::fs::create_dir_all(base_path)?;
 
-        let lsm_path = base_path.join("lsm");
-        let value_log_path = base_path.join("value_logs");
+        let lsm_path = crate::layout::namespace_lsm_dir(base_path);
+        let value_log_path = crate::layout::namespace_value_log_dir(base_path);
 
         let mut lsm_cfg = lsm_config;
         lsm_cfg.data_dir = lsm_path.clone();
@@ -284,14 +293,15 @@ impl KVStore {
                 name, e
             )))
         })?;
+        lsm.set_displaced_sink(Arc::new(MergeGarbage {
+            logs: value_log.bucket_logs(),
+        }));
 
         let store = Self {
             namespace_id,
             name: name.to_string(),
             lsm,
-            lsm_path,
             value_log,
-            value_log_path,
             sync_config,
             write_count: Arc::new(AtomicU64::new(0)),
             unflushed_no_wal_writes: Arc::new(AtomicBool::new(false)),
@@ -307,6 +317,9 @@ impl KVStore {
             row_to_key_fn: Arc::new(RwLock::new(None)),
             rowmap: Arc::new(RwLock::new(None)),
             seq_counter: RwLock::new(Arc::new(AtomicU64::new(1))),
+            key_locks: key_locks::KeyLocks::new(),
+            unapplied_writes: parking_lot::Mutex::new(HashMap::new()),
+            any_unapplied: AtomicBool::new(false),
             metrics: OnceLock::new(),
             #[cfg(test)]
             gc_crash_after_unlink: AtomicBool::new(false),
@@ -323,8 +336,13 @@ impl KVStore {
     /// Recompute per-segment live/garbage byte counts from the LSM's pointers, for any
     /// bucket whose accounting could not be loaded.
     ///
-    /// Exact, not conservative: a record is live iff the LSM still points at it, and
-    /// every other byte in the segment is garbage. Costs one LSM key+pointer scan.
+    /// Exact, not conservative: a record is live iff some LSM entry still points at
+    /// it, the key's newest or an older one a merge has not dropped yet, and every
+    /// other byte in the segment is garbage. That is the definition the running
+    /// counts keep (garbage is counted when the last entry pointing at a record
+    /// goes: see `MergeGarbage`), so the two agree. Costs one read of every layer
+    /// of those buckets alone (the value log and the LSM hash keys to buckets
+    /// alike).
     fn rebuild_missing_segment_stats(&self) -> Result<()> {
         let buckets = self.value_log.buckets_needing_stat_rebuild();
         if buckets.is_empty() {
@@ -337,9 +355,13 @@ impl KVStore {
         );
 
         let mut live: HashMap<u32, HashMap<u32, u64>> = HashMap::new(); // bucket -> segment -> bytes
-        for (key, offset_u128) in self.lsm.key_pointer_pairs(None)? {
-            if let Some(pointer) = decode_sharded_pointer(offset_u128) {
-                *live.entry(pointer.bucket).or_default().entry(pointer.location.segment_id).or_insert(0) += pointer.record_len(key.len());
+        let mut rebuild = vec![false; self.value_log.num_buckets()];
+        for &bucket in &buckets {
+            rebuild[bucket as usize] = true;
+        }
+        for Displaced { key_len, pointer } in self.lsm.referenced_pointers(Some(&rebuild))? {
+            if let Some(pointer) = decode_sharded_pointer(pointer) {
+                *live.entry(pointer.bucket).or_default().entry(pointer.location.segment_id).or_insert(0) += pointer.record_len(key_len);
             }
         }
         let empty = HashMap::new();
@@ -364,21 +386,17 @@ impl KVStore {
         self.metrics.get().map(|m| m.as_ref())
     }
 
-    /// Share a global write-sequence counter with this store (called by the
-    /// `Database` coordinator with its WAL sequence counter, so all writes —
-    /// WAL-backed and non-WAL — draw from one monotonic sequence space).
-    /// Share the database's write-sequence counter, first raising it above
-    /// every sequence this store already holds.
+    /// Share the database's write-sequence counter with this store, first raising
+    /// it above every sequence this store already holds, so all writes (WAL-backed
+    /// and no-WAL) draw from one monotonic sequence space.
     ///
     /// **Load-bearing for no-WAL writes.** The counter is recovered from the WAL
     /// at open, but a no-WAL write takes a sequence the WAL never sees. After a
     /// crash the counter could restart below a no-WAL value already flushed to an
     /// SSTable, and every later write to that key — WAL-backed or not — would
     /// lose to the stale value under highest-sequence-wins: a delete silently
-    /// undone, an update silently reverted. Found by the M3a split crash audit
-    /// while trying no-WAL meta writes (a meta rewritten after a restart never
-    /// became visible). Regression
-    /// test: `a_write_after_a_crash_beats_a_flushed_no_wal_value`.
+    /// undone, an update silently reverted. Test:
+    /// `a_write_after_a_crash_beats_a_flushed_no_wal_value`.
     pub(crate) fn set_seq_counter(&self, counter: Arc<AtomicU64>) {
         counter.fetch_max(self.lsm.max_stored_seq().saturating_add(1), Ordering::SeqCst);
         *self.seq_counter.write() = counter;
@@ -395,7 +413,49 @@ impl KVStore {
         self.seq_counter.read().fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Set the LSM flush observer (used to wire up WAL persistence callbacks)
+    /// Lock `key`'s stripe (see [`key_locks`]). Every write to this namespace
+    /// takes it before it draws its sequence and holds it until the write is
+    /// applied.
+    pub(crate) fn lock_key(&self, key: &[u8]) -> parking_lot::MutexGuard<'_, ()> {
+        self.key_locks.guard(key)
+    }
+
+    /// Record that the WAL-backed write `seq` to `key` is durable but failed to
+    /// apply on every retry. Called with the key's stripe held.
+    pub(crate) fn note_unapplied_write(&self, key: &[u8], seq: u64) {
+        self.unapplied_writes.lock().insert(key.to_vec(), seq);
+        self.any_unapplied.store(true, Ordering::SeqCst);
+    }
+
+    /// The seq of `key`'s durable-but-unapplied write, if it has one, forgetting
+    /// it: the caller (`merge`, with the stripe held) is about to write the key
+    /// over the value it can read, superseding that write.
+    pub(crate) fn take_unapplied_write(&self, key: &[u8]) -> Option<u64> {
+        if !self.any_unapplied.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut unapplied = self.unapplied_writes.lock();
+        let seq = unapplied.remove(key);
+        if unapplied.is_empty() {
+            self.any_unapplied.store(false, Ordering::SeqCst);
+        }
+        seq
+    }
+
+    /// Test-only: the seq of `key`'s durable-but-unapplied write, if any,
+    /// without forgetting it.
+    #[cfg(test)]
+    pub(crate) fn unapplied_write(&self, key: &[u8]) -> Option<u64> {
+        self.unapplied_writes.lock().get(key).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stripe_of(&self, key: &[u8]) -> usize {
+        self.key_locks.stripe_of(key)
+    }
+
+    /// Set the LSM flush observer: the database's hook that retires WAL entries
+    /// once a flush makes them durable.
     pub(crate) fn set_flush_observer(&self, observer: Option<Arc<dyn LsmFlushObserver>>) {
         let observer = observer.map(|inner| {
             Arc::new(SyncValueLogBeforePersist {
@@ -424,7 +484,6 @@ impl KVStore {
 
     /// Flush and sync all data for this namespace.
     pub fn shutdown(&self) -> Result<()> {
-        self.lsm.cleanup_pending_memtables_on_close();
         // Values before the LSM entries that point at them (see
         // `SyncValueLogBeforePersist`).
         self.value_log.sync_all()?;
@@ -437,6 +496,51 @@ impl KVStore {
     }
 }
 
+/// Counts the records an L0→L1 merge stopped referencing as value-log garbage.
+///
+/// With the memtable's own report ([`Applied`]), this is the only place garbage
+/// is counted for an overwrite or a delete: the writer does not look up the
+/// pointer it replaces. A record shadowed by a newer write therefore stays live
+/// in the counters until the merge drops its entry. The counters only choose
+/// which segments GC rewrites; GC reads liveness from the LSM. A record in a
+/// segment GC has already deleted is not counted anywhere.
+struct MergeGarbage {
+    logs: Vec<Arc<crate::storage::value_log::ValueLog>>,
+}
+
+impl DisplacedSink for MergeGarbage {
+    fn on_displaced(&self, records: &[Displaced]) {
+        for record in records {
+            if let Some(pointer) = decode_sharded_pointer(record.pointer)
+                && let Some(log) = self.logs.get(pointer.bucket as usize)
+            {
+                log.note_displaced(pointer.location, record.key_len);
+            }
+        }
+    }
+}
+
+impl KVStore {
+    /// Count as garbage what a memtable write left unreferenced: the live
+    /// pointer it replaced in place, or, if it was stale, its own record.
+    /// `pointer` is the write's own record (`None` for a delete).
+    pub(super) fn note_applied(&self, applied: Applied, pointer: Option<ShardedValuePointer>, key_len: usize) {
+        match applied {
+            Applied::Won { displaced: Some(old) } => {
+                if let Some(old) = decode_sharded_pointer(old) {
+                    self.value_log.note_displaced(old, key_len);
+                }
+            }
+            Applied::Won { displaced: None } => {}
+            Applied::Stale => {
+                if let Some(own) = pointer {
+                    self.value_log.note_displaced(own, key_len);
+                }
+            }
+        }
+    }
+}
+
 /// Makes a store's value log durable before any WAL entry is retired.
 ///
 /// Writes fsync the WAL but not the value log (that is `records_per_sync`'s
@@ -444,7 +548,7 @@ impl KVStore {
 /// memtable's L0 files are written, `on_ro_memtable_written` lets both WALs
 /// retire its entries — recovery then skips them and WAL GC deletes them — so
 /// the value-log records those SSTable entries point at must be on stable
-/// storage first. Without this, a power loss after the flush lost up to
+/// storage first. Without this, a power loss after the flush would lose up to
 /// `records_per_sync` acknowledged values (and any segment sealed since its
 /// last fsync) with nothing left to replay them from. If the fsync fails the
 /// flush is undone: the entries stay replayable and the memtable is flushed

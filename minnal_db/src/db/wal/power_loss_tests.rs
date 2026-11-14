@@ -389,7 +389,7 @@ fn power_loss_stress(seed: u64, images: usize) {
     activate_status_index(&db, docs);
 
     // Each writer owns its keys, and no two writers' keys share a key-stripe
-    // lock: a writer stopped inside a commit holds its key's stripe, and a
+    // lock (stripes are per namespace): a writer stopped inside a commit holds its key's stripe, and a
     // second writer waiting on that stripe could never reach a stopping point.
     let mut taken = std::collections::HashSet::new();
     let keys: Vec<Vec<(NamespaceId, Vec<u8>)>> = (0..WRITERS)
@@ -399,7 +399,7 @@ fn power_loss_stress(seed: u64, images: usize) {
             while (mine.len() as u64) < KEYS_PER_WRITER {
                 let ns = if i.is_multiple_of(3) { other } else { docs };
                 let key = format!("w{w}/k{i}").into_bytes();
-                if taken.insert(db.stripe_of(ns, &key)) {
+                if taken.insert((ns, db.stripe_of(ns, &key))) {
                     mine.push((ns, key));
                 }
                 i += 1;

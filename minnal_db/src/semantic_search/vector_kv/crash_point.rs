@@ -1,4 +1,4 @@
-//! Test-only crash injection for the crash audit (design doc M0-2).
+//! Test-only crash injection for the crash audit (`Dynamic-RaBitQ-Index-Design.md` → M0-2).
 //!
 //! [`crash_point!`] sits before every vector-index write in `vector_kv`. A test
 //! arms a countdown of N writes; the next check after N fails with a simulated

@@ -110,7 +110,6 @@ impl IndexCheckpointTarget for Database {
             if let Some(store) = stores.get(&ns_id) {
                 let ns_index = store.namespace_index.read();
                 if let Some(entry) = ns_index.get(field_id) {
-                    let field_path = self.index_manager.field_path(ns_id, field_id);
                     // Write the field's buffered changes out, crash-ordered and
                     // with no fsync under the write lock:
                     //   1. stage  (write lock): append the changed blobs; no slot
@@ -163,7 +162,7 @@ impl IndexCheckpointTarget for Database {
                     if over_threshold {
                         let mut idx = entry.index.write();
                         if idx.maybe_compact(waste_threshold).map_err(KVError::Io)? {
-                            idx.flush(&field_path).map_err(KVError::Io)?;
+                            idx.flush().map_err(KVError::Io)?;
                             debug!("[IndexCheckpoint] compacted field-index stores ns={ns_id} field={field_id}");
                         }
                     }
@@ -256,8 +255,8 @@ impl ValueLogGcTarget for Database {
 
     /// `waste_threshold` decides **whether** a namespace is collected; the separate,
     /// lower `segment_gc_threshold` then decides **which sealed segments** get rewritten.
-    /// Passing the trigger through as the selection threshold (as this used to) makes
-    /// garbage sitting just under it uncollectable: those segments read as "clean", are
+    /// Passing the trigger through as the selection threshold would make garbage
+    /// sitting just under it uncollectable: those segments read as "clean", are
     /// left in place with their garbage intact, and keep the bucket over its trigger
     /// forever.
     fn run_gc_if_needed(&self, waste_threshold: f64) {
@@ -338,9 +337,8 @@ impl TtlTarget for Database {
             let Some(store) = self.stores.read().get(&ns_id).cloned() else {
                 continue;
             };
-            // The key stripe keeps expiry out of every same-key write's
-            // seq-to-apply window (see `KVStore::expire_records_locked`).
-            match store.expire_records_locked(ttl, max_deletes, |key| self.key_locks.guard(ns_id, key)) {
+            // Expiry takes each key's stripe itself (see `KVStore::expire_records_with`).
+            match store.expire_records(ttl, max_deletes) {
                 Ok(deleted) => {
                     if deleted > 0 {
                         info!("[TtlWorker] ns_id={} expired {} record(s)", ns_id, deleted);

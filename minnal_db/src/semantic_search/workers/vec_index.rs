@@ -20,7 +20,7 @@
 //! ([`vector_kv::make_vector_writes_durable`]) and then completed. A crash before
 //! that sync leaves the entries queued, and the next pass re-embeds them; writing
 //! the same text's vectors again is harmless. See
-//! `vector_kv::make_vector_writes_durable` for what completing first used to lose.
+//! `vector_kv::make_vector_writes_durable` for what completing first would lose.
 //!
 //! # Checked against the document
 //!
@@ -147,7 +147,7 @@ pub(crate) async fn check_entry<H: WorkerHost>(db: &AsyncDb, host: &H, entry: &Q
 /// Pass this to the store's builder,
 /// [`DocStoreBuilder::vector_index_config`](crate::doc_store::DocStoreBuilder::vector_index_config).
 /// Defaults are conservative values suitable for most deployments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VectorIndexConfig {
     /// Seconds to sleep after a pass that contained at least one failure,
     /// before re-scanning the queue.  Default: 2.
@@ -164,9 +164,9 @@ pub struct VectorIndexConfig {
 impl Default for VectorIndexConfig {
     fn default() -> Self {
         Self {
-            retry_wait_secs: 2,
-            max_retries: 5,
-            concurrency: 6,
+            retry_wait_secs: crate::defaults::vector_index::RETRY_WAIT_SECS,
+            max_retries: crate::defaults::vector_index::MAX_RETRIES,
+            concurrency: crate::defaults::vector_index::CONCURRENCY,
         }
     }
 }

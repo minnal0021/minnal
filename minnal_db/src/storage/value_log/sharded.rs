@@ -8,7 +8,7 @@ use super::{BatchValue, SegmentStats, ValueLocation, ValueLog, ValueLogMetadata,
 use crate::support;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -50,8 +50,8 @@ pub type Result<T> = std::result::Result<T, ShardedValueLogError>;
 /// ```
 ///
 /// `value_len` rides along so a read is **one `pread` of exactly
-/// `header + value_len` bytes** — there is no page header to consult and no slot
-/// table to walk. `segment_id == 0` is the reserved "no value" sentinel.
+/// `header + value_len` bytes**, with nothing to look up first.
+/// `segment_id == 0` is the reserved "no value" sentinel.
 ///
 /// Segment ids are **never reused**, so an address identifies one record for the
 /// life of the database: a pointer GC has superseded still resolves to the same
@@ -115,10 +115,6 @@ pub struct ShardedValueLog {
     /// one key.
     bucket_write_locks: Vec<Arc<Mutex<()>>>,
     num_buckets: usize,
-    #[allow(dead_code)] // kept for diagnostics: the size new segments are sealed at
-    segment_size: u64,
-    #[allow(dead_code)]
-    base_path: PathBuf,
 }
 
 impl ShardedValueLog {
@@ -138,23 +134,11 @@ impl ShardedValueLog {
             logs,
             bucket_write_locks,
             num_buckets,
-            segment_size,
-            base_path,
         })
     }
 
     pub fn num_buckets(&self) -> usize {
         self.num_buckets
-    }
-
-    #[allow(dead_code)]
-    pub fn segment_size(&self) -> u64 {
-        self.segment_size
-    }
-
-    #[allow(dead_code)]
-    pub fn base_path(&self) -> &Path {
-        &self.base_path
     }
 
     pub fn bucket_for_key(&self, key: &[u8]) -> u32 {

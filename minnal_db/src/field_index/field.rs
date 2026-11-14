@@ -24,24 +24,18 @@ pub struct FieldMeta {
     /// A dropped field keeps its entry so a later re-add reuses the same
     /// [`FieldId`], but it is excluded from
     /// [`NamespaceRegistry::all_indexed_fields`](crate::namespace::NamespaceRegistry::all_indexed_fields) and cannot be activated until
-    /// it is re-registered. See `FEATURE-REQUEST.md` (FR-001) —
-    /// *Dropped-index cleanup*.
+    /// it is re-registered.
     pub dropped: bool,
 }
 
 /// The result of a field-index query: the matching keys **and** whether the
 /// indices that produced them are known to be incomplete.
 ///
-/// Returning a bare `Vec` of keys was the original defect in a different
-/// costume: a degraded index served results that *looked* complete, so a caller
-/// could not tell a genuinely empty result from a missing one. The status is
-/// carried here rather than only at the REST boundary because
-/// [`AsyncDb::query_index`](crate::AsyncDb::query_index) is a first-class documented path
-/// — flagging only in `doc_store` would fix HTTP callers and leave embedders
-/// exactly where they started.
-///
-/// See `FEATURE-REQUEST.md` (FR-001) — *Queryable + degraded ⇒ the answer must
-/// say so*.
+/// A bare `Vec` of keys would let a degraded index serve results that *look*
+/// complete, so a caller could not tell a genuinely empty result from a missing
+/// one. The status is carried here rather than only at the REST boundary because
+/// [`AsyncDb::query_index`](crate::AsyncDb::query_index) is a documented entry
+/// point of its own: flagging only in `doc_store` would leave embedders unwarned.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueryOutcome {
     /// The matching keys. For a paginated query, only the requested window.

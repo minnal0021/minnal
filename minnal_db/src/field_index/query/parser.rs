@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(expr, expected);
     }
 
-    // ── Complexity limits (stack-overflow DoS regression) ───────────────────
+    // ── Complexity limits (a deep query must not overflow the stack) ────────
 
     #[test]
     fn deeply_nested_parens_are_rejected_not_stack_overflowed() {

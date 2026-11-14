@@ -1,11 +1,12 @@
 //! How vectors are partitioned and encoded: the [`IvfLayout`] a search and the
-//! indexer work against (design doc M2b).
+//! indexer work against (`Dynamic-RaBitQ-Index-Design.md` → M2b).
 //!
-//! Two roles that one centroid file used to play at once are kept apart:
+//! Two roles are kept apart:
 //!
 //! - **Routing.** A *posting* is the set of chunk entries stored under one key
 //!   prefix. Each has a routing centroid: a vector is filed under the nearest one,
-//!   and a query probes the nearest few. Routing may change (M3 splits postings).
+//!   and a query probes the nearest few. Routing changes as postings split and
+//!   merge.
 //! - **Encoding.** A *centre* is what a code is encoded against (`x − c`). A code
 //!   records its `centre_id` and is always decoded through it, never through the
 //!   posting it sits in, so a centre must never change once a code points at it.
@@ -25,7 +26,7 @@ use crate::semantic_search::quantisation::rotation::FhtKacRotator;
 /// The centre whole-document (Pass-2) codes are encoded against: the origin.
 /// Reserved: no stored centre may use this id. A zero centre makes Pass 2
 /// independent of the partition, so postings and centres can change under it
-/// (design doc M2c).
+/// (`Dynamic-RaBitQ-Index-Design.md` → M2c).
 pub const ZERO_CENTRE: u32 = u32::MAX;
 
 /// What indexing and search need to know about a partition.
@@ -330,7 +331,7 @@ impl CountTable {
     }
 }
 
-/// Lifecycle of a posting (design doc M3a, *Maintenance journal*).
+/// Lifecycle of a posting (`Dynamic-RaBitQ-Index-Design.md` → M3a, *Maintenance journal*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PostingState {
@@ -362,12 +363,12 @@ impl PostingState {
 pub enum PostingOrigin {
     /// The single posting a namespace starts with.
     Root = 0,
-    /// Copied from a centroid file (namespaces enabled before M3; tests and
-    /// benches seed static baselines this way).
+    /// Copied from fixed centres: tests and benches seed static baselines this
+    /// way.
     Seed = 1,
     /// One half of a split.
     Split = 2,
-    /// Fitted by a rebuild (design doc M4).
+    /// Fitted by a rebuild (`Dynamic-RaBitQ-Index-Design.md` → M4).
     Rebuild = 3,
 }
 
@@ -713,7 +714,7 @@ impl NamespaceIvf {
 }
 
 /// What a namespace's maintenance has done since its partition was loaded
-/// (design doc M3b). Reported by partition health and the frozen eval.
+/// (`Dynamic-RaBitQ-Index-Design.md` → M3b). Reported by partition health and the frozen eval.
 #[derive(Debug, Default)]
 pub struct MaintenanceCounters {
     /// Postings split.
@@ -900,9 +901,9 @@ impl Grace {
 ///   so once it returns nothing is still filing chunks by the old routing.
 ///   [`epoch_barrier`](Self::epoch_barrier) waits the same way, so a split can
 ///   delete a posting's old keys without a search that began before the copy
-///   missing them (design doc M3a, rule 4). Neither holds up a write or search
-///   that starts after it, so a slow search delays maintenance, never other
-///   searches.
+///   missing them (`Dynamic-RaBitQ-Index-Design.md` → M3a, rule 4). Neither
+///   holds up a write or search that starts after it, so a slow search delays
+///   maintenance, never other searches.
 /// - **Maintenance lock.** One maintenance operation per namespace at a time.
 /// - **Recovery.** A handle starts out needing its journal recovered (a crash
 ///   may have left an operation half done), and is marked so again after any
@@ -1053,7 +1054,6 @@ impl PartitionHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic_search::cluster::DEFAULT_ROTATION_SEED;
 
     fn centroids(dim: usize) -> HashMap<u32, Vec<f32>> {
         (0..4u32)
@@ -1068,7 +1068,7 @@ mod tests {
     #[test]
     fn seeded_layout_matches_the_identity_layout() {
         let c = centroids(16);
-        let ivf = NamespaceIvf::seeded(&c, DEFAULT_ROTATION_SEED).unwrap();
+        let ivf = NamespaceIvf::seeded(&c, crate::defaults::schema_vector_index::ROTATION_SEED).unwrap();
         let identity = ClusterIndex::from_clusters(c.iter().map(|(&id, v)| (id, Cluster::new(id, v.clone()))).collect());
         // Distinct distances to every centroid, so no tie is broken by map order.
         let q: Vec<f32> = (0..16).map(|i| 1.0 / (i as f32 + 1.0)).collect();
@@ -1095,7 +1095,7 @@ mod tests {
     fn routing_and_centres_are_separate() {
         let c = centroids(16);
         let postings = vec![Posting::seeded(10, c[&0].clone(), 0), Posting::seeded(11, c[&1].clone(), 0)];
-        let ivf = NamespaceIvf::new(postings, c.clone(), DEFAULT_ROTATION_SEED).unwrap();
+        let ivf = NamespaceIvf::new(postings, c.clone(), crate::defaults::schema_vector_index::ROTATION_SEED).unwrap();
         assert_eq!(IvfLayout::route(&ivf, &c[&1]), Some(11));
         assert_eq!(ivf.centre_of(11), Some(0));
         assert_eq!(ivf.centre_of(12), None);
@@ -1242,7 +1242,7 @@ mod tests {
     #[test]
     fn evolving_keeps_the_existing_rotated_centres() {
         let c = centroids(16);
-        let ivf = NamespaceIvf::seeded(&c, DEFAULT_ROTATION_SEED).unwrap();
+        let ivf = NamespaceIvf::seeded(&c, crate::defaults::schema_vector_index::ROTATION_SEED).unwrap();
         let added: Vec<f32> = (0..16).map(|i| (i as f32 - 7.5) / 10.0).collect();
         let next = ivf.evolve(&[(9, added.clone())], &[]).unwrap();
         for id in 0..4u32 {
@@ -1258,7 +1258,9 @@ mod tests {
     /// before it ...
     #[tokio::test]
     async fn a_barrier_waits_for_readers_that_started_before_it() {
-        let h = Arc::new(PartitionHandle::new(NamespaceIvf::seeded(&centroids(16), DEFAULT_ROTATION_SEED).unwrap()));
+        let h = Arc::new(PartitionHandle::new(
+            NamespaceIvf::seeded(&centroids(16), crate::defaults::schema_vector_index::ROTATION_SEED).unwrap(),
+        ));
         let old = h.read_epoch().await;
         let barrier = tokio::spawn({
             let h = Arc::clone(&h);
@@ -1274,7 +1276,9 @@ mod tests {
     /// queue behind a split waiting for an older, slow search.
     #[tokio::test]
     async fn a_new_reader_does_not_wait_behind_a_barrier() {
-        let h = Arc::new(PartitionHandle::new(NamespaceIvf::seeded(&centroids(16), DEFAULT_ROTATION_SEED).unwrap()));
+        let h = Arc::new(PartitionHandle::new(
+            NamespaceIvf::seeded(&centroids(16), crate::defaults::schema_vector_index::ROTATION_SEED).unwrap(),
+        ));
         let old = h.read_epoch().await;
         let barrier = tokio::spawn({
             let h = Arc::clone(&h);

@@ -15,7 +15,7 @@ impl DocStore {
     #[cfg(feature = "semantic-search")]
     pub(in crate::doc_store) async fn clear_doc_vectors(&self, namespace: &str, key: &[u8]) -> Result<(), DocStoreError> {
         // The partition first, so the count change below always reaches it. A
-        // change made while no partition was loaded was dropped, which is right
+        // change made while no partition is loaded is dropped, which is right
         // only if the next load counts after the delete; a load already
         // counting (and not yet installed) would keep the deleted document for
         // good. Loading here installs it before the delete.
@@ -80,28 +80,22 @@ impl DocStore {
     /// worker has not processed them yet or the embedding service is
     /// temporarily unavailable.
     #[cfg(feature = "semantic-search")]
-    pub async fn pending_vector_index_count(&self) -> usize {
-        vector_kv::list_queue_entries(&self.db).await.map(|e| e.len()).unwrap_or(0)
+    pub async fn pending_vector_index_count(&self) -> Result<usize, DocStoreError> {
+        Ok(vector_kv::count_queue_entries(&self.db).await?)
     }
 
-    /// Return the live count of documents that have a committed vector index
-    /// entry in `{namespace}_sparse_vector_meta`.
-    ///
-    /// Unlike the LSM manifest entry counts, this reads through the active
-    /// memtable so it reflects recently indexed documents immediately.  It also
-    /// excludes tombstones (the engine merges deletes before returning results),
-    /// so the count decreases as soon as a document's vector is removed — no
-    /// need to wait for LSM compaction.
-    ///
-    /// Returns 0 when the companion namespace has not been created yet (i.e. no
-    /// document has been indexed in this namespace).
+    /// How many documents of `namespace` have vector-index entries, counted
+    /// from the keys of `{namespace}_sparse_vector_meta` (one per indexed
+    /// document; no value is read). Recent writes count at once, and a deleted
+    /// document's entry stops counting as soon as it is removed. 0 when nothing
+    /// in the namespace has been indexed.
     #[cfg(feature = "semantic-search")]
-    pub async fn count_indexed_docs(&self, namespace: &str) -> u64 {
+    pub async fn count_indexed_docs(&self, namespace: &str) -> Result<u64, DocStoreError> {
         let meta_ns = vector_kv::sparse_vectors_meta_ns(namespace);
-        match self.db.existing_namespace(meta_ns).await {
-            Ok(Some(ns)) => ns.iter().await.map(|v| v.len() as u64).unwrap_or(0),
-            Ok(None) | Err(_) => 0,
-        }
+        Ok(match self.db.existing_namespace(meta_ns).await? {
+            Some(ns) => ns.count().await? as u64,
+            None => 0,
+        })
     }
 
     /// Return all entries currently in the async vector-index queue.

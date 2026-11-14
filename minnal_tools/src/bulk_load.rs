@@ -158,8 +158,6 @@ pub(crate) enum DocKeyType {
 /// Minimal projection of a doc-store schema entry in the `GET /stores` list.
 #[derive(Debug, Deserialize)]
 struct DocSchema {
-    #[allow(dead_code)]
-    namespace: String,
     key_type: DocKeyType,
 }
 
@@ -176,8 +174,6 @@ pub(crate) enum KvKeyType {
 /// Minimal projection of a KV-store schema entry in the `GET /stores` list.
 #[derive(Debug, Deserialize)]
 struct KvSchema {
-    #[allow(dead_code)]
-    namespace: String,
     key_type: KvKeyType,
 }
 
@@ -1034,8 +1030,8 @@ mod tests {
         assert_eq!(errs.len(), 1);
     }
 
-    /// The KV path gained the same cap as the doc path — previously any length
-    /// was accepted here and reached the server.
+    /// The KV path has the same key-length cap as the doc path, so an
+    /// over-long key fails here rather than at the server.
     #[test]
     fn kv_str_key_is_length_capped_and_non_empty() {
         let mut errs = Vec::new();

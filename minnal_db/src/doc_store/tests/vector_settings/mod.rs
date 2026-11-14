@@ -1,7 +1,8 @@
 //! A namespace's vector-index settings through the store: defaults written on
 //! create, fixed fields kept across a vector-index drop, search updates, model
 //! checks, per-request overrides, and two namespaces with different models in
-//! one process (design doc M2a).
+//! one process (design: `Dynamic-RaBitQ-Index-Design.md` → *M2a — The
+//! namespace owns its vector-index settings*).
 
 #[cfg(feature = "semantic-search")]
 mod drop_cleanup;

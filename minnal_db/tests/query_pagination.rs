@@ -106,7 +106,7 @@ async fn paged_query_matches_full_query_via_row_id_fn_across_containers() -> Res
         u64::from_be_bytes(arr) as u128
     });
     let row_to_key: RowToKeyFn = Arc::new(|id: u128| (id as u64).to_be_bytes().to_vec());
-    db.set_row_id_fn(DEFAULT_NAMESPACE_ID, row_id, Some(row_to_key)).await?;
+    db.set_row_id_fn(DEFAULT_NAMESPACE_ID, row_id, row_to_key).await?;
 
     let field = db.register_index_field(DEFAULT_NAMESPACE_ID, "status", IndexValueType::Str)?;
     db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())

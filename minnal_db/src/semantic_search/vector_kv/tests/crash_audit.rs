@@ -1,4 +1,4 @@
-//! Crash audit of the vector write paths (design doc M0-2).
+//! Crash audit of the vector write paths (`Dynamic-RaBitQ-Index-Design.md` → M0-2).
 //!
 //! Each scenario runs a sequence of vector-index operations with a crash injected
 //! before its Nth write (`crash_point`), for every N, and under several flush

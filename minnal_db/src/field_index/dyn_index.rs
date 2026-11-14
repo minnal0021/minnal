@@ -13,8 +13,8 @@
 //! frees a slot whose old bitmap is still on disk.
 //!
 //! Bitmap changes are buffered in memory and written by `spill` (see
-//! [`FieldIndex`]'s *Changes are buffered* section); [`DynFieldIndex::flush`]
-//! spills and then syncs both stores.
+//! [`FieldIndex`]'s *Changes are buffered in memory until the next spill*
+//! section); [`DynFieldIndex::flush`] spills and then syncs both stores.
 //!
 //! # Crash safety — each store is crash-ordered, the pair is reconciled at open
 //!
@@ -258,12 +258,9 @@ impl DynFieldIndex {
 
     /// Write the in-memory overlay to the stores ([`spill`](Self::spill)), then
     /// sync both stores to disk ([`sync`](Self::sync)).
-    ///
-    /// The `dir` parameter is retained for API compatibility but is no longer
-    /// used — all state is already in the mmap stores opened at construction.
-    pub fn flush(&mut self, dir: &Path) -> std::io::Result<()> {
+    pub fn flush(&mut self) -> std::io::Result<()> {
         self.spill();
-        self.sync(dir)
+        self.sync()
     }
 
     /// Write every buffered change out, crash-ordered: [`stage`](Self::stage),
@@ -393,8 +390,7 @@ impl DynFieldIndex {
     /// is no marker across the two stores, so a crash part-way can leave them
     /// skewed; [`open`](Self::open) reconciles that, and the owner's replay
     /// restores the rows. See the module-level *Crash safety* section.
-    pub fn sync(&self, dir: &Path) -> std::io::Result<()> {
-        let _ = dir; // retained for backward compatibility
+    pub fn sync(&self) -> std::io::Result<()> {
         // Values of both stores before the key table of either.
         self.sync_values()?;
         self.sync_keys()
@@ -637,8 +633,7 @@ impl DynFieldIndex {
     /// # Errors
     /// Returns the same type-mismatch error as [`insert`](Self::insert). The row
     /// has already been cleared from all buckets when this returns `Err`, so a
-    /// type mismatch leaves the field with no value for the row (matching the
-    /// clear-then-insert order callers used before this method existed).
+    /// type mismatch leaves the field with no value for the row.
     pub fn set(&mut self, value: &IndexValue, row_id: u128) -> Result<(), String> {
         self.remove_all_for_row(row_id);
         self.insert(value, row_id)
@@ -877,7 +872,7 @@ mod tests {
 
     #[test]
     fn insert_normal_values_are_within_the_u32_limit() {
-        // Regression: a realistic value must pass the size guard on the real path.
+        // A realistic value must pass the size guard on the real path.
         let mut idx = DynFieldIndex::new(IndexValueType::Str);
         assert!(idx.insert(&IndexValue::Str("active".into()), 1).is_ok());
         assert!(idx.set(&IndexValue::Str("archived".into()), 1).is_ok());
@@ -951,7 +946,7 @@ mod tests {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.set(&IndexValue::Int(42), 1).unwrap();
             idx.set(&IndexValue::Int(7), 1).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
         assert_eq!(query_int_eq(&idx, 7), vec![1]);
@@ -1011,7 +1006,7 @@ mod tests {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(42), 10).unwrap();
             idx.insert(&IndexValue::Int(-7), 20).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
         assert_eq!(idx.distinct_count(), 2);
@@ -1024,7 +1019,7 @@ mod tests {
             let mut idx = DynFieldIndex::open(IndexValueType::Str, dir.path()).unwrap();
             idx.insert(&IndexValue::Str("hello".into()), 1).unwrap();
             idx.insert(&IndexValue::Str("world".into()), 2).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let idx = DynFieldIndex::open(IndexValueType::Str, dir.path()).unwrap();
         assert_eq!(idx.distinct_count(), 2);
@@ -1037,7 +1032,7 @@ mod tests {
             let mut idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
             idx.insert(&IndexValue::Bool(true), 1).unwrap();
             idx.insert(&IndexValue::Bool(false), 2).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
         assert_eq!(idx.distinct_count(), 2);
@@ -1084,7 +1079,7 @@ mod tests {
             idx.insert(&IndexValue::Int(20), 2).unwrap();
             // Remove the only row for value 10 — keymap entry should be purged.
             idx.remove(&IndexValue::Int(10), 1);
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
         assert_eq!(idx.distinct_count(), 1);
@@ -1099,7 +1094,7 @@ mod tests {
             idx.insert(&IndexValue::Int(2), 100).unwrap();
             idx.insert(&IndexValue::Int(1), 200).unwrap();
             idx.remove_all_for_row(100);
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
         // Value 2 had only row 100 → removed; value 1 still has row 200.
@@ -1110,9 +1105,8 @@ mod tests {
 
     #[test]
     fn writes_between_spills_leave_no_dead_space() {
-        // The case the overlay exists for: 2,000 writes to one value used to
-        // append 2,000 copies of its bitmap. Now they change one in-memory
-        // bitmap, and the spill appends it once.
+        // The case the overlay exists for: 2,000 writes to one value change one
+        // in-memory bitmap, and the spill appends it once, not 2,000 copies.
         let dir = tempfile::TempDir::new().unwrap();
         let mut idx = DynFieldIndex::open(IndexValueType::Bool, dir.path()).unwrap();
         for row in 0..2_000u128 {
@@ -1166,7 +1160,7 @@ mod tests {
         assert_eq!(int_rows(&idx, 1).len(), 70_000);
     }
 
-    /// FR-005: once a field's bitmaps are bigger than the hard limit, every
+    /// Once a field's changed bitmaps are bigger than the hard limit, every
     /// write spills. Each spill must append the containers that changed (one
     /// per bucket a write touches) plus their directories, not whole bitmaps.
     #[test]
@@ -1178,7 +1172,7 @@ mod tests {
             let rows: Vec<u128> = (0..ROWS).filter(|r| (r % 2 == 1) == v).collect();
             idx.insert_many(&IndexValue::Bool(v), &rows).unwrap();
         }
-        idx.flush(dir.path()).unwrap();
+        idx.flush().unwrap();
         let bitmap_bytes = idx.blob_stats().bitmap_live_bytes / 2;
         assert!(bitmap_bytes > 32 * 8_192, "each bitmap is ~{bitmap_bytes} bytes");
 
@@ -1210,12 +1204,12 @@ mod tests {
         {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(5), 1).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
             idx.insert(&IndexValue::Int(5), 2).unwrap();
             assert_eq!(int_rows(&idx, 5), vec![1, 2], "overlay read includes the unspilled row");
             idx.remove_all_for_row(1);
             assert_eq!(int_rows(&idx, 5), vec![2], "clearing probes the overlay and the store");
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
         assert_eq!(int_rows(&idx, 5), vec![2]);
@@ -1230,11 +1224,11 @@ mod tests {
         {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(9), 1).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
             idx.remove(&IndexValue::Int(9), 1);
             assert_eq!(idx.distinct_count(), 0);
             idx.insert(&IndexValue::Int(9), 2).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
             assert_eq!(idx.keymap_store.as_ref().unwrap().count(), 1, "one keymap entry for value 9");
         }
         let idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
@@ -1248,7 +1242,7 @@ mod tests {
         {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(1), 10).unwrap();
-            idx.flush(dir.path()).unwrap(); // committed: value 1 = {10}
+            idx.flush().unwrap(); // committed: value 1 = {10}
             idx.insert(&IndexValue::Int(1), 11).unwrap();
             idx.insert(&IndexValue::Int(2), 20).unwrap();
             let _stage = idx.stage();
@@ -1282,7 +1276,7 @@ mod tests {
         {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(5), 1).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
             // Simulate the crash order "keymap durable, bitmap not".
             let DynFieldIndexInner::Int(fi) = &mut idx.inner else { unreachable!() };
             let slot = fi.slot_id_for(&5).unwrap();
@@ -1302,7 +1296,7 @@ mod tests {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(1), 1).unwrap();
             idx.insert(&IndexValue::Int(2), 2).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
             // Simulate "bitmap durable, keymap entry not" for the newest slot.
             let DynFieldIndexInner::Int(fi) = &idx.inner else { unreachable!() };
             orphan = fi.slot_id_for(&2).unwrap();
@@ -1323,11 +1317,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
         idx.insert(&IndexValue::Int(7), 1).unwrap();
-        idx.flush(dir.path()).unwrap();
+        idx.flush().unwrap();
         idx.remove(&IndexValue::Int(7), 1);
-        idx.flush(dir.path()).unwrap();
+        idx.flush().unwrap();
         assert_eq!(idx.keymap_store.as_ref().unwrap().count(), 1, "removed one spill after the bitmap");
-        idx.flush(dir.path()).unwrap();
+        idx.flush().unwrap();
         assert_eq!(idx.keymap_store.as_ref().unwrap().count(), 0);
     }
 
@@ -1387,7 +1381,7 @@ mod tests {
             }
             assert!(idx.bitmap_waste_ratio() > 0.0);
             assert!(idx.maybe_compact(0.0).unwrap());
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
 
         // Reopen from disk: the staged-swap-compacted bitmap store is loaded and
@@ -1427,7 +1421,7 @@ mod tests {
             assert!(keymap_waste > 0.0, "churn must leave reclaimable keymap dead space, got {keymap_waste}");
             assert!(idx.maybe_compact(0.0).unwrap(), "compaction must run");
             assert!(idx.keymap_waste_ratio() < keymap_waste, "compaction must reduce keymap waste");
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
 
         // Reopen: the `ordering` map is rebuilt from the compacted keymap.
@@ -1457,7 +1451,7 @@ mod tests {
             }
             assert!(idx.bitmap_waste_ratio() > 0.0);
             assert!(idx.maybe_compact(0.0).unwrap());
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
 
         // Variable-length string values exercise the UTF-8 keymap rebuild path.
@@ -1501,7 +1495,7 @@ mod tests {
         {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(100), 0).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let ks_keys = std::fs::read(keymap.join("blobs.keys")).unwrap();
         let ks_vals = std::fs::read(keymap.join("blobs.vals")).unwrap();
@@ -1510,7 +1504,7 @@ mod tests {
         {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(200), 1).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
 
         // Roll the KEYMAP back: the bitmap store still has slot 1's bitmap, but
@@ -1527,7 +1521,7 @@ mod tests {
 
         // Owner reconciliation: replaying the same insert restores consistency.
         idx.insert(&IndexValue::Int(200), 1).unwrap();
-        idx.flush(dir.path()).unwrap();
+        idx.flush().unwrap();
         assert_eq!(query_int_eq(&idx, 200), vec![1], "re-insert (WAL replay) reconciles the skew");
     }
 
@@ -1539,7 +1533,7 @@ mod tests {
         {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(100), 0).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
         let bm_keys = std::fs::read(dir.path().join("blobs.keys")).unwrap();
         let bm_vals = std::fs::read(dir.path().join("blobs.vals")).unwrap();
@@ -1548,7 +1542,7 @@ mod tests {
         {
             let mut idx = DynFieldIndex::open(IndexValueType::Int, dir.path()).unwrap();
             idx.insert(&IndexValue::Int(200), 1).unwrap();
-            idx.flush(dir.path()).unwrap();
+            idx.flush().unwrap();
         }
 
         // Roll the BITMAP store back: the keymap still maps slot 1 → 200, but the
@@ -1565,7 +1559,7 @@ mod tests {
 
         // Re-applying the insert (WAL replay) restores the missing bitmap bit.
         idx.insert(&IndexValue::Int(200), 1).unwrap();
-        idx.flush(dir.path()).unwrap();
+        idx.flush().unwrap();
         assert_eq!(query_int_eq(&idx, 200), vec![1], "re-insert (WAL replay) reconciles the skew");
     }
 
@@ -1679,7 +1673,7 @@ mod tests {
                 idx.set(&IndexValue::Int(6), r).unwrap();
                 truth.insert(r, 6);
             }
-            idx.flush(live.path()).unwrap();
+            idx.flush().unwrap();
             if seed % 2 == 0 {
                 // Churn, then compact, so the durable state is a compacted file.
                 for _ in 0..200 {
@@ -1688,9 +1682,9 @@ mod tests {
                     idx.set(&IndexValue::Int(v), r).unwrap();
                     truth.insert(r, v);
                 }
-                idx.flush(live.path()).unwrap();
+                idx.flush().unwrap();
                 assert!(idx.maybe_compact(0.0).unwrap());
-                idx.flush(live.path()).unwrap();
+                idx.flush().unwrap();
             }
             let durable = snapshot(live.path());
             let durable_truth = truth.clone();
@@ -1746,7 +1740,7 @@ mod tests {
             idx.sync_keys().unwrap();
             images.push(("after sync_keys", snapshot(live.path())));
             assert_matches(&idx, &truth, "live index");
-            idx.flush(live.path()).unwrap();
+            idx.flush().unwrap();
             assert_eq!(idx.overlay_bytes(), 0);
             assert_matches(&idx, &truth, "live index after the next spill");
 
@@ -1767,7 +1761,7 @@ mod tests {
                 }
                 assert_matches(&rec, &truth, &what);
                 // And it survives its own spill + reopen.
-                rec.flush(crashed.path()).unwrap();
+                rec.flush().unwrap();
                 drop(rec);
                 let reopened = DynFieldIndex::open(IndexValueType::Int, crashed.path()).unwrap();
                 assert_eq!(reopened.damaged_at_open(), 0, "{what}: clean after recovery");

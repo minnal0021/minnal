@@ -67,9 +67,6 @@ pub(crate) static FORMAT: LogFormat = LogFormat {
     version: 3,
 };
 
-/// Default WAL segment size (64 MiB).
-pub const DEFAULT_SEGMENT_SIZE: u32 = 64 * 1024 * 1024;
-
 /// Smallest segment size a configuration may ask for (64 KiB, as the value
 /// log). A record must fit one segment, so a tiny segment would refuse writes.
 pub const MIN_CONFIGURED_SEGMENT_SIZE: u64 = 64 * 1024;

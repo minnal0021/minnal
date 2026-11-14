@@ -191,6 +191,11 @@ Every endpoint at a glance, grouped by task. The [REST API reference](#rest-api-
 ## Configuration
 
 All settings have built-in defaults so no config file is required to get started.
+[`config/sample.toml`](../config/sample.toml) lists every key with its default and
+what it does. A key or table the server does not know stops it at startup, so a
+misspelt key cannot silently fall back to its default. The same file opens an
+embedded database (`minnal_db::ConfigFile`, or `AsyncDb::open_with_config_file`),
+which reads every table but `[api]` and `[logging]`.
 
 ```toml
 # minnal_db_api.toml
@@ -1426,7 +1431,7 @@ value. There are two distinct kinds:
   `GET /admin/storage/stores/{ns}/ops-metrics` (see below).
 - **Storage metrics** (the other `/admin/storage/*` GET endpoints) — structural
   snapshots of *how big the engine is* and *how much dead space it holds*. These
-  are **recomputed from on-disk state** (WAL metadata, LSM manifests, value-log
+  are **recomputed from on-disk state** (WAL metadata, the LSM's SSTable files, value-log
   metadata, index blob stores) on every request, so a restart does not reset them
   — they reflect whatever is durably on disk.
 
@@ -1468,13 +1473,12 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `scans` | reads | Multi-key scans (range/prefix) executed | **No** |
 | `scan_rows` | reads | Total rows returned across all scans | **No** |
 | `lookups` | lsm_lookups | LSM point lookups (≥ `reads` — also counts GC-validation reads and WAL-replay probes) | **No** |
-| `fast_path_hits` | lsm_lookups | Lookups served by the active-memtable fast path (no lower-layer scan) | **No** |
+| `fast_path_hits` | lsm_lookups | Lookups answered by the active memtable (no lower layer read) | **No** |
 | `fast_path_hit_ratio` | lsm_lookups | `fast_path_hits / lookups` (derived) | **No** |
 | `l0_probes` | lsm_lookups | Lookups that scanned at least one L0 SSTable | **No** |
 | `l1_probes` | lsm_lookups | Lookups that scanned the L1 SSTable (not bloom-rejected) | **No** |
 | `bloom_rejects` | lsm_lookups | L1 lookups short-circuited by the bloom filter ("definitely absent") | **No** |
 | `l0_bloom_rejects` | lsm_lookups | L0 files a lookup skipped unread: key outside the file's key range, or its bloom filter says "definitely absent" | **No** |
-| `seq_prunes` | lsm_lookups | SSTables (L0 files or the L1 file) a lookup skipped unread because a newer layer already held a copy at least as new as anything in them | **No** |
 | `sparse_hint_rejects` | lsm_lookups | Lookups whose sparse-index hint failed validation, so the scan restarted from the top of the file. Answers stay correct but slow. Expect it only briefly for L1 during a compaction; a steady rate means the index offsets disagree with the files | **No** |
 | `puts` | writes | WAL-backed upserts applied | **No** |
 | `deletes` | writes | WAL-backed deletes applied | **No** |
@@ -1638,11 +1642,11 @@ On a database whose vector worker has written nothing:
 }
 ```
 
-**`GET /admin/storage/lsm`** — per-namespace LSM manifest:
+**`GET /admin/storage/lsm`** — per-namespace LSM manifest, a list of each level's SSTable files built from what is on disk:
 
 | Field | Meaning | Survives restart? |
 |-------|---------|-------------------|
-| `manifest_version`, `created_at_ms` | Manifest version + creation time | **Yes** |
+| `manifest_version`, `created_at_ms` | The response format's version, and when this snapshot was built | **Yes** |
 | `level_count`, `total_entries`, `total_size_bytes` | Levels, key count, on-disk SSTable bytes | **Yes** |
 | `levels[].buckets[].files[]` | Per-file `{path, created_at_ms, entry_count, size_bytes}` | **Yes** |
 | `in_memory.memtable_entries` | Live active-memtable entry count | **No** |
@@ -2724,7 +2728,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   fail_logs/                  ← written only if WAL recovery could not apply an entry
   ns_system_catalog/          ← every namespace's id and TTL settings, every field index's id and type, the id counter
   ns_{namespace}/             ← one directory per namespace (doc store, KV store, or vector companion)
-    lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
+    lsm/                      ← keys: level0/, level1/level1_{bucket}.dat
     value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
   ns_{namespace}_sparse_vector/      ← chunk embeddings (1, 2 or 4 bits), keyed by [posting_id ‖ doc_id] (Pass 1)
   ns_{namespace}_dense_vector/       ← multi-bit whole-document embeddings, keyed by doc_id (Pass 2)

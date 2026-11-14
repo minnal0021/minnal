@@ -63,7 +63,7 @@ impl CheckpointState {
 ///
 /// The field index is missing every update recorded in the absent segments, and
 /// **cannot recover them** — the entries are gone. Restoring full coverage needs
-/// a re-index; see `FEATURE-REQUEST.md` (FR-001).
+/// a re-index (see `db/indexing/health.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayGap {
     /// Offset replay was to start from (the field's recorded checkpoint, or 0).
@@ -149,8 +149,7 @@ pub enum GapCause {
 /// take to repair it.
 ///
 /// Written beside the field's `checkpoint` marker as `gap.json`. Survives
-/// restart; cleared only by a successful repair. See `FEATURE-REQUEST.md`
-/// (FR-001).
+/// restart; cleared only by a successful repair (see `db/indexing/health.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GapRecord {
     pub namespace_id: NamespaceId,
@@ -381,8 +380,8 @@ impl IndexManager {
     ///
     /// Leaves the namespace directory and its sibling `rowmap/` untouched.
     ///
-    /// The caller must have persisted the field's `dropped` flag first; see
-    /// `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
+    /// The caller must have persisted the field's `dropped` flag first, so a
+    /// crash mid-removal leaves the drop recorded and finished at the next open.
     pub fn remove_field_path(&self, namespace_id: NamespaceId, field_id: FieldId) -> Result<()> {
         let path = self.field_path(namespace_id, field_id);
         // A build or a checkpoint can still be writing a file there when the drop
@@ -423,7 +422,7 @@ impl IndexManager {
     /// Returns the fields whose marker it wrote. A field dropped while the
     /// checkpoint ran has no directory any more and is left out: the checkpoint
     /// gathers its fields first and writes their markers after, so a drop can
-    /// land in between, and it used to fail the whole checkpoint with NotFound.
+    /// land in between, and must not fail the whole checkpoint with NotFound.
     pub fn checkpoint_fields(&self, wal_tail: u64, fields: &[(NamespaceId, FieldId)]) -> Result<Vec<(NamespaceId, FieldId)>> {
         let mut written = Vec::with_capacity(fields.len());
         for &(namespace_id, field_id) in fields {

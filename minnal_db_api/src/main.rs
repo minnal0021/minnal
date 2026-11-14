@@ -1,3 +1,7 @@
+//! The `minnal_db_api` server: reads the config file, sets up logging, opens
+//! the document store with every background worker, serves the REST routes and
+//! shuts the store down cleanly on SIGINT or SIGTERM.
+
 mod config;
 mod config_report;
 mod error;
@@ -10,7 +14,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use config::DocStoreApiConfig;
 use minnal_db::doc_store::StoredSchema;
 use minnal_db::semantic_search::service::SemanticSearchConfig as EmbeddingServiceConfig;
-use minnal_db::{AsyncDb, DocStore, DocStoreSchema, KvStoreSchema, SemanticSearchContext};
+use minnal_db::{AsyncDb, DocStore, DocStoreSchema, KvStoreSchema};
 use tracing::{error, info};
 
 /// jemalloc, not the system allocator: under concurrent load glibc malloc keeps
@@ -105,9 +109,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // debugged from the log without guessing which knob actually took effect.
     config_report::log_config_table(&cfg, raw_toml.as_ref());
 
-    let semantic_cfg = cfg.semantic_search.resolve();
-    let service = semantic_cfg.service_config();
-    let supported = semantic_cfg.supported_models();
+    let service = cfg.file.semantic_search_config();
+    let supported = cfg.file.semantic_search.supported_models();
     info!(
         models = %if supported.is_empty() {
             "any the embedding service serves".to_string()
@@ -122,21 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // whatever a crash left part-way. Each namespace picks its model and
     // grows its own partition; the server only lists the allowed models, if
     // any.
-    let store = DocStore::builder(cfg.db_path())
-        .db_config(cfg.to_db_config())
-        .lifecycle(cfg.lifecycle.config())
-        .audit_retention(cfg.lifecycle.audit_retention())
-        .vector_index_config(cfg.to_vector_index_config())
-        .semantic_search(
-            SemanticSearchContext::new(service.clone())
-                .with_supported_models(supported)
-                // Validated when the config was loaded.
-                .with_index_defaults(cfg.semantic_search.index_defaults().expect("validated at load"))
-                .with_maintenance_threads(cfg.semantic_search.maintenance.threads().expect("validated at load"))
-                .with_rebuild_threads(cfg.semantic_search.maintenance.rebuild_threads().expect("validated at load")),
-        )
-        .open()
-        .await?;
+    let store = DocStore::builder(cfg.db_path()).config_file(&cfg.file).open().await?;
     info!(
         "loaded {} store schema(s) from {}",
         store.schemas().len(),

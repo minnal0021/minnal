@@ -1,8 +1,10 @@
 //! Field-index health, repair, and the durable gap records behind them.
 //!
-//! Split out of `database/`. This is the remediation half of FR-001: an index
-//! that is missing updates records the fact durably, reports it to anyone who
-//! queries it, and can be repaired without re-putting documents.
+//! A field index can fall behind its store: it can miss updates it has no way
+//! to recover by replay. When it does, it records the fact durably (a *gap
+//! record*), reports it to anyone who queries it, and can be repaired without
+//! re-putting documents. This module holds the records, the health report and
+//! the repair.
 //!
 //! Three separate ways an index diverges from the store feed the same records --
 //! WAL GC's backstop, no-WAL writes, and updates a field index rejected -- and
@@ -71,7 +73,7 @@ impl Database {
                 let mut reindexed = 0usize;
                 let mut absent = 0usize;
                 for key in &decoded {
-                    match self.reindex_key(&store, namespace_id, field_id, key)? {
+                    match self.reindex_key(&store, field_id, key)? {
                         FieldReindexOutcome::Reindexed => reindexed += 1,
                         // The key has no current value. `reindex_field` has
                         // already cleared its row, which is the repair when it
@@ -92,21 +94,26 @@ impl Database {
             }
             RepairMode::FullRebuild => {
                 let deactivated = || KVError::Serialization(format!("Field {field_id} in namespace {namespace_id} was deactivated mid-repair"));
-                let keys = store.keys()?;
-                let scanned = keys.len();
-                for key in &keys {
-                    if self.reindex_key(&store, namespace_id, field_id, key)? == FieldReindexOutcome::FieldNotActive {
-                        return Err(deactivated());
+                // Reindex every live key, a page at a time, and note its row.
+                let mut scanned = 0usize;
+                let mut live_rows: std::collections::HashSet<u128> = std::collections::HashSet::new();
+                store.for_each_key_page(&[], None, |page| {
+                    for (key, ..) in &page {
+                        if self.reindex_key(&store, field_id, key)? == FieldReindexOutcome::FieldNotActive {
+                            return Err(deactivated());
+                        }
+                        live_rows.extend(store.resolve_row_id_get(key));
                     }
-                }
+                    scanned += page.len();
+                    Ok(std::ops::ControlFlow::Continue(()))
+                })?;
 
                 // Walking live keys cannot clear a row whose key no longer
-                // exists — and a stale row of a deleted key is one of the ways an
+                // exists, and a stale row of a deleted key is one of the ways an
                 // index diverges (a lost delete). So also visit every row the
                 // index holds that no live key accounts for: `reindex_key` clears
                 // it if its key is still absent, or re-sets it if the key was
-                // written since the snapshot above.
-                let live_rows: std::collections::HashSet<u128> = keys.iter().filter_map(|k| store.resolve_row_id_get(k)).collect();
+                // written since the walk above passed it.
                 let mut orphan_rows = Vec::new();
                 {
                     let ns_index = store.namespace_index.read();
@@ -121,7 +128,7 @@ impl Database {
                 for row in orphan_rows {
                     match store.key_for_row(row) {
                         Some(key) => {
-                            if self.reindex_key(&store, namespace_id, field_id, &key)? == FieldReindexOutcome::FieldNotActive {
+                            if self.reindex_key(&store, field_id, &key)? == FieldReindexOutcome::FieldNotActive {
                                 return Err(deactivated());
                             }
                         }
@@ -358,11 +365,10 @@ mod tests {
         db.shutdown().unwrap();
     }
 
-    /// FR-001 step 1: dropping a field index deletes its on-disk directory.
+    /// Dropping a field index deletes its on-disk directory.
     ///
-    /// Before this, `deactivate_field_index` was an in-memory deregister only, so
-    /// the bitmap blob, keymap and — the load-bearing part — the frozen
-    /// `checkpoint` marker survived until the whole namespace was dropped.
+    /// Otherwise the bitmap blob, the keymap and, above all, the frozen
+    /// `checkpoint` marker would survive until the whole namespace was dropped.
     #[test]
     fn test_drop_field_index_deletes_its_directory() {
         let dir = TempDir::new().unwrap();
@@ -389,7 +395,7 @@ mod tests {
         db.shutdown().unwrap();
     }
 
-    /// FR-001 step 1: a dropped field is excluded from the checkpoint worker's
+    /// A dropped field is excluded from the checkpoint worker's
     /// field set, so its frozen marker can never hold up WAL GC (and the
     /// checkpoint does not try to write into a directory that is gone).
     #[test]
@@ -416,7 +422,7 @@ mod tests {
         db.shutdown().unwrap();
     }
 
-    /// FR-001 step 1: the drop is persisted, so a drop interrupted after the
+    /// The drop is persisted, so a drop interrupted after the
     /// schema write but before the files were deleted is completed at the next
     /// open rather than leaking until the namespace is dropped.
     #[test]
@@ -444,7 +450,7 @@ mod tests {
         db.shutdown().unwrap();
     }
 
-    /// FR-001 step 1: activating a dropped field must fail loudly.
+    /// Activating a dropped field must fail loudly.
     ///
     /// This is the guard that closes the silent-incomplete window directly: a
     /// dropped field's directory is gone, so activation would open an empty index
@@ -482,7 +488,7 @@ mod tests {
         db.shutdown().unwrap();
     }
 
-    /// FR-001 step 1: the `dropped` flag survives a restart. Without persistence
+    /// The `dropped` flag survives a restart. Without persistence
     /// the drop could not be completed at open, and a dropped field would silently
     /// become activatable again over an empty directory.
     #[test]
@@ -581,7 +587,7 @@ mod tests {
         db.shutdown().unwrap();
     }
 
-    /// FR-001 step 3: a rejected index update becomes a durable one-key gap
+    /// A rejected index update becomes a durable one-key gap
     /// rather than only a `warn!`.
     #[test]
     fn a_rejected_index_update_is_recorded_as_a_gap() -> Result<()> {
@@ -594,7 +600,7 @@ mod tests {
         let ns = DEFAULT_NAMESPACE_ID;
 
         // A Str-typed field whose extractor yields an Int for one document: the
-        // index refuses the update, which used to be a log line and nothing else.
+        // index refuses the update, which must record a gap, not just log.
         let field_id = db.register_index_field(ns, "status", IndexValueType::Str)?;
         let extractor: ExtractorFn = Arc::new(|bytes: &[u8]| {
             if bytes.starts_with(b"bad") {
@@ -621,7 +627,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 3: no-WAL writes have no WAL entries, so an unclean shutdown
+    /// No-WAL writes have no WAL entries, so an unclean shutdown
     /// leaves the field index incomplete with nothing to replay. The marker turns
     /// that silence into a recorded, repairable full rebuild.
     #[test]
@@ -666,7 +672,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 3: a clean shutdown must NOT report a no-WAL gap — it
+    /// A clean shutdown must NOT report a no-WAL gap — it
     /// checkpoints first, which is what makes those index updates durable.
     #[test]
     fn clean_shutdown_after_no_wal_writes_records_no_gap() -> Result<()> {
@@ -693,7 +699,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 3: gaps accumulate rather than overwrite. A second detection
+    /// Gaps accumulate rather than overwrite. A second detection
     /// before anyone repairs the first must not discard the first worklist.
     #[test]
     fn gap_records_merge_instead_of_overwriting() {
@@ -737,7 +743,7 @@ mod tests {
         assert_eq!(full.repair, RepairMode::FullRebuild);
     }
 
-    /// FR-001 step 4: index health names the degraded fields for an operator.
+    /// Index health names the degraded fields for an operator.
     #[test]
     fn index_health_reports_gaps_per_field() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -767,7 +773,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 5: row-scoped repair fixes exactly the recorded keys and
+    /// Row-scoped repair fixes exactly the recorded keys and
     /// clears the gap, so queries stop reporting degradation.
     #[test]
     fn row_scoped_repair_restores_the_index_and_clears_the_gap() -> Result<()> {
@@ -835,12 +841,12 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 5: a key on the worklist whose value is **gone** must have its
+    /// A key on the worklist whose value is **gone** must have its
     /// row cleared, not skipped.
     ///
-    /// The lost update can be the *delete*. `reindex_field` used to return
-    /// `KeyNotFound` and do nothing, leaving a stale row that queries as a hit —
-    /// a repair that leaves the index wrong in the opposite direction.
+    /// The lost update can be the *delete*. A `reindex_field` that returned
+    /// `KeyNotFound` and did nothing would leave a stale row that queries as a
+    /// hit: a repair that leaves the index wrong in the opposite direction.
     #[test]
     fn repair_clears_the_row_of_a_key_whose_delete_was_lost() -> Result<()> {
         use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};
@@ -908,7 +914,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 5: a `FullRebuild` gap re-extracts the whole field.
+    /// A `FullRebuild` gap re-extracts the whole field.
     #[test]
     fn full_rebuild_repair_reindexes_every_key() -> Result<()> {
         use crate::db::indexing::manager::{GapCause, GapRecord, RepairMode};

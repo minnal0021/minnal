@@ -208,7 +208,7 @@ mod tests {
         Ok(())
     }
 
-    // ── GC race regression tests ──────────────────────────────────────────────
+    // ── GC racing writes ──────────────────────────────────────────────────────
 
     #[test]
     fn test_gc_write_before_gc_survives() -> Result<()> {
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_gc_concurrent_writes_no_data_loss() -> Result<()> {
-        // Regression: concurrent writes and GC must not lose any data.
+        // Concurrent writes and GC must not lose any data.
         let temp_dir = TempDir::new()?;
         let db = Db::open_with_config(temp_dir.path(), create_db_config())?;
 

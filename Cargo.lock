@@ -1001,7 +1001,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "minnal_db",
- "parking_lot",
  "serde",
  "serde_json",
  "tikv-jemallocator",
@@ -1019,7 +1018,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 

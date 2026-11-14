@@ -72,7 +72,9 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("minnal_db supports only Linux and macOS (its storage engine uses Unix pread/pwrite)");
 
+pub mod config_file;
 pub mod db;
+pub mod defaults;
 pub mod error;
 mod storage;
 mod support;
@@ -142,17 +144,6 @@ pub use db::config::DbConfig;
 /// Controls when the value-log GC is triggered.
 pub use db::config::ThresholdConfig;
 
-/// Default field-index bitmap compaction threshold (percentage of dead space).
-pub use db::config::{
-    DEFAULT_INDEX_BLOB_BACKPRESSURE_BYTES, DEFAULT_INDEX_BLOB_WASTE_THRESHOLD, DEFAULT_INDEX_OVERLAY_HARD_BYTES, DEFAULT_INDEX_OVERLAY_SOFT_BYTES,
-    DEFAULT_MAX_PINNED_WAL_SEGMENTS, DEFAULT_SEGMENT_GC_THRESHOLD,
-};
-
-pub use storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES;
-
-/// Default index checkpoint interval in milliseconds (the crash-replay window).
-pub const DEFAULT_INDEX_CHECKPOINT_INTERVAL_MS: u64 = db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL.as_millis() as u64;
-
 /// Hex encoding/decoding for raw key bytes.
 ///
 /// Exposed because keys are arbitrary bytes and several surfaces carry them as
@@ -167,8 +158,8 @@ pub use db::config::ScheduledTaskConfig;
 /// Controls how many writes to batch before syncing.
 pub use db::config::SyncConfig;
 
-/// TOML configuration file parser.
-pub use db::config::toml::MinnalTomlConfig;
+/// The config file: its parser and the one mapping to each part's configuration.
+pub use config_file::ConfigFile;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 

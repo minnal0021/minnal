@@ -624,7 +624,7 @@ async fn e2e_partition_invariants() {
     let db = AsyncDb::open_with_config(std::path::PathBuf::from(path), crate::DbConfig::default())
         .await
         .unwrap();
-    let ivf = load_ivf(&db, &ns, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+    let ivf = load_ivf(&db, &ns, crate::defaults::schema_vector_index::ROTATION_SEED)
         .await
         .unwrap()
         .unwrap();
@@ -640,7 +640,7 @@ async fn e2e_partition_invariants() {
     db.shutdown().await.unwrap();
 }
 
-// ── Reassignment and merges (M3b) ──
+// ── Reassignment and merges ──
 
 /// Maintenance with merges at `merge_limit` and reassignment over `range`
 /// neighbours.
@@ -973,7 +973,7 @@ async fn e2e_oversized_postings() {
     let db = AsyncDb::open_with_config(std::path::PathBuf::from(path), crate::DbConfig::default())
         .await
         .unwrap();
-    let ivf = load_ivf(&db, &ns, crate::semantic_search::cluster::DEFAULT_ROTATION_SEED)
+    let ivf = load_ivf(&db, &ns, crate::defaults::schema_vector_index::ROTATION_SEED)
         .await
         .unwrap()
         .unwrap();
@@ -998,7 +998,7 @@ async fn e2e_oversized_postings() {
     db.shutdown().await.unwrap();
 }
 
-// ── Rebuild (M4) ──
+// ── Rebuild ──
 
 fn rebuild_params(postings: usize) -> rebuild::RebuildParams {
     rebuild::RebuildParams {
@@ -1155,7 +1155,7 @@ async fn a_search_during_a_rebuild_misses_nothing() {
     db.shutdown().await.unwrap();
 }
 
-// ── Review fixes (2026-10-17) ───────────────────────────────────────────────
+// ── Maintenance failures and crashes mid-step ────────────────────────────────
 
 /// A transient error after a split's `Planned` record, then an in-process
 /// retry, then a restart. The retry must not run on top of the failed

@@ -1,17 +1,18 @@
 //! Maintaining a namespace's postings: splits, reassignment and merges, the
-//! maintenance journal they run through, and recovery after a crash (design doc
-//! *M3 split algorithm (LIRE)*, *Maintenance journal*; M3a and M3b).
+//! maintenance journal they run through, and recovery after a crash
+//! (`Dynamic-RaBitQ-Index-Design.md` → *M3 split algorithm (LIRE)*, *Maintenance
+//! journal*).
 //!
 //! Three operations change which posting holds a chunk:
 //!
-//! - **Split** (M3a): a posting holding more than `split_limit` chunks is
+//! - **Split**: a posting holding more than `split_limit` chunks is
 //!   divided by balanced 2-means on its codes' reconstructions
 //!   ([`crate::semantic_search::cluster::split`]) into two new postings, and
 //!   retired.
-//! - **Reassign** (M3b, [`reassign`]): after every split, the chunks of the two
+//! - **Reassign** ([`reassign`]): after every split, the chunks of the two
 //!   new postings and of the `reassign_range` postings nearest the old centre
 //!   that LIRE's conditions select move to their nearest active posting.
-//! - **Merge** (M3b, [`merge`]): a posting left with `merge_limit` chunks or
+//! - **Merge** ([`merge`]): a posting left with `merge_limit` chunks or
 //!   fewer is folded into a nearby posting with room, and retired.
 //!
 //! A split and a merge both **drain** one posting: mark it `Draining` so nothing
@@ -51,7 +52,7 @@
 //!    says `Copied`; after it, recovery redoes only the delete, and a lost copy
 //!    would leave the chunk gone for good.
 //! 2. **The meta is always a superset of the live postings.** A document's
-//!    meta (WAL-backed, as since M0-2) is the only record of which postings hold
+//!    meta (WAL-backed) is the only record of which postings hold
 //!    its chunks; a destination is added to it before the copy. A source is the
 //!    exception: it loses its meta entry (or count) just before its key is
 //!    deleted or shrunk, because a redo walks the source's own keys and finishes
@@ -194,7 +195,7 @@ enum Op {
     },
     /// Drain every posting of `drained` into `postings` new postings with ids
     /// from `first_posting`, encoded against centres with ids from
-    /// `first_centre`; each chunk to the nearest new centre (M4).
+    /// `first_centre`; each chunk to the nearest new centre.
     Rebuild {
         first_centre: u32,
         first_posting: u32,
@@ -437,7 +438,8 @@ fn reconstruct_into(ivf: &NamespaceIvf, code: &VectorIndex, buf: &mut Vec<f32>) 
 
 /// Whether centre `a` is nearer to `x` than centre `b`. With `gate`
 /// (`skip_uncertain_moves`), by more than `2 · error_bound · ‖a − b‖`, the most
-/// the code's estimate of that comparison can be off (design doc step 6).
+/// the code's estimate of that comparison can be off (`Dynamic-RaBitQ-Index-Design.md` →
+/// *M3 split algorithm (LIRE)*, step 6).
 fn nearer(x: &[f32], a: &[f32], b: &[f32], code: &VectorIndex, gate: bool) -> bool {
     let (da, db) = (sq_dist(x, a), sq_dist(x, b));
     if da >= db {
@@ -558,7 +560,7 @@ impl DrainRule<'_> {
 /// foreground tail latency. Four lanes of 64 held up to 256 documents' locks (as
 /// many as there were stripes) and put a delete's p99 at 580 ms under a
 /// delete-and-insert load while partitions split; 16 at a time, with 4,096
-/// stripes, 110 ms (M5 investigation).
+/// stripes, 110 ms (measured in the system benchmark).
 const BATCH_DOCS: usize = 16;
 
 /// Run `work` on `items` in batches of [`BATCH_DOCS`], one batch at a time, in

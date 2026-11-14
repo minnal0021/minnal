@@ -14,7 +14,9 @@ mod common;
 use common::*;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use minnal_db::db::wal::{DEFAULT_SEGMENT_SIZE, Wal, WalEntry};
+use minnal_db::db::wal::{Wal, WalEntry};
+
+const SEGMENT_SIZE: u32 = minnal_db::defaults::wal::SEGMENT_SIZE_BYTES as u32;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -30,7 +32,7 @@ const WAL_BYTES_PER_RUN: usize = 24 * 1024 * 1024;
 /// a new 4 KiB block also pays for allocating it (a database's first writes;
 /// `write/first_put_into_new_db` measures that). Returns the WAL and its tail.
 fn warm_wal(dir: &std::path::Path) -> (Wal, u64) {
-    let (wal, mut tail) = Wal::open_standalone(dir, DEFAULT_SEGMENT_SIZE).unwrap();
+    let (wal, mut tail) = Wal::open_standalone(dir, SEGMENT_SIZE).unwrap();
     let filler = WalEntry::new_upsert(b"warm".to_vec(), vec![0u8; 1 << 20]);
     while wal.segment_of(tail) == 0 {
         wal.append_entry(&filler, &mut tail).unwrap();
@@ -141,7 +143,7 @@ fn bench_wal_scan(c: &mut Criterion) {
 
     for &(num_entries, value_size) in &[(1_000u64, 128usize), (1_000, 4_096), (5_000, 128)] {
         let temp = bench_tempdir();
-        let (wal, mut tail) = Wal::open_standalone(&temp.path().join("wal"), DEFAULT_SEGMENT_SIZE).expect("failed to open WAL");
+        let (wal, mut tail) = Wal::open_standalone(&temp.path().join("wal"), SEGMENT_SIZE).expect("failed to open WAL");
         let value = vec![0xEFu8; value_size];
 
         // Pre-populate

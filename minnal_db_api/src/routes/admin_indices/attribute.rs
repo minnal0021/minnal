@@ -174,7 +174,7 @@ pub async fn attribute_reindex_doc(
 /// whether it is active, and any outstanding gap (what is missing and what
 /// repair it needs).
 ///
-/// This is the operator-facing half of FR-001. The per-query `degraded_fields`
+/// This is the operator-facing side of index gaps. The per-query `degraded_fields`
 /// field tells a *caller* their answer may be short; this tells an operator
 /// which indices to repair, and is what makes the condition alertable rather
 /// than something buried in a log line.

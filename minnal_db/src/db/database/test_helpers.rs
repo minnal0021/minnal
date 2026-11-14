@@ -30,7 +30,8 @@ impl Database {
     pub(crate) fn open_with_wal_segment_size(db_path: &Path, mut config: DbConfig, wal_segment_size: u64) -> Result<Self> {
         std::fs::create_dir_all(db_path)?;
 
-        let default_vlog_dir = db_path.join("ns_default").join("value_logs");
+        let default_vlog_dir =
+            crate::layout::namespace_value_log_dir(&crate::layout::namespace_data_dir(db_path, crate::namespace::DEFAULT_NAMESPACE));
         if default_vlog_dir.exists() {
             let existing_count = Self::detect_bucket_count(&default_vlog_dir);
             if existing_count > 0 && existing_count != config.num_buckets {
@@ -58,11 +59,6 @@ impl Database {
         let index_manager = IndexManager::open(db_path)?;
         let mut stores = HashMap::new();
         stores.insert(NamespaceId::CATALOG, Arc::new(Self::open_catalog_store(db_path, &config)?));
-
-        let old_wal = db_path.join("wal.log.old");
-        if old_wal.exists() {
-            let _ = std::fs::remove_file(&old_wal);
-        }
 
         let fail_log_dir = config.fail_log_dir.clone().unwrap_or_else(|| db_path.join("fail_logs"));
 
@@ -102,7 +98,6 @@ impl Database {
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_checkpoints: Default::default(),
             next_seq,
-            key_locks: KeyLocks::new(),
             fail_log_dir,
             metrics,
             #[cfg(test)]
@@ -115,7 +110,7 @@ impl Database {
     /// Test hook: the key-stripe lock `key` takes in `namespace_id`.
     #[cfg(test)]
     pub(crate) fn stripe_of(&self, namespace_id: NamespaceId, key: &[u8]) -> usize {
-        self.key_locks.stripe_of(namespace_id, key)
+        self.get_store(namespace_id).expect("namespace is open").stripe_of(key)
     }
 
     /// Test hook: copy this database's directory to `to` as a power loss

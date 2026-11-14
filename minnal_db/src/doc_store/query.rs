@@ -44,7 +44,7 @@ impl DocStore {
             .semantic_ctx
             .as_ref()
             .map(|c| c.config.query_embedding_cache_ttl)
-            .unwrap_or(vector_kv::DEFAULT_QUERY_EMBEDDING_CACHE_TTL);
+            .unwrap_or(crate::defaults::semantic_search::QUERY_EMBEDDING_CACHE_TTL);
         Ok(vector_kv::clear_cached_query_embeddings(&self.db, ttl).await?)
     }
 

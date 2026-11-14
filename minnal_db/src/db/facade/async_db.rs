@@ -67,7 +67,7 @@ pub struct AsyncDb {
     pub(super) inner: Arc<Db>,
 }
 
-#[cfg(all(test, feature = "semantic-search"))]
+#[cfg(test)]
 impl AsyncDb {
     /// Test-only access to the internal coordinator. See
     /// [`Db::coordinator_for_test`].
@@ -92,11 +92,15 @@ impl AsyncDb {
         Self::open_with_config(path, DbConfig::default()).await
     }
 
-    /// Open a database using a `minnal.toml` configuration file, with every
-    /// background worker started (see [`open_with_config`](Self::open_with_config)).
+    /// Open the database a config file describes (see
+    /// [`ConfigFile`](crate::ConfigFile)), with every background worker
+    /// started (see [`open_with_config`](Self::open_with_config)). The API
+    /// server's own tables (`[api]`, `[logging]`) are allowed and ignored, so
+    /// the server's file opens here too.
     pub async fn open_with_config_file<P: AsRef<Path> + Send + 'static>(config_path: P) -> Result<Self> {
-        let toml_config = crate::db::config::toml::MinnalTomlConfig::from_file(config_path.as_ref())?;
-        Self::open_with_config(toml_config.db_path(), toml_config.to_db_config()).await
+        let (config, _) = crate::ConfigFile::from_file(config_path.as_ref(), crate::config_file::API_SERVER_TABLES)
+            .map_err(|e| KVError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+        Self::open_with_config(config.db_path(), config.db_config()).await
     }
 
     /// Open a database with the given config, with every background worker
@@ -131,7 +135,7 @@ impl AsyncDb {
         tokio::task::spawn_blocking(move || {
             // Flush index state on clean shutdown, now that no worker can race
             // with it. This is also what clears the no-WAL markers, so a clean
-            // shutdown reports no gap on the next open (FR-001).
+            // shutdown reports no gap on the next open.
             if let Err(e) = db.inner.run_index_checkpoint() {
                 log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
             }

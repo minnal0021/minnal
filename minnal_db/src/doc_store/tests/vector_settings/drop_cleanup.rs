@@ -142,9 +142,9 @@ async fn writes_during_a_drop_leave_nothing_behind() {
 
 /// A document deleted while its namespace's partition is first loaded
 /// (after the load counted the store, before it was installed) must not
-/// leave the counts one too high: a delete's count change was dropped when
-/// no partition was loaded, so the load's count, which saw the document,
-/// stayed.
+/// leave the counts one too high. A delete's count change is dropped when no
+/// partition is loaded, so unless the delete reaches the partition first, the
+/// load's count, which saw the document, would stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delete_during_the_first_load_keeps_the_counts_exact() {
     let (url, _seen) = spawn_service();

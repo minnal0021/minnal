@@ -3,19 +3,13 @@
 use super::*;
 use crate::namespace::NamespaceId;
 
-// ── GC swap-commit recovery (recover_gc_swaps) ──────────────────────────
-//
-// These exercise the FILE-level pass directly with distinct "OLD"/"NEW"
-
 /// Value-log GC must resolve liveness in BATCHES, not one point-get per
 /// record.
 ///
-/// A Level-0 file carries no bloom, no min/max and no sparse index, so a
-/// point-get reaching L0 scans every entry of every L0 file in the bucket.
-/// Done per record, GC becomes O(records × total L0 entries) — quadratic in
-/// churn. Measured before the fix at ~165 µs per record *per L0 file*, dead
-/// flat from 2 to 16 files: 8 000 records against 16 L0 files took 22 s, and
-/// a live run spent 484 s moving 9 MB on the vector-index queue.
+/// A point-get can read every L0 file of the bucket its summary cannot rule
+/// out. Done per record, GC's cost grows with records × L0 entries, quadratic
+/// in churn: measured at ~165 µs per record per L0 file read, 8,000 records
+/// against 16 L0 files took 22 s.
 ///
 /// Asserted on `l0_probes` rather than on elapsed time, so it is a statement
 /// about the algorithm and cannot flake on a slow machine. That counter is
@@ -66,7 +60,7 @@ fn gc_resolves_liveness_in_batches_not_per_record() {
     store.garbage_collect_with_thresholds(0.01, 0.01).unwrap();
     let probes = store.metrics().unwrap().snapshot().l0_probes - before.l0_probes;
 
-    // The per-record path issued one probe per record scanned (thousands
+    // A per-record path would issue one probe per record scanned (thousands
     // here); the batched path issues none at all. A tenth of one round is a
     // wide margin either side.
     assert!(
@@ -97,8 +91,8 @@ fn gc_resolves_liveness_in_batches_not_per_record() {
 fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
     // A small store keeps all its data in one active-tail segment per bucket that
     // never fills a 64 MiB segment, so tail-sealing is its only path to collection.
-    // With the tail-seal bar tracking the trigger, garbage in the 30-50% band — which
-    // sat stranded below the old hardcoded 50% bar — is reclaimed.
+    // With the tail-seal bar tracking the 30% trigger, garbage in the 30-50% band is
+    // reclaimed; a fixed 50% bar would strand it.
     let dir = TempDir::new().unwrap();
     let lsm_config = LSMConfig {
         num_buckets: 1, // one bucket → one active tail holds everything
@@ -110,7 +104,7 @@ fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
         dir.path(),
         lsm_config,
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -119,7 +113,7 @@ fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
         store.put_to_storage(format!("k{i:03}").as_bytes(), &value).unwrap();
     }
     // Overwrite 70 keys: their old records become garbage — ~41% of the single tail
-    // segment (70 dead of 170 total), squarely in the old dead zone.
+    // segment (70 dead of 170 total), between the two bars.
     for i in 0..70u32 {
         store.put_to_storage(format!("k{i:03}").as_bytes(), &value).unwrap();
     }
@@ -129,7 +123,7 @@ fn a_never_filled_tail_over_the_trigger_is_sealed_and_collected() {
         "test needs tail garbage in the 30-50% band, got {waste_before:.1}%"
     );
 
-    // Old behavior (50% tail bar): the sub-50% tail is not sealed, nothing collectable.
+    // A 50% tail bar: the sub-50% tail is not sealed, nothing collectable.
     let stats = store.garbage_collect_with_thresholds(10.0, 50.0).unwrap();
     assert_eq!(stats.bytes_reclaimed, 0, "at a 50% tail bar a 41%-garbage tail must stay uncollected");
 
@@ -161,7 +155,7 @@ fn test_kvstore_gc() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -177,7 +171,9 @@ fn test_kvstore_gc() {
         }
     }
 
-    let _gc_stats = store.garbage_collect().unwrap();
+    let _gc_stats = store
+        .garbage_collect_with_threshold(crate::defaults::thresholds::VALUE_LOG_WASTE_THRESHOLD)
+        .unwrap();
 
     // Verify data still readable
     for i in 0..5 {
@@ -196,7 +192,7 @@ fn test_gc_write_before_gc_survives() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -221,8 +217,8 @@ fn test_gc_write_before_gc_survives() {
 
 #[test]
 fn test_gc_writes_after_swap_go_to_new_file() {
-    // After GC swaps the value-log file, subsequent writes must go to the
-    // new file and be readable.
+    // After GC relocates survivors and unlinks their segments, later writes
+    // must land and be readable.
     let dir = TempDir::new().unwrap();
     let store = KVStore::open(
         NamespaceId::from_u64(0),
@@ -230,7 +226,7 @@ fn test_gc_writes_after_swap_go_to_new_file() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -263,7 +259,7 @@ fn test_gc_multi_round_all_values_survive() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
 
@@ -290,7 +286,7 @@ fn test_gc_after_delete_sequential_stays_deleted() {
         dir.path(),
         default_lsm_config(),
         SyncConfig::default(),
-        DEFAULT_SEGMENT_SIZE_BYTES,
+        crate::defaults::value_log::SEGMENT_SIZE_BYTES,
     )
     .unwrap();
     const N: u32 = 120;
@@ -310,4 +306,132 @@ fn test_gc_after_delete_sequential_stays_deleted() {
         }
     }
     assert_eq!(survivors, 0, "{survivors} keys resurrected by sequential GC-after-delete");
+}
+
+/// A bucket whose value-log metadata file is lost has its live/garbage
+/// accounting rebuilt at open from the LSM's pointers, reading only the buckets
+/// that need it. The rebuilt numbers must equal what the writes tracked, and the
+/// other buckets must keep theirs.
+#[test]
+fn lost_value_log_metadata_is_rebuilt_for_that_bucket_alone() {
+    let dir = TempDir::new().unwrap();
+    let lsm = LSMConfig {
+        num_buckets: 4,
+        ..default_lsm_config()
+    };
+    let open = || {
+        KVStore::open(
+            NamespaceId::from_u64(0),
+            "ns",
+            dir.path(),
+            lsm.clone(),
+            SyncConfig::default(),
+            crate::defaults::value_log::SEGMENT_SIZE_BYTES,
+        )
+        .unwrap()
+    };
+    let accounting = |store: &KVStore| -> Vec<(u64, u64)> {
+        store
+            .value_log
+            .all_bucket_metadata()
+            .into_iter()
+            .map(|(_, m)| (m.live_bytes(), m.garbage_bytes()))
+            .collect()
+    };
+
+    let tracked = {
+        let store = open();
+        for i in 0..200u32 {
+            store.put_to_storage(format!("key{i:04}").as_bytes(), &[1u8; 40]).unwrap();
+        }
+        // Overwrites and deletes leave garbage in every bucket.
+        for i in (0..200u32).step_by(3) {
+            store.put_to_storage(format!("key{i:04}").as_bytes(), &[2u8; 70]).unwrap();
+        }
+        for i in (0..200u32).step_by(5) {
+            store.delete_from_storage(format!("key{i:04}").as_bytes()).unwrap();
+        }
+        store.flush_memtable_to_level0().unwrap();
+        store.value_log.flush_all_metadata().unwrap();
+        accounting(&store)
+    };
+    assert!(tracked.iter().all(|&(live, garbage)| live > 0 && garbage > 0));
+
+    let lost: Vec<std::path::PathBuf> = walk(dir.path())
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "value_log_1.metadata"))
+        .collect();
+    assert_eq!(lost.len(), 1, "one metadata file per bucket");
+    std::fs::remove_file(&lost[0]).unwrap();
+
+    let store = open();
+    assert_eq!(accounting(&store), tracked, "bucket 1 rebuilt exactly, the others kept");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// GC's relocation is an append then an LSM insert, like a put. If the insert
+/// fails, the pass stops with an error and nothing points at the copy just
+/// appended; it must be counted as garbage, or its segment carries bytes that
+/// look live and are never referenced.
+#[test]
+fn a_gc_copy_whose_lsm_insert_fails_counts_as_garbage() {
+    let lsm = LSMConfig {
+        num_buckets: 1,
+        ..LSMConfig::default()
+    };
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(NamespaceId::from_u64(0), "gc", dir.path(), lsm, SyncConfig::default(), 1024 * 1024).unwrap();
+
+    let keep = vec![b'k'; 300];
+    let junk = vec![b'j'; 200];
+    store.put_to_storage(b"keep", &keep).unwrap();
+    for _ in 0..20 {
+        store.put_to_storage(b"junk", &junk).unwrap(); // 19 of these become garbage
+    }
+    let record_len = |key: &[u8], value: &[u8]| crate::storage::value_log::ValueRecordHeader::record_len(key.len(), value.len());
+    let referenced = record_len(b"keep", &keep) + record_len(b"junk", &junk);
+    let live_bytes = || -> u64 {
+        store
+            .value_log
+            .all_segment_stats()
+            .into_iter()
+            .flat_map(|(_, segs)| segs)
+            .map(|s| s.live_bytes)
+            .sum()
+    };
+    assert_eq!(live_bytes(), referenced, "setup: only the two current records are live");
+
+    let total_bytes = || -> u64 {
+        store
+            .value_log
+            .all_segment_stats()
+            .into_iter()
+            .flat_map(|(_, segs)| segs)
+            .map(|s| s.total_bytes)
+            .sum()
+    };
+    let before = total_bytes();
+    store.lsm.fail_next_insert();
+    // A failed bucket is logged, not returned, so the pass itself reports Ok.
+    store.garbage_collect_with_thresholds(0.01, 0.01).unwrap();
+    assert!(total_bytes() > before, "setup: GC appended a copy before its re-point failed");
+    assert_eq!(live_bytes(), referenced, "the copy that was never re-pointed must be counted as garbage");
+
+    // A later pass completes, and the data is intact.
+    store.garbage_collect_with_thresholds(0.01, 0.01).unwrap();
+    assert_eq!(store.get(b"keep").unwrap(), Some(keep));
+    assert_eq!(store.get(b"junk").unwrap(), Some(junk));
+    assert_eq!(live_bytes(), referenced, "after GC, still exactly the referenced records are live");
 }

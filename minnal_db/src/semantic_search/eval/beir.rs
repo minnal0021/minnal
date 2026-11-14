@@ -180,7 +180,7 @@ async fn eval_beir() {
     let mut sorted_words = query_words.clone();
     sorted_words.sort_unstable();
 
-    // No centroid file ships with minnal (design doc M4): bring one, e.g. a
+    // No centroid file ships with minnal (`Dynamic-RaBitQ-Index-Design.md` → M4): bring one, e.g. a
     // static fit from `work/bench/analysis/m3pre/fit_static.py`.
     let cluster_path = std::env::var("MINNAL_BEIR_CENTROIDS").expect("MINNAL_BEIR_CENTROIDS: a JSONL centroid file for this model");
     let raw = read_clusters_from_file(&cluster_path).unwrap_or_else(|e| panic!("load {cluster_path}: {e}"));

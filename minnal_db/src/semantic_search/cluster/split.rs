@@ -1,4 +1,4 @@
-//! Balanced 2-means: how a posting is split in two (design doc M3, *M3 split
+//! Balanced 2-means: how a posting is split in two (`Dynamic-RaBitQ-Index-Design.md` → M3, *M3 split
 //! algorithm (LIRE)*, step 3).
 //!
 //! This is SPTAG's `KmeansClustering` / `TryClustering` with k = 2, the
@@ -43,11 +43,12 @@ pub struct SplitParams {
 impl Default for SplitParams {
     /// SPTAG's values.
     fn default() -> Self {
+        use crate::defaults::semantic_search::maintenance as m;
         Self {
-            samples: 1000,
-            init_trials: 3,
-            max_iters: 100,
-            lambda_factor: 100.0,
+            samples: m::SPLIT_SAMPLES as usize,
+            init_trials: m::SPLIT_INIT_TRIALS as usize,
+            max_iters: m::SPLIT_MAX_ITERS as usize,
+            lambda_factor: m::SPLIT_LAMBDA_FACTOR,
         }
     }
 }

@@ -332,7 +332,7 @@ impl NamespaceRegistry {
     ///
     /// Returns `false` if no live field has `field_id` (nothing to mark).
     /// Saving first is what makes an interrupted drop completable at the next
-    /// open; see `FEATURE-REQUEST.md` (FR-001) — *Dropped-index cleanup*.
+    /// open (`complete_interrupted_field_drops`).
     pub fn mark_schema_field_dropped(&mut self, ns_id: NamespaceId, field_id: FieldId) -> Result<bool> {
         let schema = self
             .schemas
@@ -352,8 +352,7 @@ impl NamespaceRegistry {
     ///
     /// **Excludes dropped fields.** Their definitions are kept for id reuse
     /// but their on-disk directories are gone, so checkpointing them would fail;
-    /// and a dropped field's frozen checkpoint marker must never hold up WAL GC
-    /// (FR-001, *The trap: active fields only*).
+    /// and a dropped field's frozen checkpoint marker must never hold up WAL GC.
     pub fn all_indexed_fields(&self) -> Vec<(NamespaceId, FieldId)> {
         self.schemas
             .iter()

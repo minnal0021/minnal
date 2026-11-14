@@ -66,16 +66,11 @@ static SCORING_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 
 pub use embedding_service::{EmbeddingError, EmbeddingTarget};
 
-/// The default probe settings: each query reads its 256 nearest postings
-/// (clusters), or every posting of a namespace with fewer. On FiQA (173k
-/// chunks, about 960 postings, the largest corpus measured) 256 is the smallest
-/// count within 0.001 nDCG of a full read at every cutoff from 10 to 100 on
-/// gemma and qwen; it reads 28% of the entries in 6.4 ms warm (192: up to
-/// 0.0024 behind). SciFact (about 135 postings) is read in full (frozen eval,
-/// 2026-10-19).
+/// The default probe settings, from
+/// [`defaults::semantic_search::search_defaults`](crate::defaults::semantic_search::search_defaults).
 pub const DEFAULT_PROBE: ProbeSettings = ProbeSettings {
-    min_probes: 1,
-    max_probes: 256,
+    min_probes: crate::defaults::semantic_search::search_defaults::MIN_PROBES as usize,
+    max_probes: crate::defaults::semantic_search::search_defaults::MAX_PROBES as usize,
 };
 
 /// Configuration required to call the embedding service.
@@ -151,21 +146,22 @@ pub struct SemanticSearchConfig {
 
 impl Default for SemanticSearchConfig {
     fn default() -> Self {
+        use crate::defaults;
         Self {
-            embedding_service_url: "http://localhost:8001".into(),
-            model_name: "qwen".into(),
-            embedding_dim: 768,
-            top_k_results: 100,
-            number_of_bits_for_dense_quantisation: 8,
-            pass1_bits: 1,
+            embedding_service_url: defaults::semantic_search::EMBEDDING_SERVICE_URL.into(),
+            model_name: defaults::schema_vector_index::EMBEDDING_MODEL.into(),
+            embedding_dim: defaults::schema_vector_index::EMBEDDING_DIM as usize,
+            top_k_results: defaults::semantic_search::search_defaults::TOP_K as usize,
+            number_of_bits_for_dense_quantisation: defaults::schema_vector_index::PASS2_BITS as usize,
+            pass1_bits: defaults::schema_vector_index::PASS1_BITS as usize,
             probe: DEFAULT_PROBE,
-            window_size: 4,
-            sliding_size: 2,
-            first_pass_sparse_search_top_k: 1000,
-            query_embedding_cache_ttl: std::time::Duration::from_secs(86_400),
-            partition_history_ttl: crate::semantic_search::ivf_split::history::DEFAULT_HISTORY_TTL,
-            embedding_request_timeout: std::time::Duration::from_secs(30),
-            embedding_connect_timeout: std::time::Duration::from_secs(10),
+            window_size: defaults::schema_vector_index::WINDOW_SIZE as usize,
+            sliding_size: defaults::schema_vector_index::SLIDING_SIZE as usize,
+            first_pass_sparse_search_top_k: defaults::semantic_search::search_defaults::FIRST_PASS_TOP_K as usize,
+            query_embedding_cache_ttl: defaults::semantic_search::QUERY_EMBEDDING_CACHE_TTL,
+            partition_history_ttl: defaults::semantic_search::PARTITION_HISTORY_TTL,
+            embedding_request_timeout: defaults::semantic_search::EMBEDDING_REQUEST_TIMEOUT,
+            embedding_connect_timeout: defaults::semantic_search::EMBEDDING_CONNECT_TIMEOUT,
         }
     }
 }
@@ -183,7 +179,7 @@ pub struct QueryEmbeddings {
 
 /// Fetch embeddings for a document and produce its whole-document code and its chunk codes.
 ///
-/// Chunking now happens here (the service no longer chunks). A **single** batch
+/// Chunking happens here (the service never chunks). A **single** batch
 /// call embeds one ordered payload list:
 ///
 /// - **payload\[0\]** — the whole document text → 1 raw embedding → quantised as
@@ -256,8 +252,9 @@ pub fn index_embeddings<L: IvfLayout + ?Sized>(
         number_of_bits: config.number_of_bits_for_dense_quantisation,
     };
     let mut indexes = Vec::with_capacity(1 + chunks.len());
-    // Whole-document codes against the zero centre (design doc M2c); chunks against
-    // their posting's centre.
+    // Whole-document codes against the zero centre
+    // (`Dynamic-RaBitQ-Index-Design.md` → M2c); chunks against their posting's
+    // centre.
     indexes.push(rabitq::index_embedding_zero_centred(layout, dense, multi_bit_style));
     for e in chunks {
         indexes.push(rabitq::index_embedding_rotated(layout, e, QuantisationStyle::pass1(config.pass1_bits))?);
@@ -271,8 +268,8 @@ pub fn index_embeddings<L: IvfLayout + ?Sized>(
 /// both passes. It is Pass 2's dense vector and also Pass 1's single MaxSim
 /// query vector, so `S(q, d) = max_j ⟨q, d_j⟩`, the best-matching document chunk.
 ///
-/// Queries used to be split into 4-word sliding windows, each embedded on its
-/// own. A BEIR evaluation (SciFact, NFCorpus, ArguAna; see
+/// The query is not split into sliding windows, each embedded on its own. A
+/// BEIR evaluation (SciFact, NFCorpus, ArguAna; see
 /// `semantic_search/docs/query-embedding-report.md`) found the whole-query vector
 /// never worse and often better. With a tight first-pass cut it kept more
 /// relevant documents: ArguAna candidate recall 0.991 vs 0.870, nDCG@10 +0.038.
@@ -1039,10 +1036,11 @@ where
         number_of_bits: config.number_of_bits_for_dense_quantisation,
     };
 
-    // Whole-document codes are encoded against the zero centre (design doc M2c), so
-    // `⟨q, c⟩ = 0` and one estimator serves every candidate. A code encoded
-    // against anything else is a write-path bug or corruption: skipped, counted
-    // and logged, never silently scored against the wrong centre.
+    // Whole-document codes are encoded against the zero centre
+    // (`Dynamic-RaBitQ-Index-Design.md` → M2c), so `⟨q, c⟩ = 0` and one estimator
+    // serves every candidate. A code encoded against anything else is a write-path
+    // bug or corruption: skipped, counted and logged, never silently scored against
+    // the wrong centre.
     //
     // Entries are read zero-copy from their rkyv archive (packed words copied into a
     // per-worker buffer via `map_init`); doc_ids are moved (not cloned) into the
@@ -1219,7 +1217,7 @@ mod tests {
     fn test_default_config() {
         let config = SemanticSearchConfig::default();
         assert_eq!(config.embedding_dim, 768);
-        assert_eq!(config.model_name, "qwen");
+        assert_eq!(config.model_name, "gemma");
         assert_eq!(config.embedding_service_url, "http://localhost:8001");
     }
 
@@ -1297,7 +1295,7 @@ mod tests {
     }
 
     fn spawn_probe_server(dim: usize, norm: f32) -> String {
-        spawn_service(dim, norm, &["qwen"], healthy(&["qwen"])).url
+        spawn_service(dim, norm, &["gemma"], healthy(&["gemma"])).url
     }
 
     fn probe_config(url: String, embedding_dim: usize) -> SemanticSearchConfig {
@@ -1355,10 +1353,10 @@ mod tests {
     /// what it does load.
     #[tokio::test]
     async fn check_embedding_service_rejects_a_model_the_service_does_not_load() {
-        let service = spawn_service(8, 1.0, &["gemma"], healthy(&["gemma"]));
-        let result = check_embedding_service(&probe_config(service.url, 8)).await; // default model: qwen
+        let service = spawn_service(8, 1.0, &["qwen"], healthy(&["qwen"]));
+        let result = check_embedding_service(&probe_config(service.url, 8)).await; // default model: gemma
         assert!(
-            matches!(&result, Err(EmbeddingError::ModelNotServed { model, available }) if model == "qwen" && available == "gemma"),
+            matches!(&result, Err(EmbeddingError::ModelNotServed { model, available }) if model == "gemma" && available == "qwen"),
             "got {result:?}",
         );
     }
@@ -1369,19 +1367,19 @@ mod tests {
     async fn check_embedding_service_judges_only_the_configured_model() {
         let health = serde_json::json!({
             "status": "starting",
-            "models": { "gemma": { "status": "loading" }, "qwen": { "status": "ok" } },
+            "models": { "qwen": { "status": "loading" }, "gemma": { "status": "ok" } },
         });
         let service = spawn_service(8, 1.0, &["gemma", "qwen"], health);
-        let qwen = probe_config(service.url.clone(), 8);
-        assert!(check_embedding_service(&qwen).await.is_ok(), "qwen is ready");
+        let gemma = probe_config(service.url.clone(), 8);
+        assert!(check_embedding_service(&gemma).await.is_ok(), "gemma is ready");
 
-        let gemma = SemanticSearchConfig {
-            model_name: "gemma".into(),
-            ..qwen
+        let qwen = SemanticSearchConfig {
+            model_name: "qwen".into(),
+            ..gemma
         };
-        let result = check_embedding_service(&gemma).await;
+        let result = check_embedding_service(&qwen).await;
         assert!(
-            matches!(&result, Err(EmbeddingError::ModelNotReady { model, status }) if model == "gemma" && status == "loading"),
+            matches!(&result, Err(EmbeddingError::ModelNotReady { model, status }) if model == "qwen" && status == "loading"),
             "got {result:?}",
         );
     }
@@ -1389,12 +1387,12 @@ mod tests {
     /// An embed call for an unknown model surfaces the service's own message.
     #[tokio::test]
     async fn embed_for_an_unknown_model_reports_the_service_detail() {
-        let service = spawn_service(8, 1.0, &["gemma"], healthy(&["gemma"]));
+        let service = spawn_service(8, 1.0, &["qwen"], healthy(&["qwen"]));
         let result = embed_query(&probe_config(service.url, 8), "hello").await;
         match result {
             Err(EmbeddingError::Status { status, detail, .. }) => {
                 assert_eq!(status, 404);
-                assert_eq!(detail, "Unknown model 'qwen'; available: gemma");
+                assert_eq!(detail, "Unknown model 'gemma'; available: qwen");
             }
             other => panic!("expected a 404 Status error, got {other:?}"),
         }
@@ -1500,7 +1498,7 @@ mod tests {
 
     // ── QuantisationStyle ─────────────────────────────────────────────────────
 
-    // ── Rotation (design doc M1) ──────────────────────────────────────────────
+    // ── Rotation (`Dynamic-RaBitQ-Index-Design.md` → M1) ─────────────────────
 
     fn unit_vec(dim: usize, seed: u64) -> Vec<f32> {
         let mut st = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -2209,9 +2207,8 @@ mod tests {
         }
     }
 
-    /// A storage failure in either pass must reach the caller. The store's batch
-    /// reads used to turn errors into an empty map or `None`s, so a failed search
-    /// returned fewer (or no) results as if nothing had matched.
+    /// A storage failure in either pass must reach the caller: a failed search
+    /// must not return fewer (or no) results as if nothing had matched.
     #[tokio::test]
     async fn test_search_surfaces_storage_errors_from_either_pass() {
         let cluster_index = make_cluster_index(&[(1, [1.0, 0.0, 0.0, 0.0])]);
@@ -2806,7 +2803,7 @@ mod tests {
     ///   MaxSim(doc_b) = score(q1, chunk_c1) + 0.0 (no chunk probed for q2)
     ///                 = 1.0             + 0.0             = 1.0
     ///
-    /// With the old SimMax (max across query tokens):
+    /// With SimMax instead (max across query tokens):
     ///   SimMax(doc_a) = max(1.0, 1.0) = 1.0   ← tied with doc_b
     ///   SimMax(doc_b) = max(1.0, 0.0) = 1.0
     ///
@@ -2970,8 +2967,8 @@ mod tests {
     }
 
     /// With a single query token, MaxSim reduces to a plain per-chunk max.
-    /// This test confirms that the refactored path produces the same result as
-    /// the old single-embedding pass-1 path in the degenerate case.
+    /// This test confirms the MaxSim path gives the plain per-chunk score in
+    /// that case.
     #[tokio::test]
     async fn test_pass1_maxsim_single_query_token_equals_plain_score() {
         // Two docs in two clusters; query probes only cluster 1.
