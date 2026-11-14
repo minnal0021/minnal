@@ -3,12 +3,22 @@
 
 use super::*;
 
-/// The header bytes written at offset 0 of a non-empty SSTable file.
-pub(super) fn sstable_header_bytes() -> [u8; SSTABLE_DATA_START as usize] {
+/// The header bytes written at offset 0 of an SSTable file: magic, format
+/// version, and `merged_through` — for an L1 file, the newest L0 stamp merged
+/// into it (see [`LSMTree::level1_merged_through`]); 0 for an L0 file.
+pub(super) fn sstable_header_bytes(merged_through: u64) -> [u8; SSTABLE_DATA_START as usize] {
     let mut header = [0u8; SSTABLE_DATA_START as usize];
     header[0..4].copy_from_slice(&SSTABLE_MAGIC);
     header[4..8].copy_from_slice(&SSTABLE_FORMAT_VERSION.to_le_bytes());
+    header[8..16].copy_from_slice(&merged_through.to_le_bytes());
     header
+}
+
+/// The `merged_through` stamp of an SSTable whose header has been validated.
+pub(super) fn sstable_merged_through(file: &File) -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    file.read_exact_at(&mut bytes, 8)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 /// Verify that `file` begins with a header this build can read.

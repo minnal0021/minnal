@@ -68,13 +68,13 @@ impl LSMTree {
 
     /// Write merged entries to a temporary SSTable file, building the sparse
     /// index from the byte offsets as it writes (no extra pass).
-    pub(super) fn write_merged_sstable(&self, path: &Path, entries: &[SStableEntry]) -> Result<MergedSstableInfo> {
+    pub(super) fn write_merged_sstable(&self, path: &Path, entries: &[SStableEntry], merged_through: u64) -> Result<MergedSstableInfo> {
         if entries.is_empty() {
             return Err(LSMError::Serialization("Cannot write empty SSTable".to_string()));
         }
 
         let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
-        file.write_all(&sstable_header_bytes())?;
+        file.write_all(&sstable_header_bytes(merged_through))?;
 
         // Counts entry bytes only — it is returned as the merge's `bytes_merged`
         // metric, not as a file position. The sparse index adds `SSTABLE_DATA_START`
@@ -118,11 +118,19 @@ impl LSMTree {
         let mut by_key: std::collections::BTreeMap<Vec<u8>, SStableEntry> = std::collections::BTreeMap::new();
         let mut displaced = DisplacedCollector::default();
         let mut any_read = false;
+        // The newest stamp this merge takes in, recorded in the new L1 file so an
+        // open after a crash deletes the merged files instead of reading them
+        // again. A stamp past `u64` (centuries away) is not recorded: the merged
+        // files are then only removed by cleanup, which is safe, just slower.
+        let mut merged_through = self.level1_merged_through[bucket as usize].load(Ordering::SeqCst);
         for entry in &entries {
             if entry.is_obsolete() {
                 continue;
             }
             any_read = true;
+            if let Ok(stamp) = u64::try_from(entry.created_at_ms) {
+                merged_through = merged_through.max(stamp);
+            }
             let _guard = L0ReadGuard::new(Arc::clone(entry));
             // Within one file each key appears once; across files the newer
             // file's copy replaces the older one's.
@@ -155,14 +163,22 @@ impl LSMTree {
 
         if merged_entries.is_empty() {
             let bucket_idx = bucket as usize;
+            // A header-only file: no entries, but it keeps `merged_through`, so the
+            // files this merge emptied are still recognised as merged at open.
+            // Published like a full one: written, fsynced, renamed, directory
+            // fsynced.
+            let temp_path = Self::level1_dir_from(&self.base_path).join(format!("level1_{}.dat.tmp", bucket));
+            {
+                let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(&temp_path)?;
+                file.write_all(&sstable_header_bytes(merged_through))?;
+                file.sync_all()?;
+            }
             let null_file = Arc::new(Self::create_null_file()?);
             {
                 let mut file_guard = self.sstable_files[bucket_idx].write();
+                std::fs::rename(&temp_path, &level1_path)?;
+                File::open(Self::level1_dir_from(&self.base_path))?.sync_all()?;
                 *file_guard = null_file;
-            }
-            // Keep an empty file so the per-bucket Level-1 path is always present.
-            if let Ok(f) = OpenOptions::new().write(true).create(true).truncate(true).open(&level1_path) {
-                let _ = f.sync_all();
             }
             let mut metadata_guard = self.sstable_metadata[bucket_idx].write();
             metadata_guard.clear();
@@ -171,7 +187,7 @@ impl LSMTree {
             *self.sstable_indexes[bucket_idx].write() = None;
         } else {
             let temp_path = Self::level1_dir_from(&self.base_path).join(format!("level1_{}.dat.tmp", bucket));
-            let (min_key, max_key, entry_count, data_size, index) = self.write_merged_sstable(&temp_path, &merged_entries)?;
+            let (min_key, max_key, entry_count, data_size, index) = self.write_merged_sstable(&temp_path, &merged_entries, merged_through)?;
             bytes_merged = data_size;
 
             let bucket_idx = bucket as usize;
@@ -225,6 +241,8 @@ impl LSMTree {
             *self.sstable_indexes[bucket_idx].write() = (!index.is_empty()).then(|| Arc::new(index));
         }
 
+        // Published with the file, before its inputs are marked obsolete.
+        self.level1_merged_through[bucket as usize].store(merged_through, Ordering::SeqCst);
         for entry in entries {
             entry.mark_obsolete();
         }

@@ -236,7 +236,7 @@ fn test_l0_order_survives_the_wall_clock_stepping_back() -> Result<()> {
     std::fs::rename(&first, l0_dir.join(format!("{}.dat", stamp + hour)))?;
 
     let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
-    lsm.insert_with_seq(b"k", relocated, 5)?; // GC relocation: same seq, new pointer
+    lsm.insert_with_seq(b"k", relocated, Version::user(5).next_system().unwrap())?; // a GC relocation
     lsm.flush_memtable_to_level0()?;
     // Drop the read-only memtable (still holding the relocation) so reads must
     // settle the tie by L0 file order alone.

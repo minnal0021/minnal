@@ -43,7 +43,7 @@ fn test_sstable_with_unknown_format_version_is_rejected() -> Result<()> {
     let path = temp_dir.path().join("future.dat");
 
     // Correct magic, but a version this build does not know how to read.
-    let mut header = sstable_header_bytes();
+    let mut header = sstable_header_bytes(0);
     header[4..8].copy_from_slice(&(SSTABLE_FORMAT_VERSION + 1).to_le_bytes());
     let mut f = File::create(&path)?;
     f.write_all(&header)?;
@@ -103,7 +103,7 @@ fn test_corrupt_frame_length_is_rejected_before_allocating() -> Result<()> {
     for bogus in [u32::MAX, 1 << 30, 0] {
         let path = temp_dir.path().join(format!("frame_{bogus}.dat"));
         let mut f = File::create(&path)?;
-        f.write_all(&sstable_header_bytes())?;
+        f.write_all(&sstable_header_bytes(0))?;
         f.write_all(&bogus.to_le_bytes())?; // claims `bogus` bytes…
         f.write_all(&[0xABu8; 8])?; // …but the file holds 8
         f.sync_all()?;

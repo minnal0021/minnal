@@ -95,7 +95,7 @@ fn test_compact_bucket_resets_flag_on_merge_error() -> Result<()> {
         for entry in rd {
             let path = entry?.path();
             if path.is_file() {
-                let mut bad = sstable_header_bytes().to_vec();
+                let mut bad = sstable_header_bytes(0).to_vec();
                 bad.extend_from_slice(&100u32.to_le_bytes()); // claims a 100-byte entry…
                 bad.extend_from_slice(&[0xABu8; 10]); // …but only 10 bytes follow
                 std::fs::write(&path, &bad)?;
@@ -432,5 +432,77 @@ fn a_crash_while_merged_level0_files_are_deleted_does_not_bring_a_key_back() -> 
     }
     let lsm = LSMTree::open(temp_dir.path(), config)?;
     assert_eq!(lsm.get(b"k")?, None, "a merged L0 file left by a crash brought a deleted key back");
+    assert!(lsm.level0_entries_snapshot(0).is_empty(), "the open must delete the merged file");
+    Ok(())
+}
+
+// Merged L0 files a crash left on disk are deleted at open, not read again: L1's
+// header records the newest stamp merged into it. Read again, an older merged
+// file could sit above an L1 copy that a newer one fed (two merges here, neither
+// cleaned up), and the layer order would not hold.
+#[test]
+fn merged_level0_files_left_by_a_crash_are_deleted_at_open() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let config = LSMConfig {
+        num_buckets: 1,
+        ..LSMConfig::default()
+    };
+    {
+        let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
+        lsm.insert_with_seq(b"k", 1, 10)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.merge_level0_to_level1(0)?; // k @ 10 in L1; its L0 file obsolete, not deleted
+        lsm.insert_with_seq(b"k", 2, 20)?;
+        lsm.insert_with_seq(b"other", 3, 21)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.merge_level0_to_level1(0)?; // k @ 20 in L1; both L0 files on disk
+        // Crash: no cleanup ran, and a new, unmerged file is flushed after.
+        lsm.insert_with_seq(b"other", 4, 30)?;
+        lsm.flush_memtable_to_level0()?;
+        assert_eq!(std::fs::read_dir(LSMTree::level0_bucket_dir_from(temp_dir.path(), 0))?.count(), 3);
+    }
+    let lsm = LSMTree::open(temp_dir.path(), config)?;
+    assert_eq!(lsm.level0_entries_snapshot(0).len(), 1, "only the unmerged file is read again");
+    assert!(lsm.layer_order_violations()?.is_empty());
+    assert_eq!(lsm.get_with_seq(b"k")?, Some((2, Version::user(20))));
+    assert_eq!(lsm.get_with_seq(b"other")?, Some((4, Version::user(30))));
+    assert!(
+        *lsm.last_l0_stamp.lock() >= u128::from(lsm.level1_merged_through[0].load(Ordering::SeqCst)),
+        "a new flush must stamp above every merged file"
+    );
+    Ok(())
+}
+
+// A merge that leaves L1 empty (every key deleted) still records what it merged:
+// it writes a header-only file, so the open recognises the merged files, which
+// hold the values the tombstones deleted.
+#[test]
+fn an_empty_merge_still_records_what_it_merged() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let config = LSMConfig {
+        num_buckets: 1,
+        ..LSMConfig::default()
+    };
+    {
+        let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
+        lsm.insert_with_seq(b"k", 1, 10)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.delete_with_seq(b"k", 11)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.merge_level0_to_level1(0)?; // L1 empty; both L0 files on disk
+    }
+    let level1 = LSMTree::level1_path_from(temp_dir.path(), 0);
+    assert_eq!(std::fs::metadata(&level1)?.len(), SSTABLE_DATA_START, "a header-only L1 file");
+    let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
+    assert!(lsm.level0_entries_snapshot(0).is_empty(), "both merged files must be deleted");
+    assert_eq!(lsm.get(b"k")?, None, "the value its delete removed came back");
+    assert_eq!(lsm.get_multiple(&[b"k".to_vec()])?, vec![None]);
+    drop(lsm);
+    // The empty L1 still reads as empty after a reopen, and takes new data.
+    let lsm = LSMTree::open(temp_dir.path(), config)?;
+    lsm.insert_with_seq(b"k", 5, 20)?;
+    lsm.flush_memtable_to_level0()?;
+    lsm.compact_all()?;
+    assert_eq!(lsm.get(b"k")?, Some(5));
     Ok(())
 }

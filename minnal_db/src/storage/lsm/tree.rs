@@ -20,7 +20,7 @@ use super::skip_list::skip_list::{KeyValueRecord, SkipList};
 use super::sparse_index::SparseIndex;
 pub(crate) use super::version::Version;
 use crate::support::{get_bucket_for_key, key_prefix_of, prefix_upper_bound};
-use log::warn;
+use log::{info, warn};
 use parking_lot::RwLock;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::fs::{File, OpenOptions};
@@ -502,6 +502,12 @@ pub(crate) struct LSMTree {
     /// [`next_l0_stamp`](Self::next_l0_stamp), so file order is flush order even
     /// when the wall clock steps backwards.
     last_l0_stamp: parking_lot::Mutex<u128>,
+    /// Per bucket, the newest L0 stamp merged into its Level-1 file, also kept in
+    /// the file's header. At open an L0 file stamped at or below it is already in
+    /// L1 and is deleted rather than read again: a merge takes every file
+    /// registered when it starts, and files register in stamp order, so the
+    /// merged files are exactly those at or below the stamp.
+    level1_merged_through: Vec<AtomicU64>,
     /// Held across a deletion of merged Level-0 files, unlinks and directory
     /// fsyncs included, so two cleanups cannot interleave their unlinks. See
     /// `cleanup_obsolete_level0_files`.

@@ -163,7 +163,7 @@ impl LSMTree {
         let write = || -> Result<()> {
             let file = std::fs::File::create(&tmp_path)?;
             let mut out = std::io::BufWriter::new(&file);
-            out.write_all(&sstable_header_bytes())?;
+            out.write_all(&sstable_header_bytes(0))?;
             for (i, entry) in bucket_records.into_iter().enumerate() {
                 if (i as u64).is_multiple_of(SparseIndex::SAMPLE_INTERVAL) {
                     index.push(entry.key.clone(), offset);

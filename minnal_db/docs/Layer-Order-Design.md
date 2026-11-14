@@ -147,20 +147,21 @@ unflushed (`LSMError::FlushOutOfOrder`), before anything is written.
 
 ## What a crash can leave behind
 
-After a merge into L1 the merged L0 files are deleted oldest first, each unlink
-made durable before the next, stopping at the first one a reader still holds
-(`cleanup_obsolete_level0_files`). A crash before they are all gone leaves the
-newest merged files on disk, and the next open reads them again as L0 files
-above the L1 they were merged into. Each holds, for every key in it, the version
-that L1 holds or an older one below a newer leftover, so the first copy a read
-finds is still the newest. The rule between adjacent layers can fail there (an
-older leftover above an L1 copy a newer leftover fed), but the property reads
-need holds, and the next merge folds the leftovers in again.
+After a merge into L1 the merged L0 files are deleted, and a crash can come
+first. Read again at open, a merged file would sit above the L1 it was merged
+into, and an older one could hold an older copy of a key than L1 does (L1 having
+taken a newer copy from a later merge). So each L1 file records in its header
+the newest L0 stamp merged into it (`merged_through`), and the open deletes
+every L0 file stamped at or below it instead of reading it. A merge takes every
+file registered when it starts, and files register in stamp order, so those are
+exactly the merged files. A merge that leaves L1 empty writes a header-only
+file, so the stamp is kept. The open also starts new stamps above it, so a clock
+that steps backwards cannot name a new file as if it were merged.
 
-Deleting newest first, or skipping a file a reader held and deleting the newer
-ones, would break this: an older merged file (a value) could survive without the
-newer one (its delete), and the key would come back above an L1 whose merge had
-dropped the tombstone.
+The merged files are also deleted oldest first, each unlink made durable before
+the next, stopping at the first one a reader still holds
+(`cleanup_obsolete_level0_files`), so whatever survives is the newest of them: a
+second line of defence.
 
 ## A write that never applied
 
@@ -176,8 +177,7 @@ over them.
 ## Tests
 
 `LSMTree::layer_order_violations` (test-only) walks every layer and reports each
-key whose first copy is not its newest version (equal versions in L1 below a
-leftover merged L0 file allowed). The differential tests compare the reads, which
+key with a copy that is not older than the copy above it. The differential tests compare the reads, which
 stop at the first copy, with `reference_get`, which reads every layer and keeps
 the highest version.
 
@@ -192,12 +192,14 @@ the highest version.
 | `test_scans_agree_with_brute_force_resolution` | a scan disagrees with the brute-force read |
 | `test_get_multiple_takes_the_newer_layers_copy_at_every_boundary` | a batch read takes an older layer's copy at some layer boundary |
 | `a_newer_memtable_cannot_reach_level0_before_an_older_one` | a newer memtable can be flushed before an older one |
-| `a_crash_while_merged_level0_files_are_deleted_does_not_bring_a_key_back` | merged L0 files are deleted other than oldest first |
+| `a_crash_while_merged_level0_files_are_deleted_does_not_bring_a_key_back` | a merged L0 file a crash left is read again |
+| `merged_level0_files_left_by_a_crash_are_deleted_at_open` | the open reads merged L0 files again, or a new stamp falls at or below a merged one |
+| `an_empty_merge_still_records_what_it_merged` | a merge that empties L1 loses its `merged_through` |
 | `a_merge_over_a_put_that_never_applied_keeps_the_value_it_read` | a failed apply is not recorded, or replay brings it back over the merge |
 | `a_held_stripe_does_not_block_writes_to_another_namespace` | stripes are shared between namespaces |
 
-The GC, TTL and failed-apply tests were checked by reverting each change: each
-revert fails at least one of them.
+The GC, TTL, failed-apply and open-time deletion tests were checked by
+reverting each change: each revert fails at least one of them.
 
 ## What it costs
 

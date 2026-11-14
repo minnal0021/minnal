@@ -22,6 +22,7 @@ impl LSMTree {
         // Newest user seq across every L1 and L0 file: what the write sequence
         // must start above (`max_stored_seq`).
         let mut max_stored_seq_init: Option<u64> = None;
+        let mut merged_through: Vec<u64> = Vec::with_capacity(num_buckets);
 
         // Open or create each bucket's Level-1 file.
         for bucket in 0u32..num_buckets as u32 {
@@ -42,6 +43,9 @@ impl LSMTree {
             // garbage entries instead of an error.
             if file_len > 0 {
                 validate_sstable_header(&file, &level1_path)?;
+                merged_through.push(sstable_merged_through(&file)?);
+            } else {
+                merged_through.push(0);
             }
             sstable_files_vec.push(Arc::new(RwLock::new(Arc::new(file))));
 
@@ -56,8 +60,14 @@ impl LSMTree {
             if file_len > 0
                 && let Ok((meta, built_bloom, built_index, file_max_seq)) = Self::load_metadata_from_file(&level1_path)
             {
+                // A header-only file (a merge that left no entries) rejects
+                // every key, like an empty one.
+                if meta.entry_count == 0 {
+                    bloom = Some(Arc::new(BloomFilter::build([], 0)));
+                } else {
+                    bloom = built_bloom.map(Arc::new);
+                }
                 metadata.push(meta);
-                bloom = built_bloom.map(Arc::new);
                 index = built_index.map(Arc::new);
                 if let Some(seq) = file_max_seq
                     && max_stored_seq_init.is_none_or(|m| seq_newer(seq, m))
@@ -80,18 +90,22 @@ impl LSMTree {
         // L0 is newer than L1, so its sequences must be folded into the read
         // fast-path bound too — otherwise the bound (L1-only above) is too low
         // after a restart and a low-seq active entry could wrongly short-circuit.
-        if let Some(seq) = Self::load_existing_level0_files(&base_path, &level0_files)?
+        if let Some(seq) = Self::load_existing_level0_files(&base_path, &level0_files, &merged_through)?
             && max_stored_seq_init.is_none_or(|m| seq_newer(seq, m))
         {
             max_stored_seq_init = Some(seq);
         }
 
-        // Seed the L0 stamp floor from the newest file on disk, so the first flush
-        // after a restart sorts after every file already there even if the clock
-        // is now behind the one that named them.
+        // Seed the L0 stamp floor from the newest file on disk and the newest
+        // stamp any L1 file has merged, so the first flush after a restart sorts
+        // after every file already there, merged or not, even if the clock is now
+        // behind the one that named them. A new file stamped at or below an L1
+        // file's `merged_through` would be taken for merged and deleted at the
+        // next open.
         let last_l0_stamp = level0_files
             .iter()
             .flat_map(|bucket| bucket.read().iter().map(|e| e.created_at_ms).collect::<Vec<_>>())
+            .chain(merged_through.iter().map(|&stamp| u128::from(stamp)))
             .max()
             .unwrap_or(0);
 
@@ -113,6 +127,7 @@ impl LSMTree {
             ro_memtable_version: Arc::new(AtomicU64::new(0)),
             level0_files,
             last_l0_stamp: parking_lot::Mutex::new(last_l0_stamp),
+            level1_merged_through: merged_through.into_iter().map(AtomicU64::new).collect(),
             level0_cleanup_lock: parking_lot::Mutex::new(()),
             flush_observer: Arc::new(RwLock::new(None)),
             base_path,
@@ -215,13 +230,24 @@ impl LSMTree {
     /// than L1, so omitting it would leave the bound too low after a restart (a
     /// low-seq active entry could then wrongly short-circuit above a higher-seq
     /// L0 tombstone).
-    pub(super) fn load_existing_level0_files(base_path: &Path, level0_files: &[Arc<RwLock<Vec<Arc<L0FileEntry>>>>]) -> Result<Option<u64>> {
+    ///
+    /// A file stamped at or below its bucket's `merged_through` (from the L1
+    /// file's header) is already in L1 — a crash came between the merge and the
+    /// file's deletion — and is deleted here rather than registered: read again
+    /// above that L1, it could hold an older copy of a key than L1 does.
+    pub(super) fn load_existing_level0_files(
+        base_path: &Path,
+        level0_files: &[Arc<RwLock<Vec<Arc<L0FileEntry>>>>],
+        merged_through: &[u64],
+    ) -> Result<Option<u64>> {
         let mut max_seq: Option<u64> = None;
         for bucket in 0u32..level0_files.len() as u32 {
             let dir = Self::level0_bucket_dir_from(base_path, bucket);
             if !dir.exists() {
                 continue;
             }
+            let merged = u128::from(merged_through.get(bucket as usize).copied().unwrap_or(0));
+            let mut removed_merged = false;
             let mut guard = level0_files[bucket as usize].write();
             for entry in std::fs::read_dir(&dir)? {
                 let entry = entry?;
@@ -247,15 +273,27 @@ impl LSMTree {
                             path.display()
                         )));
                     }
+                    let created_at = Self::level0_created_at_from_path(&path);
+                    if created_at <= merged {
+                        info!(
+                            "removing Level-0 file {} already merged into Level 1 (a crash came before its deletion)",
+                            path.display()
+                        );
+                        std::fs::remove_file(&path)?;
+                        removed_merged = true;
+                        continue;
+                    }
                     let summary = Self::level0_file_summary(&path)?;
                     if let Some(seq) = summary.as_ref().map(|s| s.max_seq)
                         && max_seq.is_none_or(|m| seq_newer(seq, m))
                     {
                         max_seq = Some(seq);
                     }
-                    let created_at = Self::level0_created_at_from_path(&path);
                     guard.push(Arc::new(L0FileEntry::new(path, created_at, summary)));
                 }
+            }
+            if removed_merged {
+                File::open(&dir)?.sync_all()?;
             }
         }
         Ok(max_seq)
