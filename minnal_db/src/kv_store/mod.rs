@@ -20,7 +20,7 @@ pub use reads::PrefixScan;
 
 use self::stats::{GCStats, Stats};
 use crate::error::{KVError, Result};
-use crate::storage::lsm::tree::{Applied, Displaced, DisplacedSink, LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys};
+use crate::storage::lsm::tree::{Applied, Displaced, DisplacedSink, LSMConfig, LSMTree, LsmFlushObserver, PrefixScanKeys, Version};
 use crate::storage::value_log::sharded::{ShardedValueLog, ShardedValuePointer};
 use crate::storage::value_log::{TAIL_GC_MIN_GARBAGE_PCT, ValueLocation, ValueRecordMeta};
 
@@ -42,7 +42,7 @@ use std::time::Duration;
 pub(crate) type KeyValue = (Vec<u8>, Vec<u8>);
 
 /// A key paired with its encoded value-log pointer and the full-width LSM write `seq`.
-pub(crate) type KeyPointer = (Vec<u8>, u128, u64);
+pub(crate) type KeyPointer = (Vec<u8>, u128, crate::storage::lsm::tree::Version);
 
 /// One page of a cursor scan: the resolved pairs plus the next cursor
 /// (`None` when the scan is exhausted).
@@ -210,6 +210,14 @@ pub struct KVStore {
     /// See [`key_locks`].
     pub(crate) key_locks: key_locks::KeyLocks,
 
+    /// Keys whose last WAL-backed write is durable but failed to apply on every
+    /// retry, with that write's seq: until a later user write to the key, a read
+    /// still sees the value before it. `merge` logs an ERROR when it reads such a
+    /// key (see [`take_unapplied_write`](Self::take_unapplied_write)). Empty in
+    /// normal operation; `any_unapplied` lets the write path skip the lock.
+    unapplied_writes: parking_lot::Mutex<HashMap<Vec<u8>, u64>>,
+    any_unapplied: AtomicBool,
+
     /// Engine-wide operational counters, shared from `Database` via
     /// [`set_metrics`](Self::set_metrics). `None` for a standalone store (tests).
     pub(crate) metrics: OnceLock<Arc<crate::support::metrics::Metrics>>,
@@ -310,6 +318,8 @@ impl KVStore {
             rowmap: Arc::new(RwLock::new(None)),
             seq_counter: RwLock::new(Arc::new(AtomicU64::new(1))),
             key_locks: key_locks::KeyLocks::new(),
+            unapplied_writes: parking_lot::Mutex::new(HashMap::new()),
+            any_unapplied: AtomicBool::new(false),
             metrics: OnceLock::new(),
             #[cfg(test)]
             gc_crash_after_unlink: AtomicBool::new(false),
@@ -408,6 +418,35 @@ impl KVStore {
     /// applied.
     pub(crate) fn lock_key(&self, key: &[u8]) -> parking_lot::MutexGuard<'_, ()> {
         self.key_locks.guard(key)
+    }
+
+    /// Record that the WAL-backed write `seq` to `key` is durable but failed to
+    /// apply on every retry. Called with the key's stripe held.
+    pub(crate) fn note_unapplied_write(&self, key: &[u8], seq: u64) {
+        self.unapplied_writes.lock().insert(key.to_vec(), seq);
+        self.any_unapplied.store(true, Ordering::SeqCst);
+    }
+
+    /// The seq of `key`'s durable-but-unapplied write, if it has one, forgetting
+    /// it: the caller (`merge`, with the stripe held) is about to write the key
+    /// over the value it can read, superseding that write.
+    pub(crate) fn take_unapplied_write(&self, key: &[u8]) -> Option<u64> {
+        if !self.any_unapplied.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut unapplied = self.unapplied_writes.lock();
+        let seq = unapplied.remove(key);
+        if unapplied.is_empty() {
+            self.any_unapplied.store(false, Ordering::SeqCst);
+        }
+        seq
+    }
+
+    /// Test-only: the seq of `key`'s durable-but-unapplied write, if any,
+    /// without forgetting it.
+    #[cfg(test)]
+    pub(crate) fn unapplied_write(&self, key: &[u8]) -> Option<u64> {
+        self.unapplied_writes.lock().get(key).copied()
     }
 
     #[cfg(test)]

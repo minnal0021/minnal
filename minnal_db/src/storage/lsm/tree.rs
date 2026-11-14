@@ -18,6 +18,7 @@ use super::bloom::BloomFilter;
 use super::manifest::{LsmManifest, ManifestBucket, ManifestFile, ManifestLevel};
 use super::skip_list::skip_list::{KeyValueRecord, SkipList};
 use super::sparse_index::SparseIndex;
+pub(crate) use super::version::Version;
 use crate::support::{get_bucket_for_key, key_prefix_of, prefix_upper_bound};
 use log::warn;
 use parking_lot::RwLock;
@@ -123,7 +124,7 @@ pub(crate) type Result<T> = std::result::Result<T, LSMError>;
 
 /// A bucket's Level-0 files are merged into its Level 1 once this many have
 /// built up, however small. Every L0 file a point read cannot rule out by its
-/// key range, Bloom filter or `max_seq` is read, so this bounds the read cost
+/// key range or Bloom filter is read, so this bounds the read cost
 /// that waiting adds. See [`LSMTree::compaction_due`].
 pub(crate) const L0_COMPACTION_MAX_FILES: usize = 8;
 
@@ -183,12 +184,6 @@ struct SStableMetadata {
     max_key: Vec<u8>,
     /// Number of entries in this SSTable
     entry_count: u64,
-    /// Newest write sequence in this SSTable (`None` when it has no entries). An
-    /// upper bound used to skip the L1 probe once a newer layer already holds a
-    /// copy at least this new. It lives here, not beside the file, so it is
-    /// published under the same lock as min/max and inherits their race argument
-    /// (see `merge_level0_to_level1`). Too high is safe; too low resurrects.
-    max_seq: Option<u64>,
 }
 
 /// Magic identifying an SSTable file, written at offset 0 of every **non-empty**
@@ -202,7 +197,7 @@ const SSTABLE_MAGIC: [u8; 4] = *b"MSST";
 /// version, or without the magic, is rejected by [`validate_sstable_header`]
 /// rather than misread: the entry CRC covers only the bytes, so it cannot catch a
 /// change in how they are interpreted.
-const SSTABLE_FORMAT_VERSION: u32 = 1;
+const SSTABLE_FORMAT_VERSION: u32 = 2;
 
 /// Byte offset at which entry frames begin: `magic(4) | version(4) | reserved(8)`.
 ///
@@ -264,13 +259,13 @@ type LoadedSstable = (SStableMetadata, Option<BloomFilter>, Option<SparseIndex>,
 /// One layer's copy of a key during a scan: `(key, Some(pointer) | None for a
 /// tombstone, seq)`. Tombstones keep their seq so they can be resolved against
 /// other layers' copies by [`fold_newest`], never by layer order.
-type ScanEntry = (Vec<u8>, Option<u128>, u64);
+type ScanEntry = (Vec<u8>, Option<u128>, Version);
 
 /// One L1 entry of a prefix scan, its key a range of its bucket's key buffer:
 /// `(buffer, start, end, Some(pointer) | None for a tombstone, seq)`. A large scan
 /// reads tens of thousands of entries; packing their keys saves an allocation
 /// (and a free) each.
-type PackedScanEntry = (usize, usize, usize, Option<u128>, u64);
+type PackedScanEntry = (usize, usize, usize, Option<u128>, Version);
 
 /// What [`LSMTree::scan_prefixes`] returns: every live key under the requested
 /// prefixes in ascending order, each with its value pointer. The keys are packed
@@ -283,21 +278,20 @@ pub(crate) struct PrefixScanKeys {
     pointers: Vec<u128>,
 }
 
-/// A scan's running view of each key: the newest copy seen so far,
-/// `(Some(pointer) | None for a tombstone, seq)`.
-type ScanMap = std::collections::BTreeMap<Vec<u8>, (Option<u128>, u64)>;
+/// A scan's running view of each key: the copy in the newest layer folded so
+/// far, `(Some(pointer) | None for a tombstone, version)`.
+type ScanMap = std::collections::BTreeMap<Vec<u8>, (Option<u128>, Version)>;
 
-/// A key's running winner during cross-layer resolution: the newest-`seq` copy
-/// seen so far, `(Some(pointer) | None for a tombstone, seq)`, or `None` if no
-/// layer visited yet holds the key.
-type Candidate = Option<(Option<u128>, u64)>;
+/// A key's current copy: `(Some(pointer) | None for a tombstone, version)`, or
+/// `None` if no layer holds the key.
+type Candidate = Option<(Option<u128>, Version)>;
 
 /// One bucket's share of a `get_multiple` batch: each distinct pending key and
 /// its running [`Candidate`].
 type BatchSlots<'k> = std::collections::HashMap<&'k [u8], Candidate>;
 
-/// Per input key, its winning `(pointer, seq)` or `None` (absent or deleted).
-type BatchLookup = Vec<Option<(u128, u64)>>;
+/// Per input key, its current `(pointer, version)` or `None` (absent or deleted).
+type BatchLookup = Vec<Option<(u128, Version)>>;
 
 /// A single entry in the SSTable
 #[derive(Clone, Debug, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -306,10 +300,40 @@ struct SStableEntry {
     key_prefix: u64, // First 8 bytes of key as u64 for fast prefix matching
     value: u128,
     tombstone: bool,
+    /// The version's user seq ([`Version::user`]).
     seq: u64,
+    /// The version's system seq ([`Version::system`]).
+    system: u32,
 }
 
 impl SStableEntry {
+    fn version(&self) -> Version {
+        Version {
+            user: self.seq,
+            system: self.system,
+        }
+    }
+
+    /// An archived entry's version, without deserialising it.
+    fn archived_version(archived: &ArchivedSStableEntry) -> Version {
+        Version {
+            user: archived.seq.to_native(),
+            system: archived.system.to_native(),
+        }
+    }
+
+    /// A memtable record as an SSTable entry.
+    fn of_record(record: &KeyValueRecord) -> Self {
+        Self {
+            key: record.key.clone(),
+            key_prefix: key_prefix_of(&record.key),
+            value: record.value,
+            tombstone: record.tombstone,
+            seq: record.version.user,
+            system: record.version.system,
+        }
+    }
+
     /// The value-log pointer this entry holds, or `None` for a tombstone.
     fn live_pointer(&self) -> Option<u128> {
         (!self.tombstone).then_some(self.value)
@@ -347,6 +371,8 @@ struct ReadOnlyMemTable {
 struct L0Summary {
     min_key: Vec<u8>,
     max_key: Vec<u8>,
+    /// Highest user seq in the file: folded at open into the bound the write
+    /// sequence must start above ([`LSMTree::max_stored_seq`]).
     max_seq: u64,
     /// Records in the file; what [`LSMTree::compaction_due`] weighs against Level 1.
     entries: u64,
@@ -382,10 +408,7 @@ struct L0ReadGuard {
     entry: Arc<L0FileEntry>,
 }
 
-/// Whether `a` is a strictly-newer write sequence than `b`, matching the
-/// memtable's comparison (`SkipList::seq_is_newer_or_equal`). Resolution across
-/// layers picks the entry with the newest sequence, so order of inspection only
-/// breaks exact ties.
+/// Whether `a` is a strictly-newer user seq than `b`.
 ///
 /// Sequences are the global `u64` counter (`Database::next_seq`) at full width,
 /// so this is a plain comparison. **Do not narrow it** to a smaller, wrapping
@@ -400,30 +423,25 @@ fn seq_newer(a: u64, b: u64) -> bool {
     a > b
 }
 
-/// Whether `a` is newer than *or equal to* `b` (see [`seq_newer`]).
-#[inline]
-fn seq_newer_or_eq(a: u64, b: u64) -> bool {
-    a >= b
-}
-
-/// Outcome of looking a key up in a single SSTable layer, carrying the matched
-/// entry's write sequence so resolution can pick the newest version across all
-/// layers by sequence rather than by layer.
+/// Outcome of looking a key up in a single SSTable: a value, a tombstone (which
+/// must shadow older layers, so "deleted" and "absent" stay distinct), or
+/// nothing.
 #[derive(Debug, Clone, Copy)]
 enum SsLookup {
-    /// Live value pointer found in this layer, with its stored sequence.
-    Found(u128, u64),
-    /// An explicit tombstone for the key was found, with its stored sequence.
-    Deleted(u64),
+    /// Live value pointer found in this layer, with its version.
+    Found(u128, Version),
+    /// An explicit tombstone for the key was found, with its version.
+    Deleted(Version),
     /// The key is simply not present in this layer.
     Missing,
 }
 
 impl SsLookup {
-    /// The matched entry's sequence, or `None` for [`SsLookup::Missing`].
-    fn seq(&self) -> Option<u64> {
+    /// The copy this lookup found, as a [`Candidate`].
+    fn candidate(self) -> Candidate {
         match self {
-            SsLookup::Found(_, seq) | SsLookup::Deleted(seq) => Some(*seq),
+            SsLookup::Found(ptr, version) => Some((Some(ptr), version)),
+            SsLookup::Deleted(version) => Some((None, version)),
             SsLookup::Missing => None,
         }
     }
@@ -454,15 +472,11 @@ pub(crate) struct LSMTree {
     /// fall back to a full scan if a compaction has swapped the file underneath.
     sstable_indexes: Vec<Arc<RwLock<Option<Arc<SparseIndex>>>>>,
 
-    /// Upper bound on the write sequence of any entry in a non-active layer
-    /// (read-only memtables + L0 + L1). Read resolution is highest-sequence-wins
-    /// across all layers, but an active-memtable hit whose sequence is `>=` this
-    /// bound dominates everything below it and can be returned without scanning
-    /// the lower layers, which is the common case: every write, GC copies
-    /// included, carries the newest sequence. An entry that fails the bound falls
-    /// through to the full seq-aware search. Raised to the newest sequence of every memtable flushed and of the
-    /// L1 files loaded at open.
-    max_lower_seq: AtomicU64,
+    /// Upper bound on the user seq of any entry below the active memtable,
+    /// raised by every memtable sealed and from every L0 and L1 file at open. At
+    /// open the memtable is empty, so it bounds everything stored, and the write
+    /// sequence must start above it ([`max_stored_seq`](Self::max_stored_seq)).
+    max_stored_seq: AtomicU64,
 
     /// Engine-wide operational counters, shared from `Database` via
     /// [`set_metrics`](Self::set_metrics). `None` until set (e.g. a standalone
@@ -498,9 +512,10 @@ pub(crate) struct LSMTree {
 
     base_path: PathBuf,
 
-    /// Test-only fault: the next `insert_with_seq` fails before inserting.
+    /// Test-only fault: how many of the next `insert_with_seq` calls fail
+    /// before inserting.
     #[cfg(test)]
-    fail_next_insert: AtomicBool,
+    fail_next_inserts: std::sync::atomic::AtomicU32,
 }
 
 impl LSMTree {
@@ -509,7 +524,7 @@ impl LSMTree {
     /// At open the memtable is empty, so it bounds everything stored: the write
     /// sequence must start above it (see `KVStore::set_seq_counter`).
     pub(crate) fn max_stored_seq(&self) -> u64 {
-        self.max_lower_seq.load(Ordering::Relaxed)
+        self.max_stored_seq.load(Ordering::Relaxed)
     }
 
     /// Attach the engine-wide operational counters (called once by `KVStore`).
@@ -596,7 +611,14 @@ impl LSMTree {
     /// memtable arena past `u32::MAX` would.
     #[cfg(test)]
     pub(crate) fn fail_next_insert(&self) {
-        self.fail_next_insert.store(true, Ordering::SeqCst);
+        self.fail_next_inserts(1);
+    }
+
+    /// Test-only: make the next `count` calls of `insert_with_seq` fail, as
+    /// [`fail_next_insert`](Self::fail_next_insert) does for one.
+    #[cfg(test)]
+    pub(crate) fn fail_next_inserts(&self, count: u32) {
+        self.fail_next_inserts.store(count, Ordering::SeqCst);
     }
 
     /// Test-only: hold the active memtable, so a flush of this tree waits.

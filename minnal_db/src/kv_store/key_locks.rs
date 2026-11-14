@@ -7,11 +7,14 @@
 //! in sequence order, and a writer that draws a sequence after acquiring the
 //! stripe is newer than every copy of the key already stored.
 //!
-//! Who takes a stripe: every WAL-backed write, the vector index WAL's logged
-//! writes, the no-WAL writes, `merge` (which reads a key, runs a user closure
-//! and writes the result back as one indivisible step), TTL expiry, the field
-//! index's out-of-band reindex, and value-log GC when it re-points a key.
-//! Reads and scans never take one.
+//! Who takes a stripe: every user write — WAL-backed, the vector index WAL's
+//! logged writes, the no-WAL writes, and `merge` (which reads a key, runs a user
+//! closure and writes the result back as one indivisible step) — and the field
+//! index's out-of-band reindex. Reads and scans never take one, and neither do
+//! the system actions, value-log GC and TTL expiry: they keep the user seq of the
+//! copy they replace and raise its system seq (`storage::lsm::version`), so a
+//! user write that drew its seq before them is newer whenever it lands. Only a
+//! copy whose system seq is used up makes them fall back to the stripe.
 //!
 //! Why a lock of its own rather than one of the two the write path already
 //! takes:
@@ -25,14 +28,13 @@
 //!   the established order.
 //!
 //! So the stripe sits strictly above both. The order is
-//! **`key stripe → wal_metadata → (released) → value-log bucket`**, uniformly.
-//! The one path that holds a bucket lock and wants a stripe, GC's re-point,
-//! only ever *tries* it ([`KeyLocks::try_guard`]) and falls back to taking the
-//! two in order, so a cycle is impossible rather than merely unlikely.
+//! **`key stripe → wal_metadata → (released) → value-log bucket`**, uniformly:
+//! nothing waits for a stripe while holding either of the others, so a cycle is
+//! impossible rather than merely unlikely.
 //!
 //! The stripes are per namespace so that a writer only ever waits on work in
-//! its own namespace: a GC pass, a slow merge closure or a TTL pass in one
-//! namespace never holds up writes to another. A stripe is one byte (an
+//! its own namespace: a slow merge closure in one namespace never holds up
+//! writes to another. A stripe is one byte (an
 //! uncontended acquire is one atomic compare-and-swap), so 1,024 per namespace
 //! is about 1 KiB.
 //!
@@ -76,15 +78,6 @@ impl KeyLocks {
         self.stripes[self.stripe_of(key)].lock()
     }
 
-    /// Lock the stripe guarding `key` if it is free, without waiting.
-    ///
-    /// For a caller that already holds a lock taken *after* the stripe in the
-    /// lock order (GC holding a value-log bucket lock): waiting there could
-    /// deadlock against a writer holding the stripe and waiting for that bucket.
-    pub(crate) fn try_guard(&self, key: &[u8]) -> Option<MutexGuard<'_, ()>> {
-        self.stripes[self.stripe_of(key)].try_lock()
-    }
-
     /// Hashes the **whole** key, deliberately not
     /// [`get_bucket_for_key`](crate::support::get_bucket_for_key), which hashes
     /// only the first 8 bytes: reusing it would collapse every key sharing an
@@ -121,15 +114,6 @@ mod tests {
         let locks = KeyLocks::new();
         let stripes: std::collections::HashSet<usize> = (0..64).map(|i| locks.stripe_of(format!("job_content_{}", i).as_bytes())).collect();
         assert!(stripes.len() > 32, "expected keys to spread, got {} distinct stripes", stripes.len());
-    }
-
-    #[test]
-    fn try_guard_fails_only_while_the_stripe_is_held() {
-        let locks = KeyLocks::new();
-        let held = locks.guard(b"k");
-        assert!(locks.try_guard(b"k").is_none(), "a held stripe must not be handed out twice");
-        drop(held);
-        assert!(locks.try_guard(b"k").is_some(), "a free stripe must be taken");
     }
 
     #[test]

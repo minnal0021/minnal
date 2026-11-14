@@ -316,9 +316,9 @@ impl LSMTree {
 
             if archived.key.as_slice() == key {
                 if archived.tombstone {
-                    return Ok(SsLookup::Deleted(archived.seq.to_native()));
+                    return Ok(SsLookup::Deleted(SStableEntry::archived_version(archived)));
                 }
-                return Ok(SsLookup::Found(archived.value.to_native(), archived.seq.to_native()));
+                return Ok(SsLookup::Found(archived.value.to_native(), SStableEntry::archived_version(archived)));
             }
 
             if archived.key.as_slice() > key {
@@ -385,6 +385,7 @@ impl LSMTree {
                 value: archived.value.to_native(),
                 tombstone: archived.tombstone,
                 seq: archived.seq.to_native(),
+                system: archived.system.to_native(),
             };
 
             entries.push(entry);
@@ -433,6 +434,7 @@ impl LSMTree {
                 value: archived.value.to_native(),
                 tombstone: archived.tombstone,
                 seq: archived.seq.to_native(),
+                system: archived.system.to_native(),
             };
 
             entries.push(entry);
@@ -526,7 +528,6 @@ impl LSMTree {
                 min_key,
                 max_key,
                 entry_count,
-                max_seq,
             },
             bloom,
             index,

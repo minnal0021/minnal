@@ -1,7 +1,7 @@
 //! The layer-order invariant: a newer layer always holds a newer version of a
-//! key. GC writes its copies as new versions under the key's stripe, replay
-//! drops a record that is not newer than what is stored, and memtables reach
-//! Level 0 in the order they were frozen.
+//! key. GC writes each copy at the next system version of the copy it replaces,
+//! replay drops a record that is not newer than what is stored, and memtables
+//! reach Level 0 in the order they were frozen.
 
 use super::*;
 use crate::namespace::NamespaceId;
@@ -27,7 +27,7 @@ fn assert_layers_in_order(store: &KVStore, when: &str) {
     );
 }
 
-fn seq_of(store: &KVStore, key: &[u8]) -> u64 {
+fn version_of(store: &KVStore, key: &[u8]) -> Version {
     store.lsm.get_with_seq(key).unwrap().expect("key is live").1
 }
 
@@ -45,9 +45,10 @@ fn fill_with_garbage(store: &KVStore, cold: usize, hot: usize, rounds: usize) {
     }
 }
 
-/// A GC copy is a new version of its key: a fresh seq, newer than the copy it
-/// replaces. Written at the old seq instead, the copy would sit in the memtable
-/// (and then a newer L0 file) beside the original at the same seq.
+/// A GC copy keeps the write's user seq and takes the next system seq: newer
+/// than the copy it replaces, so it can sit in the memtable (and then a newer L0
+/// file) above the original. Written at the same version instead, the two would
+/// tie.
 #[test]
 fn gc_writes_its_copy_as_the_newest_version() {
     let dir = TempDir::new().unwrap();
@@ -55,11 +56,11 @@ fn gc_writes_its_copy_as_the_newest_version() {
     fill_with_garbage(&store, 200, 50, 6);
     store.flush_memtable_to_level0().unwrap();
 
-    let before: Vec<(Vec<u8>, u64)> = (0..200)
+    let before: Vec<(Vec<u8>, Version)> = (0..200)
         .map(|i| {
             let key = format!("cold{i:04}").into_bytes();
-            let seq = seq_of(&store, &key);
-            (key, seq)
+            let version = version_of(&store, &key);
+            (key, version)
         })
         .collect();
 
@@ -67,24 +68,24 @@ fn gc_writes_its_copy_as_the_newest_version() {
     assert!(stats.bytes_reclaimed > 0, "the test needs GC to reclaim segments holding cold keys");
 
     let mut moved = 0;
-    for (key, old_seq) in &before {
+    for (key, old) in &before {
         assert_eq!(store.get(key).unwrap(), Some(vec![0xC0u8; 512]), "GC lost a live value");
-        let seq = seq_of(&store, key);
-        assert!(seq >= *old_seq, "a key's version went backwards across GC");
-        if seq > *old_seq {
+        let now = version_of(&store, key);
+        assert_eq!(now.user, old.user, "a GC copy is the same user write");
+        assert!(now.system >= old.system, "a key's version went backwards across GC");
+        if now > *old {
             moved += 1;
         }
     }
-    assert!(moved > 0, "GC must have relocated some cold keys, each at a fresh seq");
+    assert!(moved > 0, "GC must have relocated some cold keys, each at the next system seq");
     assert_layers_in_order(&store, "after GC");
     store.lsm.compact_all().unwrap();
     assert_layers_in_order(&store, "after GC and a merge");
 }
 
-/// A writer holds its key's stripe from drawing its seq to applying the write.
-/// GC must not re-point that key in between: its copy would carry a fresh,
-/// higher seq and beat the write, which is newer. So GC waits for the stripe,
-/// then sees the key no longer points at the record it copied, and skips it.
+/// A writer that drew its seq before GC moved its key, and applies after, must
+/// still win: GC's copy keeps the old user seq, so the writer's is newer
+/// whenever it lands. GC takes no stripe, so it does not wait for the writer.
 #[test]
 fn a_write_that_drew_its_seq_before_gc_still_wins() {
     let dir = TempDir::new().unwrap();
@@ -100,8 +101,8 @@ fn a_write_that_drew_its_seq_before_gc_still_wins() {
         let store = Arc::clone(&store);
         std::thread::spawn(move || store.garbage_collect_with_thresholds(1.0, 1.0).unwrap())
     };
-    // Let GC reach the key and find its stripe taken. Were GC to re-point the
-    // key without the stripe, it would do so now, at a seq above `seq`.
+    // Let GC move the key meanwhile. Were its copy at a fresh user seq, it
+    // would be above `seq` and the write below would lose.
     std::thread::sleep(std::time::Duration::from_millis(200));
     store.put_to_storage_seq(key, b"the writer's value", seq).unwrap();
     drop(stripe);
@@ -113,7 +114,7 @@ fn a_write_that_drew_its_seq_before_gc_still_wins() {
         Some(b"the writer's value".as_slice()),
         "GC's copy beat a write that was newer than it"
     );
-    assert_eq!(seq_of(&store, key), seq);
+    assert_eq!(version_of(&store, key), Version::user(seq));
     assert_layers_in_order(&store, "after GC raced a writer");
 }
 
@@ -215,4 +216,32 @@ fn the_layer_order_holds_under_every_writer() {
         }
     }
     assert_layers_in_order(&store, "at the end");
+}
+
+/// TTL expiry is a system action: its tombstone keeps the expired copy's user
+/// seq and takes the next system seq. A user write that drew its seq before the
+/// expiry and applies after it is newer, so it wins — live and after replay.
+#[test]
+fn a_write_that_drew_its_seq_before_ttl_expiry_still_wins() {
+    let dir = TempDir::new().unwrap();
+    let store = small_segment_store(&dir);
+    store.put_to_storage(b"k", b"expired").unwrap();
+    let written = version_of(&store, b"k");
+
+    // A writer has drawn its seq and not yet applied its write.
+    let seq = store.alloc_seq();
+    assert_eq!(store.expire_records(std::time::Duration::ZERO, 10).unwrap(), 1);
+    assert_eq!(store.get(b"k").unwrap(), None, "the expired value is gone");
+    assert!(
+        store.lsm.current_pointer_and_wins(b"k", Version::user(seq)).unwrap().1,
+        "a user write drawn before the expiry must be newer than its tombstone"
+    );
+    assert!(
+        !store.lsm.current_pointer_and_wins(b"k", written).unwrap().1,
+        "the tombstone must be newer than the copy it expired"
+    );
+
+    store.put_to_storage_seq(b"k", b"the writer's value", seq).unwrap();
+    assert_eq!(store.get(b"k").unwrap().as_deref(), Some(b"the writer's value".as_slice()));
+    assert_layers_in_order(&store, "after a write landed behind a TTL expiry");
 }

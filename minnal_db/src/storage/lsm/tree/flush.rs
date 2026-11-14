@@ -140,7 +140,7 @@ impl LSMTree {
         }
 
         bucket_records.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut summary = L0Summary::of_sorted(bucket_records.iter().map(|r| (r.key.as_slice(), r.seq)));
+        let mut summary = L0Summary::of_sorted(bucket_records.iter().map(|r| (r.key.as_slice(), r.version.user)));
         // Absolute frame offsets, sampled exactly as `write_merged_sstable` and
         // `load_metadata_from_file` do, so all three agree.
         let mut index = SparseIndex::new();
@@ -168,14 +168,7 @@ impl LSMTree {
                 if (i as u64).is_multiple_of(SparseIndex::SAMPLE_INTERVAL) {
                     index.push(entry.key.clone(), offset);
                 }
-                let key_prefix = key_prefix_of(&entry.key);
-                let entry_obj = SStableEntry {
-                    key: entry.key,
-                    key_prefix,
-                    value: entry.value,
-                    tombstone: entry.tombstone,
-                    seq: entry.seq,
-                };
+                let entry_obj = SStableEntry::of_record(&entry);
                 let payload = encode_sstable_entry(&entry_obj)?;
                 out.write_all(&(payload.len() as u32).to_le_bytes())?;
                 out.write_all(&payload)?;
@@ -222,9 +215,9 @@ impl LSMTree {
         let mut memtable = self.memtable.write();
         let records = memtable.collect_records();
         // These records are leaving the active memtable for a lower layer, so
-        // advance the lower-layer sequence bound to cover them.
-        if let Some(max) = records.iter().map(|r| r.seq).reduce(|a, b| if seq_newer(b, a) { b } else { a }) {
-            self.note_lower_seq(max);
+        // advance the bound on stored user seqs to cover them.
+        if let Some(max) = records.iter().map(|r| r.version.user).max() {
+            self.note_stored_seq(max);
         }
         let version = self.ro_memtable_version.fetch_add(1, Ordering::SeqCst);
         let ro_memtable = ReadOnlyMemTable::new(records, version);

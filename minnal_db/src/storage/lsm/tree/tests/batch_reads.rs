@@ -165,15 +165,10 @@ fn test_get_multiple_deleted_after_flush() -> Result<()> {
     Ok(())
 }
 
-// `get_multiple` must resolve a key by highest `seq` across all layers,
-// exactly like `get_with_seq`, never by layer order. Value-log GC decides
-// liveness with `get_multiple`, so a layer-order answer of "deleted" for a
-// live key would make GC drop its record and unlink the segment: permanent
-// loss. Nothing in the LSM keeps a newer layer's copies at higher seqs, so the
-// inversion (a lower-seq copy in a newer layer) must resolve correctly.
-//
-// Each case places `high` (seq 20) in an older layer and `low` (seq 10) in a
-// newer one, at every layer boundary the batch path walks.
+// `get_multiple` must find the same copy as `get_with_seq`: the one in the
+// newest layer that holds the key. Value-log GC decides liveness with it, so a
+// "deleted" answer for a live key would make GC drop its record and unlink the
+// segment: permanent loss.
 fn assert_batch_matches_point_gets(lsm: &LSMTree, keys: &[&[u8]], label: &str) -> Result<()> {
     let owned: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
     let batch = lsm.get_multiple(&owned)?;
@@ -188,9 +183,12 @@ fn assert_batch_matches_point_gets(lsm: &LSMTree, keys: &[&[u8]], label: &str) -
     Ok(())
 }
 
+// At every layer boundary the reads walk, a newer layer's copy wins: a user
+// write's tombstone over a value, a user write's value over a tombstone, and a
+// system action's copy (same user seq, next system seq, as GC writes) over the
+// copy it replaced.
 #[test]
-fn test_get_multiple_resolves_by_seq_not_layer_order() -> Result<()> {
-    // Stage: which layer the newer-but-lower-seq copy ends up in.
+fn test_get_multiple_takes_the_newer_layers_copy_at_every_boundary() -> Result<()> {
     #[derive(Debug, Clone, Copy)]
     enum Newer {
         ActiveMemtable,
@@ -217,9 +215,10 @@ fn test_get_multiple_resolves_by_seq_not_layer_order() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
 
-        // Older layer, higher seq: a live value and a tombstone.
-        lsm.insert_with_seq(b"live", 0xAAAA, 20)?;
-        lsm.delete_with_seq(b"dead", 20)?;
+        // Older layer: three live values.
+        lsm.insert_with_seq(b"deleted", 0xAAAA, 10)?;
+        lsm.insert_with_seq(b"rewritten", 0xBBBB, 11)?;
+        lsm.insert_with_seq(b"moved", 0xCCCC, 12)?;
         match older {
             Older::ReadOnlyMemtable => lsm.flush_memtable()?,
             Older::Level0 => lsm.flush_memtable_to_level0()?,
@@ -229,26 +228,24 @@ fn test_get_multiple_resolves_by_seq_not_layer_order() -> Result<()> {
             }
         }
 
-        // Newer layer, lower seq: a stale tombstone over `live`, a stale value
-        // over `dead`.
-        lsm.delete_with_seq(b"live", 10)?;
-        lsm.insert_with_seq(b"dead", 0xBBBB, 10)?;
+        // Newer layer: a delete, an overwrite, and a GC copy of `moved`.
+        lsm.delete_with_seq(b"deleted", 20)?;
+        lsm.insert_with_seq(b"rewritten", 0xDDDD, 21)?;
+        let moved = Version::user(12).next_system().unwrap();
+        lsm.insert_with_seq(b"moved", 0xEEEE, moved)?;
         match newer {
             Newer::ActiveMemtable => {}
             Newer::ReadOnlyMemtable => lsm.flush_memtable()?,
             Newer::Level0 => lsm.flush_memtable_to_level0()?,
         }
 
-        assert_eq!(lsm.get_with_seq(b"live")?, Some((0xAAAA, 20)), "{older:?}/{newer:?}: point get");
-        // L1 is the bottom level, so compaction drops the tombstone: nothing is
-        // left to shadow the seq-10 value, and both paths must agree it is live.
-        let dead_expected = match older {
-            Older::Level1 => Some((0xBBBB, 10)),
-            _ => None,
-        };
-        assert_eq!(lsm.get_with_seq(b"dead")?, dead_expected, "{older:?}/{newer:?}: point get");
-        // `live` twice: a duplicated input key must resolve at every position.
-        assert_batch_matches_point_gets(&lsm, &[b"live", b"dead", b"never", b"live"], &format!("{older:?}/{newer:?}"))?;
+        let label = format!("{older:?}/{newer:?}");
+        assert!(lsm.layer_order_violations()?.is_empty(), "{label}: the test must build an ordered tree");
+        assert_eq!(lsm.get_with_seq(b"deleted")?, None, "{label}");
+        assert_eq!(lsm.get_with_seq(b"rewritten")?, Some((0xDDDD, Version::user(21))), "{label}");
+        assert_eq!(lsm.get_with_seq(b"moved")?, Some((0xEEEE, moved)), "{label}");
+        // A duplicated input key must resolve at every position.
+        assert_batch_matches_point_gets(&lsm, &[b"deleted", b"rewritten", b"moved", b"never", b"moved"], &label)?;
     }
     Ok(())
 }

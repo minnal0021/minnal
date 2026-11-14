@@ -1473,13 +1473,12 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `scans` | reads | Multi-key scans (range/prefix) executed | **No** |
 | `scan_rows` | reads | Total rows returned across all scans | **No** |
 | `lookups` | lsm_lookups | LSM point lookups (≥ `reads` — also counts GC-validation reads and WAL-replay probes) | **No** |
-| `fast_path_hits` | lsm_lookups | Lookups served by the active-memtable fast path (no lower-layer scan) | **No** |
+| `fast_path_hits` | lsm_lookups | Lookups answered by the active memtable (no lower layer read) | **No** |
 | `fast_path_hit_ratio` | lsm_lookups | `fast_path_hits / lookups` (derived) | **No** |
 | `l0_probes` | lsm_lookups | Lookups that scanned at least one L0 SSTable | **No** |
 | `l1_probes` | lsm_lookups | Lookups that scanned the L1 SSTable (not bloom-rejected) | **No** |
 | `bloom_rejects` | lsm_lookups | L1 lookups short-circuited by the bloom filter ("definitely absent") | **No** |
 | `l0_bloom_rejects` | lsm_lookups | L0 files a lookup skipped unread: key outside the file's key range, or its bloom filter says "definitely absent" | **No** |
-| `seq_prunes` | lsm_lookups | SSTables (L0 files or the L1 file) a lookup skipped unread because a newer layer already held a copy at least as new as anything in them | **No** |
 | `sparse_hint_rejects` | lsm_lookups | Lookups whose sparse-index hint failed validation, so the scan restarted from the top of the file. Answers stay correct but slow. Expect it only briefly for L1 during a compaction; a steady rate means the index offsets disagree with the files | **No** |
 | `puts` | writes | WAL-backed upserts applied | **No** |
 | `deletes` | writes | WAL-backed deletes applied | **No** |

@@ -12,7 +12,7 @@ impl LSMTree {
     /// read then fails with `SegmentMissing` and the caller re-resolves the key through
     /// the LSM (`KVStore::refetch_dropped`). Segment ids are never reused, so a stale
     /// pointer can fail but never return another key's value.
-    pub(crate) fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, u128, u64)>> {
+    pub(crate) fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, u128, Version)>> {
         // Layers are folded oldest→newest by `fold_newest`: each key resolves to its
         // highest-seq copy, exactly as `get_with_seq` resolves it, so a tombstone
         // shadows only copies older than itself.
@@ -95,7 +95,7 @@ impl LSMTree {
                         &mut all_entries,
                         record.key.clone(),
                         (!record.tombstone).then_some(record.value),
-                        record.seq,
+                        record.version,
                     );
                 }
             }
@@ -157,7 +157,7 @@ impl LSMTree {
     ) -> Result<()> {
         self.for_each_l1_entry_in_range(bucket, file, start, end, max_live, |archived| {
             let val = (!archived.tombstone).then(|| archived.value.to_native());
-            out.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
+            out.push((archived.key.as_slice().to_vec(), val, SStableEntry::archived_version(archived)));
         })
     }
 

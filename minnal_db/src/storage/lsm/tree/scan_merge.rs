@@ -1,5 +1,5 @@
 //! How a scan merges its layers: Level-1 runs packed into one buffer and merged,
-//! newer layers folded over them by highest seq.
+//! newer layers folded over them, the newer layer's copy of a key winning.
 
 use super::*;
 
@@ -12,10 +12,9 @@ use super::*;
 /// then `newer` into one map by [`fold_newest`] would yield, minus tombstones —
 /// without paying a map insert, or an allocation, per L1 entry:
 ///
-/// * [`merge_l1_runs`] merges the runs into key order, keeping the newest copy of
-///   a key found in more than one run (the later run on a tie), as the fold would;
-/// * [`resolve_scan_layers`] then resolves a key present in both by seq, `newer`
-///   winning a tie.
+/// * [`merge_l1_runs`] merges the runs into key order, keeping the later run's
+///   copy of a key found in more than one, as the fold would;
+/// * [`resolve_scan_layers`] then takes `newer`'s copy of a key present in both.
 ///
 /// `scan_prefixes` merges its runs on its workers and calls
 /// [`resolve_scan_layers`] itself; this whole form is kept for the test that pins
@@ -34,18 +33,15 @@ pub(super) fn resolve_scan_layers(l1_keys: &[Vec<u8>], l1: Vec<PackedScanEntry>,
     let key_bytes = l1.iter().map(|e| e.2 - e.1).sum::<usize>() + newer.keys().map(Vec::len).sum::<usize>();
     let mut out = PrefixScanKeys::with_capacity(l1.len() + newer.len(), key_bytes);
     let mut older = l1.into_iter().peekable();
-    for (newer_key, (val, seq)) in newer {
+    for (newer_key, (val, _version)) in newer {
         while let Some(e) = older.next_if(|e| key(e) < newer_key.as_slice()) {
             if let Some(v) = e.3 {
                 out.push(key(&e), v);
             }
         }
-        // Same key in both: the higher seq wins, `newer` on a tie.
-        let winner = match older.next_if(|e| key(e) == newer_key.as_slice()) {
-            Some(e) if seq_newer(e.4, seq) => e.3,
-            _ => val,
-        };
-        if let Some(v) = winner {
+        // Same key in both: the newer layer holds the current copy.
+        older.next_if(|e| key(e) == newer_key.as_slice());
+        if let Some(v) = val {
             out.push(&newer_key, v);
         }
     }
@@ -57,8 +53,8 @@ pub(super) fn resolve_scan_layers(l1_keys: &[Vec<u8>], l1: Vec<PackedScanEntry>,
     out
 }
 
-/// Merge a scan's L1 entries into key order, one entry per key (the newest, as
-/// `seq_newer_or_eq` decides; the later entry on a tie).
+/// Merge a scan's L1 entries into key order, one entry per key (the later
+/// entry's, should a key appear twice; bucket runs are disjoint, so it does not).
 ///
 /// A scan's L1 entries arrive as one run per bucket, each in key order (an
 /// SSTable is sorted). Runs are found where the order steps down, and merged
@@ -87,7 +83,7 @@ pub(super) fn merge_l1_runs<'a>(l1: &[PackedScanEntry], key: impl Fn(&PackedScan
     merge_runs_in(l1, &sorted, &order)
 }
 
-/// Keep the newest of each key's entries, visiting `l1` in `sorted` order (key
+/// Keep the last of each key's entries, visiting `l1` in `sorted` order (key
 /// order, input order among equal keys).
 pub(super) fn merge_runs_in(l1: &[PackedScanEntry], sorted: &[usize], order: &impl Fn(usize, usize) -> std::cmp::Ordering) -> Vec<PackedScanEntry> {
     let mut out: Vec<PackedScanEntry> = Vec::with_capacity(sorted.len());
@@ -96,11 +92,7 @@ pub(super) fn merge_runs_in(l1: &[PackedScanEntry], sorted: &[usize], order: &im
         if let Some(l) = last
             && order(l, i).is_eq()
         {
-            let kept = out.last_mut().expect("`last` names the entry just pushed");
-            if seq_newer_or_eq(l1[i].4, kept.4) {
-                kept.3 = l1[i].3;
-                kept.4 = l1[i].4;
-            }
+            *out.last_mut().expect("`last` names the entry just pushed") = l1[i];
             continue;
         }
         out.push(l1[i]);
@@ -110,7 +102,7 @@ pub(super) fn merge_runs_in(l1: &[PackedScanEntry], sorted: &[usize], order: &im
 }
 
 /// Merge `runs` of `l1` (each in key order by `order`) into one, keeping the
-/// newest copy of each key (the later run on a tie).
+/// later run's copy of a key found in more than one.
 pub(super) fn merge_runs(
     l1: &[PackedScanEntry],
     runs: &[std::ops::Range<usize>],
@@ -129,15 +121,11 @@ pub(super) fn merge_runs(
         let Some(b) = best else { break };
         let i = next[b];
         next[b] += 1;
-        // A key in more than one run: keep whichever copy is newer.
+        // A key in more than one run: keep the later run's copy.
         if let Some(l) = last
             && order(l, i).is_eq()
         {
-            let kept = out.last_mut().expect("`last` names the entry just pushed");
-            if seq_newer_or_eq(l1[i].4, kept.4) {
-                kept.3 = l1[i].3;
-                kept.4 = l1[i].4;
-            }
+            *out.last_mut().expect("`last` names the entry just pushed") = l1[i];
             continue;
         }
         out.push(l1[i]);
@@ -198,24 +186,10 @@ impl PrefixScanKeys {
     }
 }
 
-/// Fold one layer's copy of `key` into a scan's running view, keeping the
-/// highest `seq`. Callers fold layers **oldest first**, so `>=` lets an exact tie
-/// go to the newer layer — the same rule `get_with_seq` applies.
-///
-/// Every multi-key read resolves through this, never by "the newer layer
-/// overwrites". The writers keep newer versions in newer layers
-/// (`docs/Layer-Order-Design.md`), but the scans do not rely on it; were a writer
-/// to break it, overwriting by layer would hide a live key or surface a deleted
-/// one (`test_scans_agree_with_brute_force_resolution`).
-pub(super) fn fold_newest(map: &mut ScanMap, key: Vec<u8>, value: Option<u128>, seq: u64) {
-    match map.entry(key) {
-        std::collections::btree_map::Entry::Occupied(mut e) => {
-            if seq_newer_or_eq(seq, e.get().1) {
-                e.insert((value, seq));
-            }
-        }
-        std::collections::btree_map::Entry::Vacant(e) => {
-            e.insert((value, seq));
-        }
-    }
+/// Fold one layer's copy of `key` into a scan's running view. Callers fold layers
+/// **oldest first**, so each copy replaces the older layer's: the newer layer
+/// holds the current copy (`docs/Layer-Order-Design.md`), as `get_with_seq` reads
+/// it.
+pub(super) fn fold_newest(map: &mut ScanMap, key: Vec<u8>, value: Option<u128>, version: Version) {
+    map.insert(key, (value, version));
 }

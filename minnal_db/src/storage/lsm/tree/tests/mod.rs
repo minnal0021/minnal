@@ -2,7 +2,6 @@
 
 mod batch_reads;
 mod compaction;
-mod first_hit;
 mod flush;
 mod format;
 mod point_reads;
@@ -30,18 +29,27 @@ fn test_lsm_config() -> LSMConfig {
     }
 }
 
+/// Keep `(value, version)` in `best` if it is newer than what `best` holds;
+/// fed newest layer first, an exact tie stays with the newer copy.
+fn keep_newest(best: &mut Candidate, value: Option<u128>, version: Version) {
+    if best.is_none_or(|(_, b)| version > b) {
+        *best = Some((value, version));
+    }
+}
+
 /// Brute-force point lookup for the differential tests (`point_reads`,
-/// `prefix_scan`): reads every layer in full — no summaries, no seq pruning, no
-/// fast path — and keeps the highest seq, newest layer first so an exact tie
-/// stays with the newer copy.
-fn reference_get(lsm: &LSMTree, key: &[u8]) -> Result<Option<(u128, u64)>> {
+/// `prefix_scan`): reads every layer in full — no summaries, no stopping at the
+/// first hit — and keeps the highest version. On any tree the writers can
+/// produce (newer layers hold newer versions) this is the first copy found, so
+/// the production reads, which stop there, must agree with it.
+fn reference_get(lsm: &LSMTree, key: &[u8]) -> Result<Option<(u128, Version)>> {
     let mut best: Candidate = None;
-    if let Some((value, seq, tombstone)) = lsm.memtable.read().skip_list.entry(key) {
-        LSMTree::merge_candidate(&mut best, (!tombstone).then_some(value), seq);
+    if let Some((value, version, tombstone)) = lsm.memtable.read().skip_list.entry(key) {
+        keep_newest(&mut best, (!tombstone).then_some(value), version);
     }
     for ro in lsm.read_only_memtables.read().iter().rev() {
         if let Some(r) = ro.records().iter().find(|r| r.key == key) {
-            LSMTree::merge_candidate(&mut best, (!r.tombstone).then_some(r.value), r.seq);
+            keep_newest(&mut best, (!r.tombstone).then_some(r.value), r.version);
         }
     }
     let bucket = get_bucket_for_key(key, lsm.config.num_buckets);
@@ -51,14 +59,14 @@ fn reference_get(lsm: &LSMTree, key: &[u8]) -> Result<Option<(u128, u64)>> {
     for file in files {
         for e in lsm.read_sstable_entries_from_path(&file.path)? {
             if e.key == key {
-                LSMTree::merge_candidate(&mut best, (!e.tombstone).then_some(e.value), e.seq);
+                keep_newest(&mut best, (!e.tombstone).then_some(e.value), e.version());
             }
         }
     }
     for e in lsm.read_sstable_entries(bucket)? {
         if e.key == key {
-            LSMTree::merge_candidate(&mut best, (!e.tombstone).then_some(e.value), e.seq);
+            keep_newest(&mut best, (!e.tombstone).then_some(e.value), e.version());
         }
     }
-    Ok(best.and_then(|(value, seq)| value.map(|ptr| (ptr, seq))))
+    Ok(best.and_then(|(value, version)| value.map(|ptr| (ptr, version))))
 }

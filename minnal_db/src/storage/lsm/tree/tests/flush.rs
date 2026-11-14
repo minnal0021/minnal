@@ -284,6 +284,6 @@ fn a_newer_memtable_cannot_reach_level0_before_an_older_one() -> Result<()> {
     lsm.flush_memtable_to_level0()?;
     assert_eq!(lsm.level0_entries_snapshot(0).len(), 2);
     assert!(lsm.layer_order_violations()?.is_empty());
-    assert_eq!(lsm.get_with_seq(b"k")?, Some((2, 2)));
+    assert_eq!(lsm.get_with_seq(b"k")?, Some((2, Version::user(2))));
     Ok(())
 }

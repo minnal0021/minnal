@@ -1,4 +1,5 @@
-//! Merging a bucket's Level-0 files into its Level-1 file, by highest seq, and
+//! Merging a bucket's Level-0 files into its Level-1 file, the newer layer's
+//! copy of each key winning, and
 //! deciding when a bucket's merge is due.
 
 use super::*;
@@ -27,43 +28,21 @@ impl LSMTree {
                     i += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    // Resolve the same-key conflict by highest write `seq` (globally
-                    // ordered), NOT by layer — an out-of-order ro→L0 flush or a GC
-                    // re-point can leave a lower-seq value in a "newer" file above a
-                    // higher-seq tombstone, so file recency is not a safe proxy for
-                    // recency here. On an exact tie prefer the L0 record (newer
-                    // layer). A winning tombstone drops the key (L1 is the bottom
-                    // level, so there is nothing below for it to shadow).
+                    // The L0 record is from the newer layer, so it is the key's
+                    // current copy (`docs/Layer-Order-Design.md`). A tombstone drops
+                    // the key: L1 is the bottom level, so there is nothing below
+                    // for it to shadow.
                     let new_pointer = (!new_record.tombstone).then_some(new_record.value);
-                    if seq_newer_or_eq(new_record.seq, existing_entry.seq) {
-                        displaced.lost(existing_entry.key.len(), existing_entry.live_pointer(), new_pointer);
-                        if !new_record.tombstone {
-                            result.push(SStableEntry {
-                                key: new_record.key.clone(),
-                                key_prefix: key_prefix_of(&new_record.key),
-                                value: new_record.value,
-                                tombstone: new_record.tombstone,
-                                seq: new_record.seq,
-                            });
-                        }
-                    } else {
-                        displaced.lost(new_record.key.len(), new_pointer, existing_entry.live_pointer());
-                        if !existing_entry.tombstone {
-                            result.push(existing_entry.clone());
-                        }
+                    displaced.lost(existing_entry.key.len(), existing_entry.live_pointer(), new_pointer);
+                    if !new_record.tombstone {
+                        result.push(SStableEntry::of_record(new_record));
                     }
                     i += 1;
                     j += 1;
                 }
                 std::cmp::Ordering::Greater => {
                     if !new_record.tombstone {
-                        result.push(SStableEntry {
-                            key: new_record.key.clone(),
-                            key_prefix: key_prefix_of(&new_record.key),
-                            value: new_record.value,
-                            tombstone: new_record.tombstone,
-                            seq: new_record.seq,
-                        });
+                        result.push(SStableEntry::of_record(new_record));
                     }
                     j += 1;
                 }
@@ -79,13 +58,7 @@ impl LSMTree {
 
         while j < new_records.len() {
             if !new_records[j].tombstone {
-                result.push(SStableEntry {
-                    key: new_records[j].key.clone(),
-                    key_prefix: key_prefix_of(&new_records[j].key),
-                    value: new_records[j].value,
-                    tombstone: new_records[j].tombstone,
-                    seq: new_records[j].seq,
-                });
+                result.push(SStableEntry::of_record(&new_records[j]));
             }
             j += 1;
         }
@@ -137,16 +110,9 @@ impl LSMTree {
         let compaction_started = std::time::Instant::now();
         let mut bytes_merged = 0u64;
 
-        // Collapse same-key conflicts across L0 files by highest write `seq`
-        // (globally ordered, one counter for WAL and internal/test/bulk writes
-        // alike), NOT by file recency. The writers keep newer versions in newer
-        // files (`docs/Layer-Order-Design.md`), but the merge does not rely on it:
-        // resolved by recency, a writer that broke that rule would let a lower-seq
-        // value beat a higher-seq tombstone, and the merge would bake the
-        // resurrected key into L1 for good. Point reads (`get_with_seq`)
-        // already resolve by seq, so seq-aware resolution here keeps the merge
-        // consistent with them. The oldest-first sort only breaks exact seq ties
-        // (prefer the newer file).
+        // Collapse same-key copies across L0 files: files are read oldest first,
+        // so a newer file's copy replaces an older one's — the newer layer holds
+        // the newer version (`docs/Layer-Order-Design.md`).
         entries.sort_by_key(|a| a.created_at_ms);
 
         let mut by_key: std::collections::BTreeMap<Vec<u8>, SStableEntry> = std::collections::BTreeMap::new();
@@ -158,21 +124,12 @@ impl LSMTree {
             }
             any_read = true;
             let _guard = L0ReadGuard::new(Arc::clone(entry));
-            // Within one file each key appears once; across files the highest-seq
-            // record wins (exact ties resolve to the later/newer file).
+            // Within one file each key appears once; across files the newer
+            // file's copy replaces the older one's.
             for record in self.read_sstable_entries_from_path(&entry.path)? {
-                match by_key.entry(record.key.clone()) {
-                    std::collections::btree_map::Entry::Occupied(mut e) => {
-                        if seq_newer_or_eq(record.seq, e.get().seq) {
-                            let old = e.insert(record);
-                            displaced.lost(old.key.len(), old.live_pointer(), e.get().live_pointer());
-                        } else {
-                            displaced.lost(record.key.len(), record.live_pointer(), e.get().live_pointer());
-                        }
-                    }
-                    std::collections::btree_map::Entry::Vacant(e) => {
-                        e.insert(record);
-                    }
+                let key = record.key.clone();
+                if let Some(old) = by_key.insert(key, record) {
+                    displaced.lost(old.key.len(), old.live_pointer(), by_key[&old.key].live_pointer());
                 }
             }
         }
@@ -184,10 +141,10 @@ impl LSMTree {
         let level0_records: Vec<KeyValueRecord> = by_key
             .into_values()
             .map(|e| KeyValueRecord {
+                version: e.version(),
                 key: e.key,
                 value: e.value,
                 tombstone: e.tombstone,
-                seq: e.seq,
             })
             .collect();
 
@@ -256,7 +213,6 @@ impl LSMTree {
                 min_key,
                 max_key,
                 entry_count,
-                max_seq: merged_entries.iter().map(|e| e.seq).reduce(|a, b| if seq_newer(b, a) { b } else { a }),
             });
 
             // Rebuild the L1 bloom from the merged entries (in memory, no extra

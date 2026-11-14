@@ -194,7 +194,7 @@ impl LSMTree {
                                     let val = (!archived.tombstone).then(|| archived.value.to_native());
                                     let key_start = keys.len();
                                     keys.extend_from_slice(archived.key.as_slice());
-                                    entries.push((0, key_start, keys.len(), val, archived.seq.to_native()));
+                                    entries.push((0, key_start, keys.len(), val, SStableEntry::archived_version(archived)));
                                 })?;
                             }
                             let merged = merge_l1_runs(&entries, |e: &PackedScanEntry| &keys[e.1..e.2]);
@@ -252,7 +252,7 @@ impl LSMTree {
                                 let starts: Vec<u64> = sorted_ids.iter().map(|id| guard.entry.scan_start(&id.to_be_bytes())).collect();
                                 Self::for_each_entry_in_prefixes(&file, &starts, sorted_ids, |archived| {
                                     let val = (!archived.tombstone).then(|| archived.value.to_native());
-                                    bucket_entries.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
+                                    bucket_entries.push((archived.key.as_slice().to_vec(), val, SStableEntry::archived_version(archived)));
                                 })?;
                             }
                             Ok(bucket_entries)
@@ -288,7 +288,12 @@ impl LSMTree {
                 if record.key.len() >= 4 {
                     let prefix_id = u32::from_be_bytes(record.key[..4].try_into().unwrap());
                     if prefix_ids.contains(&prefix_id) {
-                        fold_newest(&mut newer, record.key.clone(), (!record.tombstone).then_some(record.value), record.seq);
+                        fold_newest(
+                            &mut newer,
+                            record.key.clone(),
+                            (!record.tombstone).then_some(record.value),
+                            record.version,
+                        );
                     }
                 }
             }

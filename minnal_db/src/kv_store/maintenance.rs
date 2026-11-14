@@ -25,14 +25,13 @@ impl KVStore {
     /// to a writer, is left alone. A pointer the page holds that GC has since
     /// moved fails the compare too, and the next pass judges the key afresh.
     ///
-    /// The delete runs under the key's stripe ([`lock_key`](Self::lock_key)):
-    /// every write holds that stripe from allocating its seq to applying it, so
-    /// no same-key write can sit between the two while TTL allocates its own
-    /// seq. Without it a TTL delete could carry a lower seq than a concurrent
-    /// put that lands in an older layer, putting an older version above a newer
-    /// one. `after_lock` runs with the stripe held, before the compare-and-set:
-    /// a test hook for landing a write in exactly that window.
-    pub(crate) fn expire_records_with(&self, ttl: Duration, max_deletes_per_run: usize, after_lock: impl Fn(&[u8])) -> Result<usize> {
+    /// Expiry is a system action, not a user write: its tombstone keeps the
+    /// expired copy's user seq and takes the next system seq
+    /// ([`Version::next_system`]), so it needs no key stripe. A user write that
+    /// drew its seq before the delete and has not applied yet is newer, and wins
+    /// whenever it lands, after a crash too. `before_delete` runs between the
+    /// verdict and the compare-and-set: a test hook for landing a write there.
+    pub(crate) fn expire_records_with(&self, ttl: Duration, max_deletes_per_run: usize, before_delete: impl Fn(&[u8])) -> Result<usize> {
         let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ttl_millis = ttl.as_millis() as u64;
 
@@ -51,8 +50,7 @@ impl KVStore {
                     continue;
                 };
                 if now_millis.saturating_sub(meta.epoch) >= ttl_millis {
-                    let _key_guard = self.lock_key(&key);
-                    after_lock(&key);
+                    before_delete(&key);
                     if self.delete_if_current(&key, pointer)? {
                         deleted += 1;
                     }
@@ -69,17 +67,31 @@ impl KVStore {
     /// GC) since is left for the next pass to judge afresh; pointers are unique for
     /// the life of the database, so pointer equality means "the same write".
     ///
-    /// The seq is allocated only after the check, under the bucket lock and the
-    /// caller's key lock, so the delete is newer than anything already applied to
-    /// the key and — with the key stripe held — than anything about to be.
+    /// The tombstone's version is the expired copy's next system version, decided
+    /// under the bucket lock with the compare. A copy whose system seq is used up
+    /// is deleted as a user write instead: stripe, then bucket, a fresh user seq.
     fn delete_if_current(&self, key: &[u8], expected: ShardedValuePointer) -> Result<bool> {
         let bucket = self.value_log.bucket_for_key(key);
+        {
+            let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+            let Some((pointer, version)) = self.lsm.get_with_seq(key)? else {
+                return Ok(false);
+            };
+            if decode_sharded_pointer(pointer) != Some(expected) {
+                return Ok(false);
+            }
+            if let Some(expiry) = version.next_system() {
+                self.delete_with_bucket_locked(key, expiry, bucket_guard)?;
+                return Ok(true);
+            }
+        }
+        let _stripe = self.lock_key(key);
         let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
         if self.lsm.get(key)?.and_then(decode_sharded_pointer) != Some(expected) {
             return Ok(false);
         }
         let seq = self.alloc_seq();
-        self.delete_with_bucket_locked(key, seq, bucket_guard)?;
+        self.delete_with_bucket_locked(key, Version::user(seq), bucket_guard)?;
         Ok(true)
     }
 

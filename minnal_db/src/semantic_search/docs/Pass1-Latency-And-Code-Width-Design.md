@@ -104,8 +104,9 @@ pattern `get_multiple` already uses (`scan_sorted_candidates`). When the probed
 postings cover most of a file, the jumps disappear and the walk becomes one
 sequential read.
 
-Correctness does not change: layers still fold by highest sequence
-(`fold_newest`), and a hint is used only after `valid_scan_start` accepts it.
+Correctness does not change: layers still fold oldest first, the newer
+layer's copy of a key winning (`fold_newest`), and a hint is used only after
+`valid_scan_start` accepts it.
 
 Expected: 11.4 → 2–3 ms at 1,024 probes. Guard: the existing scan-versus-brute-
 force tests, plus a test that the per-posting and single-cursor scans return

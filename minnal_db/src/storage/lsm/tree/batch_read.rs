@@ -1,5 +1,6 @@
 //! Batch reads (`get_multiple`): many keys resolved at once, each file read once
-//! with a forward cursor rather than one search per key.
+//! with a forward cursor rather than one search per key, each key's copy taken
+//! from the newest layer that holds it.
 
 use super::*;
 
@@ -14,17 +15,13 @@ impl LSMTree {
     /// reads a few KiB per file and a large batch one sequential read, never more
     /// than the file.
     ///
-    /// Resolution is identical to [`get_with_seq`](Self::get_with_seq): the
-    /// highest-`seq` copy across **every** layer wins (a winning tombstone ⇒
-    /// `None`), with the same active-memtable fast path. It must never become
-    /// first-hit-by-layer: value-log GC decides liveness with this method, so a stale
-    /// lower-seq tombstone in a newer layer answering "deleted" for a live key would
-    /// make GC drop that key's only record (see
-    /// `test_get_multiple_resolves_by_seq_not_layer_order`).
+    /// Resolution is identical to [`get_with_seq`](Self::get_with_seq): each
+    /// key's copy in the newest layer that holds it (a tombstone there ⇒ `None`).
+    /// Value-log GC decides liveness with this method.
     ///
-    /// Returns one `Option<(pointer, seq)>` per input key, in input order; a key
-    /// given more than once resolves at every position. `None` means the key does
-    /// not exist or was deleted.
+    /// Returns one `Option<(pointer, version)>` per input key, in input order; a
+    /// key given more than once resolves at every position. `None` means the key
+    /// does not exist or was deleted.
     pub(crate) fn get_multiple(&self, keys: &[Vec<u8>]) -> Result<BatchLookup> {
         Ok(self.get_multiple_counted(keys)?.0)
     }
@@ -34,23 +31,16 @@ impl LSMTree {
     pub(super) fn get_multiple_counted(&self, keys: &[Vec<u8>]) -> Result<(BatchLookup, u64)> {
         let n = keys.len();
         let mut sstable_bytes = 0u64;
-        // Running winner per input position, folded newest layer first through
-        // `merge_candidate` so an exact sequence tie stays with the newer layer.
-        let mut best: Vec<Candidate> = vec![None; n];
-        // Positions the active-memtable fast path settled: nothing below can beat them.
-        let mut settled: Vec<bool> = vec![false; n];
+        // Each position's copy, from the newest layer holding the key; `None`
+        // until a layer does.
+        let mut found: Vec<Candidate> = vec![None; n];
 
         // ── 1. Active memtable ────────────────────────────────────────────────
         {
             let memtable = self.memtable.read();
-            // Loaded under the memtable lock, as in `get_with_seq`: a flush raises
-            // the bound while holding the write lock, so a bound read before taking
-            // the lock could be too low for the memtable we then read.
-            let max_lower_seq = self.max_lower_seq.load(Ordering::Relaxed);
             for i in 0..n {
-                if let Some((value, seq, tombstone)) = memtable.skip_list.entry(&keys[i]) {
-                    Self::merge_candidate(&mut best[i], (!tombstone).then_some(value), seq);
-                    settled[i] = seq_newer_or_eq(seq, max_lower_seq);
+                if let Some((value, version, tombstone)) = memtable.skip_list.entry(&keys[i]) {
+                    found[i] = Some(((!tombstone).then_some(value), version));
                 }
             }
         }
@@ -60,23 +50,23 @@ impl LSMTree {
             let ro_memtables = self.read_only_memtables.read();
             for ro in ro_memtables.iter().rev() {
                 for i in 0..n {
-                    if settled[i] {
+                    if found[i].is_some() {
                         continue;
                     }
                     if let Some(record) = ro.find(&keys[i]) {
-                        Self::merge_candidate(&mut best[i], (!record.tombstone).then_some(record.value), record.seq);
+                        found[i] = Some(((!record.tombstone).then_some(record.value), record.version));
                     }
                 }
             }
         }
 
-        // ── 3. Group unsettled keys by SSTable bucket, one slot per distinct key ─
+        // ── 3. Group the keys still unfound by SSTable bucket, one slot per
+        //    distinct key ──────────────────────────────────────────────────────
         let mut pending_by_bucket: Vec<BatchSlots> = (0..self.config.num_buckets).map(|_| std::collections::HashMap::new()).collect();
         for i in 0..n {
-            if !settled[i] {
+            if found[i].is_none() {
                 let bucket = get_bucket_for_key(&keys[i], self.config.num_buckets) as usize;
-                // Every position of a duplicated key carries the same memtable winner.
-                pending_by_bucket[bucket].entry(keys[i].as_slice()).or_insert(best[i]);
+                pending_by_bucket[bucket].entry(keys[i].as_slice()).or_insert(None);
             }
         }
 
@@ -109,35 +99,34 @@ impl LSMTree {
 
         let results = (0..n)
             .map(|i| {
-                let winner = if settled[i] {
-                    best[i]
-                } else {
+                let copy = found[i].or_else(|| {
                     let bucket = get_bucket_for_key(&keys[i], self.config.num_buckets) as usize;
                     pending_by_bucket[bucket].get(keys[i].as_slice()).copied().flatten()
-                };
-                winner.and_then(|(value, seq)| value.map(|ptr| (ptr, seq)))
+                });
+                copy.and_then(|(value, version)| value.map(|ptr| (ptr, version)))
             })
             .collect();
         Ok((results, sstable_bytes))
     }
 
-    /// The SSTable half of [`get_multiple`](Self::get_multiple) for one bucket: fold
-    /// every L0 file's and then the L1 file's copy of each pending key into its slot,
-    /// highest `seq` winning. Each slot arrives holding the memtable winner (if any).
+    /// The SSTable half of [`get_multiple`](Self::get_multiple) for one bucket:
+    /// fill each pending key's slot from the newest L0 file holding it, else from
+    /// the L1 file.
     pub(super) fn resolve_bucket_batch(&self, bucket: usize, pending: &mut BatchSlots<'_>) -> Result<u64> {
         let mut bytes_read = 0u64;
+        // A file is read newest first, so the first copy to fill a slot is the
+        // key's current one; a later (older) file leaves it alone.
         let fold = |pending: &mut BatchSlots<'_>, archived: &ArchivedSStableEntry| {
-            if let Some(slot) = pending.get_mut(archived.key.as_slice()) {
+            if let Some(slot) = pending.get_mut(archived.key.as_slice())
+                && slot.is_none()
+            {
                 let value = (!archived.tombstone).then(|| archived.value.to_native());
-                Self::merge_candidate(slot, value, archived.seq.to_native());
+                *slot = Some((value, SStableEntry::archived_version(archived)));
             }
         };
 
-        // Level 0: EVERY captured file, newest first. A hit in one file does not
-        // settle the key — an older file (or L1) can hold a higher seq, because
-        // flush order is not seq order. The guards are held through the L1 read
-        // below, so a key a concurrent merge moves into L1 is still in a captured,
-        // already-scanned L0 file.
+        // Level 0, newest first. The guards are held through the L1 read below,
+        // so a key a concurrent merge moves into L1 is still in a captured L0 file.
         let mut l0_guards: Vec<L0ReadGuard> = self
             .level0_entries_snapshot(bucket as u32)
             .iter()
@@ -146,12 +135,12 @@ impl LSMTree {
             .collect();
         l0_guards.sort_by_key(|b| std::cmp::Reverse(b.entry.created_at_ms));
         for guard in &l0_guards {
-            // Read the file only if some pending key may be in it AND could still
-            // be beaten by it — the same exact rejects as `search_level0_files`.
+            // Read the file only for keys still unfound that it may hold — the
+            // same exact rejects as `search_level0_files`.
             let entry = &guard.entry;
             let mut wanted: Vec<&[u8]> = pending
                 .iter()
-                .filter(|(key, slot)| entry.may_contain(key) && !slot.is_some_and(|(_, seq)| entry.cannot_beat(seq)))
+                .filter(|(key, slot)| slot.is_none() && entry.may_contain(key))
                 .map(|(key, _)| *key)
                 .collect();
             if wanted.is_empty() {
@@ -170,36 +159,29 @@ impl LSMTree {
             bytes_read += read;
         }
 
-        // L1 pre-filter: skip the file when no pending key can be in it.
-        // Same exact fast-rejects as `lookup_level1` (min/max is exact, a bloom
-        // negative is exact), and only applied when the metadata/bloom are present —
-        // absent metadata reads the file rather than risk skipping a live key.
+        // L1 pre-filter: the keys still unfound that may be in the file. Same exact
+        // fast-rejects as `lookup_level1` (min/max is exact, a bloom negative is
+        // exact), applied only when the metadata/bloom are present — absent
+        // metadata reads the file rather than risk skipping a live key.
         //
         // Race-safety mirrors the scan paths: the L0 guards above are still held, and
         // `merge_level0_to_level1` installs the new L1 file + metadata/bloom BEFORE
         // marking the old L0 files obsolete, so a key stale L1 metadata would reject
-        // is still in a captured L0 file that we have already folded in.
-        //
-        // A key whose slot already holds a copy at least as new as the file's
-        // newest entry is dropped too (it cannot be beaten there), by the same
-        // argument: stale metadata implies the merged L0 files are still captured
-        // and their seqs already folded into the slots.
-        let may_be_in_l1: Vec<&[u8]> = {
-            let (min_max, max_seq) = {
+        // is still in a captured L0 file that we have already read.
+        let mut may_be_in_l1: Vec<&[u8]> = {
+            let min_max = {
                 let meta = self.sstable_metadata[bucket].read();
-                let meta = meta.first().filter(|m| m.entry_count > 0);
-                (meta.map(|m| (m.min_key.clone(), m.max_key.clone())), meta.and_then(|m| m.max_seq))
+                meta.first().filter(|m| m.entry_count > 0).map(|m| (m.min_key.clone(), m.max_key.clone()))
             };
             let bloom = self.sstable_blooms[bucket].read();
             pending
                 .iter()
-                .filter(|(_, slot)| !max_seq.is_some_and(|max| slot.is_some_and(|(_, seq)| seq_newer_or_eq(seq, max))))
+                .filter(|(_, slot)| slot.is_none())
                 .map(|(k, _)| *k)
                 .filter(|k| min_max.as_ref().is_none_or(|(min, max)| *k >= min.as_slice() && *k <= max.as_slice()))
                 .filter(|k| bloom.as_ref().is_none_or(|b| b.contains(k)))
                 .collect()
         };
-        let mut may_be_in_l1 = may_be_in_l1;
         if may_be_in_l1.is_empty() {
             return Ok(bytes_read);
         }

@@ -19,9 +19,9 @@ impl LSMTree {
         let mut sstable_metadata_vec: Vec<Arc<RwLock<Vec<SStableMetadata>>>> = Vec::with_capacity(num_buckets);
         let mut sstable_blooms_vec: Vec<Arc<RwLock<Option<Arc<BloomFilter>>>>> = Vec::with_capacity(num_buckets);
         let mut sstable_indexes_vec: Vec<Arc<RwLock<Option<Arc<SparseIndex>>>>> = Vec::with_capacity(num_buckets);
-        // Newest sequence across all loaded L1 files — the initial lower-layer
-        // bound for the read fast path.
-        let mut max_lower_seq_init: Option<u64> = None;
+        // Newest user seq across every L1 and L0 file: what the write sequence
+        // must start above (`max_stored_seq`).
+        let mut max_stored_seq_init: Option<u64> = None;
 
         // Open or create each bucket's Level-1 file.
         for bucket in 0u32..num_buckets as u32 {
@@ -60,9 +60,9 @@ impl LSMTree {
                 bloom = built_bloom.map(Arc::new);
                 index = built_index.map(Arc::new);
                 if let Some(seq) = file_max_seq
-                    && max_lower_seq_init.is_none_or(|m| seq_newer(seq, m))
+                    && max_stored_seq_init.is_none_or(|m| seq_newer(seq, m))
                 {
-                    max_lower_seq_init = Some(seq);
+                    max_stored_seq_init = Some(seq);
                 }
             }
             sstable_metadata_vec.push(Arc::new(RwLock::new(metadata)));
@@ -81,9 +81,9 @@ impl LSMTree {
         // fast-path bound too — otherwise the bound (L1-only above) is too low
         // after a restart and a low-seq active entry could wrongly short-circuit.
         if let Some(seq) = Self::load_existing_level0_files(&base_path, &level0_files)?
-            && max_lower_seq_init.is_none_or(|m| seq_newer(seq, m))
+            && max_stored_seq_init.is_none_or(|m| seq_newer(seq, m))
         {
-            max_lower_seq_init = Some(seq);
+            max_stored_seq_init = Some(seq);
         }
 
         // Seed the L0 stamp floor from the newest file on disk, so the first flush
@@ -105,7 +105,7 @@ impl LSMTree {
             sstable_metadata,
             sstable_blooms,
             sstable_indexes,
-            max_lower_seq: AtomicU64::new(max_lower_seq_init.unwrap_or(0)),
+            max_stored_seq: AtomicU64::new(max_stored_seq_init.unwrap_or(0)),
             metrics: OnceLock::new(),
             displaced_sink: OnceLock::new(),
             config,
@@ -117,7 +117,7 @@ impl LSMTree {
             flush_observer: Arc::new(RwLock::new(None)),
             base_path,
             #[cfg(test)]
-            fail_next_insert: AtomicBool::new(false),
+            fail_next_inserts: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -211,7 +211,7 @@ impl LSMTree {
 
     /// Load the on-disk Level-0 files into the in-memory registry and return the
     /// newest write sequence across all of them. The returned seq is folded into
-    /// `max_lower_seq` so the read fast path's bound covers L0 too — L0 is newer
+    /// `max_stored_seq` so the read fast path's bound covers L0 too — L0 is newer
     /// than L1, so omitting it would leave the bound too low after a restart (a
     /// low-seq active entry could then wrongly short-circuit above a higher-seq
     /// L0 tombstone).

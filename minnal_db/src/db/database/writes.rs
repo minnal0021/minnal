@@ -183,8 +183,11 @@ impl Database {
         }
 
         let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.put_to_storage_seq(key, value, seq));
-        if !applied && let Some(m) = kv_store.metrics() {
-            crate::support::metrics::Metrics::bump(&m.apply_failures);
+        if !applied {
+            kv_store.note_unapplied_write(key, seq);
+            if let Some(m) = kv_store.metrics() {
+                crate::support::metrics::Metrics::bump(&m.apply_failures);
+            }
         }
 
         // Step 3: Maybe sync the value log.
@@ -394,6 +397,7 @@ impl Database {
             crate::support::metrics::Metrics::bump(&m.merges);
         }
 
+        Self::warn_if_merging_over_an_unapplied_write(&kv_store, namespace_id, key);
         let existing = kv_store.get(key)?;
         // `existing` outlives the call: the delete arm below needs to know
         // whether there was anything there to delete.
@@ -446,6 +450,7 @@ impl Database {
             crate::support::metrics::Metrics::bump(&m.merges);
         }
 
+        Self::warn_if_merging_over_an_unapplied_write(&kv_store, namespace_id, key);
         let existing = kv_store.get(key)?;
         let merged = merge_fn(existing.as_deref(), value)?;
 
@@ -460,6 +465,23 @@ impl Database {
                 Ok(None)
             }
             None => Ok(None),
+        }
+    }
+
+    /// Log an ERROR if `key`'s last WAL-backed write is durable but never
+    /// applied (every retry failed). The merge reads the value from before that
+    /// write and treats it as the source of truth; its own write is newer, so it
+    /// supersedes the unapplied one, after a crash too. Called with the stripe
+    /// held.
+    fn warn_if_merging_over_an_unapplied_write(kv_store: &KVStore, namespace_id: NamespaceId, key: &[u8]) {
+        if let Some(seq) = kv_store.take_unapplied_write(key) {
+            error!(
+                "[MERGE] key='{}' (ns={}): the write at seq={} is durable but was never applied; \
+                 the merge reads the value before it as the source of truth and supersedes it",
+                display_key(key),
+                namespace_id,
+                seq
+            );
         }
     }
 
@@ -535,8 +557,11 @@ impl Database {
         }
 
         let applied = Self::apply_with_retry(op_name, namespace_id, key, seq, || kv_store.delete_from_storage_seq(key, seq));
-        if !applied && let Some(m) = kv_store.metrics() {
-            crate::support::metrics::Metrics::bump(&m.apply_failures);
+        if !applied {
+            kv_store.note_unapplied_write(key, seq);
+            if let Some(m) = kv_store.metrics() {
+                crate::support::metrics::Metrics::bump(&m.apply_failures);
+            }
         }
 
         // Step 3: Maybe sync the value log. As in `put_ns`, syncing the value

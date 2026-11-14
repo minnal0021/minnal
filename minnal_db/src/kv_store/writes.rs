@@ -85,6 +85,8 @@ impl KVStore {
         // layer is counted when the L0→L1 merge drops its entry (`MergeGarbage`).
         self.note_applied(applied, Some(pointer), key.len());
         drop(_bucket_guard);
+        // A user write supersedes any earlier one to the key that never applied.
+        self.take_unapplied_write(key);
 
         // A lost write is not the key's current value, so it must not touch the
         // indices. (With no index this returns at once.)
@@ -262,7 +264,10 @@ impl KVStore {
         if replayed && !self.replay_wins(key, seq)? {
             return Ok(());
         }
-        self.delete_with_bucket_locked(key, seq, bucket_guard)
+        self.delete_with_bucket_locked(key, seq, bucket_guard)?;
+        // A user write supersedes any earlier one to the key that never applied.
+        self.take_unapplied_write(key);
+        Ok(())
     }
 
     /// Whether a write replayed at `seq` is newer than every stored copy of
@@ -294,7 +299,8 @@ impl KVStore {
     /// Doing so regardless would leave a live document missing from every query
     /// on the field whenever a delete loses its race. A namespace without them
     /// deletes blind, as it writes.
-    pub(super) fn delete_with_bucket_locked(&self, key: &[u8], seq: u64, bucket_guard: parking_lot::MutexGuard<'_, ()>) -> Result<()> {
+    pub(super) fn delete_with_bucket_locked(&self, key: &[u8], seq: impl Into<Version>, bucket_guard: parking_lot::MutexGuard<'_, ()>) -> Result<()> {
+        let seq = seq.into();
         // Read the prior value (under the bucket lock, so GC can't relocate it)
         // so index removal can target the old value's bucket instead of scanning
         // every bucket.

@@ -106,9 +106,13 @@ impl LSMTree {
     /// The result says what the write did to the active memtable: the live
     /// pointer it replaced there, or that it was stale. A copy of the key in a
     /// lower layer is not consulted; the L0→L1 merge reports it when it drops it.
-    pub(crate) fn insert_with_seq(&self, key: &[u8], value: u128, seq: u64) -> Result<Applied> {
+    pub(crate) fn insert_with_seq(&self, key: &[u8], value: u128, seq: impl Into<Version>) -> Result<Applied> {
         #[cfg(test)]
-        if self.fail_next_insert.swap(false, Ordering::SeqCst) {
+        if self
+            .fail_next_inserts
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+            .is_ok()
+        {
             return Err(LSMError::CapacityExceeded);
         }
         {
@@ -130,7 +134,7 @@ impl LSMTree {
     /// highest-sequence-wins resolution: a delete older than a concurrent write
     /// to the same key is dropped, matching recovery's sequence-ordered replay.
     /// The result is as for [`insert_with_seq`](Self::insert_with_seq).
-    pub(crate) fn delete_with_seq(&self, key: &[u8], seq: u64) -> Result<Applied> {
+    pub(crate) fn delete_with_seq(&self, key: &[u8], seq: impl Into<Version>) -> Result<Applied> {
         {
             let memtable = self.memtable.read();
             if memtable.should_flush(self.config.compaction_threshold_percent) {
@@ -149,12 +153,12 @@ impl LSMTree {
         }
     }
 
-    /// Raise the lower-layer bound to `seq` if it is newer, whenever
+    /// Raise the bound on stored user seqs to `seq` if it is newer, whenever
     /// entries move from the active memtable into a lower layer.
-    pub(super) fn note_lower_seq(&self, seq: u64) {
-        let mut cur = self.max_lower_seq.load(Ordering::Relaxed);
+    pub(super) fn note_stored_seq(&self, seq: u64) {
+        let mut cur = self.max_stored_seq.load(Ordering::Relaxed);
         while seq_newer(seq, cur) {
-            match self.max_lower_seq.compare_exchange_weak(cur, seq, Ordering::Relaxed, Ordering::Relaxed) {
+            match self.max_stored_seq.compare_exchange_weak(cur, seq, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(observed) => cur = observed,
             }

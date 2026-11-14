@@ -4,9 +4,9 @@ use super::*;
 
 // `merge_scan_layers` avoids a map insert per L1 entry, but must give exactly
 // what folding L1 and then every newer layer into one map by `fold_newest`
-// gives: highest seq wins, a tie goes to the later (newer) copy. Checked over
-// many generated layer sets with a tiny key and seq space, so duplicate keys
-// within L1, tombstones on both sides, and exact seq ties are all common.
+// gives: the later (newer) copy of a key wins. Checked over many generated
+// layer sets with a tiny key space, so duplicate keys within L1 and tombstones
+// on both sides are common.
 #[test]
 fn test_merge_scan_layers_matches_seq_fold() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64; // deterministic LCG, no RNG dependency
@@ -23,7 +23,7 @@ fn test_merge_scan_layers_matches_seq_fold() {
                     (
                         vec![next(3) as u8, next(6) as u8],
                         (next(4) != 0).then(|| u128::from(next(1000))),
-                        next(8),
+                        Version::user(next(8)),
                     )
                 })
                 .collect();
@@ -36,7 +36,7 @@ fn test_merge_scan_layers_matches_seq_fold() {
                 &mut newer,
                 vec![next(3) as u8, next(6) as u8],
                 (next(3) != 0).then(|| u128::from(next(1000))),
-                next(8),
+                Version::user(next(8)),
             );
         }
 
@@ -213,12 +213,14 @@ fn test_l0_sparse_index_hints_are_valid_and_survive_reopen() -> Result<()> {
     Ok(())
 }
 
-// Every multi-key scan must resolve each key exactly as a point read does —
-// highest seq across all layers — never by "the newer layer overwrites". Random
-// writes carry OUT-OF-ORDER seqs, so a lower-seq copy often sits in a newer
-// layer; flushes, compactions and reopens are mixed in. After every step each
-// scan must equal the brute-force view built from `reference_get`, including
-// bounded pages small enough that their window cuts layers short.
+// Every multi-key scan must resolve each key exactly as a point read does: the
+// copy in the newest layer that holds it. Random user writes (in seq order, as
+// the key stripe applies them) and GC-style system copies (the current copy's
+// next system version) are mixed with flushes, compactions and reopens. After
+// every step the tree must keep newer versions in newer layers, and each scan
+// must equal the brute-force view built from `reference_get` (highest version
+// across every layer), including bounded pages small enough that their window
+// cuts layers short.
 #[test]
 fn test_scans_agree_with_brute_force_resolution() -> Result<()> {
     let mut state = 0xD1B5_4A32_D192_ED03u64;
@@ -237,13 +239,19 @@ fn test_scans_agree_with_brute_force_resolution() -> Result<()> {
         for step in 0..250 {
             clock += 8;
             let key = &keys[next(keys.len() as u64) as usize];
-            let seq = clock - next(40);
+            let seq = clock;
             match next(100) {
-                0..=54 => {
+                0..=44 => {
                     lsm.insert_with_seq(key, u128::from(next(1 << 30)) + 1, seq)?;
                 }
-                55..=81 => {
+                45..=71 => {
                     lsm.delete_with_seq(key, seq)?;
+                }
+                72..=81 => {
+                    // A GC relocation: same user seq, next system seq, new pointer.
+                    if let Some((_, version)) = lsm.get_with_seq(key)? {
+                        lsm.insert_with_seq(key, u128::from(next(1 << 30)) + 1, version.next_system().unwrap())?;
+                    }
                 }
                 82..=88 => lsm.flush_memtable()?,
                 89..=94 => lsm.flush_memtable_to_level0()?,
@@ -255,8 +263,11 @@ fn test_scans_agree_with_brute_force_resolution() -> Result<()> {
                 }
             }
 
+            let label = format!("seed {seed} step {step}");
+            let violations = lsm.layer_order_violations()?;
+            assert!(violations.is_empty(), "{label}: {violations:?}");
             // Truth: every key's point-read answer, in key order.
-            let mut truth: Vec<(Vec<u8>, u128, u64)> = Vec::new();
+            let mut truth: Vec<(Vec<u8>, u128, Version)> = Vec::new();
             for k in &keys {
                 if let Some((ptr, s)) = reference_get(&lsm, k)? {
                     truth.push((k.clone(), ptr, s));
@@ -265,11 +276,10 @@ fn test_scans_agree_with_brute_force_resolution() -> Result<()> {
             truth.sort();
             truth.dedup();
             let with_prefix = |p: &[u8]| truth.iter().filter(|(k, _, _)| k.starts_with(p)).cloned().collect::<Vec<_>>();
-            let label = format!("seed {seed} step {step}");
 
             assert_eq!(lsm.scan_prefix(b"key1")?, with_prefix(b"key1"), "{label}: scan_prefix");
             let ids: std::collections::HashSet<u32> = [u32::from_be_bytes(*b"key0"), u32::from_be_bytes(*b"key1")].into_iter().collect();
-            let pairs = |v: Vec<(Vec<u8>, u128, u64)>| v.into_iter().map(|(k, p, _)| (k, p)).collect::<Vec<_>>();
+            let pairs = |v: Vec<(Vec<u8>, u128, Version)>| v.into_iter().map(|(k, p, _)| (k, p)).collect::<Vec<_>>();
             assert_eq!(lsm.scan_prefixes(&ids)?.to_pairs(), pairs(truth.clone()), "{label}: scan_prefixes");
             assert_eq!(lsm.key_pointer_pairs(None)?, pairs(truth.clone()), "{label}: key_pointer_pairs");
             assert_eq!(
@@ -333,7 +343,7 @@ fn test_scan_prefix_rejects_a_key_shorter_than_the_prefix_in_every_layer() -> Re
     let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
     lsm.insert_with_seq(b"ab", 1, 1)?;
     lsm.insert_with_seq(b"ab\0x", 2, 2)?; // a real match, to show the filter still admits one
-    let expected = vec![(b"ab\0x".to_vec(), 2u128, 2u64)];
+    let expected = vec![(b"ab\0x".to_vec(), 2u128, Version::user(2))];
 
     assert_eq!(lsm.scan_prefix(b"ab\0")?, expected, "memtable");
     lsm.flush_memtable_to_level0()?;
@@ -477,7 +487,7 @@ fn prefix_upper_bound_cases() {
 }
 
 /// Sort scan output to `(key, pointer)` for order-insensitive comparison.
-fn kv_sorted(v: Vec<(Vec<u8>, u128, u64)>) -> Vec<(Vec<u8>, u128)> {
+fn kv_sorted(v: Vec<(Vec<u8>, u128, Version)>) -> Vec<(Vec<u8>, u128)> {
     let mut r: Vec<(Vec<u8>, u128)> = v.into_iter().map(|(k, val, _)| (k, val)).collect();
     r.sort();
     r

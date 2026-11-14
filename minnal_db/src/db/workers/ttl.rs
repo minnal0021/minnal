@@ -264,7 +264,7 @@ mod tests {
     // A TTL pass decides a record has expired, then deletes it. A write that lands
     // in between replaced the expired record with a fresh one that was just
     // acknowledged to its writer; the pass must leave it alone, not delete
-    // whatever the key holds by then. `after_lock` runs exactly in that window (after
+    // whatever the key holds by then. `before_delete` runs exactly in that window (after
     // the verdict, before the delete), so it is where this test lands the write.
     #[test]
     fn test_expiry_spares_a_value_rewritten_after_it_was_judged_expired() {
@@ -286,6 +286,6 @@ mod tests {
         assert_eq!(store.get(b"key1").unwrap(), Some(b"fresh".to_vec()), "a fresh write was expired");
         assert_eq!(store.get(b"key2").unwrap(), None, "the untouched expired key must still go");
         assert_eq!(deleted, 1, "only the untouched key counts as deleted");
-        assert_eq!(locked.into_inner(), 2, "every delete must run under the key's stripe");
+        assert_eq!(locked.into_inner(), 2, "the hook must run before every delete");
     }
 }

@@ -34,13 +34,13 @@ impl KVStore {
     /// proportional to the segment rather than to the whole bucket or the whole key
     /// set. The segment is sealed and immutable, so nothing can change it under us.
     ///
-    /// **Phase 2 (key stripe + bucket lock):** relocate each survivor as a
-    /// **compare-and-set** — append it to the active tail and update the LSM only if
-    /// the key *still* maps to the old location. Phase 1 runs without the lock, so a
-    /// key deleted since then must stay deleted and one overwritten since then must
-    /// keep its newer value. The copy is written as a **new version** of the key, at a
-    /// fresh seq drawn under the key's stripe, so it lands in the newest layer as the
-    /// newest version, like any other write.
+    /// **Phase 2 (bucket lock):** relocate each survivor as a **compare-and-set** —
+    /// append it to the active tail and update the LSM only if the key *still* maps
+    /// to the old location. Phase 1 runs without the lock, so a key deleted since
+    /// then must stay deleted and one overwritten since then must keep its newer
+    /// value. The copy keeps the write's user seq and takes the next system seq
+    /// ([`Version::next_system`]): newer than the copy it replaces, older than any
+    /// user write to come.
     ///
     /// The old segment is deliberately **not** unlinked here — see
     /// [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold).
@@ -133,22 +133,16 @@ impl KVStore {
 
             // ── Phase 2: relocate survivors, re-point by compare-and-set ──────
             //
-            // Each copy is written as a NEW version of its key: a fresh seq, drawn
-            // under the key's stripe after checking the key still points at the
-            // record copied. Every writer holds its key's stripe from drawing its
-            // seq to applying the write, so with the stripe held no write to the
-            // key is half-done, and the fresh seq is newer than every copy of the
-            // key already stored and older than every write still to come. The
-            // copy therefore goes into the newest layer as the newest version,
-            // and a newer layer always holds a newer version.
-            //
-            // The lock order is stripe → bucket, but the batched check below
-            // needs the bucket lock first. So under the bucket lock GC only
-            // *tries* each stripe: a writer holding it may be waiting for this
-            // very bucket lock, and waiting for it here would deadlock. A key
-            // whose stripe is busy is deferred and re-pointed afterwards, taking
-            // the two locks in order.
-            let mut deferred: Vec<&Survivor> = Vec::new();
+            // A copy is the same user write, moved: it keeps the current copy's
+            // user seq and takes the next system seq (`Version::next_system`).
+            // That makes it newer than the copy it replaces, so the newest layer
+            // still holds the newest version, and older than every user write to
+            // the key: a writer that drew its seq before GC and is waiting for
+            // the bucket lock wins whenever it lands. So GC takes no key stripe.
+            // A version whose system seq is used up (about four billion moves of
+            // one unchanged write) is re-pointed after the batch as a new user
+            // write, under its stripe.
+            let mut exhausted: Vec<&Survivor> = Vec::new();
             {
                 let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
@@ -164,29 +158,34 @@ impl KVStore {
                 // the LSM as we go, but survivors carry no duplicate keys (see
                 // phase 1), so no re-point can invalidate another's answer.
                 let survivor_keys: Vec<Vec<u8>> = survivors.iter().map(|s| s.key.clone()).collect();
-                let current_pointers = self.lsm.get_multiple(&survivor_keys)?;
+                let current = self.lsm.get_multiple(&survivor_keys)?;
 
-                for (survivor, current) in survivors.iter().zip(current_pointers) {
-                    if current.map(|(pointer, _seq)| pointer) != Some(survivor.old_pointer) {
-                        continue; // deleted or overwritten since phase 1
+                for (survivor, current) in survivors.iter().zip(current) {
+                    let Some((pointer, version)) = current else {
+                        continue; // deleted since phase 1 — do not resurrect
+                    };
+                    if pointer != survivor.old_pointer {
+                        continue; // overwritten since phase 1 — do not revert
                     }
-                    let Some(_stripe) = self.key_locks.try_guard(&survivor.key) else {
-                        deferred.push(survivor);
+                    let Some(moved) = version.next_system() else {
+                        exhausted.push(survivor);
                         continue;
                     };
-                    result.bytes_rewritten += self.relocate_locked(bucket, survivor)?;
+                    result.bytes_rewritten += self.relocate_locked(bucket, survivor, moved)?;
                 }
             }
 
-            // The keys whose stripe was busy: stripe, then bucket, then the
-            // compare-and-set again (the key may have changed meanwhile).
-            for survivor in deferred {
+            // Stripe, then bucket (the write path's order), then the
+            // compare-and-set again, and a fresh user seq drawn with the stripe
+            // held: newer than every stored copy, older than any write to come.
+            for survivor in exhausted {
                 let _stripe = self.lock_key(&survivor.key);
                 let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
                 if self.lsm.get(&survivor.key)? != Some(survivor.old_pointer) {
                     continue;
                 }
-                result.bytes_rewritten += self.relocate_locked(bucket, survivor)?;
+                let version = Version::user(self.alloc_seq());
+                result.bytes_rewritten += self.relocate_locked(bucket, survivor, version)?;
             }
 
             result.pending_unlink.push(segment.id);
@@ -195,18 +194,17 @@ impl KVStore {
         Ok(result)
     }
 
-    /// Copy `survivor` to the active tail and point its key at the copy, at a
-    /// fresh seq. The caller holds the key's stripe and `bucket`'s write lock and
-    /// has checked the key still points at `survivor.old_pointer`. Returns the
-    /// bytes written.
-    fn relocate_locked(&self, bucket: u32, survivor: &Survivor) -> Result<u64> {
+    /// Copy `survivor` to the active tail and point its key at the copy, at
+    /// `version`. The caller holds `bucket`'s write lock and has checked the key
+    /// still points at `survivor.old_pointer`. Returns the bytes written.
+    fn relocate_locked(&self, bucket: u32, survivor: &Survivor, version: Version) -> Result<u64> {
         let key = survivor.key.as_slice();
-        // Drawn here, with the stripe held: newer than every stored copy of the
-        // key, older than any write to it still to come.
-        let seq = self.alloc_seq();
-        let meta = ValueRecordMeta { epoch: survivor.epoch, seq };
+        let meta = ValueRecordMeta {
+            epoch: survivor.epoch,
+            seq: version.user,
+        };
         let new_pointer = self.value_log.append_to_locked_bucket(bucket, key, &survivor.value, meta, false)?;
-        let applied = match self.lsm.insert_with_seq(key, new_pointer.to_u128(), seq) {
+        let applied = match self.lsm.insert_with_seq(key, new_pointer.to_u128(), version) {
             Ok(applied) => applied,
             Err(e) => {
                 // Nothing points at the copy: count it as garbage, as the put

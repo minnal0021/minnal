@@ -20,6 +20,7 @@ fn test_pre_header_sstable_is_rejected_not_misread() -> Result<()> {
             value: 42,
             tombstone: false,
             seq: 7,
+            system: 0,
         };
         let payload = encode_sstable_entry(&entry)?;
         let mut f = File::create(&path)?;
@@ -368,6 +369,7 @@ fn test_sstable_entry_codec_roundtrip_and_corruption() {
         value: 0xdead_beef,
         tombstone: false,
         seq: 42,
+        system: 3,
     };
 
     let mut payload = encode_sstable_entry(&entry).expect("encode");

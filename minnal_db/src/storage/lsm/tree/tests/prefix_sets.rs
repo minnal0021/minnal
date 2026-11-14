@@ -59,12 +59,11 @@ fn key_head_then_key_is_byte_order() {
     assert_eq!(by_head, keys);
 }
 
-/// The run merge must equal sorting every entry and keeping the newest copy
-/// of each key: keys of 0–23 bytes (many sharing a 16-byte head) in 8 runs,
-/// with the same key in several runs at different seqs, and the same entries
-/// shuffled.
+/// The run merge must equal sorting every entry and keeping the last copy of
+/// each key, in input order: keys of 0–23 bytes (many sharing a 16-byte head)
+/// in 8 runs, with the same key in several runs, and the same entries shuffled.
 #[test]
-fn merging_l1_runs_equals_sorting_and_keeping_the_newest() {
+fn merging_l1_runs_equals_sorting_and_keeping_the_last() {
     let mut s = 0x5851_f42d_4c95_7f2d_u64;
     let mut next = move || {
         s ^= s << 13;
@@ -93,31 +92,29 @@ fn merging_l1_runs_equals_sorting_and_keeping_the_newest() {
                 let start = buffer.len();
                 buffer.extend_from_slice(&k);
                 let seq = next() % 1_000;
-                entries.push((run, start, buffer.len(), Some(seq as u128), seq));
+                entries.push((run, start, buffer.len(), Some(seq as u128), Version::user(seq)));
             }
             buffers.push(buffer);
         }
         let key = |e: &PackedScanEntry| &buffers[e.0][e.1..e.2];
-        let merged: Vec<(Vec<u8>, u64)> = merge_l1_runs(&entries, key).iter().map(|e| (key(e).to_vec(), e.4)).collect();
-
-        let mut reference: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
-        for e in &entries {
-            let seq = reference.entry(key(e).to_vec()).or_insert(e.4);
-            if e.4 > *seq {
-                *seq = e.4;
+        let last_of_each = |input: &[PackedScanEntry]| -> Vec<(Vec<u8>, Version)> {
+            let mut reference = std::collections::BTreeMap::new();
+            for e in input {
+                reference.insert(key(e).to_vec(), e.4);
             }
-        }
-        let reference: Vec<(Vec<u8>, u64)> = reference.into_iter().collect();
-        assert_eq!(merged, reference, "{total} entries");
+            reference.into_iter().collect()
+        };
+        let merged: Vec<(Vec<u8>, Version)> = merge_l1_runs(&entries, key).iter().map(|e| (key(e).to_vec(), e.4)).collect();
+        assert_eq!(merged, last_of_each(&entries), "{total} entries");
 
         // In random order the input breaks into far more than `MAX_MERGED_RUNS`
-        // runs, which takes the sorting path; it must give the same result.
+        // runs, which takes the sorting path; it must keep input order too.
         let mut shuffled = entries.clone();
         for i in (1..shuffled.len()).rev() {
             shuffled.swap(i, (next() % (i as u64 + 1)) as usize);
         }
-        let merged: Vec<(Vec<u8>, u64)> = merge_l1_runs(&shuffled, key).iter().map(|e| (key(e).to_vec(), e.4)).collect();
-        assert_eq!(merged, reference, "{total} entries, shuffled");
+        let merged: Vec<(Vec<u8>, Version)> = merge_l1_runs(&shuffled, key).iter().map(|e| (key(e).to_vec(), e.4)).collect();
+        assert_eq!(merged, last_of_each(&shuffled), "{total} entries, shuffled");
     }
 }
 

@@ -42,7 +42,7 @@ pub(super) fn read_l0_range(entry: &L0FileEntry, start: &[u8], end: Option<&[u8]
         entries.push((
             key.to_vec(),
             (!archived.tombstone).then(|| archived.value.to_native()),
-            archived.seq.to_native(),
+            SStableEntry::archived_version(archived),
         ));
     }
     Ok(entries)
@@ -88,13 +88,6 @@ impl L0FileEntry {
         self.summary
             .as_ref()
             .is_none_or(|s| key >= s.min_key.as_slice() && key <= s.max_key.as_slice() && s.bloom.contains(key))
-    }
-
-    /// Whether every entry in this file is at most `seq` — so, visiting layers
-    /// newest first with a candidate at `seq` already in hand, nothing here can
-    /// win (an exact tie stays with the newer layer already visited).
-    pub(super) fn cannot_beat(&self, seq: u64) -> bool {
-        self.summary.as_ref().is_some_and(|s| seq_newer_or_eq(seq, s.max_seq))
     }
 
     /// Where to start scanning this file for `key`: a sparse-index hint, or the

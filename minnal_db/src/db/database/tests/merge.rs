@@ -517,4 +517,51 @@ mod merge_tests {
         );
         db.crash();
     }
+
+    /// A put whose apply failed on every retry is durable but unreadable. A
+    /// merge on the key reads the value before it, treats that as the source of
+    /// truth (logging an ERROR), and writes over it; the unapplied put is
+    /// superseded, so a crash does not bring it back over the merge's result.
+    #[test]
+    fn a_merge_over_a_put_that_never_applied_keeps_the_value_it_read() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = Database::open(dir.path(), create_db_config()).unwrap();
+            let store = db.get_store(NamespaceId::DEFAULT).unwrap();
+            db.put(b"counter", &3u64.to_le_bytes()).unwrap();
+
+            store.lsm.fail_next_inserts(Database::APPLY_RETRY_ATTEMPTS as u32);
+            db.put(b"counter", &5u64.to_le_bytes()).unwrap(); // durable, never applied
+            assert_eq!(db.get(b"counter").unwrap(), Some(3u64.to_le_bytes().to_vec()));
+            assert!(store.unapplied_write(b"counter").is_some(), "the failed apply must be recorded");
+
+            let written = db.merge(b"counter", &1u64.to_le_bytes(), add).unwrap();
+            assert_eq!(written, Some(4u64.to_le_bytes().to_vec()), "the merge builds on the value it can read");
+            assert_eq!(store.take_unapplied_write(b"counter"), None, "the merge supersedes the unapplied put");
+            db.crash();
+        }
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        assert_eq!(
+            db.get(b"counter").unwrap(),
+            Some(4u64.to_le_bytes().to_vec()),
+            "replay brought the unapplied put back over the merge"
+        );
+        db.crash();
+    }
+
+    /// A later user write clears the marker too: the unapplied write is
+    /// superseded, so a merge after it has nothing to warn about.
+    #[test]
+    fn a_later_write_clears_the_unapplied_marker() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let store = db.get_store(NamespaceId::DEFAULT).unwrap();
+        store.lsm.fail_next_inserts(Database::APPLY_RETRY_ATTEMPTS as u32);
+        db.put(b"k", b"never applied").unwrap();
+        assert!(store.unapplied_write(b"k").is_some(), "the failed apply must be recorded");
+        db.put(b"k", b"applied").unwrap();
+        assert_eq!(store.take_unapplied_write(b"k"), None);
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"applied".as_slice()));
+        db.crash();
+    }
 }

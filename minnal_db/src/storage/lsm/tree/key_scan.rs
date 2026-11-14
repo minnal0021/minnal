@@ -182,7 +182,7 @@ impl LSMTree {
                                     let archived =
                                         unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
                                     let val = if archived.tombstone { None } else { Some(archived.value.to_native()) };
-                                    out.push((archived.key.as_slice().to_vec(), val, archived.seq.to_native()));
+                                    out.push((archived.key.as_slice().to_vec(), val, SStableEntry::archived_version(archived)));
                                 }
                             }
                             Ok(out)
@@ -224,7 +224,7 @@ impl LSMTree {
                     &mut all_entries,
                     record.key.clone(),
                     (!record.tombstone).then_some(record.value),
-                    record.seq,
+                    record.version,
                 );
             }
         }
@@ -245,7 +245,7 @@ impl LSMTree {
     /// (pre-captured) Level-1 file. Tombstones are skipped: a seq-aware merge
     /// (`merge_level0_to_level1`) never writes a tombstone into L1, so an L1 entry
     /// is always live; a newer layer carrying the key shadows it by seq.
-    pub(super) fn scan_bucket_key_pointers(&self, level1_file: &File) -> Result<Vec<(Vec<u8>, u128, u64)>> {
+    pub(super) fn scan_bucket_key_pointers(&self, level1_file: &File) -> Result<Vec<(Vec<u8>, u128, Version)>> {
         let mut kvs = Vec::new();
         // Bound for `check_frame_len`: a frame can never be longer than its file.
         let file_len = level1_file.metadata().map(|m| m.len()).unwrap_or(0);
@@ -266,7 +266,11 @@ impl LSMTree {
             let archived = unsafe { rkyv::access_unchecked::<ArchivedSStableEntry>(verify_sstable_payload(&entry_bytes[..size])?) };
 
             if !archived.tombstone {
-                kvs.push((archived.key.to_vec(), archived.value.to_native(), archived.seq.to_native()));
+                kvs.push((
+                    archived.key.to_vec(),
+                    archived.value.to_native(),
+                    SStableEntry::archived_version(archived),
+                ));
             }
         }
 

@@ -189,32 +189,6 @@ fn test_lsm_basic_operations() -> Result<()> {
     Ok(())
 }
 
-// A value re-inserted at an OLD sequence into the newest layer must NOT shadow
-// a higher-sequence tombstone that has flushed to an older layer. A `get` that
-// returned at the first layer holding the key would resolve this to the value
-// and resurrect a deleted key. No writer produces this state any more (GC
-// writes its copies at a fresh seq, replay drops older records:
-// `docs/Layer-Order-Design.md`); the test builds it directly, so it guards the
-// read path as a second line of defence.
-#[test]
-fn test_repoint_at_old_seq_does_not_resurrect_across_layers() -> Result<()> {
-    let temp_dir = TempDir::new()?;
-    let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
-
-    lsm.insert_with_seq(b"k", 0xAAAA, 1)?; // value @ seq 1
-    lsm.delete_with_seq(b"k", 5)?; // tombstone @ seq 5 (newer)
-    assert_eq!(lsm.get(b"k")?, None, "deleted before flush");
-
-    lsm.flush_memtable_to_level0()?; // tombstone @ seq 5 → L0
-    assert_eq!(lsm.get(b"k")?, None, "deleted after flush");
-
-    // Re-insert a value at the OLD seq into the now-empty active memtable. The
-    // key is still logically deleted.
-    lsm.insert_with_seq(b"k", 0xBBBB, 1)?;
-    assert_eq!(lsm.get(b"k")?, None, "a re-insert at an old seq resurrected a deleted key");
-    Ok(())
-}
-
 // A cold key's L1 entry keeps its original seq forever, so the gap between it
 // and a much-later write to the same key is unbounded. The sequence width must
 // therefore cover the database's whole lifetime: a 32-bit seq with wrapping
@@ -268,36 +242,24 @@ fn test_write_after_huge_seq_gap_beats_cold_l1_entry() -> Result<()> {
     Ok(())
 }
 
-// The read fast-path bound `max_lower_seq` must be initialized
-// from L0 files (not just L1) at open. L0 is newer than L1, so an L0-only
-// tombstone's seq would otherwise be missing from the bound after a restart,
-// letting a low-seq active entry wrongly short-circuit above it. This is the
-// restart variant of test_repoint_at_old_seq_does_not_resurrect_across_layers.
+// At open the write sequence must start above every stored user seq
+// (`KVStore::set_seq_counter` raises it to `max_stored_seq() + 1`), or a write
+// after a restart could lose to an older stored copy. The bound must count L0
+// files as well as L1: here the newest seq is only in an L0 file.
 #[test]
-fn test_max_lower_seq_folds_l0_at_open_so_fast_path_is_safe() -> Result<()> {
+fn test_the_stored_seq_bound_counts_level0_at_open() -> Result<()> {
     let temp_dir = TempDir::new()?;
     {
         let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
-        lsm.insert_with_seq(b"k", 0xAAAA, 1)?; // value @ seq 1
-        lsm.delete_with_seq(b"k", 5)?; // tombstone @ seq 5 (newer)
-        lsm.flush_memtable_to_level0()?; // tombstone @ seq 5 → an L0 file (no L1)
-        assert_eq!(lsm.get(b"k")?, None, "deleted before restart");
+        lsm.insert_with_seq(b"k", 0xAAAA, 1)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?; // seq 1 in L1
+        lsm.delete_with_seq(b"k", 5)?;
+        lsm.flush_memtable_to_level0()?; // seq 5 only in an L0 file
     }
-
-    // Reopen: max_lower_seq must be folded from the L0 file (seq 5), not left
-    // at 0 (which only L1 would have contributed).
     let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+    assert_eq!(lsm.max_stored_seq(), 5, "the bound must include the L0 file's seq");
     assert_eq!(lsm.get(b"k")?, None, "still deleted after restart");
-
-    // Re-point at the old seq into the fresh (empty) active memtable. With the
-    // bound correctly at 5, the fast path must NOT short-circuit on seq 1 — it
-    // falls through to the full scan that sees the higher-seq L0 tombstone.
-    lsm.insert_with_seq(b"k", 0xBBBB, 1)?;
-    assert_eq!(
-        lsm.get(b"k")?,
-        None,
-        "stale max_lower_seq let the fast path resurrect a deleted key after restart"
-    );
     Ok(())
 }
 
@@ -346,13 +308,14 @@ fn test_keys_excludes_sstable_entry_tombstoned_in_memtable() -> Result<()> {
     Ok(())
 }
 
-// Differential guard for the read path's shortcuts — the active-memtable fast
-// path, RO binary search, L0 summaries (range/bloom/max-seq) and L1 max-seq
-// pruning — in both `get_with_seq` and `get_multiple`. Random writes carry
-// OUT-OF-ORDER sequences (so lower-seq copies land in newer layers, the case
-// every shortcut must respect) plus re-points at an existing seq (ties), with
-// flushes, compactions and reopens mixed in. After every step both lookup paths
-// must agree with `reference_get` for every key, including never-written ones.
+// Differential guard for the read paths — stopping at the first layer holding
+// the key, the RO binary search, the L0 summaries (range/bloom) and the L1
+// filters — in both `get_with_seq` and `get_multiple`. Random user writes (in
+// seq order, as the key stripe applies them) and GC-style system copies (the
+// current copy's next system version) are mixed with flushes, compactions and
+// reopens. After every step the tree must keep newer versions in newer layers,
+// and both lookup paths must agree with `reference_get` (highest version across
+// every layer) for every key, including never-written ones.
 #[test]
 fn test_read_shortcuts_agree_with_brute_force_resolution() -> Result<()> {
     // splitmix64: tiny, seedable, reproducible across runs.
@@ -393,9 +356,7 @@ fn test_read_shortcuts_agree_with_brute_force_resolution() -> Result<()> {
         for step in 0..300 {
             clock += 8;
             let key = &keys[rng.below(keys.len() as u64) as usize];
-            // Jitter the sequence backwards by up to 5 writes' worth, so later
-            // writes often carry lower seqs than earlier ones.
-            let seq = clock - rng.below(40);
+            let seq = clock;
             match rng.below(100) {
                 0..=54 => {
                     lsm.insert_with_seq(key, u128::from(rng.next()), seq)?;
@@ -404,9 +365,9 @@ fn test_read_shortcuts_agree_with_brute_force_resolution() -> Result<()> {
                     lsm.delete_with_seq(key, seq)?;
                 }
                 80..=86 => {
-                    // A re-point at the same seq as the current winner, new pointer.
+                    // A GC relocation: the current copy's next system version.
                     if let Some((_, cur)) = lsm.get_with_seq(key)? {
-                        lsm.insert_with_seq(key, u128::from(rng.next()), cur)?;
+                        lsm.insert_with_seq(key, u128::from(rng.next()), cur.next_system().unwrap())?;
                     }
                 }
                 87..=91 => lsm.flush_memtable()?,
@@ -421,6 +382,8 @@ fn test_read_shortcuts_agree_with_brute_force_resolution() -> Result<()> {
                 }
             }
 
+            let violations = lsm.layer_order_violations()?;
+            assert!(violations.is_empty(), "seed {seed} step {step}: {violations:?}");
             let batch = lsm.get_multiple(&probes)?;
             for (probe, batched) in probes.iter().zip(batch) {
                 let expected = reference_get(&lsm, probe)?;
@@ -433,7 +396,6 @@ fn test_read_shortcuts_agree_with_brute_force_resolution() -> Result<()> {
     let m = metrics.snapshot();
     assert!(m.fast_path_hits > 0, "the active-memtable fast path never fired");
     assert!(m.l0_bloom_rejects > 0, "no L0 file was ever skipped by range/bloom");
-    assert!(m.seq_prunes > 0, "no SSTable was ever skipped by max-seq");
     assert!(m.l0_probes > 0 && m.l1_probes > 0, "the slow path never read L0 and L1");
     Ok(())
 }

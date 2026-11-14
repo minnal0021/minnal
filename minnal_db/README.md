@@ -144,13 +144,9 @@ Data moves through three levels, from fast-and-volatile to slow-and-durable — 
 
 A write first lands in the in-memory **MemTable** (a skip list). At 95% capacity it is sealed read-only, a fresh MemTable takes over writes, and the sealed one is flushed to disk as an **L0 file** for the relevant bucket. L0 files accumulate and *overlap* — the same key can appear in several of them — so once a bucket's L0 files hold 10% as many entries as its L1 file, or number 8, a background worker merge-sorts them together with that L1 file into a single, sorted **L1 SSTable**. That merge is where the tree shrinks: duplicate versions of a key collapse to the newest one, and a tombstone drops the key entirely, so L1 holds fewer entries than the inputs it was built from.
 
-Because the same key can exist in several tiers at once, a read must decide which copy is current. It does that by **write sequence, not by layer order**:
+Because the same key can exist in several tiers at once, a read must decide which copy is current. It takes the **first copy it finds, newest layer first**: the active MemTable, the sealed read-only MemTables (newest first), the bucket's L0 files (newest first), then its L1 SSTable. A tombstone found first means "not found"; a pointer is followed into the value log for the bytes. Each L0 file and L1 file is skipped unread when its key range or Bloom filter rules the key out.
 
-1. **Fast path.** Look up the key in the active MemTable (an `O(log n)` skip-list lookup). Each tree tracks the highest sequence held anywhere below that MemTable, so if the hit's sequence beats it, no lower tier can hold anything newer and the read returns straight away. Ordinary writes always carry the newest sequence, so this is the common case.
-2. **Full resolution.** Otherwise, gather the key's entry from *every* layer — the active MemTable, each sealed read-only MemTable, the bucket's L0 files, and its L1 SSTable — and keep the one with the **highest sequence**. A tombstone winning means "not found".
-3. Follow the winning pointer into the value log to fetch the actual bytes.
-
-Every writer keeps a newer layer holding newer versions: live writes and GC's re-points draw their sequence under the key's stripe, replay drops a record that is not newer than what is stored, and MemTables reach L0 in the order they were frozen ([Layer-Order-Design.md](docs/Layer-Order-Design.md)). Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) gives the right answer without relying on that rule, at a cost of roughly 5–10% on reads.
+That is correct because every writer keeps a newer layer holding a newer **version** of a key ([Layer-Order-Design.md](docs/Layer-Order-Design.md)). A version is a user write's sequence plus a small counter for the engine's own rewrites (value-log GC moving a record, TTL expiring one): those keep the write's sequence and raise the counter, so they are newer than what they replace and older than any later user write. User writes take a per-key lock while they draw their sequence, recovery drops a replayed record that is not newer than what is stored, and MemTables reach L0 in the order they were frozen. Scans and the L0→L1 merge follow the same rule: the newer layer's copy of a key wins.
 
 Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash of their first 8 bytes**, so any given lookup only ever touches one bucket's L1 file — a single 1/8th-sized slice of the data rather than the whole tree.
 
@@ -234,7 +230,7 @@ GC's unit is a **segment**, never the whole bucket:
 
 1. **Pick** the sealed segments whose garbage ratio is over the per-segment selection bar, worst first. The active tail is never a candidate.
 2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so GC looks all of the segment's keys up in the LSM in one batched lookup: a record survives if the LSM still points at exactly this location.
-3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. Each copy is a new version of its key, at a fresh sequence drawn under the key's stripe, so it is the newest version like any other write; a key whose stripe a writer holds is re-pointed after the batch, taking its stripe first.
+3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. Each copy keeps the write's sequence and takes the next system version, so it is newer than the copy it replaces and older than any user write still to land; GC takes no per-key lock.
 4. **Flush** the memtable to L0, making the re-point durable.
 5. **Unlink** the old segment file.
 
@@ -408,8 +404,8 @@ The design and its measurements are in `src/semantic_search/docs/Vector-Index-WA
 - **WAL lock** (`Database::wal_metadata`) — the lock every main-WAL write takes to take its seq and append its entry, so seq order is log order. Inside it the append takes the log's own append lock, which is never contended (every main-WAL append already holds the WAL lock) and which a commit round takes briefly to read the tail. Both are released before the fsync.
 - **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
 - **Commit round** — one fsync and the callers it releases, in either log (`db/wal/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
-- **Sequence (seq)** — the global write counter (`next_seq`) every write draws from, whichever log it uses. The highest seq for a key wins everywhere: memtable, L0, L1, and replay of either log.
-- **Key stripe lock** (`kv_store/key_locks.rs`) — a fixed array of 1,024 locks per namespace; each key hashes to one, its *stripe*, so two keys of a namespace may share one. Every write takes its key's stripe first, before any log lock, and holds it until the write is in the memtable; value-log GC takes it to re-point a key. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
+- **Sequence (seq)** — the global write counter (`next_seq`) every user write draws from, whichever log it uses. With the system seq of GC and TTL rewrites it makes a copy's version; a newer layer always holds a newer version, and replay of either log applies a record only if it is newer than the key's current copy.
+- **Key stripe lock** (`kv_store/key_locks.rs`) — a fixed array of 1,024 locks per namespace; each key hashes to one, its *stripe*, so two keys of a namespace may share one. Every user write takes its key's stripe first, before any log lock, and holds it until the write is in the memtable. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs. Value-log GC and TTL expiry take none.
 - **Memtable** — a namespace's in-memory sorted buffer of recent writes (a skip list). **Seal:** turning a full one read-only so it can be flushed. **Flush:** writing a sealed memtable to L0 files and fsyncing them.
 - **L0 / L1** — the LSM tree's on-disk levels: L0 holds one file per flush per bucket, L1 one merged file per bucket. **Compaction** merges L0 into L1 and may drop tombstones there.
 - **Tombstone** — the record a delete leaves, so the key reads as absent until compaction removes both.
@@ -604,31 +600,26 @@ Three things fall out of that shape:
 
 ### Read Path
 
-A read resolves the key's current version by **highest write sequence**, then follows that pointer into the value log:
+A read takes the first copy of the key it finds, newest layer first, then follows that pointer into the value log:
 
 ```
 get(key)
         │
-        ├──► SkipList.get(key)  → hit whose seq beats every lower tier?
-        │                            └─► yes: nothing below can be newer, return it  (fast path)
-        │
-        │    otherwise gather candidates from every layer and keep the highest seq:
-        ├──► active MemTable            → (pointer | tombstone, seq)
-        ├──► read-only MemTables         → (pointer | tombstone, seq)
-        ├──► L0 files for bucket         → (pointer | tombstone, seq)
-        ├──► L1 SSTable for bucket       → (pointer | tombstone, seq)
-        │                                            │
-        │                          winner = max by seq
+        ├──► active MemTable           → hit? (pointer | tombstone)
+        ├──► read-only MemTables        → hit?   newest first
+        ├──► L0 files for bucket        → hit?   newest first, skipped unread
+        │                                        when range or Bloom filter rule it out
+        ├──► L1 SSTable for bucket      → hit?   min/max, Bloom filter, sparse index
         │                                            │
         │                    tombstone ──► None      │ pointer
         │                                            ▼
         │                            ValueLog.read(segment, offset, len)
         │                                     └─► value bytes
         │
-        └──► no candidate → return None
+        └──► no layer holds it → return None
 ```
 
-Every writer keeps newer versions in newer layers ([Layer-Order-Design.md](docs/Layer-Order-Design.md)), but the read does not depend on it: it compares sequences across every layer. See [LSM Tree](#lsm-tree).
+The first copy is the current one because every writer keeps newer versions in newer layers ([Layer-Order-Design.md](docs/Layer-Order-Design.md)). See [LSM Tree](#lsm-tree).
 
 ---
 

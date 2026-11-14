@@ -75,7 +75,7 @@ impl LSMTree {
     /// so a tombstone in a newer layer hides an older live copy.
     ///
     /// Its pointers can go stale as [`scan_prefix`](Self::scan_prefix)'s can.
-    pub(crate) fn range_pointers_bounded(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, u128, u64)>> {
+    pub(crate) fn range_pointers_bounded(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, u128, Version)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -93,7 +93,7 @@ impl LSMTree {
                     fold_newest(&mut resolved, key, value, seq);
                 }
             }
-            let page: Vec<(Vec<u8>, u128, u64)> = resolved
+            let page: Vec<(Vec<u8>, u128, Version)> = resolved
                 .into_iter()
                 .filter_map(|(key, (value, seq))| value.map(|v| (key, v, seq)))
                 .take(limit)
@@ -168,7 +168,7 @@ impl LSMTree {
                 records[from..]
                     .iter()
                     .take_while(|r| in_range(&r.key))
-                    .map(|r| (r.key.clone(), (!r.tombstone).then_some(r.value), r.seq)),
+                    .map(|r| (r.key.clone(), (!r.tombstone).then_some(r.value), r.version)),
                 window,
             ));
         }
@@ -191,7 +191,7 @@ impl LSMTree {
         // does not keep) would not count towards it.
         self.for_each_l1_entry_in_range(bucket, file, start, end, Some(window), |archived| {
             let value = (!archived.tombstone).then(|| archived.value.to_native());
-            entries.push((archived.key.as_slice().to_vec(), value, archived.seq.to_native()));
+            entries.push((archived.key.as_slice().to_vec(), value, SStableEntry::archived_version(archived)));
         })?;
         if entries.iter().filter(|e| e.1.is_some()).count() >= window {
             cut = true;
