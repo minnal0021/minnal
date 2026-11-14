@@ -456,7 +456,7 @@ L0 file is found by seeking (it fails if the hints are ignored).
 
 ## Part C — contiguous per-posting blocks (if still needed)
 
-After Part A, each entry still carries a key in the LSM, a 36-byte value-log
+After Part A, each entry still carries a key in the LSM, a 32-byte value-log
 record header plus its key, an rkyv list wrapper and per-entry validation.
 That is about half the bytes at 1 bit. Part C removes them from the search
 path without changing what is stored.

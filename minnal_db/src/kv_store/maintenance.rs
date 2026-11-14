@@ -17,7 +17,7 @@ impl KVStore {
     ///
     /// Walks the live keys a page at a time ([`for_each_key_page`](Self::for_each_key_page)),
     /// so a pass holds one page of keys, and reads each record's `epoch` straight
-    /// from the value log (a 36-byte header read, no value bytes). At most
+    /// from the value log (a 32-byte header read, no value bytes). At most
     /// `max_deletes_per_run` records are removed per call so a single pass cannot
     /// stall on a huge backlog; value-log GC reclaims the physical space
     /// afterwards. Returns the number deleted.

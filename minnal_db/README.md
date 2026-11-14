@@ -205,11 +205,11 @@ Two properties make everything else fall out:
 ```
 segment file:  [file header 16B] [record] [record] ...
 
-record:        [header 36B][value bytes][key bytes]
+record:        [header 32B][value bytes][key bytes]
                 ^ rec_offset
 ```
 
-The header holds `total_len`, `version`, `epoch_ms`, the write `seq`, `key_len`, `value_len`, and a CRC32 of the value. A key's pointer — the `u128` the LSM stores — is:
+The header holds `total_len`, `epoch_ms`, the write `seq`, `key_len`, `value_len`, and a CRC32 of the value. A key's pointer — the `u128` the LSM stores — is:
 
 ```
  127            96 95            64 63            32 31             0
@@ -218,9 +218,9 @@ The header holds `total_len`, `version`, `epoch_ms`, the write `seq`, `key_len`,
 └────────────────┴────────────────┴────────────────┴────────────────┘
 ```
 
-Two details in there earn their keep. The **value sits before the key** in the record, and the pointer **carries `value_len`** — so reading a value is **one `pread` of exactly `36 + value_len` bytes**. There is no page header to consult and no slot directory to walk. And the **key is stored in the record**, which is what lets GC decide what a segment still owes without inverting the entire LSM (see below).
+Two details in there earn their keep. The **value sits before the key** in the record, and the pointer **carries `value_len`** — so reading a value is **one `pread` of exactly `32 + value_len` bytes**. There is no page header to consult and no slot directory to walk. And the **key is stored in the record**, which is what lets GC decide what a segment still owes without inverting the entire LSM (see below).
 
-Every record also carries an **`epoch_ms` timestamp**. This is what makes TTL cheap: the TTL worker reads a record's creation time straight from its 36-byte header, without touching the value or the LSM.
+Every record also carries an **`epoch_ms` timestamp**. This is what makes TTL cheap: the TTL worker reads a record's creation time straight from its 32-byte header, without touching the value or the LSM.
 
 #### Writes, deletes, and garbage
 

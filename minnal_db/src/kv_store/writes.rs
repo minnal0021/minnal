@@ -24,7 +24,6 @@ impl KVStore {
 
     fn put_to_storage_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         let epoch = current_epoch_millis();
-        let mut next_version = 1u32;
         // Capture the prior value's bytes so field-index updates can be O(1)
         // (targeted at the old value's bucket) instead of scanning every bucket.
         // Only worth a value-log read when the namespace actually has indexes.
@@ -44,25 +43,18 @@ impl KVStore {
         let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
         let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
-        // Only a winning write replaces anything. A losing write's record is
-        // garbage the moment it lands, so the winner's record is neither its
-        // previous version nor the old value for the index: read nothing.
+        // Only a winning write replaces anything. A losing write is garbage the
+        // moment it lands and leaves the index alone, so it reads nothing. A winner
+        // reads the old value only when the namespace has indexes, for a targeted
+        // index update. Which write is newest is decided by `seq` alone, never by
+        // anything in the record.
         let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
-        let mut old_value: Option<Vec<u8>> = None;
-        if let Some(existing_ptr) = displaced {
-            if let Ok(meta) = self.value_log.read_record_meta(existing_ptr) {
-                next_version = meta.version.saturating_add(1);
-            }
-            if want_old_for_index {
-                old_value = self.value_log.read_value(existing_ptr).ok();
-            }
-        }
-
-        let record_meta = ValueRecordMeta {
-            version: next_version,
-            epoch,
-            seq,
+        let old_value: Option<Vec<u8>> = match displaced {
+            Some(existing_ptr) if want_old_for_index => self.value_log.read_value(existing_ptr).ok(),
+            _ => None,
         };
+
+        let record_meta = ValueRecordMeta { epoch, seq };
         let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
         if let Err(e) = self.lsm.insert_with_seq(key, pointer.to_u128(), seq) {
             // A failed insert inserts nothing, so nothing points at the record just

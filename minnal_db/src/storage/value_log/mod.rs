@@ -24,12 +24,12 @@
 //! ```text
 //! segment file:  [file header 16B] [record] [record] ...
 //!
-//! record:        [header 36B][value bytes][key bytes]
+//! record:        [header 32B][value bytes][key bytes]
 //!                 ^ rec_offset
 //! ```
 //!
 //! The value sits **before** the key deliberately: a reader knows `value_len` from
-//! the pointer, so a `get` is **one `pread` of exactly `36 + value_len` bytes**.
+//! the pointer, so a `get` is **one `pread` of exactly `32 + value_len` bytes**.
 //! Only GC needs the key, and it reads whole records sequentially anyway.
 //!
 //! # Liveness and garbage
@@ -76,6 +76,9 @@ pub enum ValueLogError {
     /// A single record cannot exceed one segment.
     #[error("value too large: a record of {record_len} bytes does not fit in a {segment_size}-byte segment")]
     ValueTooLarge { record_len: u64, segment_size: u64 },
+    /// A segment file on disk was written in another format (or is not a segment).
+    #[error("value-log segment {path} has format {found}, expected {expected}")]
+    UnsupportedSegmentFormat { path: String, found: String, expected: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, ValueLogError>;
@@ -114,7 +117,10 @@ pub fn validate_segment_size(segment_size: u64) -> Result<()> {
 // ── On-disk formats ────────────────────────────────────────────────────────
 
 const SEGMENT_MAGIC: [u8; 4] = *b"VSG1";
-const SEGMENT_FORMAT_VERSION: u32 = 1;
+/// Bumped whenever the segment or record layout changes. Open refuses a segment
+/// written in another format: read with this layout, its records would not parse,
+/// and the tail repair would truncate them away.
+const SEGMENT_FORMAT_VERSION: u32 = 2;
 /// magic(4) + version(4) + segment_id(4) + reserved(4)
 const SEGMENT_HEADER_SIZE: u64 = 16;
 
@@ -164,8 +170,6 @@ pub struct ValueLocation {
 /// Per-record metadata that is not the value itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueRecordMeta {
-    /// Per-key version counter, incremented on each overwrite.
-    pub version: u32,
     /// Creation time in Unix millis. TTL expiry reads this straight from the record.
     pub epoch: u64,
     /// The global write sequence that produced this record. GC preserves it when it
@@ -212,11 +216,10 @@ fn record_end(loc: ValueLocation) -> u64 {
     loc.rec_offset as u64 + ValueRecordHeader::SIZE as u64 + loc.value_len as u64
 }
 
-/// 36 bytes, followed by the value bytes and then the key bytes.
+/// 32 bytes, followed by the value bytes and then the key bytes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValueRecordHeader {
     total_len: u32,
-    version: u32,
     epoch: u64,
     seq: u64,
     key_len: u32,
@@ -226,7 +229,7 @@ pub(crate) struct ValueRecordHeader {
 }
 
 impl ValueRecordHeader {
-    pub(crate) const SIZE: usize = 36;
+    pub(crate) const SIZE: usize = 32;
 
     pub(crate) fn record_len(key_len: usize, value_len: usize) -> u64 {
         Self::SIZE as u64 + key_len as u64 + value_len as u64
@@ -235,12 +238,11 @@ impl ValueRecordHeader {
     fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut out = [0u8; Self::SIZE];
         out[0..4].copy_from_slice(&self.total_len.to_le_bytes());
-        out[4..8].copy_from_slice(&self.version.to_le_bytes());
-        out[8..16].copy_from_slice(&self.epoch.to_le_bytes());
-        out[16..24].copy_from_slice(&self.seq.to_le_bytes());
-        out[24..28].copy_from_slice(&self.key_len.to_le_bytes());
-        out[28..32].copy_from_slice(&self.value_len.to_le_bytes());
-        out[32..36].copy_from_slice(&self.checksum.to_le_bytes());
+        out[4..12].copy_from_slice(&self.epoch.to_le_bytes());
+        out[12..20].copy_from_slice(&self.seq.to_le_bytes());
+        out[20..24].copy_from_slice(&self.key_len.to_le_bytes());
+        out[24..28].copy_from_slice(&self.value_len.to_le_bytes());
+        out[28..32].copy_from_slice(&self.checksum.to_le_bytes());
         out
     }
 
@@ -249,12 +251,11 @@ impl ValueRecordHeader {
             return None;
         }
         let total_len = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-        let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-        let epoch = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-        let seq = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
-        let key_len = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
-        let value_len = u32::from_le_bytes(bytes[28..32].try_into().ok()?);
-        let checksum = u32::from_le_bytes(bytes[32..36].try_into().ok()?);
+        let epoch = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
+        let seq = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+        let key_len = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
+        let value_len = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
+        let checksum = u32::from_le_bytes(bytes[28..32].try_into().ok()?);
         // The length must agree with its parts, or these bytes are not a record
         // header — a torn tail, or a pointer into the middle of a record.
         if total_len as u64 != Self::record_len(key_len as usize, value_len as usize) {
@@ -262,7 +263,6 @@ impl ValueRecordHeader {
         }
         Some(Self {
             total_len,
-            version,
             epoch,
             seq,
             key_len,
@@ -273,7 +273,6 @@ impl ValueRecordHeader {
 
     fn meta(&self) -> ValueRecordMeta {
         ValueRecordMeta {
-            version: self.version,
             epoch: self.epoch,
             seq: self.seq,
         }
@@ -488,6 +487,31 @@ impl ValueLog {
         name.strip_prefix(&format!("value_log_{bucket}.seg"))?.parse::<u32>().ok()
     }
 
+    /// Refuse a segment written in another format. A file shorter than the
+    /// segment header holds no records (a crash between creating it and writing
+    /// the header), so there is nothing to misread and it is let through.
+    fn check_segment_format(path: &Path, len: u64) -> Result<()> {
+        if len < SEGMENT_HEADER_SIZE {
+            return Ok(());
+        }
+        let mut header = [0u8; 8];
+        read_exact_or_corrupt(&File::open(path)?, &mut header, 0)?;
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if header[0..4] != SEGMENT_MAGIC || version != SEGMENT_FORMAT_VERSION {
+            let found = if header[0..4] == SEGMENT_MAGIC {
+                version.to_string()
+            } else {
+                "unknown (bad magic)".to_string()
+            };
+            return Err(ValueLogError::UnsupportedSegmentFormat {
+                path: path.display().to_string(),
+                found,
+                expected: SEGMENT_FORMAT_VERSION,
+            });
+        }
+        Ok(())
+    }
+
     fn write_segment_header(file: &File, id: u32) -> Result<()> {
         let mut header = [0u8; SEGMENT_HEADER_SIZE as usize];
         header[0..4].copy_from_slice(&SEGMENT_MAGIC);
@@ -549,6 +573,7 @@ impl ValueLog {
                 continue;
             };
             let len = entry.metadata()?.len();
+            Self::check_segment_format(&entry.path(), len)?;
             on_disk.insert(id, len.saturating_sub(SEGMENT_HEADER_SIZE));
         }
 
@@ -827,7 +852,6 @@ impl ValueLog {
 
         let header = ValueRecordHeader {
             total_len: record_len as u32,
-            version: meta.version,
             epoch: meta.epoch,
             seq: meta.seq,
             key_len: key.len() as u32,
@@ -956,7 +980,7 @@ impl ValueLog {
         self.parse_record(&buf, location)
     }
 
-    /// The record's metadata only — a 36-byte read. TTL expiry uses it for `epoch`.
+    /// The record's metadata only — a 32-byte read. TTL expiry uses it for `epoch`.
     pub fn read_record_meta(&self, location: ValueLocation) -> Result<ValueRecordMeta> {
         if location.segment_id == 0 {
             return Err(ValueLogError::InvalidLocation);
@@ -1323,7 +1347,6 @@ mod tests {
 
     fn meta(seq: u64) -> ValueRecordMeta {
         ValueRecordMeta {
-            version: 1,
             epoch: 1_700_000_000_000,
             seq,
         }
@@ -1332,6 +1355,34 @@ mod tests {
     /// Unsynced appends are tracked until something makes them durable: `sync`,
     /// an append with `sync = true`, or sealing the segment (which fsyncs it, so
     /// only the fresh tail can hold unsynced bytes afterwards).
+    /// A segment written in another format must stop the open, not be read with
+    /// this layout: its records would fail to parse, and the tail repair would
+    /// truncate the segment to its header. A file too short to hold a header has
+    /// no records to misread and still opens.
+    #[test]
+    fn open_refuses_a_segment_in_another_format() -> Result<()> {
+        let dir = TempDir::new()?;
+        let id = {
+            let log = ValueLog::open(dir.path(), 0, SEG)?;
+            log.append(b"k", &[7u8; 100], meta(1), true)?;
+            log.inner.read().active_id
+        };
+        let path = ValueLog::segment_path(dir.path(), 0, id);
+        let len = std::fs::metadata(&path)?.len();
+        let file = OpenOptions::new().write(true).open(&path)?;
+        file.write_all_at(&(SEGMENT_FORMAT_VERSION - 1).to_le_bytes(), 4)?;
+        drop(file);
+
+        let err = ValueLog::open(dir.path(), 0, SEG).err().expect("an older format must not open");
+        assert!(matches!(err, ValueLogError::UnsupportedSegmentFormat { .. }), "{err}");
+        assert_eq!(std::fs::metadata(&path)?.len(), len, "the refused segment must be left untouched");
+
+        let fresh = TempDir::new()?;
+        File::create(ValueLog::segment_path(fresh.path(), 0, 1))?;
+        ValueLog::open(fresh.path(), 0, SEG)?;
+        Ok(())
+    }
+
     #[test]
     fn unsynced_bytes_track_what_a_power_loss_could_take() -> Result<()> {
         let dir = TempDir::new()?;
