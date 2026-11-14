@@ -53,9 +53,9 @@ def steps():
     snap("GC reads segment 12 with no lock held. Each record stores its key, so one batched LSM lookup finds k1 and k4 live.", GREY, 1)
     seg[14][1] += [["k1", MOVED], ["k4", MOVED]]; mark(12, "k1", GARBAGE); mark(12, "k4", GARBAGE)
     lsm["k1"] = lsm["k4"] = "seg 14"
-    snap("Under the bucket lock, k1 and k4 are appended to the tail and re-pointed, each only if it still points at segment 12.", BLUE, 2)
+    snap("Under the bucket lock, k1 and k4 move to the tail and are re-pointed (same sequence), each only if still at segment 12.", BLUE, 2)
     snap("The reader uses its old pointer and gets k1's own value from segment 12. The pointer is stale, not wrong.", GREEN, 2,
-         ("ok", "reads segment 12: k1's own value, same version"))
+         ("ok", "reads segment 12: k1's own value, the same write"))
     snap("A memtable flush makes the re-pointed entries durable in an SSTable.", GREY, 3)
     seg[12][0] = "deleted"
     snap("Only now is segment 12 deleted. A crash at any earlier step leaves every pointer on a file that exists.", GREY, 4)

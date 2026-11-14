@@ -142,7 +142,7 @@ Data moves through three levels, from fast-and-volatile to slow-and-durable — 
 
 ![Animated diagram of the LSM tiers: keys land in the in-memory MemTable, which is sealed and flushed to an L0 file when it fills; accumulated L0 files are merge-sorted by background compaction into one sorted L1 SSTable per bucket, collapsing duplicate keys and dropping tombstoned ones](docs/lsm-tiers.svg)
 
-A write first lands in the in-memory **MemTable** (a skip list). At 95% capacity it is sealed read-only, a fresh MemTable takes over writes, and the sealed one is flushed to disk as an **L0 file** for the relevant bucket. L0 files accumulate and *overlap* — the same key can appear in several of them — so a background worker periodically merge-sorts a bucket's L0 files together with its L1 file into a single, sorted **L1 SSTable**. That merge is where the tree shrinks: duplicate versions of a key collapse to the newest one, and a tombstone drops the key entirely, so L1 holds fewer entries than the inputs it was built from.
+A write first lands in the in-memory **MemTable** (a skip list). At 95% capacity it is sealed read-only, a fresh MemTable takes over writes, and the sealed one is flushed to disk as an **L0 file** for the relevant bucket. L0 files accumulate and *overlap* — the same key can appear in several of them — so once a bucket's L0 files hold 10% as many entries as its L1 file, or number 8, a background worker merge-sorts them together with that L1 file into a single, sorted **L1 SSTable**. That merge is where the tree shrinks: duplicate versions of a key collapse to the newest one, and a tombstone drops the key entirely, so L1 holds fewer entries than the inputs it was built from.
 
 Because the same key can exist in several tiers at once, a read must decide which copy is current. It does that by **write sequence, not by layer order**:
 
@@ -150,7 +150,7 @@ Because the same key can exist in several tiers at once, a read must decide whic
 2. **Full resolution.** Otherwise, gather the key's entry from *every* layer — the active MemTable, each sealed read-only MemTable, the bucket's L0 files, and its L1 SSTable — and keep the one with the **highest sequence**. A tombstone winning means "not found".
 3. Follow the winning pointer into the value log to fetch the actual bytes.
 
-Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
+Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. L0 files are also ordered by when they were flushed, and sealed MemTables can finish flushing out of order. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
 
 Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash of their first 8 bytes**, so any given lookup only ever touches one bucket's L1 file — a single 1/8th-sized slice of the data rather than the whole tree.
 
@@ -161,7 +161,7 @@ Two details make this efficient. First, each LSM entry stores its key alongside 
 The MemTable — the in-memory tier of every LSM tree — is a custom **arena-allocated skip list** tuned for CPU cache efficiency. Rather than allocating each node on the heap (which scatters related data across memory), it packs everything into three flat, contiguous buffers:
 
 ```
-nodes[]   — Node structs (height, key_offset, key_len, value, tombstone, seq)
+nodes[]   — Node structs (height, key_offset, key_len, key_prefix, value, tombstone, seq)
 keys[]    — Raw key bytes, packed contiguously (nodes index by offset+len)
 links[]   — Forward pointer arrays (u32 node indices, packed per-node)
 ```
@@ -185,7 +185,7 @@ The structure's other properties:
 
 - Up to **32 levels**, with probabilistic height assignment.
 - Up to **100,000 entries** by default (configurable), flushing at **95% capacity**.
-- **Tombstones are counted separately** from live entries, and capacity is measured against live entries only.
+- **Tombstones count toward capacity** just as live entries do (each is tracked in its own counter), so a delete frees no room. The table is also sealed early if its arenas could not fit one more full-height node with a 256-byte key, or any arena reaches half its `u32` index range.
 - Key ordering uses **SIMD-accelerated byte comparison** — AVX-512/AVX2 on x86_64, NEON on Apple Silicon (see [SIMD coverage by architecture](#simd-coverage-by-architecture)). Bucket assignment uses a separate, also SIMD-accelerated hash of the key prefix.
 - Every node carries its write's **`u64` sequence number** — the same global number the WAL and SSTables use — which is what resolves two writes to the same key.
 
@@ -220,13 +220,13 @@ The header holds `total_len`, `epoch_ms`, the write `seq`, `key_len`, `value_len
 
 Two details in there earn their keep. The **value sits before the key** in the record, and the pointer **carries `value_len`** — so reading a value is **one `pread` of exactly `32 + value_len` bytes**. There is no page header to consult and no slot directory to walk. And the **key is stored in the record**, which is what lets GC decide what a segment still owes without inverting the entire LSM (see below).
 
-Every record also carries an **`epoch_ms` timestamp**. This is what makes TTL cheap: the TTL worker reads a record's creation time straight from its 32-byte header, without touching the value or the LSM.
+Every record also carries an **`epoch_ms` timestamp**. This is what lets TTL skip the values: the TTL worker walks the LSM's keys and pointers and reads each record's creation time straight from its 32-byte header, never the value bytes.
 
 #### Writes, deletes, and garbage
 
 Writes only ever append, which turns all value writes into sequential I/O — exactly what SSDs and NVMe drives are fastest at. Nothing is ever rewritten in place, and — unlike most log-structured stores — **records carry no tombstone or "superseded" flags at all**. The LSM is the sole authority on what is live.
 
-So an update appends a *new* record and a delete writes an LSM tombstone; in both cases the displaced record is simply **added to its segment's garbage counter**. That accounting costs **zero I/O**: the writer already holds the old pointer, and the pointer carries `value_len`, so the record's size is known without reading it. (The alternative — flipping a flag inside the old record — is a read-modify-write of a header at a random, possibly-cold offset on *every* overwrite and delete, and it cannot work at all when the record lives in a sealed, immutable segment.)
+So an update appends a *new* record and a delete writes an LSM tombstone; in both cases the displaced record is simply **added to its segment's garbage counter**. That accounting costs no value-log I/O: before writing, the writer looks the key up in the LSM (it needs the current entry anyway, to tell whether its own write is the newest and to update field indexes), so it holds the old pointer, and the pointer carries `value_len`, so the record's size is known without reading it. (The alternative — flipping a flag inside the old record — is a read-modify-write of a header at a random, possibly-cold offset on *every* overwrite and delete, and it cannot work at all when the record lives in a sealed, immutable segment.)
 
 #### Garbage collection
 
@@ -234,7 +234,7 @@ GC's unit is a **segment**, never the whole bucket:
 
 1. **Pick** the sealed segments whose garbage ratio is over the per-segment selection bar, worst first. The active tail is never a candidate.
 2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so GC looks all of the segment's keys up in the LSM in one batched lookup: a record survives if the LSM still points at exactly this location.
-3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. The re-insert preserves the key's existing sequence, so relocating a record never changes its version.
+3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. The re-insert keeps the key's existing sequence, so relocating a record never makes it look like a newer write.
 4. **Flush** the memtable to L0, making the re-point durable.
 5. **Unlink** the old segment file.
 
