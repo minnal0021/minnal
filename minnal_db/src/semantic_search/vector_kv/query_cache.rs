@@ -27,7 +27,7 @@ use crate::AsyncDb;
 /// flushed to disk, so a no-WAL tombstone lost to a crash before the next flush
 /// tick would resurrect an entry the operator explicitly cleared — and keep
 /// serving it until the TTL expires.
-const SYSTEM_QUERY_EMB_CACHE_NS: &str = "system_qemb_cache";
+pub(super) const SYSTEM_QUERY_EMB_CACHE_NS: &str = "system_qemb_cache";
 
 /// Maximum records the TTL worker will delete per pass.
 const QUERY_EMBEDDING_CACHE_MAX_DELETES: usize = 10_000;

@@ -189,10 +189,18 @@ async fn test_cache_populates_bypass_wal_and_clears_use_it() {
 
 /// Populate the cache and flush it to L0 — the state a long-running server
 /// is in once the periodic no-WAL flush tick has persisted cache entries.
+///
+/// Flushes the cache namespace unconditionally. The compaction worker's tick
+/// flushes no-WAL memtables too, and when it landed first the no-WAL flush
+/// found nothing left and returned 0, failing an assertion on that count about
+/// once in 200 runs; what the tests need is the entries on disk, whoever wrote
+/// them. A flush already running is waited for, not skipped.
 async fn populate_and_flush(db: &AsyncDb) {
     put_cached_query_embedding(db, MODEL, "q1", &[1.0f32, 0.0], TEST_TTL).await;
     put_cached_query_embedding(db, MODEL, "q2", &[0.0f32, 1.0], TEST_TTL).await;
-    assert!(db.coordinator_for_test().flush_no_wal_memtables() >= 1);
+    db.flush_namespaces(vec![query_cache::SYSTEM_QUERY_EMB_CACHE_NS.to_string()])
+        .await
+        .unwrap();
 }
 
 /// A clear must survive a graceful restart.
