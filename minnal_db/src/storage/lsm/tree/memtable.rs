@@ -126,7 +126,7 @@ impl LSMTree {
         let mut memtable = self.memtable.write();
         match memtable.skip_list.try_insert_with_seq(key, value, seq) {
             Ok(applied) => Ok(applied),
-            Err(crate::storage::lsm::skip_list::skip_list::InsertError::CapacityExceeded) => Err(LSMError::CapacityExceeded),
+            Err(crate::storage::lsm::skip_list::InsertError::CapacityExceeded) => Err(LSMError::CapacityExceeded),
         }
     }
 
@@ -149,7 +149,7 @@ impl LSMTree {
         // Honours the sequence guard: a newer write to this key is left untouched.
         match memtable.skip_list.insert_tombstone_with_seq(key, seq) {
             Ok(applied) => Ok(applied),
-            Err(crate::storage::lsm::skip_list::skip_list::InsertError::CapacityExceeded) => Err(LSMError::CapacityExceeded),
+            Err(crate::storage::lsm::skip_list::InsertError::CapacityExceeded) => Err(LSMError::CapacityExceeded),
         }
     }
 

@@ -16,7 +16,7 @@
 
 use super::bloom::BloomFilter;
 use super::manifest::{LsmManifest, ManifestBucket, ManifestFile, ManifestLevel};
-use super::skip_list::skip_list::{KeyValueRecord, SkipList};
+use super::skip_list::{KeyValueRecord, SkipList};
 use super::sparse_index::SparseIndex;
 pub(crate) use super::version::Version;
 use crate::support::{get_bucket_for_key, key_prefix_of, prefix_upper_bound};
@@ -57,7 +57,7 @@ use level0::*;
 use scan_merge::*;
 use sstable::*;
 
-pub(crate) use super::skip_list::skip_list::Applied;
+pub(crate) use super::skip_list::Applied;
 use displaced::DisplacedCollector;
 pub(crate) use displaced::{Displaced, DisplacedSink};
 
