@@ -281,7 +281,7 @@ A segment is **sealed** with the end marker, and fsynced, before the next one is
 
 A **position** in either log is `(segment_id << 32) | byte`, so the segment size is not encoded in positions: it can change from one start to the next (`wal.segment_size_bytes`, at most 4 GiB; a record must fit one segment). The admin API shows positions as `{segment_id, byte}`.
 
-The **`sequence` number** is what keeps recovery correct. It is allocated under the WAL append lock, so it always matches the order entries were written to disk. On recovery, MinnalDB sorts every eligible entry by sequence and replays them in that one global order — so the last write to any key wins after a crash just as it did before.
+The **`sequence` number** is what keeps recovery correct. It is allocated under the WAL append lock, so it always matches the order entries were written to disk. On recovery, MinnalDB sorts every eligible entry by sequence and replays them in that one global order, applying each only if it is newer than the key's current copy — so the last write to any key wins after a crash just as it did before.
 
 The WAL knows how far it is no longer needed through its **cut**: every entry below that position is safely in an L0 or L1 SSTable on disk. Each namespace also has a **safe offset** — all of *its* entries below it are in SSTables — which can be ahead of the cut (the cut is the slowest namespace's). Both are kept in the WAL metadata file, saved by the flush that moves them, before the flush's L0 files become readable. Recovery replays each namespace's entries from its own safe offset (or the cut), and nothing below.
 
@@ -633,8 +633,8 @@ LSM compaction runs when a memtable fills (95% capacity) or on the compaction wo
 
 1. The active MemTable is sealed, becoming a read-only table.
 2. A background worker flushes that sealed table to per-bucket L0 files.
-3. All of a bucket's L0 files are merge-sorted into a new L1 SSTable.
-4. The old L0 files are removed only once every in-flight read has finished with them, so a concurrent read is never pulled out from under.
+3. All of a bucket's L0 files are merge-sorted into a new L1 SSTable; for a key in several, the newest file's copy is kept, and a tombstone drops the key. The new file's header records the newest L0 file merged into it.
+4. The old L0 files are removed oldest first, each only once every in-flight read has finished with it, so a concurrent read is never pulled out from under. If a crash comes before they are all gone, the next open deletes every L0 file the bucket's L1 header says is already merged, rather than reading it again.
 
 The [LSM tier animation](#lsm-tree) walks through a full cycle of this — flush, accumulate, merge — including how duplicate keys and tombstones make L1 smaller than the files it was built from.
 

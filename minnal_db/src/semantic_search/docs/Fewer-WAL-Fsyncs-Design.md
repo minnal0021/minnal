@@ -47,10 +47,10 @@ The ones this note leans on most:
   back what the closure returns (or delete the key, or write nothing). `merge`
   logs the result in the main WAL; `merge_no_wal` (Part 1) is the same with no
   log entry.
-- **Sequence (seq)** — the global write counter every write draws from,
-  whichever log it uses. The highest seq for a key wins everywhere: memtable,
-  L0, L1, and replay of either log, which re-applies each record with its
-  original seq.
+- **Sequence (seq)** — the global write counter every user write draws from,
+  whichever log it uses. A newer layer always holds a newer copy of a key, and
+  replay of either log re-applies a record with its original seq only if it is
+  newer than the key's current copy (`minnal_db/docs/Layer-Order-Design.md`).
 - **Key stripe lock** (`kv_store/key_locks.rs`) — 1,024 locks per namespace, each key hashed to one
   (its *stripe*). Every write takes its key's stripe first. `merge` holds it
   across its read, its closure and its write, which is what makes a conditional

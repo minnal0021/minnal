@@ -132,6 +132,8 @@ impl LSMTree {
         }
         entries.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
 
+        // `l0_probes` counts lookups that read any L0 file, not files read.
+        let mut probed = false;
         for entry in entries {
             if entry.is_obsolete() {
                 continue;
@@ -142,8 +144,11 @@ impl LSMTree {
                 }
                 continue;
             }
-            if let Some(m) = self.metrics() {
-                Metrics::bump(&m.l0_probes);
+            if !probed {
+                probed = true;
+                if let Some(m) = self.metrics() {
+                    Metrics::bump(&m.l0_probes);
+                }
             }
             let _guard = L0ReadGuard::new(Arc::clone(&entry));
             match self.lookup_in_sstable_file_path(entry.path.clone(), key, entry.scan_start(key))? {

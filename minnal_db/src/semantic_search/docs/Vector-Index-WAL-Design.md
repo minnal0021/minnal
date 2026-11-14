@@ -27,9 +27,10 @@ The same terms, for both logs, are in `minnal_db/README.md` → *WAL terms*.
   value goes to the value log and the key's pointer goes to the memtable, with
   no log entry at all. The pointer exists only in memory until the memtable is
   flushed to a level-0 (L0) file.
-- **Sequence (seq)** — the global write counter every write draws from,
-  whichever log it uses; the highest seq for a key wins everywhere (memtable,
-  L0, L1, replay).
+- **Sequence (seq)** — the global write counter every user write draws from,
+  whichever log it uses. A newer layer always holds a newer copy of a key
+  (`minnal_db/docs/Layer-Order-Design.md`), and replay applies a record only
+  if it is newer than the key's current copy.
 - **Key stripe lock** (`kv_store/key_locks.rs`) — 1,024 locks per namespace, each key hashed to one
   (its *stripe*). Every write takes its key's stripe before anything else and
   holds it until the write is applied, so one key's writes apply in seq order
@@ -351,9 +352,9 @@ starts:
 3. Skip records whose namespace is no longer in the registry (dropped store or
    dropped vector index), as main-WAL recovery does.
 4. Replay each remaining record with its original seq (`replay_upsert`), which
-   writes the value to the value log again and the pointer to the memtable. The
-   memtable keeps the highest seq per key, so a replayed record never overrides a
-   newer write, from either log.
+   writes the value to the value log again and the pointer to the memtable —
+   only if the record is newer than the key's current copy in any layer, so a
+   replayed record never overrides a newer write, from either log or none.
 5. Raise the global seq counter above the highest seq in the vector index WAL, as it
    is raised above the main WAL and every SSTable (`set_seq_counter`). Without
    this, a new write could draw a seq below a replayed one and lose to it.
@@ -364,8 +365,9 @@ starts:
    tombstones. With the marker left behind, a second crash would replay a
    record whose delete that compaction erased, and the key would come back
    (`a_second_crash_does_not_bring_back_a_deleted_key`).
-7. Main-WAL recovery runs as it does now. Both logs replay with original seqs
-   into memtables that resolve by seq, so their relative order does not matter.
+7. Main-WAL recovery runs as it does now. Both logs replay with original seqs,
+   each record checked against the key's current copy, so their relative order
+   does not matter.
 
 If the marker names a position past the log's durable end, a power loss took
 records of a memtable that had already been written to L0: their data is safe
