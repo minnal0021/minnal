@@ -98,8 +98,7 @@ finds where something lives from file and folder names alone.
   file past the limit splits it in that change, by responsibility, with the moves
   in a commit of their own so the review sees no behaviour change mixed in.
 - **New code follows this from the start**, in every crate. Files already over
-  the limit (`storage/lsm/tree.rs`, `semantic_search/service/mod.rs` and about
-  twenty others) are split when they are next changed substantially, not all at
+  the limit (`semantic_search/service/mod.rs` and about twenty others) are split when they are next changed substantially, not all at
   once.
 - **Keep layering visible in the tree:** a lower module never imports a higher
   one (`kv_store` does not import `db`; `db` does not import `doc_store` or

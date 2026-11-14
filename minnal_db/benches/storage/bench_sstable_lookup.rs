@@ -10,7 +10,7 @@
 // it rejects a key outside the L1 min/max range, then one its bloom filter
 // rules out (an exact negative), then binary-searches the sparse index, so the
 // remaining linear scan covers ~SAMPLE_INTERVAL entries, not the whole file
-// (see its doc comment in `lsm/tree.rs`). This benchmark is the baseline that
+// (see `lookup_level1`'s doc comment in `lsm/tree/point_read.rs`). This benchmark is the baseline that
 // shows if any of those shortcuts stops working.
 //
 // L0 is deliberately NOT measured as its own tier: there is no public API
