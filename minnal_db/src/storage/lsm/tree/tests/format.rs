@@ -389,3 +389,72 @@ fn test_sstable_entry_codec_roundtrip_and_corruption() {
     // A truncated payload (shorter than the CRC word) is also rejected.
     assert!(matches!(verify_sstable_payload(&[0u8; 2]), Err(LSMError::Corruption(_))));
 }
+
+/// Open deletes every L0 file stamped at or below its bucket's L1
+/// `merged_through`, so that stamp is checksummed with the rest of the header.
+/// A flipped bit that raised it used to delete live L0 files at open (their WAL
+/// entries already retired) with nothing but an info log; now the open fails
+/// and every file is left where it is.
+#[test]
+fn a_damaged_merged_through_fails_the_open_and_deletes_nothing() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let mut config = test_lsm_config();
+    config.num_buckets = 1;
+    {
+        let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
+        lsm.insert_with_seq(b"merged", 0xAAAA, 1)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?;
+        lsm.insert_with_seq(b"live", 0xBBBB, 2)?;
+        lsm.flush_memtable_to_level0()?;
+    }
+    let l0_dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), 0);
+    let l0_files = || {
+        let mut names: Vec<_> = std::fs::read_dir(&l0_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        names
+    };
+    let before = l0_files();
+    assert!(!before.is_empty(), "setup: a live L0 file above L1");
+
+    // Raise `merged_through` (bytes 8..16) far above every stamp.
+    let l1 = LSMTree::level1_path_from(temp_dir.path(), 0);
+    let mut bytes = std::fs::read(&l1)?;
+    bytes[15] ^= 0x40;
+    std::fs::write(&l1, &bytes)?;
+
+    match LSMTree::open(temp_dir.path(), config) {
+        Err(LSMError::Corruption(msg)) => assert!(msg.contains("damaged header"), "{msg}"),
+        other => panic!("expected Corruption, got {:?}", other.map(|_| ())),
+    }
+    assert_eq!(l0_files(), before, "the open deleted an L0 file on a damaged stamp");
+    Ok(())
+}
+
+/// A `.dat` in a Level-0 directory that is not named by a flush stamp fails the
+/// open. Its stamp used to be taken from its mtime in milliseconds, a million
+/// times smaller than any real stamp, so open deleted it as already merged.
+#[test]
+fn a_level0_file_not_named_by_a_stamp_fails_the_open() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    {
+        let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+        lsm.insert_with_seq(b"k", 0xBBBB, 2)?;
+        lsm.flush_memtable_to_level0()?;
+        lsm.compact_all()?;
+        lsm.insert_with_seq(b"k", 0xCCCC, 3)?;
+        lsm.flush_memtable_to_level0()?;
+    }
+    let bucket = get_bucket_for_key(b"k", crate::support::TEST_NUM_BUCKETS);
+    let dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), bucket);
+    let file = std::fs::read_dir(&dir)?.next().expect("setup: an L0 file")?.path();
+    let renamed = dir.join("copied-by-hand.dat");
+    std::fs::rename(&file, &renamed)?;
+
+    match LSMTree::open(temp_dir.path(), test_lsm_config()) {
+        Err(LSMError::Corruption(msg)) => assert!(msg.contains("not named by a flush stamp"), "{msg}"),
+        other => panic!("expected Corruption, got {:?}", other.map(|_| ())),
+    }
+    assert!(renamed.exists(), "the open deleted the file");
+    Ok(())
+}

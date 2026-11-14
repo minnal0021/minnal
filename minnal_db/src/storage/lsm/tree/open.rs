@@ -87,9 +87,9 @@ impl LSMTree {
 
         let level0_files: Vec<Arc<RwLock<Vec<Arc<L0FileEntry>>>>> = (0..num_buckets).map(|_| Arc::new(RwLock::new(Vec::new()))).collect();
 
-        // L0 is newer than L1, so its sequences must be folded into the read
-        // fast-path bound too — otherwise the bound (L1-only above) is too low
-        // after a restart and a low-seq active entry could wrongly short-circuit.
+        // L0 holds seqs L1 does not, so they are folded into the bound on
+        // stored seqs too: the sequence counter starts above it after a restart
+        // (`KVStore::set_seq_counter`).
         if let Some(seq) = Self::load_existing_level0_files(&base_path, &level0_files, &merged_through)?
             && max_stored_seq_init.is_none_or(|m| seq_newer(seq, m))
         {
@@ -191,18 +191,13 @@ impl LSMTree {
         Self::level0_dir_from(base_path).join(format!("level0_{}", bucket))
     }
 
-    pub(super) fn level0_created_at_from_path(path: &Path) -> u128 {
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("0");
-        let first = stem.split('_').next().unwrap_or("0");
-        if let Ok(ts) = first.parse::<u128>() {
-            return ts;
-        }
-        path.metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
+    /// The stamp a Level-0 file is named by (`{stamp}.dat`), or `None` for a
+    /// name that is not one. The stamp orders L0 reads and decides, against
+    /// L1's `merged_through`, whether open deletes the file, so it is never
+    /// guessed (from the file's mtime, say: milliseconds, a million times
+    /// smaller than any stamp, so such a file was always deleted as merged).
+    pub(super) fn level0_created_at_from_path(path: &Path) -> Option<u128> {
+        path.file_stem()?.to_str()?.parse::<u128>().ok()
     }
 
     /// Scan an on-disk Level-0 file at open (validating its header) and summarise
@@ -225,11 +220,9 @@ impl LSMTree {
     }
 
     /// Load the on-disk Level-0 files into the in-memory registry and return the
-    /// newest write sequence across all of them. The returned seq is folded into
-    /// `max_stored_seq` so the read fast path's bound covers L0 too — L0 is newer
-    /// than L1, so omitting it would leave the bound too low after a restart (a
-    /// low-seq active entry could then wrongly short-circuit above a higher-seq
-    /// L0 tombstone).
+    /// newest user seq across all of them, which `max_stored_seq` folds in: the
+    /// sequence counter must start above every stored seq after a restart
+    /// (`KVStore::set_seq_counter`), and L0 holds some L1 does not.
     ///
     /// A file stamped at or below its bucket's `merged_through` (from the L1
     /// file's header) is already in L1 — a crash came between the merge and the
@@ -273,7 +266,12 @@ impl LSMTree {
                             path.display()
                         )));
                     }
-                    let created_at = Self::level0_created_at_from_path(&path);
+                    let Some(created_at) = Self::level0_created_at_from_path(&path) else {
+                        return Err(LSMError::Corruption(format!(
+                            "Level-0 file {} is not named by a flush stamp; move it out of the directory",
+                            path.display()
+                        )));
+                    };
                     if created_at <= merged {
                         info!(
                             "removing Level-0 file {} already merged into Level 1 (a crash came before its deletion)",

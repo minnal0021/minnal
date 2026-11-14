@@ -9,6 +9,12 @@ impl LSMTree {
         *self.flush_observer.write() = observer;
     }
 
+    /// Test hook: the flush observer now set, to wrap in another.
+    #[cfg(test)]
+    pub(crate) fn flush_observer(&self) -> Option<Arc<dyn LsmFlushObserver>> {
+        self.flush_observer.read().clone()
+    }
+
     pub(super) fn notify_memtable_sealed(&self, version: u64) {
         if let Some(observer) = self.flush_observer.read().as_ref() {
             observer.on_memtable_sealed(version);

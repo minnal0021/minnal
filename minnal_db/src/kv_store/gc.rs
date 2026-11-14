@@ -24,6 +24,37 @@ struct Survivor {
     old_pointer: u128,
 }
 
+/// Most survivors phase 2 relocates under one hold of the bucket lock.
+const RELOCATION_BATCH_RECORDS: usize = 1024;
+/// Most survivor value bytes phase 2 relocates under one hold of the bucket
+/// lock (and holds in memory). With 256 MiB segments relocated under one hold,
+/// the worst write during a GC pass took 193–195 ms; batched, 24–29 ms, for
+/// about 10% less GC throughput (`docs/Layer-Order-Design.md` → *What it costs*).
+const RELOCATION_BATCH_BYTES: usize = 1024 * 1024;
+
+/// Survivors found by phase 1, waiting for phase 2.
+#[derive(Default)]
+struct RelocationBatch {
+    survivors: Vec<Survivor>,
+    bytes: usize,
+}
+
+impl RelocationBatch {
+    fn push(&mut self, survivor: Survivor) {
+        self.bytes += survivor.key.len() + survivor.value.len();
+        self.survivors.push(survivor);
+    }
+
+    fn is_full(&self) -> bool {
+        self.survivors.len() >= RELOCATION_BATCH_RECORDS || self.bytes >= RELOCATION_BATCH_BYTES
+    }
+
+    fn take(&mut self) -> Vec<Survivor> {
+        self.bytes = 0;
+        std::mem::take(&mut self.survivors)
+    }
+}
+
 impl KVStore {
     /// GC one bucket: rewrite the survivors of its worst segments, and hand back the
     /// segments that become safe to unlink *once the re-point is durable*.
@@ -34,13 +65,16 @@ impl KVStore {
     /// proportional to the segment rather than to the whole bucket or the whole key
     /// set. The segment is sealed and immutable, so nothing can change it under us.
     ///
-    /// **Phase 2 (bucket lock):** relocate each survivor as a **compare-and-set** —
-    /// append it to the active tail and update the LSM only if the key *still* maps
-    /// to the old location. Phase 1 runs without the lock, so a key deleted since
-    /// then must stay deleted and one overwritten since then must keep its newer
-    /// value. The copy keeps the write's user seq and takes the next system seq
-    /// ([`Version::next_system`]): newer than the copy it replaces, older than any
-    /// user write to come.
+    /// **Phase 2 (bucket lock, per batch):** relocate each survivor as a
+    /// **compare-and-set** — append it to the active tail and update the LSM only
+    /// if the key *still* maps to the old location. Phase 1 runs without the
+    /// lock, so a key deleted since then must stay deleted and one overwritten
+    /// since then must keep its newer value. The copy keeps the write's user seq
+    /// and takes the next system seq ([`Version::next_system`]): newer than the
+    /// copy it replaces, older than any user write to come. Survivors are
+    /// relocated in batches as pass B finds them ([`relocate_batch`](Self::relocate_batch)),
+    /// so the lock is released between batches and only one batch of values is
+    /// in memory.
     ///
     /// The old segment is deliberately **not** unlinked here — see
     /// [`garbage_collect_with_threshold`](Self::garbage_collect_with_threshold).
@@ -91,7 +125,7 @@ impl KVStore {
             // only, pass B re-reads to materialise just the survivors' values.
             // That trades random LSM lookups for one extra sequential read of a
             // file we are about to rewrite anyway, and keeps peak memory at
-            // keys + survivors rather than the whole segment.
+            // keys + one batch of survivors rather than the whole segment.
             // Pass A: the distinct keys this segment holds.
             let keys: Vec<Vec<u8>> = {
                 let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -109,71 +143,45 @@ impl KVStore {
                 .filter_map(|(key, found)| found.map(|(pointer, _seq)| (key.as_slice(), pointer)))
                 .collect();
 
-            // Pass B: keep only the records the LSM still points at.
+            // Pass B: keep only the records the LSM still points at, and
+            // relocate them in batches as they are found (phase 2), so neither
+            // the bucket lock nor memory is held for a whole segment.
             //
             // Note this yields at most ONE survivor per key: two records for the
             // same key in this segment have different locations, so only the one
             // whose pointer matches can match. Phase 2 relies on that.
-            let mut survivors: Vec<Survivor> = Vec::new();
+            let mut batch = RelocationBatch::default();
+            let mut exhausted: Vec<Survivor> = Vec::new();
+            let mut failed: Option<KVError> = None;
             log.for_each_record(segment.id, |key, value, meta, location| {
+                if failed.is_some() {
+                    return;
+                }
                 let Ok(pointer) = ShardedValuePointer::new(bucket, location, self.value_log.num_buckets()) else {
                     return;
                 };
                 let old_u128 = pointer.to_u128();
                 // Live iff the LSM still points at exactly this record.
-                if live.get(key) == Some(&old_u128) {
-                    survivors.push(Survivor {
-                        key: key.to_vec(),
-                        value,
-                        epoch: meta.epoch,
-                        old_pointer: old_u128,
-                    });
+                if live.get(key) != Some(&old_u128) {
+                    return;
+                }
+                batch.push(Survivor {
+                    key: key.to_vec(),
+                    value,
+                    epoch: meta.epoch,
+                    old_pointer: old_u128,
+                });
+                if batch.is_full() {
+                    match self.relocate_batch(bucket, batch.take(), &mut exhausted) {
+                        Ok(bytes) => result.bytes_rewritten += bytes,
+                        Err(e) => failed = Some(e),
+                    }
                 }
             })?;
-
-            // ── Phase 2: relocate survivors, re-point by compare-and-set ──────
-            //
-            // A copy is the same user write, moved: it keeps the current copy's
-            // user seq and takes the next system seq (`Version::next_system`).
-            // That makes it newer than the copy it replaces, so the newest layer
-            // still holds the newest version, and older than every user write to
-            // the key: a writer that drew its seq before GC and is waiting for
-            // the bucket lock wins whenever it lands. So GC takes no key stripe.
-            // A version whose system seq is used up (about four billion moves of
-            // one unchanged write) is re-pointed after the batch as a new user
-            // write, under its stripe.
-            let mut exhausted: Vec<&Survivor> = Vec::new();
-            {
-                let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
-
-                // Batched for the same reason as phase 1 — a per-survivor
-                // lookup pays the same full L0 scan, and here it is paid while
-                // holding the bucket write lock, which blocks every writer to
-                // this bucket (`put_to_storage` / `delete_from_storage` hold it
-                // across their value-log append *and* their LSM update).
-                //
-                // Still a compare-and-set: holding that lock excludes every
-                // writer's apply, so one batched read under it sees exactly what
-                // per-key reads under it would. The re-points below do mutate
-                // the LSM as we go, but survivors carry no duplicate keys (see
-                // phase 1), so no re-point can invalidate another's answer.
-                let survivor_keys: Vec<Vec<u8>> = survivors.iter().map(|s| s.key.clone()).collect();
-                let current = self.lsm.get_multiple(&survivor_keys)?;
-
-                for (survivor, current) in survivors.iter().zip(current) {
-                    let Some((pointer, version)) = current else {
-                        continue; // deleted since phase 1 — do not resurrect
-                    };
-                    if pointer != survivor.old_pointer {
-                        continue; // overwritten since phase 1 — do not revert
-                    }
-                    let Some(moved) = version.next_system() else {
-                        exhausted.push(survivor);
-                        continue;
-                    };
-                    result.bytes_rewritten += self.relocate_locked(bucket, survivor, moved)?;
-                }
+            if let Some(e) = failed {
+                return Err(e);
             }
+            result.bytes_rewritten += self.relocate_batch(bucket, batch.take(), &mut exhausted)?;
 
             // Stripe, then bucket (the write path's order), then the
             // compare-and-set again, and a fresh user seq drawn with the stripe
@@ -185,13 +193,64 @@ impl KVStore {
                     continue;
                 }
                 let version = Version::user(self.alloc_seq());
-                result.bytes_rewritten += self.relocate_locked(bucket, survivor, version)?;
+                result.bytes_rewritten += self.relocate_locked(bucket, &survivor, version)?;
             }
 
             result.pending_unlink.push(segment.id);
         }
 
         Ok(result)
+    }
+
+    /// Phase 2 for one batch of survivors: relocate each as a compare-and-set,
+    /// under **one short hold** of the bucket lock. Returns the bytes written.
+    ///
+    /// A copy is the same user write, moved: it keeps the current copy's user
+    /// seq and takes the next system seq (`Version::next_system`). That makes it
+    /// newer than the copy it replaces, so the newest layer still holds the
+    /// newest version, and older than every user write to the key: a writer that
+    /// drew its seq before GC and is waiting for the bucket lock wins whenever it
+    /// lands. So GC takes no key stripe. A version whose system seq is used up
+    /// (about four billion moves of one unchanged write) goes to `exhausted`, to
+    /// be re-pointed after the segment as a new user write, under its stripe.
+    ///
+    /// The lock is held per batch, not per segment: every writer to the bucket
+    /// waits while it is held (they hold it across their value-log append and
+    /// their LSM update), and a segment is up to `segment_size_bytes` (256 MiB
+    /// by default) of survivors. A batch is at most `RELOCATION_BATCH_RECORDS`
+    /// records or `RELOCATION_BATCH_BYTES` of values.
+    fn relocate_batch(&self, bucket: u32, batch: Vec<Survivor>, exhausted: &mut Vec<Survivor>) -> Result<u64> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(test)]
+        self.gc_relocation_batches.fetch_add(1, Ordering::Relaxed);
+        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+
+        // Batched for the same reason as phase 1: a per-survivor lookup pays a
+        // full L0 scan each. Still a compare-and-set: holding the lock excludes
+        // every writer's apply, so one batched read under it sees exactly what
+        // per-key reads under it would. The re-points below mutate the LSM as
+        // they go, but a segment yields one survivor per key (see phase 1), so
+        // no re-point can invalidate another's answer.
+        let keys: Vec<Vec<u8>> = batch.iter().map(|s| s.key.clone()).collect();
+        let current = self.lsm.get_multiple(&keys)?;
+
+        let mut written = 0;
+        for (survivor, current) in batch.into_iter().zip(current) {
+            let Some((pointer, version)) = current else {
+                continue; // deleted since phase 1 — do not resurrect
+            };
+            if pointer != survivor.old_pointer {
+                continue; // overwritten since phase 1 — do not revert
+            }
+            let Some(moved) = version.next_system() else {
+                exhausted.push(survivor);
+                continue;
+            };
+            written += self.relocate_locked(bucket, &survivor, moved)?;
+        }
+        Ok(written)
     }
 
     /// Copy `survivor` to the active tail and point its key at the copy, at

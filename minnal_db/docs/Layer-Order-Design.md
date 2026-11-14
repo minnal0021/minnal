@@ -29,7 +29,9 @@ can leave behind.
   a key hashes to one. Every user write holds its key's stripe from drawing its
   user seq until the write is in the memtable.
 - **Bucket lock** — the value-log bucket's write mutex, held across a write's
-  value-log append and its memtable insert.
+  value-log append, its memtable insert and its in-memory field-index change.
+  It is held for memory work only: nothing waits for I/O under it that it can
+  avoid (see *Holding the bucket lock* below).
 - **Replay** — re-applying a log's records at open, each at its original user
   seq: the main WAL's and the vector index WAL's records from each namespace's
   **safe offset**, the position below which its records are known to be in L0
@@ -69,9 +71,9 @@ key.
 
 Each namespace's `KVStore` owns its own 1,024 stripes (`KVStore::lock_key`),
 about 1 KiB per namespace, so a slow `merge` closure in one namespace never
-holds up writes to another. Reads, scans, GC and TTL take no stripe. The lock
-order is **key stripe → WAL → value-log bucket**, and nothing waits for a
-stripe while holding either of the others.
+holds up writes to another. Reads, scans, GC, TTL and field reindexing take no
+stripe. The lock order is **key stripe → WAL → value-log bucket → field index**,
+and nothing waits for a lock while holding one later in that order.
 
 ## System actions: GC and TTL expiry
 
@@ -89,9 +91,13 @@ into the active tail:
 
 1. **Find the survivors** (no lock): read the segment's keys, look them all up
    in one batch, keep each record the LSM still points at.
-2. **Re-point** (bucket lock): look the survivors up again in one batch, and for
-   each key that still points at the copied record, append the copy and insert
-   it at the current copy's next system version.
+2. **Re-point** (bucket lock, one batch at a time): look a batch of survivors
+   up again, and for each key that still points at the copied record, append
+   the copy and insert it at the current copy's next system version. A batch is
+   at most 1,024 records or 1 MiB of values, and the lock is released between
+   batches, so writers to the bucket wait for one batch, not for a segment (up
+   to `segment_size_bytes`, 256 MiB by default). Survivors are re-pointed as the
+   segment is read, so only one batch of values is in memory.
 3. **Flush** the memtable to L0, then **unlink** the old segment.
 
 The copy keeps the record's creation time (`epoch`), so TTL judges a value by
@@ -101,6 +107,38 @@ durable layers still point at the old segment, which still exists.
 **TTL expiry** (`kv_store/maintenance.rs`, `delete_if_current`) deletes a key
 only if it still points at the record judged expired, with a tombstone at that
 copy's next system version.
+
+## Field indexes follow the same order
+
+In a namespace with field indexes, a write also moves the key's row in each
+field's bitmaps, and those changes must land in the order the key's versions
+do: each is a change relative to the key's previous value (take the row out of
+the old value's bitmap, add it to the new one's). User writes are ordered by
+the stripe, but TTL expiry takes none, so every writer changes the index
+**under the bucket lock**, with its memtable insert. Changed after the lock, a
+TTL tombstone and a put of the same value racing it could apply the other way
+round: the put adds the row, then the expiry's removal takes it out again, and
+a live document is missing from every query on the field.
+
+The index change under the lock is in memory (the field's overlay). What can
+do I/O is left until the lock is released: a spill of a field the change took
+past the overlay budget's hard limit, and allocating a new key's row id (which
+can wait for a row-map flush) is done before the lock is taken.
+
+A field reindex (`KVStore::reindex_field`: repair, a new index's build) reads
+the key's value with no lock and sets its row by compare-and-set: under the
+bucket lock, only if the key still points at the record it read; otherwise it
+reads again.
+
+## Holding the bucket lock
+
+Every writer to a bucket, GC and TTL wait while one of them holds its lock, so
+it is released as early as possible: a holder does memory work and the
+lookups its compare-and-set needs, and leaves anything else for after the
+lock. GC re-points one batch per hold; a write's index spill runs after it.
+Two things still wait for I/O under it, both rare: sealing a full segment
+(one fsync of it and a directory fsync, once per segment) and a field index
+whose checkpoint holds the field's lock across an `msync`.
 
 A version's system seq is a `u32`: about four billion system actions on one
 unchanged write. A copy that has used them all is re-pointed or expired as a user
@@ -125,16 +163,25 @@ So `replay_upsert` and `replay_delete` check, under the bucket lock, whether the
 record is strictly newer than the key's current copy, tombstones included
 (`LSMTree::current_pointer_and_wins`). If not, the record is dropped: nothing is
 appended to the value log, no garbage is counted and no field index changes. An
-equal version is the same write, already stored.
+equal version is the same write, already stored, and its value is durable:
+every flush fsyncs the value log before it writes an L0 file
+(`SyncValueLogBeforePersist`), and open finds L0 files by listing their
+directories, so no L0 file on disk can point at a record a power loss took.
 
 Both logs keep their own files and replay as they do, the vector index WAL
 first; with the check, the order between them does not matter. One merged log
 was considered and rejected: every client write would then wait on fsyncs
 carrying bulky vector payloads, and it would not cover the no-WAL writes.
 
-The check cannot see tombstones that a merge into L1 dropped. The per-namespace
-safe offsets cover that case: a record is replayed only if no later write of its
-namespace has been retired (`WAL-Architecture.md`).
+The check cannot see tombstones that a merge into L1 dropped. For a logged
+delete the per-namespace safe offsets cover that case: a record is replayed
+only if no later write of its namespace has been retired, and the delete is a
+later record, replayed after it (`WAL-Architecture.md`). A TTL tombstone is in
+no log, and the argument is the flush order instead: the tombstone's L0 file
+becomes mergeable only after its flush saved the progress its seal recorded,
+and that seal's safe offset is past the expired put unless a write appended
+before the put was still not applied at the seal — a write whose apply took
+longer than the TTL itself.
 
 ## Memtables reach L0 in order
 
@@ -152,7 +199,10 @@ first. Read again at open, a merged file would sit above the L1 it was merged
 into, and an older one could hold an older copy of a key than L1 does (L1 having
 taken a newer copy from a later merge). So each L1 file records in its header
 the newest L0 stamp merged into it (`merged_through`), and the open deletes
-every L0 file stamped at or below it instead of reading it. A merge takes every
+every L0 file stamped at or below it instead of reading it. The header carries
+a CRC, and a damaged one fails the open: a raised `merged_through` would delete
+live L0 files. An L0 file whose name is not a stamp fails the open too, rather
+than being given one. A merge takes every
 file registered when it starts, and files register in stamp order, so those are
 exactly the merged files. A merge that leaves L1 empty writes a header-only
 file, so the stamp is kept. The open also starts new stamps above it, so a clock
@@ -167,12 +217,16 @@ second line of defence.
 
 A WAL-backed put or delete whose in-memory apply fails on every retry is durable
 but not readable: reads still see the value before it. The store records the
-key (`KVStore::note_unapplied_write`) until the next user write to it. A `merge`
-on such a key logs an ERROR naming the unapplied write's seq, reads the value it
-can see as the source of truth, and writes over it; its write is newer, so the
-unapplied one stays superseded after a crash too. GC and TTL never supersede it:
-their versions keep the older user seq, so replay applies the unapplied write
-over them.
+key (`KVStore::note_unapplied_write`) until a user write to it applies. A
+`merge` on such a key logs an ERROR naming the unapplied write's seq, reads the
+value it can see as the source of truth, and writes over it; its write is newer,
+so the unapplied one stays superseded after a crash too. A merge that aborts or
+writes nothing leaves the mark, and the next merge reports it again. GC and TTL
+never supersede it: their versions keep the older user seq, so if the
+unapplied record is replayed it applies over them. It is not always replayed:
+the barrier that holds a namespace's safe offset behind a write is released
+when the write returns, applied or not, so a later flush can retire it. The
+fail log is then the operator's record of it.
 
 ## Tests
 
@@ -197,26 +251,41 @@ the highest version.
 | `an_empty_merge_still_records_what_it_merged` | a merge that empties L1 loses its `merged_through` |
 | `a_merge_over_a_put_that_never_applied_keeps_the_value_it_read` | a failed apply is not recorded, or replay brings it back over the merge |
 | `a_held_stripe_does_not_block_writes_to_another_namespace` | stripes are shared between namespaces |
+| `an_l0_file_never_points_at_a_value_a_power_loss_could_take` | a flush writes an L0 file before the value log is fsynced |
+| `ttl_expiry_and_reindexing_racing_puts_keep_the_index_in_step` | an index change is made after the bucket lock, or a reindex sets its row unchecked |
+| `gc_releases_the_bucket_lock_between_batches_of_survivors` | GC re-points a whole segment under one hold of the lock |
+| `a_damaged_merged_through_fails_the_open_and_deletes_nothing` | the L1 header's CRC is not checked |
+| `an_aborted_merge_keeps_the_unapplied_marker` | a merge clears the unapplied mark before it writes |
 
-The GC, TTL, failed-apply and open-time deletion tests were checked by
-reverting each change: each revert fails at least one of them.
+The GC, TTL, failed-apply, open-time deletion, flush-fsync and index-order
+tests were checked by reverting each change: each revert fails at least one of
+them.
 
 ## What it costs
 
 GC and TTL take no lock beyond the bucket lock they always held, and a system
 version costs four bytes per memtable node and SSTable entry.
 `gc_cost_under_writers` (`db/database/tests/gc_cost.rs`, `#[ignore]`d; run in
-release with `TMPDIR` on a real disk) runs a GC pass over 300,000 keys of 1 KiB
-values in 4 MiB segments, alone and beside 8 writers doing WAL-backed puts of
-random keys. Three runs on NVMe:
+release with `TMPDIR` on a real disk, `GC_COST_SEGMENT_MIB` for the segment
+size) runs a GC pass over 300,000 keys of 1 KiB values, alone and beside 8
+writers doing WAL-backed puts of random keys. Two runs each on NVMe
+(2026-11-15), with the re-point batched as described above and, for
+comparison, with one hold of the bucket lock per segment:
 
-| | Result |
-|---|---|
-| GC alone, 720 MiB reclaimed | 497–500 MiB/s |
-| GC with writers, 632 MiB reclaimed | 457–467 MiB/s |
-| Writers during GC: p50 / p99 | 4.7 / 11.5–13.0 ms |
-| Writers during GC: p99.9 / max | 16.2–19.0 / 18.6–20.4 ms |
-| Writers without GC: p50 / p99 | 4.6 / 6.9–7.0 ms |
+| 256 MiB segments (the default) | One batch per hold | One segment per hold |
+|---|---|---|
+| GC alone | 730–735 MiB/s | 817–837 MiB/s |
+| GC with writers | 685–686 MiB/s | 764–766 MiB/s |
+| Writes completed during GC | 1,667–1,689/s | 1,299–1,324/s |
+| Writers during GC: p99 | 11.8–13.5 ms | 26.1–73.9 ms |
+| Writers during GC: p99.9 / max | 23.9–29.0 / 23.9–29.0 ms | 190–195 / 193–195 ms |
+| Writers without GC: p50 / p99 | 4.6 / 6.8–7.0 ms | 4.6 / 6.8–6.9 ms |
+
+With 4 MiB segments the two are close (writers' p99 during GC 10.1–12.9 ms
+batched, 10.2–19.7 ms per segment). Batching costs GC about a tenth of its
+throughput, one batched lookup per batch instead of per segment, and takes the
+worst write during a pass from the time to rewrite a segment to the time to
+rewrite a batch.
 
 A first-hit read and the seq-resolved read it replaced were measured on a tree
 with L1, six L0 files of overwrites, a read-only and an active memtable: first

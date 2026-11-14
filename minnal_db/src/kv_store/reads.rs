@@ -84,7 +84,7 @@ impl KVStore {
     /// when GC unlinks a segment in the exact window between resolving the pointer and
     /// reading it, so in practice it succeeds first time; the cap only bounds the
     /// pathological case of GC churning one bucket continuously.
-    const MAX_READ_ATTEMPTS: usize = 8;
+    pub(super) const MAX_READ_ATTEMPTS: usize = 8;
 
     /// Get a value by key.
     ///

@@ -138,7 +138,7 @@ impl LSMTree {
     /// stay readable), but never at or below any stamp already issued or on disk.
     ///
     /// L0 file order is layer order: a newer file must hold newer versions than an
-    /// older one (`docs/Layer-Order-Design.md`), and it breaks exact seq ties.
+    /// older one (`docs/Layer-Order-Design.md`): reads stop at the first copy.
     /// Ordered by raw wall time, a clock that steps backwards (NTP, a VM or WSL
     /// resume) between two flushes would put the newer memtable's files *first*.
     /// Stamps are taken after the per-memtable flush lock, and memtables flush in
@@ -197,6 +197,24 @@ impl LSMTree {
             .collect();
         let l1_files: Vec<Arc<File>> = (0..num_buckets).map(|bucket| self.sstable_files[bucket].read().clone()).collect();
         (l0_guards, l1_files)
+    }
+
+    /// Read guards on `bucket`'s live (not yet merged) L0 files, newest first,
+    /// taken **under the registry's read lock**. Cleanup takes a merged file off
+    /// the registry under its write lock and only when no reader holds it, so a
+    /// file found live here cannot be unlinked before the caller reads it.
+    /// Checked and guarded from an unlocked snapshot instead, a merge and its
+    /// cleanup could land between the check and the guard, and the read then
+    /// failed with `NotFound`.
+    pub(super) fn live_level0_guards(&self, bucket: u32) -> Vec<L0ReadGuard> {
+        let mut guards: Vec<L0ReadGuard> = self.level0_files[bucket as usize]
+            .read()
+            .iter()
+            .filter(|e| !e.is_obsolete())
+            .map(|e| L0ReadGuard::new(Arc::clone(e)))
+            .collect();
+        guards.sort_by_key(|g| std::cmp::Reverse(g.entry.created_at_ms));
+        guards
     }
 
     pub(super) fn level0_entries_snapshot(&self, bucket: u32) -> Vec<Arc<L0FileEntry>> {

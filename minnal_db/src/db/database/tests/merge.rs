@@ -564,4 +564,20 @@ mod merge_tests {
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"applied".as_slice()));
         db.crash();
     }
+
+    /// Only a write that applies supersedes the unapplied one. A merge that
+    /// aborts writes nothing, so the key is still stale and the next merge must
+    /// report it too; the merge used to clear the mark before its closure ran.
+    #[test]
+    fn an_aborted_merge_keeps_the_unapplied_marker() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let store = db.get_store(NamespaceId::DEFAULT).unwrap();
+        store.lsm.fail_next_inserts(Database::APPLY_RETRY_ATTEMPTS as u32);
+        db.put(b"k", b"never applied").unwrap();
+        let aborted = db.merge(b"k", b"", |_, _| Err(KVError::MergeAborted("declined".into())));
+        assert!(aborted.is_err(), "setup: the closure aborts");
+        assert!(store.unapplied_write(b"k").is_some(), "an aborted merge cleared the mark");
+        db.crash();
+    }
 }

@@ -231,7 +231,7 @@ fn test_l0_order_survives_the_wall_clock_stepping_back() -> Result<()> {
     // The clock that named that file was an hour ahead of the one we have now.
     let l0_dir = LSMTree::level0_bucket_dir_from(temp_dir.path(), 0);
     let first = std::fs::read_dir(&l0_dir)?.next().expect("one L0 file")?.path();
-    let stamp = LSMTree::level0_created_at_from_path(&first);
+    let stamp = LSMTree::level0_created_at_from_path(&first).expect("named by its stamp");
     let hour = 3_600_000u128 * 1_000_000;
     std::fs::rename(&first, l0_dir.join(format!("{}.dat", stamp + hour)))?;
 

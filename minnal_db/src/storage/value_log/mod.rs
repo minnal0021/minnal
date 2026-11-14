@@ -641,9 +641,14 @@ impl ValueLog {
 
     /// Make every record appended so far durable. Sealed segments were fsynced
     /// when sealed, so only the active tail needs it.
+    /// Returns at once, with no fsync, when nothing was appended since the last
+    /// one: every flush calls this for every bucket, most of them idle.
     pub fn sync(&self) -> Result<()> {
         let (file, id, target) = {
             let inner = self.inner.read();
+            if inner.synced_offset >= inner.active_offset {
+                return Ok(());
+            }
             (Arc::clone(&inner.active_file), inner.active_id, inner.active_offset)
         };
         file.sync_data()?;

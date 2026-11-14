@@ -427,9 +427,9 @@ as the vector index WAL's did:
 
 If the save fails, the event returns an error and the LSM undoes the flush
 (nothing registered, the memtable kept for a retry), which the flush events
-already support. The event runs behind `SyncValueLogBeforePersist`, so the
-values these entries point at are fsynced first, as they must be before the
-entries stop being replayed.
+already support. The value log was fsynced when the flush began, before any
+L0 file was written (`SyncValueLogBeforePersist`), so the values these entries
+point at are durable, as they must be before the entries stop being replayed.
 
 A crash after the save but before registration leaves durable L0 files that
 open finds by listing the level directory, so their writes are not lost; a

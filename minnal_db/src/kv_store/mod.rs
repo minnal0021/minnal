@@ -229,6 +229,11 @@ pub struct KVStore {
     /// re-point along with the segments it referred to, and the guard test would fail.
     #[cfg(test)]
     pub(crate) gc_crash_after_unlink: AtomicBool,
+
+    /// Test-only: how many times GC's phase 2 took the bucket lock to relocate
+    /// a batch of survivors.
+    #[cfg(test)]
+    pub(crate) gc_relocation_batches: AtomicU64,
 }
 
 impl KVStore {
@@ -323,12 +328,16 @@ impl KVStore {
             metrics: OnceLock::new(),
             #[cfg(test)]
             gc_crash_after_unlink: AtomicBool::new(false),
+            #[cfg(test)]
+            gc_relocation_batches: AtomicU64::new(0),
         };
 
         // A bucket whose metadata file was lost has no live/garbage accounting, so GC
         // would never trigger on it. Recompute it exactly from the LSM's pointers —
         // the LSM is the authority on liveness anyway, so this is not a heuristic.
         store.rebuild_missing_segment_stats()?;
+        // Every flush fsyncs the value log first, database observer or not.
+        store.set_flush_observer(None);
 
         Ok(store)
     }
@@ -428,8 +437,7 @@ impl KVStore {
     }
 
     /// The seq of `key`'s durable-but-unapplied write, if it has one, forgetting
-    /// it: the caller (`merge`, with the stripe held) is about to write the key
-    /// over the value it can read, superseding that write.
+    /// it: the caller has just applied a write to the key, which supersedes it.
     pub(crate) fn take_unapplied_write(&self, key: &[u8]) -> Option<u64> {
         if !self.any_unapplied.load(Ordering::SeqCst) {
             return None;
@@ -442,10 +450,14 @@ impl KVStore {
         seq
     }
 
-    /// Test-only: the seq of `key`'s durable-but-unapplied write, if any,
-    /// without forgetting it.
-    #[cfg(test)]
+    /// The seq of `key`'s durable-but-unapplied write, if any, without
+    /// forgetting it: only a write that applies to the key supersedes it
+    /// (`take_unapplied_write`, from the put and delete paths), so a merge that
+    /// aborts, or resolves to "absent stays absent", leaves it marked.
     pub(crate) fn unapplied_write(&self, key: &[u8]) -> Option<u64> {
+        if !self.any_unapplied.load(Ordering::SeqCst) {
+            return None;
+        }
         self.unapplied_writes.lock().get(key).copied()
     }
 
@@ -455,15 +467,13 @@ impl KVStore {
     }
 
     /// Set the LSM flush observer: the database's hook that retires WAL entries
-    /// once a flush makes them durable.
+    /// once a flush makes them durable. `None` detaches it; the value-log fsync
+    /// every flush begins with stays (`SyncValueLogBeforePersist`).
     pub(crate) fn set_flush_observer(&self, observer: Option<Arc<dyn LsmFlushObserver>>) {
-        let observer = observer.map(|inner| {
-            Arc::new(SyncValueLogBeforePersist {
-                inner,
-                logs: self.value_log.bucket_logs(),
-            }) as Arc<dyn LsmFlushObserver>
-        });
-        self.lsm.set_flush_observer(observer);
+        self.lsm.set_flush_observer(Some(Arc::new(SyncValueLogBeforePersist {
+            inner: observer,
+            logs: self.value_log.bucket_logs(),
+        })));
     }
 
     /// Set the LSM compaction trigger channel
@@ -541,47 +551,64 @@ impl KVStore {
     }
 }
 
-/// Makes a store's value log durable before any WAL entry is retired.
+/// Makes a store's value log durable before any L0 file points into it.
 ///
 /// Writes fsync the WAL but not the value log (that is `records_per_sync`'s
-/// cadence), which is safe only while the WAL still holds the value. When a
-/// memtable's L0 files are written, `on_ro_memtable_written` lets both WALs
-/// retire its entries — recovery then skips them and WAL GC deletes them — so
-/// the value-log records those SSTable entries point at must be on stable
-/// storage first. Without this, a power loss after the flush would lose up to
-/// `records_per_sync` acknowledged values (and any segment sealed since its
-/// last fsync) with nothing left to replay them from. If the fsync fails the
-/// flush is undone: the entries stay replayable and the memtable is flushed
-/// again later.
+/// cadence), which is safe only while nothing durable points at an unsynced
+/// record. An L0 file is durable the moment it is written: open finds L0 files
+/// by listing their directories, registered or not. So the value log is fsynced
+/// when a flush **begins** (`on_ro_memtable_flushing`), before any L0 file is
+/// written. Every record the flushed memtable points at was appended before the
+/// memtable was sealed, so that one fsync covers them all; it is the flush's only
+/// value-log fsync (the written event, where both WALs retire the memtable's
+/// entries, needs none of its own).
+///
+/// Fsynced only at the written event, a power loss after the L0 file was
+/// written left a durable pointer to a lost record. A WAL-backed write was then
+/// lost too: replay drops a record whose version equals the stored copy's (the
+/// same write), so the WAL could not heal it. A GC relocation or a no-WAL write
+/// has no log at all. Guard:
+/// `an_l0_file_never_points_at_a_value_a_power_loss_could_take`.
+///
+/// Installed on every store, with or without a database observer (`inner`).
+/// A failed fsync vetoes the flush with nothing written: the memtable stays
+/// read-only and is flushed again later.
 struct SyncValueLogBeforePersist {
-    inner: Arc<dyn LsmFlushObserver>,
+    inner: Option<Arc<dyn LsmFlushObserver>>,
     logs: Vec<Arc<crate::storage::value_log::ValueLog>>,
 }
 
 impl LsmFlushObserver for SyncValueLogBeforePersist {
     fn on_memtable_sealed(&self, version: u64) {
-        self.inner.on_memtable_sealed(version);
+        if let Some(inner) = &self.inner {
+            inner.on_memtable_sealed(version);
+        }
     }
 
     fn on_ro_memtable_flushing(&self, version: u64) -> std::io::Result<()> {
-        self.inner.on_ro_memtable_flushing(version)
-    }
-
-    // Both WALs retire records here, so the values they point at must be on
-    // stable storage first. A failed fsync vetoes the flush: the files are not
-    // registered and the memtable is flushed again later.
-    fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
         for log in &self.logs {
             if let Err(e) = log.sync() {
-                error!("value-log fsync failed before memtable {version}'s L0 files were registered; the flush is undone: {e:?}");
+                error!("value-log fsync failed before memtable {version}'s L0 files were written; the flush is put off: {e:?}");
                 return Err(std::io::Error::other(format!("value-log fsync failed: {e}")));
             }
         }
-        self.inner.on_ro_memtable_written(version)
+        match &self.inner {
+            Some(inner) => inner.on_ro_memtable_flushing(version),
+            None => Ok(()),
+        }
+    }
+
+    fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
+        match &self.inner {
+            Some(inner) => inner.on_ro_memtable_written(version),
+            None => Ok(()),
+        }
     }
 
     fn on_ro_memtable_flushed_to_level0(&self, version: u64) {
-        self.inner.on_ro_memtable_flushed_to_level0(version);
+        if let Some(inner) = &self.inner {
+            inner.on_ro_memtable_flushed_to_level0(version);
+        }
     }
 }
 

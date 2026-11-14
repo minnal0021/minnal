@@ -227,6 +227,62 @@ mod tests {
         db.shutdown().unwrap();
     }
 
+    /// TTL expiry and reindexing take no key stripe, so they race user writes
+    /// to the same key. The index must still end up agreeing with the store.
+    /// TTL used to change the index after releasing the bucket lock: it
+    /// tombstoned the key, a put of the same value then inserted the row, and
+    /// TTL's removal of the old value's row ran last — a live document gone
+    /// from every query on the field, with no gap recorded (found within 300
+    /// rounds every run). Now every write changes a key's rows under its bucket
+    /// lock, and a reindex sets the row by compare-and-set under the same lock.
+    #[test]
+    fn ttl_expiry_and_reindexing_racing_puts_keep_the_index_in_step() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path(), create_db_config()).unwrap();
+        let ns = DEFAULT_NAMESPACE_ID;
+        let field_id = activate_status_index(&db, ns);
+        let store = db.get_store(ns).unwrap();
+        let keys: Vec<Vec<u8>> = (0..4).map(|i| format!("doc:{i}").into_bytes()).collect();
+        for round in 0..300 {
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        store.expire_records(std::time::Duration::ZERO, usize::MAX).unwrap();
+                    }
+                });
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        for k in &keys {
+                            db.reindex_field(ns, field_id, k).unwrap();
+                        }
+                    }
+                });
+                s.spawn(|| {
+                    for _ in 0..200 {
+                        for k in &keys {
+                            db.put_ns_no_wal(ns, k, br#"{"status":"active"}"#).unwrap();
+                        }
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                });
+            });
+            let indexed = db.query_keys(ns, "status = \"active\"").unwrap().keys;
+            for k in &keys {
+                let live = store.get(k).unwrap().is_some();
+                assert_eq!(
+                    live,
+                    indexed.contains(k),
+                    "round {round}: {} is {} but the index says otherwise",
+                    String::from_utf8_lossy(k),
+                    if live { "live" } else { "deleted" }
+                );
+            }
+        }
+        db.shutdown().unwrap();
+    }
+
     /// A delete that finds no value to delete does no index work. Its key keeps
     /// its row id (row ids are never freed), and with no old bytes to target, the
     /// delete fell back to `remove_all_for_row`: a probe of every value's bitmap

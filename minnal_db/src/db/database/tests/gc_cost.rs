@@ -3,6 +3,9 @@
 //! (WAL fsyncs are most of a write's cost there):
 //!
 //! `TMPDIR=/var/tmp cargo test --release -p minnal_db --lib -- --ignored gc_cost_under_writers --nocapture`
+//!
+//! `GC_COST_SEGMENT_MIB` sets the value-log segment size (default 4; the
+//! engine's default is 256).
 
 use super::*;
 use std::sync::Arc;
@@ -74,7 +77,9 @@ fn summary(mut latencies: Vec<Duration>, window: Duration) -> String {
 fn gc_cost_under_writers() {
     let dir = TempDir::new().unwrap();
     let mut config = create_db_config();
-    config.segment_size_bytes = 4 * 1024 * 1024;
+    let segment_mib: u64 = std::env::var("GC_COST_SEGMENT_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    println!("value-log segments of {segment_mib} MiB");
+    config.segment_size_bytes = segment_mib * 1024 * 1024;
     let db = Arc::new(Database::open(dir.path(), config).unwrap());
     let ns = db.create_namespace("gc_cost").unwrap();
     let store = db.get_store(ns).unwrap();

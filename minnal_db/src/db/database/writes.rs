@@ -378,9 +378,10 @@ impl Database {
     /// are safe but pointless: a read of this key returns the same pre-merge
     /// value the closure was already handed.
     ///
-    /// TTL expiry takes the same stripe and deletes by compare-and-set, so a
-    /// merge that rewrites a key about to expire keeps its result; the next TTL
-    /// pass judges the new value on its own epoch.
+    /// TTL expiry takes no stripe: it deletes by compare-and-set at the expired
+    /// copy's next system version, so a merge that rewrites a key about to
+    /// expire keeps its result (its user seq is newer), and the next TTL pass
+    /// judges the new value on its own epoch.
     pub fn merge_ns<F>(&self, namespace_id: NamespaceId, key: &[u8], value: &[u8], merge_fn: F) -> Result<Option<Vec<u8>>>
     where
         F: FnOnce(Option<&[u8]>, &[u8]) -> Result<Option<Vec<u8>>>,
@@ -470,11 +471,13 @@ impl Database {
 
     /// Log an ERROR if `key`'s last WAL-backed write is durable but never
     /// applied (every retry failed). The merge reads the value from before that
-    /// write and treats it as the source of truth; its own write is newer, so it
-    /// supersedes the unapplied one, after a crash too. Called with the stripe
-    /// held.
+    /// write and treats it as the source of truth; its own write, if it makes
+    /// one, is newer and supersedes the unapplied one, after a crash too. The
+    /// mark is only read here: the write clears it when it applies, so a merge
+    /// that aborts or writes nothing leaves it for the next one to report.
+    /// Called with the stripe held.
     fn warn_if_merging_over_an_unapplied_write(kv_store: &KVStore, namespace_id: NamespaceId, key: &[u8]) {
-        if let Some(seq) = kv_store.take_unapplied_write(key) {
+        if let Some(seq) = kv_store.unapplied_write(key) {
             error!(
                 "[MERGE] key='{}' (ns={}): the write at seq={} is durable but was never applied; \
                  the merge reads the value before it as the source of truth and supersedes it",

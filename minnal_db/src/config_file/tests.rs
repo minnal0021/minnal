@@ -363,6 +363,18 @@ fn tables_the_caller_owns_are_handed_back_unread() {
 fn out_of_range_values_are_refused() {
     for bad in [
         "[sharding]\nnum_buckets = 0\n",
+        "[memtable]\nmax_capacity = 0\n",
+        "[lsm]\ncompaction_threshold_percent = 0\n",
+        "[lsm]\ncompaction_threshold_percent = 101\n",
+        "[scheduled_tasks]\nvalue_log_gc_interval_secs = 0\n",
+        "[scheduled_tasks]\nwal_gc_interval_secs = 0\n",
+        "[scheduled_tasks]\nlsm_compaction_interval_secs = 0\n",
+        "[scheduled_tasks]\nttl_cleanup_interval_secs = 0\n",
+        "[scheduled_tasks]\nindex_checkpoint_interval_ms = 0\n",
+        "[thresholds]\nvalue_log_waste_threshold = 120.0\n",
+        "[thresholds]\nsegment_gc_threshold = -1.0\n",
+        "[thresholds]\ntail_gc_min_garbage_pct = 101.0\n",
+        "[thresholds]\nsegment_gc_threshold = 30.0\nvalue_log_waste_threshold = 30.0\n",
         "[lifecycle]\naudit_retention_days = 0\n",
         "[semantic_search.maintenance]\nthreads = 0\n",
         "[semantic_search.maintenance]\nthreads = 65\n",

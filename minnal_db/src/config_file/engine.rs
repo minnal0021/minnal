@@ -262,11 +262,55 @@ impl super::ConfigFile {
         }
     }
 
-    /// Check the engine settings a typed value cannot rule out.
+    /// Check the engine settings a typed value cannot rule out: each would
+    /// otherwise fail later, at open or in a worker (a zero interval panics the
+    /// worker's timer, a zero memtable capacity divides by zero on the first
+    /// write), or quietly misbehave (GC thresholds out of order).
     pub(super) fn validate_engine(&self) -> Result<(), String> {
         let n = self.sharding.num_buckets;
         if n == 0 || n > u32::MAX as usize + 1 {
             return Err(format!("sharding.num_buckets must be between 1 and 2^32, got {n}"));
+        }
+        if self.memtable.max_capacity == 0 {
+            return Err("memtable.max_capacity must be at least 1".into());
+        }
+        let percent = self.lsm.compaction_threshold_percent;
+        if !(1..=100).contains(&percent) {
+            return Err(format!("lsm.compaction_threshold_percent must be between 1 and 100, got {percent}"));
+        }
+        let s = &self.scheduled_tasks;
+        for (key, value) in [
+            ("value_log_gc_interval_secs", s.value_log_gc_interval_secs),
+            ("wal_gc_interval_secs", s.wal_gc_interval_secs),
+            ("lsm_compaction_interval_secs", s.lsm_compaction_interval_secs),
+            ("ttl_cleanup_interval_secs", s.ttl_cleanup_interval_secs),
+            ("index_checkpoint_interval_ms", s.index_checkpoint_interval_ms),
+        ] {
+            if value == 0 {
+                return Err(format!("scheduled_tasks.{key} must be at least 1"));
+            }
+        }
+        let t = &self.thresholds;
+        for (key, value) in [
+            ("value_log_waste_threshold", Some(t.value_log_waste_threshold)),
+            ("segment_gc_threshold", Some(t.segment_gc_threshold)),
+            ("tail_gc_min_garbage_pct", t.tail_gc_min_garbage_pct),
+            ("index_blob_waste_threshold", Some(t.index_blob_waste_threshold)),
+        ] {
+            if let Some(value) = value
+                && !(0.0..=100.0).contains(&value)
+            {
+                return Err(format!("thresholds.{key} is a percentage (0 to 100), got {value}"));
+            }
+        }
+        // A segment under its threshold keeps its garbage. At or above the
+        // bucket trigger, garbage just under the trigger is never collected:
+        // every pass skips those segments and the bucket stays over it.
+        if t.segment_gc_threshold >= t.value_log_waste_threshold {
+            return Err(format!(
+                "thresholds.segment_gc_threshold ({}) must be below thresholds.value_log_waste_threshold ({})",
+                t.segment_gc_threshold, t.value_log_waste_threshold
+            ));
         }
         Ok(())
     }

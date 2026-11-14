@@ -435,3 +435,41 @@ fn a_gc_copy_whose_lsm_insert_fails_counts_as_garbage() {
     assert_eq!(store.get(b"junk").unwrap(), Some(junk));
     assert_eq!(live_bytes(), referenced, "after GC, still exactly the referenced records are live");
 }
+
+/// GC's phase 2 takes the bucket lock once per batch of survivors, not once
+/// per segment. Every writer to the bucket waits while GC holds it, and a
+/// segment is up to 256 MiB of survivors by default: relocated under one hold,
+/// a GC pass stalled the bucket's writers for the whole rewrite. A batch is at
+/// most 1,024 records or 1 MiB of values.
+#[test]
+fn gc_releases_the_bucket_lock_between_batches_of_survivors() {
+    let lsm = LSMConfig {
+        num_buckets: 1,
+        skip_list_capacity: 100_000,
+        ..LSMConfig::default()
+    };
+    let dir = TempDir::new().unwrap();
+    let store = KVStore::open(NamespaceId::from_u64(0), "default", dir.path(), lsm, SyncConfig::new(0), 64 * 1024 * 1024).unwrap();
+    let value = vec![0x42u8; 1024];
+    let keys = 3_000u32;
+    for i in 0..keys {
+        store.put_to_storage(format!("key:{i:05}").as_bytes(), &value).unwrap();
+    }
+    // Some garbage, so the segment is a candidate: one overwrite in ten.
+    for i in (0..keys).step_by(10) {
+        store.put_to_storage(format!("key:{i:05}").as_bytes(), &value).unwrap();
+    }
+    store.lsm.flush_memtable_to_level0().unwrap();
+
+    let stats = store.garbage_collect_with_thresholds(0.0, 0.0).unwrap();
+    assert!(stats.bytes_reclaimed > 0, "setup: the segment is collected");
+    let batches = store.gc_relocation_batches.load(Ordering::Relaxed);
+    // ~2,700 survivors of 1 KiB: at least three batches by bytes.
+    assert!(
+        batches >= 3,
+        "a segment's survivors were relocated in {batches} hold(s) of the bucket lock"
+    );
+    for i in 0..keys {
+        assert_eq!(store.get(format!("key:{i:05}").as_bytes()).unwrap(), Some(value.clone()), "key:{i:05}");
+    }
+}

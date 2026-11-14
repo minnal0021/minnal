@@ -174,12 +174,10 @@ impl LSMTree {
                 file.sync_all()?;
             }
             let null_file = Arc::new(Self::create_null_file()?);
-            {
-                let mut file_guard = self.sstable_files[bucket_idx].write();
-                std::fs::rename(&temp_path, &level1_path)?;
-                File::open(Self::level1_dir_from(&self.base_path))?.sync_all()?;
-                *file_guard = null_file;
-            }
+            // Renamed and made durable before the handle swap, as below.
+            std::fs::rename(&temp_path, &level1_path)?;
+            File::open(Self::level1_dir_from(&self.base_path))?.sync_all()?;
+            *self.sstable_files[bucket_idx].write() = null_file;
             let mut metadata_guard = self.sstable_metadata[bucket_idx].write();
             metadata_guard.clear();
             // Empty filter, as at open: every lookup in this bucket's L1 is a miss.
@@ -191,37 +189,37 @@ impl LSMTree {
             bytes_merged = data_size;
 
             let bucket_idx = bucket as usize;
-            {
-                let mut file_guard = self.sstable_files[bucket_idx].write();
+            // Publish with a SINGLE atomic rename. `rename(2)` replaces the
+            // destination atomically, so the bucket's L1 path always names a
+            // complete SSTable — the old one before this call, the new one after,
+            // never nothing.
+            //
+            // Never move the old file aside first (`rename(level1 -> .old)`,
+            // then `rename(.tmp -> level1)`): between the two renames the L1
+            // path would not exist, `LSMTree::open` after a crash there would
+            // create an empty file and read the bucket as empty, and every key
+            // that lived only in L1 would be lost. Test:
+            // `test_crash_between_l1_publish_steps_keeps_l1`.
+            std::fs::rename(&temp_path, &level1_path)?;
 
-                // Publish with a SINGLE atomic rename. `rename(2)` replaces the
-                // destination atomically, so the bucket's L1 path always names a
-                // complete SSTable — the old one before this call, the new one after,
-                // never nothing.
-                //
-                // Never move the old file aside first (`rename(level1 -> .old)`,
-                // then `rename(.tmp -> level1)`): between the two renames the L1
-                // path would not exist, `LSMTree::open` after a crash there would
-                // create an empty file and read the bucket as empty, and every key
-                // that lived only in L1 would be lost. Test:
-                // `test_crash_between_l1_publish_steps_keeps_l1`.
-                //
-                // Readers holding the previous `Arc<File>` keep reading the old
-                // inode until they drop it.
-                std::fs::rename(&temp_path, &level1_path)?;
+            // Make the rename itself durable before anything relies on it.
+            // Its inputs are marked obsolete below, and cleanup then unlinks
+            // them, each unlink made durable: were the rename not, a power
+            // loss would revert to the pre-merge L1 with its inputs gone.
+            // On an error the merge stops here, as the empty-merge path
+            // does: the old file stays installed and the inputs stay live
+            // (the renamed file holds the same versions, so either is right
+            // to read after a crash), and the next merge's directory fsync
+            // covers this rename too.
+            File::open(Self::level1_dir_from(&self.base_path))?.sync_all()?;
 
-                // Make the rename itself durable: without an fsync of the containing
-                // directory the swap can be lost on power failure, silently reverting
-                // to the pre-merge L1. That is consistent (the L0 inputs are still
-                // there, so it only costs the merge work) but it is not what the code
-                // above just reported as done.
-                if let Ok(dir) = File::open(Self::level1_dir_from(&self.base_path)) {
-                    let _ = dir.sync_all();
-                }
-
-                let new_file = OpenOptions::new().read(true).write(true).open(&level1_path)?;
-                *file_guard = Arc::new(new_file);
-            }
+            // Readers read L1 through the installed handle, never by path, so
+            // until the swap they keep reading the old file (and its bloom and
+            // index): the lock covers the swap alone, not the rename or the
+            // fsync. Readers holding the previous `Arc<File>` keep reading the
+            // old inode until they drop it.
+            let new_file = OpenOptions::new().read(true).write(true).open(&level1_path)?;
+            *self.sstable_files[bucket_idx].write() = Arc::new(new_file);
 
             let mut metadata_guard = self.sstable_metadata[bucket_idx].write();
             metadata_guard.clear();

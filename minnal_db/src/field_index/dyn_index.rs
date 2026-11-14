@@ -82,6 +82,26 @@ pub(crate) enum DynFieldIndexInner {
     Str(FieldIndex<String>),
 }
 
+/// One row's change to a field, for
+/// [`DynFieldIndex::apply_without_spill`]. Each variant is the method of the
+/// same name without its spill.
+#[derive(Debug, Clone, Copy)]
+pub enum RowChange<'a> {
+    /// Move the row from `old`'s bucket to `new`'s ([`DynFieldIndex::update`]).
+    Update {
+        old: Option<&'a IndexValue>,
+        new: Option<&'a IndexValue>,
+    },
+    /// Make `value` the row's only value ([`DynFieldIndex::set`]).
+    Set(&'a IndexValue),
+    /// Add the row under `value`, for a row in no bucket ([`DynFieldIndex::insert`]).
+    Insert(&'a IndexValue),
+    /// Take the row out of `value`'s bucket ([`DynFieldIndex::remove`]).
+    Remove(&'a IndexValue),
+    /// Take the row out of every bucket ([`DynFieldIndex::remove_all_for_row`]).
+    RemoveAll,
+}
+
 /// Type-erased field index backed by mmap `BlobStore` instances.
 ///
 /// Two stores are involved:
@@ -568,6 +588,14 @@ impl DynFieldIndex {
     /// Same type-mismatch and size errors as [`insert`](Self::insert). An empty
     /// `row_ids` is a no-op.
     pub fn insert_many(&mut self, value: &IndexValue, row_ids: &[u128]) -> Result<(), String> {
+        let result = self.insert_many_unspilled(value, row_ids);
+        if result.is_ok() {
+            self.spill_if_over_budget();
+        }
+        result
+    }
+
+    fn insert_many_unspilled(&mut self, value: &IndexValue, row_ids: &[u128]) -> Result<(), String> {
         check_value_size(value, u32::MAX as usize)?;
         if row_ids.is_empty() {
             return Ok(());
@@ -605,15 +633,59 @@ impl DynFieldIndex {
                 ));
             }
         }
-        self.spill_if_over_budget();
         Ok(())
+    }
+
+    /// Apply one row's `change` **without** the hard-limit spill every other
+    /// write method ends with, for a caller holding a lock no I/O may run
+    /// under: the store's write path changes the index under its value-log
+    /// bucket lock (so a key's index changes land in the order its versions
+    /// do), and calls [`spill_if_over_budget`](Self::spill_if_over_budget) once
+    /// that lock is released. Errors as the matching method's.
+    pub fn apply_without_spill(&mut self, row_id: u128, change: RowChange<'_>) -> Result<(), String> {
+        let rows = std::slice::from_ref(&row_id);
+        match change {
+            RowChange::Update { old, new } => {
+                if old == new {
+                    return Ok(());
+                }
+                if let Some(o) = old {
+                    self.remove_inner(o, row_id);
+                }
+                match new {
+                    Some(n) => self.insert_many_unspilled(n, rows),
+                    None => Ok(()),
+                }
+            }
+            RowChange::Set(value) => {
+                self.remove_all_for_rows_unspilled(rows);
+                self.insert_many_unspilled(value, rows)
+            }
+            RowChange::Insert(value) => self.insert_many_unspilled(value, rows),
+            RowChange::Remove(value) => {
+                self.remove_inner(value, row_id);
+                Ok(())
+            }
+            RowChange::RemoveAll => {
+                self.remove_all_for_rows_unspilled(rows);
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether the shared overlay budget is over its hard limit, so the next
+    /// [`spill_if_over_budget`](Self::spill_if_over_budget) would spill.
+    pub fn over_hard_limit(&self) -> bool {
+        self.overlay_budget().over_hard()
     }
 
     /// Enforce the overlay budget's hard limit: when the shared budget is over
     /// it after this field's write, spill this field before returning. Every
     /// write path (the store's write path, WAL replay, reindex) goes through
-    /// these methods, so the bound holds wherever the index is changed.
-    fn spill_if_over_budget(&mut self) {
+    /// these methods, so the bound holds wherever the index is changed; the
+    /// store's write path calls it itself, after its bucket lock
+    /// ([`apply_without_spill`](Self::apply_without_spill)).
+    pub fn spill_if_over_budget(&mut self) {
         if self.overlay_budget().over_hard() && self.overlay_bytes() > 0 {
             let started = std::time::Instant::now();
             self.spill();
@@ -715,12 +787,16 @@ impl DynFieldIndex {
     /// batch; the single-row form probes every bucket once per row. Used by WAL
     /// replay, which clears its whole affected row set in one go.
     pub fn remove_all_for_rows(&mut self, row_ids: &[u128]) {
+        self.remove_all_for_rows_unspilled(row_ids);
+        self.spill_if_over_budget();
+    }
+
+    fn remove_all_for_rows_unspilled(&mut self, row_ids: &[u128]) {
         match &mut self.inner {
             DynFieldIndexInner::Bool(idx) => idx.remove_all_for_rows(row_ids),
             DynFieldIndexInner::Int(idx) => idx.remove_all_for_rows(row_ids),
             DynFieldIndexInner::Str(idx) => idx.remove_all_for_rows(row_ids),
         };
-        self.spill_if_over_budget();
     }
 
     /// Call `f` for every bitmap across all value buckets.

@@ -109,16 +109,13 @@ impl Database {
         self.reindex_key(&store, field_id, key)
     }
 
-    /// [`KVStore::reindex_field`] under `key`'s stripe — the only way anything
-    /// outside the write path should rewrite an index row.
-    ///
-    /// Reindexing reads the key's current value and then sets its row. A put to
-    /// the same key updates the index after its own apply, under the stripe, so
-    /// without the stripe the two interleave: reindex reads v1, the put applies v2
-    /// and moves the row v1→v2, then reindex sets it back to v1 — the index now
-    /// disagrees with the store until something rewrites the key.
+    /// [`KVStore::reindex_field`] — the only way anything outside the write path
+    /// should rewrite an index row. It takes no key stripe: it sets the row by
+    /// compare-and-set under the key's bucket lock, the lock every write
+    /// changes the key's rows under, so a write landing between its read and its
+    /// set (a user write, or TTL expiry, which takes no stripe) is caught and
+    /// the reindex reads again.
     pub(crate) fn reindex_key(&self, store: &KVStore, field_id: FieldId, key: &[u8]) -> Result<FieldReindexOutcome> {
-        let _stripe = store.lock_key(key);
         store.reindex_field(field_id, key)
     }
 

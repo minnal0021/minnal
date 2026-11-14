@@ -230,7 +230,7 @@ GC's unit is a **segment**, never the whole bucket:
 
 1. **Pick** the sealed segments whose garbage ratio is over the per-segment selection bar, worst first. The active tail is never a candidate.
 2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so GC looks all of the segment's keys up in the LSM in one batched lookup: a record survives if the LSM still points at exactly this location.
-3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. Each copy keeps the write's sequence and takes the next system version, so it is newer than the copy it replaces and older than any user write still to land; GC takes no per-key lock.
+3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. Each copy keeps the write's sequence and takes the next system version, so it is newer than the copy it replaces and older than any user write still to land; GC takes no per-key lock. The lock is taken once per batch of survivors (at most 1,024 records or 1 MiB of values) and released between batches, so writers to the bucket wait for a batch, not for a whole segment.
 4. **Flush** the memtable to L0, making the re-point durable.
 5. **Unlink** the old segment file.
 
@@ -336,6 +336,7 @@ sequenceDiagram
     participant G as WAL GC (every 60 s)
     M->>F: memtable full: seal it (read-only)
     F->>W: sealed event: note how far this memtable reaches in the WAL
+    F->>F: fsync the value log (every value the L0 files will point at)
     F->>F: write and fsync its L0 files (not yet readable)
     F->>W: written event: move this namespace's safe offset and the cut, save them
     F->>F: register the L0 files
@@ -595,7 +596,7 @@ merge(key, operand, closure)
 Three things fall out of that shape:
 
 - **The WAL never learns a merge happened.** It records the *result* as an ordinary `Upsert` or `Delete`, so recovery, WAL GC and index replay are byte-for-byte unchanged, and nothing re-runs the closure at replay — which is what makes an arbitrary Rust closure usable here at all.
-- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway.
+- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway. Field-index changes are made under the bucket lock, so a key's index changes land in the order its versions do even for TTL expiry, which takes no stripe.
 - **`put` and `delete` take the stripe too**, so a blind write cannot land between a merge's read and its write. The guarantee is per key: this is not a transaction.
 
 ### Read Path
@@ -648,7 +649,7 @@ The pass itself is described in full under [Value Log](#value-log): pick the wor
 
 Two consequences worth stating plainly:
 
-- **Cost is proportional to what is being reclaimed**, not to the size of the bucket. Segments GC didn't select are never read or written, and the bucket lock is held only across the CAS re-point loop — not across the copying.
+- **Cost is proportional to what is being reclaimed**, not to the size of the bucket. Segments GC didn't select are never read or written, and the bucket lock is held only across one batch of the CAS re-point at a time — not across the scan.
 - **A crash mid-GC needs no repair**, because the old segment is unlinked only after the re-point is durable (see [Garbage collection](#garbage-collection)).
 
 ### WAL GC

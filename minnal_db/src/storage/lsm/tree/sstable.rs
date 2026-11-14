@@ -4,13 +4,16 @@
 use super::*;
 
 /// The header bytes written at offset 0 of an SSTable file: magic, format
-/// version, and `merged_through` — for an L1 file, the newest L0 stamp merged
-/// into it (see [`LSMTree::level1_merged_through`]); 0 for an L0 file.
+/// version, `merged_through` — for an L1 file, the newest L0 stamp merged into
+/// it (see [`LSMTree::level1_merged_through`]); 0 for an L0 file — and a CRC-32
+/// of those 16 bytes.
 pub(super) fn sstable_header_bytes(merged_through: u64) -> [u8; SSTABLE_DATA_START as usize] {
     let mut header = [0u8; SSTABLE_DATA_START as usize];
     header[0..4].copy_from_slice(&SSTABLE_MAGIC);
     header[4..8].copy_from_slice(&SSTABLE_FORMAT_VERSION.to_le_bytes());
     header[8..16].copy_from_slice(&merged_through.to_le_bytes());
+    let crc = crc32fast::hash(&header[0..16]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
     header
 }
 
@@ -23,8 +26,8 @@ pub(super) fn sstable_merged_through(file: &File) -> Result<u64> {
 
 /// Verify that `file` begins with a header this build can read.
 ///
-/// Returns [`LSMError::Corruption`] for a truncated header, a bad magic, or a
-/// format version this build does not understand.
+/// Returns [`LSMError::Corruption`] for a truncated header, a bad magic, a
+/// format version this build does not understand, or a header CRC mismatch.
 pub(super) fn validate_sstable_header(file: &File, path: &Path) -> Result<()> {
     let mut header = [0u8; SSTABLE_DATA_START as usize];
     file.read_exact_at(&mut header, 0)
@@ -41,6 +44,13 @@ pub(super) fn validate_sstable_header(file: &File, path: &Path) -> Result<()> {
     if version != SSTABLE_FORMAT_VERSION {
         return Err(LSMError::Corruption(format!(
             "SSTable {} has format version {version}, but this build reads version {SSTABLE_FORMAT_VERSION}",
+            path.display()
+        )));
+    }
+    let stored = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    if stored != crc32fast::hash(&header[0..16]) {
+        return Err(LSMError::Corruption(format!(
+            "SSTable {} has a damaged header (CRC mismatch); its merged-through stamp cannot be trusted",
             path.display()
         )));
     }

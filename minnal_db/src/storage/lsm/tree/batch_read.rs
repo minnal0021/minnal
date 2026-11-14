@@ -127,13 +127,7 @@ impl LSMTree {
 
         // Level 0, newest first. The guards are held through the L1 read below,
         // so a key a concurrent merge moves into L1 is still in a captured L0 file.
-        let mut l0_guards: Vec<L0ReadGuard> = self
-            .level0_entries_snapshot(bucket as u32)
-            .iter()
-            .filter(|e| !e.is_obsolete())
-            .map(|e| L0ReadGuard::new(Arc::clone(e)))
-            .collect();
-        l0_guards.sort_by_key(|b| std::cmp::Reverse(b.entry.created_at_ms));
+        let l0_guards = self.live_level0_guards(bucket as u32);
         for guard in &l0_guards {
             // Read the file only for keys still unfound that it may hold — the
             // same exact rejects as `search_level0_files`.

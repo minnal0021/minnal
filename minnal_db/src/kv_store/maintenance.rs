@@ -71,6 +71,7 @@ impl KVStore {
     /// under the bucket lock with the compare. A copy whose system seq is used up
     /// is deleted as a user write instead: stripe, then bucket, a fresh user seq.
     fn delete_if_current(&self, key: &[u8], expected: ShardedValuePointer) -> Result<bool> {
+        let row_id = self.row_id_for_delete(key);
         let bucket = self.value_log.bucket_for_key(key);
         {
             let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
@@ -81,7 +82,7 @@ impl KVStore {
                 return Ok(false);
             }
             if let Some(expiry) = version.next_system() {
-                self.delete_with_bucket_locked(key, expiry, bucket_guard)?;
+                self.delete_with_bucket_locked(key, expiry, row_id, bucket_guard)?;
                 return Ok(true);
             }
         }
@@ -91,7 +92,7 @@ impl KVStore {
             return Ok(false);
         }
         let seq = self.alloc_seq();
-        self.delete_with_bucket_locked(key, Version::user(seq), bucket_guard)?;
+        self.delete_with_bucket_locked(key, Version::user(seq), row_id, bucket_guard)?;
         Ok(true)
     }
 

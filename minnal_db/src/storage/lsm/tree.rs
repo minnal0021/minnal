@@ -78,9 +78,10 @@ struct WrittenLevel0File {
 /// 2. `on_ro_memtable_flushing` — before the first L0 file is written. At open
 ///    L0 files are found by listing each bucket's directory, so a file on disk
 ///    survives a crash whether or not it was registered: whatever must be
-///    durable before the memtable's records are (the vector index WAL's
-///    records, so that a crash keeps a prefix of that log) is made durable
-///    here. An error **vetoes the flush** with nothing written;
+///    durable before the memtable's records are (the value-log records they
+///    point at, and the vector index WAL's records, so that a crash keeps a
+///    prefix of that log) is made durable here. An error **vetoes the flush**
+///    with nothing written;
 /// 3. `on_ro_memtable_written` — every bucket's L0 file is written and fsynced,
 ///    and **none is registered yet**: nothing can read or merge them, so no
 ///    merge can have dropped a tombstone they hold. The vector index WAL makes
@@ -197,15 +198,18 @@ const SSTABLE_MAGIC: [u8; 4] = *b"MSST";
 /// version, or without the magic, is rejected by [`validate_sstable_header`]
 /// rather than misread: the entry CRC covers only the bytes, so it cannot catch a
 /// change in how they are interpreted.
-const SSTABLE_FORMAT_VERSION: u32 = 2;
+const SSTABLE_FORMAT_VERSION: u32 = 3;
 
-/// Byte offset at which entry frames begin: `magic(4) | version(4) | reserved(8)`.
+/// Byte offset at which entry frames begin:
+/// `magic(4) | version(4) | merged_through(8) | crc32(4) | reserved(4)`.
 ///
-/// The reserved tail keeps the header 16-byte aligned and leaves room to add
-/// fields without moving the data start again. Sparse-index offsets are absolute
-/// file positions and are seeded with this, so seek-based readers need no
-/// adjustment; only scans that start at the head of the file begin here.
-const SSTABLE_DATA_START: u64 = 16;
+/// The CRC covers the first 16 bytes. `merged_through` decides which L0 files
+/// open deletes (`load_existing_level0_files`), so a damaged one must fail the
+/// open, not delete live files. The reserved tail keeps the header 8-byte
+/// aligned. Sparse-index offsets are absolute file positions and are seeded
+/// with this, so seek-based readers need no adjustment; only scans that start
+/// at the head of the file begin here.
+const SSTABLE_DATA_START: u64 = 24;
 
 /// Suffix of a Level-0 file being written (`{stamp}.dat.tmp`), renamed to
 /// `{stamp}.dat` once complete; see `write_level0_file_for_records`.

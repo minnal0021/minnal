@@ -126,18 +126,12 @@ impl LSMTree {
     /// skipped unread when its summary rules the key out (out of range, or
     /// bloom-negative).
     pub(super) fn search_level0_files(&self, bucket: u32, key: &[u8]) -> Result<SsLookup> {
-        let mut entries = self.level0_entries_snapshot(bucket);
-        if entries.is_empty() {
-            return Ok(SsLookup::Missing);
-        }
-        entries.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
+        let guards = self.live_level0_guards(bucket);
 
         // `l0_probes` counts lookups that read any L0 file, not files read.
         let mut probed = false;
-        for entry in entries {
-            if entry.is_obsolete() {
-                continue;
-            }
+        for guard in &guards {
+            let entry = &guard.entry;
             if !entry.may_contain(key) {
                 if let Some(m) = self.metrics() {
                     Metrics::bump(&m.l0_bloom_rejects);
@@ -150,7 +144,6 @@ impl LSMTree {
                     Metrics::bump(&m.l0_probes);
                 }
             }
-            let _guard = L0ReadGuard::new(Arc::clone(&entry));
             match self.lookup_in_sstable_file_path(entry.path.clone(), key, entry.scan_start(key))? {
                 SsLookup::Missing => {}
                 hit => return Ok(hit),

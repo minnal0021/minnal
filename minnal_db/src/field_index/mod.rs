@@ -44,7 +44,7 @@ pub mod value;
 
 pub use self::bitmap::RoaringBitmap;
 pub use self::bitmap::shared::SharedRoaringBitmap;
-pub use self::dyn_index::{DynFieldIndex, IndexBlobStats};
+pub use self::dyn_index::{DynFieldIndex, IndexBlobStats, RowChange};
 pub use self::field::{FieldId, FieldMeta, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 pub use self::overlay_budget::{IndexOverlayBudget, IndexOverlayStats};
 pub use self::predicate::Predicate;

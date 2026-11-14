@@ -1,15 +1,57 @@
 //! Writes: put and delete, keeping the live field indexes current.
 
 use super::*;
+use crate::field_index::{DynFieldIndex, FieldId, RowChange};
+use crate::kv_store::index_set::IndexEntry;
+
+/// What a write's in-memory index change leaves for after its bucket lock is
+/// released ([`KVStore::finish_index_follow_up`]): fields to spill because the
+/// change took the overlay budget past its hard limit (a spill is I/O),
+/// rejected updates to report, and whether to ask for an early checkpoint.
+#[derive(Default)]
+pub(super) struct IndexFollowUp {
+    over_hard: Vec<Arc<parking_lot::RwLock<DynFieldIndex>>>,
+    rejected: Vec<FieldId>,
+    /// Whether any field was changed (then `dead_bytes` is meaningful).
+    touched: bool,
+    /// The most reclaimable dead blob bytes of any field changed.
+    dead_bytes: u64,
+    /// Whether the write buffers are past their soft limit.
+    overlay_full: bool,
+}
+
+impl IndexFollowUp {
+    /// Apply `change` to `entry`'s field, recording what it leaves to do. A
+    /// rejected update is noted for the gap sink and logged.
+    fn apply(&mut self, entry: &IndexEntry, row_id: u128, change: RowChange<'_>) {
+        if let Err(e) = self.apply_checked(entry, row_id, change) {
+            warn!("Index update rejected for field {}: {}", entry.field_id, e);
+            self.rejected.push(entry.field_id);
+        }
+    }
+
+    /// As [`apply`](Self::apply), but returns the rejection to the caller.
+    fn apply_checked(&mut self, entry: &IndexEntry, row_id: u128, change: RowChange<'_>) -> std::result::Result<(), String> {
+        let mut idx = entry.index.write();
+        let result = idx.apply_without_spill(row_id, change);
+        self.touched = true;
+        self.dead_bytes = self.dead_bytes.max(idx.reclaimable_dead_bytes());
+        self.overlay_full |= idx.overlay_budget().over_soft();
+        if idx.over_hard_limit() {
+            self.over_hard.push(Arc::clone(&entry.index));
+        }
+        result
+    }
+}
 
 impl KVStore {
     /// Put a key-value pair into storage (LSM + value log).
     /// WAL writing is handled by the caller (Database coordinator).
     ///
-    /// Allocates the write sequence from the store's counter. Used by non-WAL
-    /// writes (TTL expiry, bulk load) and standalone tests. The WAL-backed path
-    /// uses [`put_to_storage_seq`](Self::put_to_storage_seq) so the conflict-
-    /// resolution sequence equals the WAL append order (live == recovery).
+    /// Allocates the write sequence from the store's counter: for standalone
+    /// tests. Every database write path uses
+    /// [`put_to_storage_seq`](Self::put_to_storage_seq) with the seq it drew
+    /// under the key's stripe, so live order equals recovery's.
     pub fn put_to_storage(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.put_to_storage_inner(key, value, self.alloc_seq(), false)
     }
@@ -36,15 +78,20 @@ impl KVStore {
         // and whether this write is the key's newest at all. A namespace without
         // them writes blind: no LSM lookup, no value-log read.
         let indexed = !self.namespace_index.read().is_empty();
+        // The row id is the key's for good (ids are never freed), so it is
+        // resolved before the bucket lock: allocating one can wait for a row-map
+        // flush, and nothing may wait for I/O under that lock.
+        let row_id = indexed.then(|| self.resolve_row_id_alloc(key));
 
-        // Hold the bucket lock across the value-log append and the LSM insert (and
-        // an indexed namespace's lookup). GC's batched compare-and-set runs under
-        // it (the key still points at the record GC copied → insert the copy),
-        // so no write applies between GC's check and its insert. Same-key writers
-        // are serialised by the key stripe, which every live caller holds
-        // (`KVStore::lock_key`).
+        // Hold the bucket lock across the value-log append, the LSM insert and
+        // the in-memory field-index change. GC's and TTL's compare-and-set runs
+        // under it, so no write applies between their check and their insert;
+        // and every change to a key's index rows is made under it, so they land
+        // in the order the key's versions do — a TTL tombstone and a put racing
+        // it (TTL takes no stripe) cannot apply their index changes the other way
+        // round. Same-key user writes are serialised by the key stripe as well.
         let bucket = self.value_log.bucket_for_key(key);
-        let _bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
+        let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
         if replayed && !self.replay_wins(key, seq)? {
             return Ok(());
@@ -84,20 +131,27 @@ impl KVStore {
         // memtable, or its own record if it was stale there. A copy in a lower
         // layer is counted when the L0→L1 merge drops its entry (`MergeGarbage`).
         self.note_applied(applied, Some(pointer), key.len());
-        drop(_bucket_guard);
-        // A user write supersedes any earlier one to the key that never applied.
-        self.take_unapplied_write(key);
 
         // A lost write is not the key's current value, so it must not touch the
         // indices. (With no index this returns at once.)
-        if wins {
-            self.update_indices_on_put(key, value, old_value.as_deref(), key_existed);
-        }
+        let follow_up = if wins {
+            self.update_indices_on_put(key, row_id, value, old_value.as_deref(), key_existed)
+        } else {
+            IndexFollowUp::default()
+        };
+        drop(bucket_guard);
+        // A user write supersedes any earlier one to the key that never applied.
+        self.take_unapplied_write(key);
+        self.finish_index_follow_up(key, follow_up);
 
         Ok(())
     }
 
-    /// Update field indices for a put.
+    /// Change the field indices for a put, in memory only. Called under the
+    /// key's bucket lock; what it leaves to do (a hard-limit spill, a rejected
+    /// update to report, a checkpoint to request) is returned for
+    /// [`finish_index_follow_up`](Self::finish_index_follow_up) once the lock
+    /// is released.
     ///
     /// `old_value` is the document's *prior* stored bytes when this put replaced
     /// an existing key (`None` for a fresh insert, or when the prior bytes could
@@ -106,60 +160,69 @@ impl KVStore {
     /// `O(distinct values)` scan `remove_all_for_row` performs — a big win for
     /// high-cardinality fields. When the prior bytes are unavailable on a replace
     /// we fall back to the scan so the row never lingers in a stale bucket.
-    pub(super) fn update_indices_on_put(&self, key: &[u8], value: &[u8], old_value: Option<&[u8]>, key_existed: bool) {
+    /// `row_id` is the key's, resolved before the lock (`None` if no index
+    /// existed then).
+    fn update_indices_on_put(&self, key: &[u8], row_id: Option<u128>, value: &[u8], old_value: Option<&[u8]>, key_existed: bool) -> IndexFollowUp {
         let ns_index = self.namespace_index.read();
+        let mut follow_up = IndexFollowUp::default();
         if ns_index.is_empty() {
-            return;
+            return follow_up;
         }
-        // Resolve only after confirming there are indexed fields — an unindexed
-        // namespace has no row map loaded and nothing to resolve for.
-        let row_id = self.resolve_row_id_alloc(key);
+        // An index activated since the caller looked: resolve the id now.
+        let row_id = row_id.unwrap_or_else(|| self.resolve_row_id_alloc(key));
         for entry in ns_index.iter() {
             let new_val = (entry.extractor)(value);
-            let mut idx = entry.index.write();
-            let result = match (key_existed, old_value) {
+            let old_val = old_value.and_then(|ov| (entry.extractor)(ov));
+            let change = match (key_existed, old_value) {
                 // Replace with the prior bytes in hand → O(1) targeted update.
-                (true, Some(ov)) => {
-                    let old_val = (entry.extractor)(ov);
-                    idx.update(old_val.as_ref(), new_val.as_ref(), row_id)
-                }
+                (true, Some(_)) => RowChange::Update {
+                    old: old_val.as_ref(),
+                    new: new_val.as_ref(),
+                },
                 // Fresh insert: the row is in no bucket yet, so skip the scan.
                 (false, _) => match &new_val {
-                    Some(v) => idx.insert(v, row_id),
-                    None => Ok(()),
+                    Some(v) => RowChange::Insert(v),
+                    None => continue,
                 },
                 // Replace but prior bytes unreadable: scan to clear the old bucket,
                 // then insert the new value, preserving one-value-per-row.
                 (true, None) => match &new_val {
-                    Some(v) => idx.set(v, row_id),
-                    None => {
-                        idx.remove_all_for_row(row_id);
-                        Ok(())
-                    }
+                    Some(v) => RowChange::Set(v),
+                    None => RowChange::RemoveAll,
                 },
             };
-            let dead_bytes = idx.reclaimable_dead_bytes();
-            let overlay_full = idx.overlay_budget().over_soft();
-            drop(idx);
-            if let Err(e) = result {
-                // A rejected update leaves this row absent from the field for
-                // good. Report it so it becomes a durable gap record, which index
-                // health reports and a repair fixes, rather than only a log line.
-                warn!("[KVStore '{}'] Index update rejected for field {}: {}", self.name, entry.field_id, e);
-                if let Some(sink) = self.index_gap_sink.read().as_ref() {
-                    sink.note_rejected_update(self.namespace_id, entry.field_id, key);
-                }
+            follow_up.apply(entry, row_id, change);
+        }
+        follow_up
+    }
+
+    /// Do what a write's index change left for after its bucket lock: spill a
+    /// field the change took over the overlay budget's hard limit (I/O, so never
+    /// under that lock), report rejected updates, and ask for an early
+    /// checkpoint when a field's write buffers or dead space call for one.
+    fn finish_index_follow_up(&self, key: &[u8], follow_up: IndexFollowUp) {
+        for index in &follow_up.over_hard {
+            index.write().spill_if_over_budget();
+        }
+        for field_id in follow_up.rejected {
+            // A rejected update leaves this row absent from the field for
+            // good. Report it so it becomes a durable gap record, which index
+            // health reports and a repair fixes, rather than only a log line.
+            if let Some(sink) = self.index_gap_sink.read().as_ref() {
+                sink.note_rejected_update(self.namespace_id, field_id, key);
             }
-            // Disk: if this field's blob store has piled up enough dead space
-            // (old bitmap copies left by spills), ask the checkpoint worker to
-            // compact early instead of waiting for the next tick (debounced
-            // inside the trigger).
-            self.request_checkpoint_if_over_cap(dead_bytes);
-            // Memory: past the write buffers' soft limit, ask for a checkpoint
-            // to write them out. (The hard limit is enforced by the index itself.)
-            if overlay_full {
-                self.request_checkpoint_now();
-            }
+        }
+        // Disk: if a field's blob store has piled up enough dead space (old
+        // bitmap copies left by spills), ask the checkpoint worker to compact
+        // early instead of waiting for the next tick (debounced inside the
+        // trigger).
+        if follow_up.touched {
+            self.request_checkpoint_if_over_cap(follow_up.dead_bytes);
+        }
+        // Memory: past the write buffers' soft limit, ask for a checkpoint to
+        // write them out.
+        if follow_up.overlay_full {
+            self.request_checkpoint_now();
         }
     }
 
@@ -199,42 +262,100 @@ impl KVStore {
     /// `KeyNotFound`; the outcome describes what was found, not whether work was
     /// done. (Removing a row that is already absent is a no-op, so this is safe
     /// for a key that simply never existed.)
+    ///
+    /// **Compare-and-set, like GC and TTL.** The value is read with no lock;
+    /// the row is set under the key's bucket lock, and only if the key still
+    /// points where it was read (pointers are unique, so that means the same
+    /// write). Every write changes the key's rows under that lock, so a write
+    /// that lands between the read and the set is caught and the reindex reads
+    /// again. Set unchecked, a reindex that read v1 could undo a put's move of
+    /// the row to v2. After `MAX_READ_ATTEMPTS` lost races the read is made
+    /// under the lock, which nothing can overtake.
     pub fn reindex_field(&self, field_id: crate::field_index::FieldId, key: &[u8]) -> Result<crate::field_index::FieldReindexOutcome> {
         use crate::field_index::FieldReindexOutcome;
 
-        let value = self.get(key)?;
-
-        let ns_index = self.namespace_index.read();
-        let Some(entry) = ns_index.get(field_id) else {
+        if self.namespace_index.read().get(field_id).is_none() {
             return Ok(FieldReindexOutcome::FieldNotActive);
-        };
-
-        let Some(value) = value else {
+        }
+        let bucket = self.value_log.bucket_for_key(key);
+        for attempt in 1..=Self::MAX_READ_ATTEMPTS {
+            let last = attempt == Self::MAX_READ_ATTEMPTS;
+            let held = if last {
+                Some(self.value_log.lock_bucket_for_write(bucket)?)
+            } else {
+                None
+            };
+            let pointer = self.lsm.get(key)?.and_then(decode_sharded_pointer);
+            let value = match pointer {
+                None => None,
+                Some(p) => match self.value_log.read_value(p) {
+                    Ok(value) => Some(value),
+                    // GC moved it: read it where it is now.
+                    Err(e) if e.is_segment_missing() && !last => continue,
+                    Err(e) => return Err(e.into()),
+                },
+            };
             // `resolve_row_id_get` never allocates: a key with no row id was
             // never indexed, so there is nothing to clear.
-            if let Some(row_id) = self.resolve_row_id_get(key) {
-                entry.index.write().remove_all_for_row(row_id);
-            }
-            return Ok(FieldReindexOutcome::KeyNotFound);
-        };
+            let row_id = match value {
+                Some(_) => Some(self.resolve_row_id_alloc(key)),
+                None => self.resolve_row_id_get(key),
+            };
+            let bucket_guard = match held {
+                Some(guard) => guard,
+                None => {
+                    let guard = self.value_log.lock_bucket_for_write(bucket)?;
+                    if self.lsm.get(key)?.and_then(decode_sharded_pointer) != pointer {
+                        continue;
+                    }
+                    guard
+                }
+            };
 
-        // Same row-ID resolution and per-field ops as `update_indices_on_put`'s
-        // replace-without-prior-bytes branch: `set` clears the row's existing
-        // buckets (preserving one-value-per-row) and inserts the new value.
-        let row_id = self.resolve_row_id_alloc(key);
-        let new_val = (entry.extractor)(&value);
-        let mut idx = entry.index.write();
-        match &new_val {
-            Some(v) => idx.set(v, row_id).map_err(|e| KVError::Io(std::io::Error::other(e)))?,
-            None => idx.remove_all_for_row(row_id),
+            let ns_index = self.namespace_index.read();
+            let Some(entry) = ns_index.get(field_id) else {
+                return Ok(FieldReindexOutcome::FieldNotActive);
+            };
+            let mut follow_up = IndexFollowUp::default();
+            let outcome = match (&value, row_id) {
+                (None, None) => FieldReindexOutcome::KeyNotFound,
+                (None, Some(row_id)) => {
+                    follow_up.apply(entry, row_id, RowChange::RemoveAll);
+                    FieldReindexOutcome::KeyNotFound
+                }
+                // Same per-field ops as `update_indices_on_put`'s
+                // replace-without-prior-bytes branch: `Set` clears the row's
+                // existing buckets (one value per row) and inserts the new one.
+                (Some(value), row_id) => {
+                    let row_id = row_id.expect("allocated above for a present key");
+                    let new_val = (entry.extractor)(value);
+                    let change = match &new_val {
+                        Some(v) => RowChange::Set(v),
+                        None => RowChange::RemoveAll,
+                    };
+                    let error = follow_up.apply_checked(entry, row_id, change).err();
+                    drop(ns_index);
+                    drop(bucket_guard);
+                    self.finish_index_follow_up(key, follow_up);
+                    if let Some(e) = error {
+                        return Err(KVError::Io(std::io::Error::other(e)));
+                    }
+                    return Ok(FieldReindexOutcome::Reindexed);
+                }
+            };
+            drop(ns_index);
+            drop(bucket_guard);
+            self.finish_index_follow_up(key, follow_up);
+            return Ok(outcome);
         }
-        Ok(FieldReindexOutcome::Reindexed)
+        unreachable!("the last attempt holds the bucket lock and always returns")
     }
 
     /// Delete a key from storage (creates tombstone in LSM).
     /// WAL writing is handled by the caller. Allocates the sequence from the
-    /// store's counter (used by TTL expiry / standalone tests); the WAL-backed
-    /// path uses [`delete_from_storage_seq`](Self::delete_from_storage_seq).
+    /// store's counter: for standalone tests. Every database delete path uses
+    /// [`delete_from_storage_seq`](Self::delete_from_storage_seq), and TTL
+    /// expiry deletes at a system version (`delete_if_current`).
     pub fn delete_from_storage(&self, key: &[u8]) -> Result<()> {
         self.delete_from_storage_inner(key, self.alloc_seq(), false)
     }
@@ -259,12 +380,13 @@ impl KVStore {
         // takes no lock; a delete landing after it is caught by the
         // compare-and-set, which re-reads the key under this lock and skips a
         // key that is gone.
+        let row_id = self.row_id_for_delete(key);
         let bucket = self.value_log.bucket_for_key(key);
         let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
         if replayed && !self.replay_wins(key, seq)? {
             return Ok(());
         }
-        self.delete_with_bucket_locked(key, seq, bucket_guard)?;
+        self.delete_with_bucket_locked(key, seq, row_id, bucket_guard)?;
         // A user write supersedes any earlier one to the key that never applied.
         self.take_unapplied_write(key);
         Ok(())
@@ -289,9 +411,19 @@ impl KVStore {
         Ok(wins)
     }
 
+    /// `key`'s row id for a delete's index change, looked up **before** the
+    /// bucket lock is taken: the row map's lock can be waiting on its flush.
+    /// `None` when the namespace has no field index (nothing looked up);
+    /// `Some(None)` for a key that was never indexed.
+    pub(super) fn row_id_for_delete(&self, key: &[u8]) -> Option<Option<u128>> {
+        (!self.namespace_index.read().is_empty()).then(|| self.resolve_row_id_get(key))
+    }
+
     /// The body of a delete, entered with `key`'s value-log bucket write lock
-    /// already held (`bucket_guard`, released before the field indices are
-    /// touched).
+    /// already held (`bucket_guard`), and its row id from
+    /// [`row_id_for_delete`](Self::row_id_for_delete). The field indices are changed before it
+    /// is released, for the reason `put_to_storage_inner` gives; what that
+    /// leaves to do (`IndexFollowUp`) runs after.
     ///
     /// In a namespace with field indexes it asks whether this delete actually
     /// **wins**: a delete older than the key's current copy is dropped by the LSM,
@@ -299,7 +431,13 @@ impl KVStore {
     /// Doing so regardless would leave a live document missing from every query
     /// on the field whenever a delete loses its race. A namespace without them
     /// deletes blind, as it writes.
-    pub(super) fn delete_with_bucket_locked(&self, key: &[u8], seq: impl Into<Version>, bucket_guard: parking_lot::MutexGuard<'_, ()>) -> Result<()> {
+    pub(super) fn delete_with_bucket_locked(
+        &self,
+        key: &[u8],
+        seq: impl Into<Version>,
+        row_id: Option<Option<u128>>,
+        bucket_guard: parking_lot::MutexGuard<'_, ()>,
+    ) -> Result<()> {
         let seq = seq.into();
         // Read the prior value (under the bucket lock, so GC can't relocate it)
         // so index removal can target the old value's bucket instead of scanning
@@ -318,7 +456,6 @@ impl KVStore {
         // itself is never touched (its segment may be sealed and immutable). Counted
         // here if the memtable held it, else when the merge drops its entry.
         self.note_applied(applied, None, key.len());
-        drop(bucket_guard);
 
         // Remove the row from the field indices only if this delete removed a value
         // (`displaced` is set only when it wins). A key with no current value has
@@ -327,51 +464,48 @@ impl KVStore {
         // without old bytes; a row a lost update left behind is for gap records
         // and repair, not for every delete of an absent key. Without indexes this
         // is a no-op, unless one appeared mid-delete: then it clears the row.
-        if displaced.is_some() || !indexed {
-            self.update_indices_on_delete(key, old_value.as_deref());
-        }
+        let follow_up = if displaced.is_some() || !indexed {
+            self.update_indices_on_delete(key, row_id, old_value.as_deref())
+        } else {
+            IndexFollowUp::default()
+        };
+        drop(bucket_guard);
+        self.finish_index_follow_up(key, follow_up);
 
         Ok(())
     }
 
-    /// Remove a deleted key's row from the field indices.
+    /// Remove a deleted key's row from the field indices, in memory only (see
+    /// [`update_indices_on_put`](Self::update_indices_on_put)).
     ///
     /// With the deleted document's prior bytes (`old_value`) in hand, each field
     /// removes the row from just its old value's bucket — `O(1)` instead of the
     /// `O(distinct values)` scan. Falls back to the scan only when those bytes
     /// could not be read, so a row never lingers in a stale bucket.
-    pub(super) fn update_indices_on_delete(&self, key: &[u8], old_value: Option<&[u8]>) {
+    fn update_indices_on_delete(&self, key: &[u8], row_id: Option<Option<u128>>, old_value: Option<&[u8]>) -> IndexFollowUp {
         let ns_index = self.namespace_index.read();
+        let mut follow_up = IndexFollowUp::default();
         if ns_index.is_empty() {
-            return;
+            return follow_up;
         }
-        // No allocation: a key the dense map has never seen has nothing indexed.
-        let Some(row_id) = self.resolve_row_id_get(key) else {
-            return;
+        // An index activated since the caller looked: look the id up now. No
+        // allocation: a key the dense map has never seen has nothing indexed.
+        let Some(row_id) = row_id.unwrap_or_else(|| self.resolve_row_id_get(key)) else {
+            return follow_up;
         };
         for entry in ns_index.iter() {
-            let mut idx = entry.index.write();
-            match old_value {
-                // Targeted: the row is under the old value's bucket (if any).
-                Some(ov) => {
-                    if let Some(old_val) = (entry.extractor)(ov) {
-                        idx.remove(&old_val, row_id);
-                    }
-                    // Field absent in the old doc → row was never indexed for it.
-                }
+            let old_val = old_value.map(|ov| (entry.extractor)(ov));
+            let change = match &old_val {
+                // Targeted: the row is under the old value's bucket.
+                Some(Some(v)) => RowChange::Remove(v),
+                // Field absent in the old doc → row was never indexed for it.
+                Some(None) => continue,
                 // Prior bytes unavailable → scan to be safe.
-                None => idx.remove_all_for_row(row_id),
-            }
-            // A removal changes the value's bitmap like a put does: signal both
-            // valves the same way.
-            let dead_bytes = idx.reclaimable_dead_bytes();
-            let overlay_full = idx.overlay_budget().over_soft();
-            drop(idx);
-            self.request_checkpoint_if_over_cap(dead_bytes);
-            if overlay_full {
-                self.request_checkpoint_now();
-            }
+                None => RowChange::RemoveAll,
+            };
+            follow_up.apply(entry, row_id, change);
         }
+        follow_up
     }
 
     /// Increment write count and return true if a sync should be triggered

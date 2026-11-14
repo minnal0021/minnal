@@ -38,12 +38,8 @@ impl LSMTree {
             if qualifying_buckets.is_some_and(|qb| !qb[bucket as usize]) {
                 continue;
             }
-            for l0 in self.level0_entries_snapshot(bucket) {
-                if l0.is_obsolete() {
-                    continue;
-                }
-                let _guard = L0ReadGuard::new(Arc::clone(&l0));
-                for e in self.read_sstable_entries_from_path(&l0.path)? {
+            for guard in self.live_level0_guards(bucket) {
+                for e in self.read_sstable_entries_from_path(&guard.entry.path)? {
                     if let Some(pointer) = e.live_pointer() {
                         add(&e.key, pointer);
                     }

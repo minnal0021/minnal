@@ -40,8 +40,10 @@ INGEST (synchronous, on the write path)                    [minnal_doc_store →
     └─ KVStore::put_to_storage_inner                       (kv_store/writes.rs)
          1. WAL append + fsync          ← durability barrier (the DOC is durable here)
          2. value-log write → pointer; memtable insert
-         3. update_indices_on_put(key, value)              ← indexing runs INLINE, in memory
-              row_id = resolve_row_id_alloc(key)           (dense RowMap id; or registered RowIdFn)
+         3. update_indices_on_put(key, value)              ← indexing runs INLINE, in memory,
+                                                             UNDER the value-log bucket lock
+              row_id = resolve_row_id_alloc(key)           (dense RowMap id; or registered RowIdFn;
+                                                             resolved BEFORE the bucket lock)
               for each registered field, under entry.index.write():
                 v = extractor(value)                       (ExtractorFn: bytes → IndexValue)
                 DynFieldIndex::insert / update / set:      (clear old bucket(s) if any, insert new)
@@ -49,8 +51,9 @@ INGEST (synchronous, on the write path)                    [minnal_doc_store →
                   overlay[slot_id][row_id >> 16] ← container (loaded from the store on first
                                                    touch via the slot's directory), changed in place
                   budget.charge(Δ heap bytes)
+              after the bucket lock (finish_index_follow_up):
                   if budget.over_hard(): spill() THIS field  ← stage, msync vals, commit, msync keys
-              after the lock: over_soft() → IndexCheckpointTrigger::request()
+                  over_soft() → IndexCheckpointTrigger::request()
                               dead_bytes ≥ index_blob_backpressure_bytes → request_if_over_cap()
          (nothing touches the index files here unless the hard limit is crossed;
           after a crash the overlay is rebuilt by WAL replay from the checkpoint offset)
@@ -128,7 +131,7 @@ Field indexes live under `{db_path}/field-index/{ns_id}/{field_id}/` (layout in 
 
 Why: before the overlay, every insert re-serialised and appended the whole bitmap, which is O(N²) cumulative bytes per value — a boolean over 200k rows appended 3 GB for 54 KB live, and a 5-value field replayed over 16k docs left a 2.6 GB file that could not be opened. The overlay (step 2) made that one bitmap per changed value per spill (bool 200k rows 3,076 MiB → 3.6 MiB). It still held **whole** bitmaps, so once the changed bitmaps exceeded the hard limit (a boolean over ~300M rows) every write spilled its whole bitmap again; the container-granular layout (FR-005, steps 3b–3d) removed that: past the hard limit each write now appends about one container and a directory (`past_the_hard_limit_each_spill_appends_containers_not_bitmaps`). See `Field-Index-Write-Back-Evaluation.md` → *Results*. **Do not reintroduce a per-write blob write** (`BlobStore::upsert` is `#[cfg(test)]` for this reason and because it is not crash-ordered), and **do not go back to whole-bitmap blobs**.
 
-The budget (`thresholds.index_overlay_soft_bytes` 32 MiB / `index_overlay_hard_bytes` 64 MiB) is **one counter per `Database`**, shared by every field (`Database::index_overlay_budget`, set on each `DynFieldIndex` at activation). It charges each overlay container's heap bytes plus a fixed overhead, each slot's overhead, and its cached directory. Soft → `IndexCheckpointTrigger::request()` (uncapped; fires even with backpressure disabled). Hard → `spill_if_over_budget` on the writer's thread, under the field's write lock, including the two msyncs — so a write that crosses the hard limit is slow. A soft limit above the hard one is clamped; a hard limit of 0 spills every write. `IndexOverlayBudget::stats()` (peak, soft crossings, hard spills and their time) is served under `index_overlay` in `GET /admin/storage/ops-metrics`.
+The budget (`thresholds.index_overlay_soft_bytes` 32 MiB / `index_overlay_hard_bytes` 64 MiB) is **one counter per `Database`**, shared by every field (`Database::index_overlay_budget`, set on each `DynFieldIndex` at activation). It charges each overlay container's heap bytes plus a fixed overhead, each slot's overhead, and its cached directory. Soft → `IndexCheckpointTrigger::request()` (uncapped; fires even with backpressure disabled). Hard → `spill_if_over_budget` on the writer's thread, under the field's write lock, including the two msyncs — so a write that crosses the hard limit is slow. The store's write path changes the index under its value-log bucket lock (so a key's changes land in version order) with `apply_without_spill`, and spills only after releasing that lock: no I/O under the bucket lock. WAL replay and the other `DynFieldIndex` write methods spill inline. A soft limit above the hard one is clamped; a hard limit of 0 spills every write. `IndexOverlayBudget::stats()` (peak, soft crossings, hard spills and their time) is served under `index_overlay` in `GET /admin/storage/ops-metrics`.
 
 **Format version.** `BlobStore` `VERSION` is 2 (directory layout). A version-1 store fails `validate_open` with `InvalidData` and the field cannot activate — greenfield: delete the database (or the field's directory) and rebuild. There is no migration.
 
