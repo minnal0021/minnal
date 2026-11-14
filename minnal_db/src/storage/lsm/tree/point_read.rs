@@ -205,12 +205,8 @@ impl LSMTree {
             if entry.is_obsolete() {
                 continue;
             }
-            if !entry.may_contain(key) {
-                if let Some(m) = self.metrics() {
-                    Metrics::bump(&m.l0_bloom_rejects);
-                }
-                continue;
-            }
+            // The seq bound first: a comparison, where the bloom check hashes the
+            // key twice. After a hit, every older file usually fails it.
             let best_seq = match (floor, best.seq()) {
                 (Some(f), Some(b)) => Some(if seq_newer(b, f) { b } else { f }),
                 (f, b) => f.or(b),
@@ -218,6 +214,12 @@ impl LSMTree {
             if best_seq.is_some_and(|s| entry.cannot_beat(s)) {
                 if let Some(m) = self.metrics() {
                     Metrics::bump(&m.seq_prunes);
+                }
+                continue;
+            }
+            if !entry.may_contain(key) {
+                if let Some(m) = self.metrics() {
+                    Metrics::bump(&m.l0_bloom_rejects);
                 }
                 continue;
             }

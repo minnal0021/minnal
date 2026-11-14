@@ -2,6 +2,7 @@
 
 mod batch_reads;
 mod compaction;
+mod first_hit;
 mod flush;
 mod format;
 mod point_reads;

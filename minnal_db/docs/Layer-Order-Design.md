@@ -176,10 +176,22 @@ each key with a copy that is not older than the copy above it.
 The first four were checked by reverting each change: each revert fails at
 least one of them.
 
-## What this allows next
+## Reads still resolve by sequence
 
 With the rule kept by every writer, a read could stop at the first layer that
-holds the key, and scans and merges could resolve by layer. The seq-resolution
-code stays for now: changing the read paths is a separate step, to be measured
-on its own. GC's cost should be measured too: GC throughput, and writers' p99
-latency during a GC pass, against the batched re-point without stripes.
+holds the key. That was measured against the seq-resolved read and not adopted:
+on a tree with L1, six L0 files of overwrites, a read-only and an active
+memtable, stopping at the first hit saved about 1% on keys whose newest copy is
+in L0 or only in L1, and on misses. It saved more only on keys in a read-only
+memtable, which exists only until it is flushed. The seq-resolved read already
+skips almost every lower layer by its sequence bounds (each L0 file's and L1's
+newest seq), checked before the file's bloom filter. Keeping it means a writer
+that ever broke the rule would still be read correctly.
+
+The measurement is `first_hit_against_seq_resolution`
+(`storage/lsm/tree/tests/first_hit.rs`, `#[ignore]`d; run it in release).
+Scans and the L0→L1 merge compare one seq per entry they already read, so
+resolving them by layer would save no I/O.
+
+GC's cost with the stripe has still to be measured: GC throughput, and writers'
+p99 latency during a GC pass.
