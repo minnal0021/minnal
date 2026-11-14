@@ -113,6 +113,7 @@ impl LSMTree {
             ro_memtable_version: Arc::new(AtomicU64::new(0)),
             level0_files,
             last_l0_stamp: parking_lot::Mutex::new(last_l0_stamp),
+            level0_cleanup_lock: parking_lot::Mutex::new(()),
             flush_observer: Arc::new(RwLock::new(None)),
             base_path,
             #[cfg(test)]

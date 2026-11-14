@@ -400,3 +400,37 @@ fn compact_all_merges_what_compact_due_leaves() -> Result<()> {
     assert!(lsm.get_with_seq(&key(6))?.is_some());
     Ok(())
 }
+
+// A crash after a merge into L1, while the merged L0 files are being deleted,
+// must not bring back what the merge removed. Here the newer file (a tombstone)
+// is deleted and the older one (the value it deleted) survives, because a
+// reader still had it open; the merge dropped the tombstone, so after a reopen
+// nothing above L1 says the key is gone.
+#[test]
+fn a_crash_while_merged_level0_files_are_deleted_does_not_bring_a_key_back() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let config = LSMConfig {
+        num_buckets: 1,
+        ..LSMConfig::default()
+    };
+    {
+        let lsm = LSMTree::open(temp_dir.path(), config.clone())?;
+        lsm.insert_with_seq(b"k", 0xAAAA, 5)?;
+        lsm.flush_memtable_to_level0()?; // older file: k @ 5
+        lsm.delete_with_seq(b"k", 9)?;
+        lsm.flush_memtable_to_level0()?; // newer file: tombstone @ 9
+        let files = lsm.level0_entries_snapshot(0);
+        assert_eq!(files.len(), 2);
+        let older = files.iter().min_by_key(|f| f.created_at_ms).cloned().unwrap();
+
+        lsm.merge_level0_to_level1(0)?; // L1: nothing (the tombstone is dropped)
+        let reader = L0ReadGuard::new(older); // a read still in the older file
+        lsm.cleanup_obsolete_level0_files(); // deletes only the newer file
+        drop(reader);
+        assert_eq!(lsm.get(b"k")?, None);
+        // Crash here: the older file is still on disk.
+    }
+    let lsm = LSMTree::open(temp_dir.path(), config)?;
+    assert_eq!(lsm.get(b"k")?, None, "a merged L0 file left by a crash brought a deleted key back");
+    Ok(())
+}

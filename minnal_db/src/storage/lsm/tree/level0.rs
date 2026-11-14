@@ -210,17 +210,51 @@ impl LSMTree {
         self.level0_files[bucket as usize].read().clone()
     }
 
+    /// Delete the Level-0 files a merge into Level 1 has made obsolete: oldest
+    /// first, stopping at the first one a reader still holds, each unlink made
+    /// durable (a directory fsync) before the next.
+    ///
+    /// The order is what keeps a crash in the middle safe. A merge drops
+    /// tombstones, so a merged file that survives a crash is read again at open,
+    /// above the new L1, as a live L0 file. If an older merged file survived
+    /// while a newer one was deleted, a value in the older file whose delete was
+    /// in the newer one would come back, with nothing left to say it was deleted.
+    /// Deleting oldest first, with each unlink durable before the next, means
+    /// whatever survives is the newest merged files, which hold each of their keys'
+    /// newest copy (the one L1 holds too). A merge marks a prefix of the bucket's
+    /// files (every file registered when it started), so the obsolete files are
+    /// the oldest ones. Guard:
+    /// `a_crash_while_merged_level0_files_are_deleted_does_not_bring_a_key_back`.
     pub(super) fn cleanup_obsolete_level0_files(&self) {
+        let _cleanup = self.level0_cleanup_lock.lock();
         for bucket in 0u32..self.config.num_buckets as u32 {
-            let mut guard = self.level0_files[bucket as usize].write();
-            guard.retain(|entry| {
-                if entry.is_obsolete() && entry.readers() == 0 {
-                    let _ = std::fs::remove_file(&entry.path);
-                    false
-                } else {
-                    true
+            // Taken off the registry under its lock (briefly, as today); the
+            // unlinks and fsyncs run after it is released, so reads of the bucket
+            // do not wait for them.
+            let deletable: Vec<PathBuf> = {
+                let mut guard = self.level0_files[bucket as usize].write();
+                guard.sort_by_key(|entry| entry.created_at_ms);
+                let count = guard.iter().take_while(|entry| entry.is_obsolete() && entry.readers() == 0).count();
+                guard.drain(..count).map(|entry| entry.path.clone()).collect()
+            };
+            if deletable.is_empty() {
+                continue;
+            }
+            let dir = Self::level0_bucket_dir_from(&self.base_path, bucket);
+            for path in &deletable {
+                let unlinked = match std::fs::remove_file(path) {
+                    Ok(()) => File::open(&dir).and_then(|d| d.sync_all()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = unlinked {
+                    // Stop: the files after this one stay on disk (out of the
+                    // registry), and the next open reads them as live L0 files,
+                    // which is safe for the newest merged files.
+                    warn!("could not delete merged Level-0 file {}: {e}; the newer ones are kept", path.display());
+                    break;
                 }
-            });
+            }
         }
     }
 }

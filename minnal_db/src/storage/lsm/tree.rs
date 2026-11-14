@@ -488,6 +488,10 @@ pub(crate) struct LSMTree {
     /// [`next_l0_stamp`](Self::next_l0_stamp), so file order is flush order even
     /// when the wall clock steps backwards.
     last_l0_stamp: parking_lot::Mutex<u128>,
+    /// Held across a deletion of merged Level-0 files, unlinks and directory
+    /// fsyncs included, so two cleanups cannot interleave their unlinks. See
+    /// `cleanup_obsolete_level0_files`.
+    level0_cleanup_lock: parking_lot::Mutex<()>,
 
     /// Optional observer for flush lifecycle events.
     flush_observer: Arc<RwLock<Option<Arc<dyn LsmFlushObserver>>>>,
