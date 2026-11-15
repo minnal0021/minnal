@@ -21,7 +21,7 @@ to other hardware much better than the raw microseconds do.
 | A field-index equality query over 100,000 rows | 0.3–2.0 µs | [Field-index queries](#field-index-queries) |
 | A field-index range query over 100,000 rows | 55–130 µs | [Field-index queries](#field-index-queries) |
 | A semantic search over 5,000 documents | 1.0–4.8 ms, excluding the embedding call | [Semantic search](#semantic-search) |
-| The whole engine under load, 1 to 16 clients | 380 to 1,937 operations per second; searches 4.0 to 10.2 ms at the median; documents searchable 11–12 ms after their write at the median (embeddings replayed, not computed) | [Latency by number of clients](#latency-by-number-of-clients) |
+| The whole engine under load, 1 to 16 clients | 376 to 2,004 operations per second; writes 1.8 to 3.2 ms at the median; searches 4.2 to 15.8 ms; documents searchable 11–22 ms after their write at the median (embeddings replayed, not computed) | [Latency by number of clients](#latency-by-number-of-clients) |
 
 The one number that shapes the write path: **a write costs 0.75 ms because it
 waits for the disk to confirm the data is safe** (an fsync). The WAL append
@@ -58,7 +58,7 @@ ran. So more writers mean more writes per fsync, not a queue for the disk.
 | Machine | AMD Ryzen 9 9950X3D (16 cores), 96 GB RAM, NVMe SSD, bare metal |
 | OS | Ubuntu 26.04, Linux 7.0.0-43 |
 | Rust | 1.99.1 |
-| Code | commit `9e8586a`; the range scans and typed iteration in [Scans](#scans) at commit `a11f16c`; [The engine at work](#the-engine-at-work) at commit `6daf8e4` |
+| Code | commit `9e8586a`; the range scans and typed iteration in [Scans](#scans) at commit `a11f16c`; [The engine at work](#the-engine-at-work) at commit `cf12cb1` |
 | Date | 2026-11-15 |
 
 To reproduce everything, including the charts:
@@ -441,15 +441,15 @@ works, and what it leaves out, follows them.
 
 ### Latency by number of clients
 
-Code at commit `6daf8e4`, on 2026-11-15, on the machine under [Setup](#setup),
+Code at commit `cf12cb1`, on 2026-11-15, on the machine under [Setup](#setup),
 with jemalloc as the allocator. Each cell ran once, and the soak lasted
 10 minutes ([What is measured](#what-is-measured) explains both). Every cell
 was valid.
 
 ![Operations per second, by number of clients](docs/benchmarks/engine_throughput.png)
 
-Throughput rises from 380 operations per second with one client to 1,937 with
-16, 5.1 times as many. Throughput times mean latency equals the number of
+Throughput rises from 376 operations per second with one client to 2,004 with
+16, 5.3 times as many. Throughput times mean latency equals the number of
 clients in every cell, as a closed loop requires.
 
 ![Latency of each operation, by number of clients](docs/benchmarks/engine_latency.png)
@@ -460,40 +460,52 @@ p99.9 included, is in [engine_latency.md](docs/benchmarks/engine_latency.md).*
 
 What the charts show:
 
-- **Reads stay fast.** `get` has a median of 0.02–0.03 ms at every client
-  count; its p99 rises from 0.04 to 0.41 ms. `scan`'s median goes from 0.29 to
-  0.65 ms, and `field_query`'s from 2.5 to 8.8 ms, with a p99 of 12–37 ms.
-- **Searches slow gradually.** The median `search` takes 4.0 ms with one client
-  and 10.2 ms with 16; its p99 goes from 4.6 to 19.4 ms. At most four searches
-  score their candidates at once, each spread over the cores, and the others
-  wait their turn in order, so a search's time grows with the searches ahead
-  of it. `filtered_search` costs more than `search`: 1.1 ms more at the median
-  with one client, 7.3 ms with 16.
-- **Writes share fsyncs.** The median `insert` and `update` take 1.7–1.8 ms
-  with one client; with 16, `insert` takes 10.1 ms and `update` 7.6 ms, while
-  the clients write about 440 documents a second between them; `delete` takes
-  4.9 ms and 16.1 ms. A document write is at
-  least two WAL writes (the document, then its entry in the embedding queue),
-  and concurrent writes share each fsync. A delete first removes the
-  document's vector-index entries, each a durable delete of its own, which is
-  why it costs about three inserts with one client.
+- **Reads stay fast.** `get` has a median of 0.02–0.04 ms at every client
+  count; its p99 rises from 0.04 to 0.54 ms. `scan`'s median goes from 0.28 to
+  1.28 ms, and `field_query`'s from 2.3 to 6.4 ms, with a p99 of 12–25 ms.
+- **Searches slow as more of them wait.** The median `search` takes 4.2 ms
+  with one client and 15.8 ms with 16; its p99 goes from 5.0 to 26.5 ms. At
+  most four searches score their candidates at once, each spread over the
+  cores, and the others wait their turn in order, so a search's time grows
+  with the searches ahead of it. `filtered_search` costs more than `search`:
+  1.0 ms more at the median with one client, 2.8 ms with 16.
+- **Writes return without waiting for the field indexes.** The median
+  `insert` and `update` take 1.8 ms with one client and 3.2 ms with 16 (p99
+  10 ms), while the clients write about 460 documents a second between them;
+  `delete` takes 4.9 ms and 9.6 ms. A document write is at least two WAL
+  writes (the document, then its entry in the embedding queue), and
+  concurrent writes share each fsync. A write queues its field-index changes
+  and returns; a background worker applies them, waiting 20 ms after a write
+  wakes it (`scheduled_tasks.index_apply_delay_ms`) so a burst is applied in
+  one pass, which is about how long a field query can lag a write. A delete
+  first removes the document's vector-index entries, each a durable delete of
+  its own, which is why it costs about three inserts with one client.
+- **Where the time goes with 16 clients.** Each client sends its next request
+  when the last returns, so a client not waiting on one operation is waiting
+  on another. Writes return in about 3 ms, so between them they hold 2.6 of
+  the 16 clients at a time, and much of the rest queue for the search gate:
+  8.1 searches are in flight on average, while the gate's four slots complete
+  one every 6.2 ms each. Most of a search's 15.8 ms median there is that
+  queue; with requests arriving at a steady rate rather than from a fixed set
+  of clients, it would be shorter. The busy cores are also why `scan`'s median
+  and `get`'s p99 rise with the client count.
 - **Indexing keeps up at every client count.** Embeddings come from a table
   recorded from the embedding service, so this leaves out the service's own
   time (see [How it runs](#how-it-runs)). The time from a write's
   acknowledgement until its document is searchable has a median of 11 ms
-  with 1 to 8 clients and 12 ms with 16, and a p99 of 12–44 ms. In the 10-minute
-  soak at 4 clients (1,041 operations per second) the median stayed at 11 ms and
-  the indexing backlog at 2 documents (7 at most). Disk use rose and fell
-  between 265 and 482 MiB as garbage collection reclaimed space, with no upward
-  trend, and resident memory stayed between 1.45 and 1.60 GiB (0.93 GiB of it
-  the benchmark's replay table).
+  with 1 to 6 clients, 12 ms with 8 and 22 ms with 16, and a p99 of 12–60 ms.
+  In the 10-minute soak at 4 clients (1,064 operations per second) the median
+  stayed at 11 ms and the indexing backlog at 2 documents (6 at most). Disk use
+  rose and fell between 266 and 483 MiB as garbage collection reclaimed space,
+  with no upward trend, and resident memory stayed between 1.44 and 1.61 GiB
+  (0.93 GiB of it the benchmark's replay table).
 - **Alone against in the mix.** Reads sent alone are faster than the same
   reads in the 1-client mix (`get` 0.01 against 0.02 ms, `scan` 0.21 against
-  0.29 ms), where they share the machine with searches and indexing. We have not
+  0.28 ms), where they share the machine with searches and indexing. We have not
   measured which part of that work slows them. Inserts sent alone are *slower*
-  (2.5 against 1.7 ms at the median): a client sending only inserts drove
-  45,000 document writes in 2 minutes 15 seconds, with 146,000 key-value puts
-  across the engine and 809 vector-partition splits as the store grew, against
+  (2.4 against 1.8 ms at the median): a client sending only inserts drove
+  46,000 document writes in 2 minutes 15 seconds, with 150,000 key-value puts
+  across the engine and 826 vector-partition splits as the store grew, against
   41,000 puts and no split in the 3 minutes 15 seconds of the 1-client mix.
 
 Search quality held through the run (nDCG, FiQA test queries):
@@ -501,8 +513,8 @@ Search quality held through the run (nDCG, FiQA test queries):
 | | @10 | @20 | @30 | @40 | @50 | @100 |
 |---|---:|---:|---:|---:|---:|---:|
 | Before the run | 0.501 | 0.527 | 0.538 | 0.545 | 0.551 | 0.564 |
-| Under load, concurrent cells | 0.508 | 0.535 | 0.546 | 0.552 | 0.557 | 0.571 |
-| At rest after the run | 0.505 | 0.534 | 0.544 | 0.551 | 0.556 | 0.570 |
+| Under load, concurrent cells | 0.507 | 0.536 | 0.544 | 0.551 | 0.556 | 0.570 |
+| At rest after the run | 0.507 | 0.535 | 0.545 | 0.551 | 0.556 | 0.569 |
 
 The store changes during the run (documents are deleted, rewritten and
 inserted), so the rows measure slightly different stores, not only a busier
