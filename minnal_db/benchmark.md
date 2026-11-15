@@ -16,16 +16,16 @@ to other hardware much better than the raw microseconds do.
 |---|---|---|
 | A durable write (`put`, `delete`, `merge`), one writer | 0.75 ms, whatever the value size up to 64 KiB | [Writes](#writes) |
 | Reading one key from memory | 0.3–0.6 µs | [Reads](#reads) |
-| Reading one key from disk | 2.6–2.8 µs, barely growing with store size | [Reads](#reads) |
+| Reading one key from disk | 2.5–2.8 µs, barely growing with store size | [Reads](#reads) |
 | Scanning 1,000 keys with their values | 0.3–0.4 ms | [Scans](#scans) |
 | A field-index equality query over 100,000 rows | 0.3–2.0 µs | [Field-index queries](#field-index-queries) |
-| A field-index range query over 100,000 rows | 56–131 µs | [Field-index queries](#field-index-queries) |
-| A semantic search over 5,000 documents | 1.1–4.9 ms, excluding the embedding call | [Semantic search](#semantic-search) |
-| The whole engine under load, 1 to 16 clients | 385 to 2,022 operations per second; searches 3.9 to 10.5 ms at the median; documents searchable 11–22 ms after their write (embeddings replayed, not computed) | [Latency by number of clients](#latency-by-number-of-clients) |
+| A field-index range query over 100,000 rows | 55–130 µs | [Field-index queries](#field-index-queries) |
+| A semantic search over 5,000 documents | 1.0–4.8 ms, excluding the embedding call | [Semantic search](#semantic-search) |
+| The whole engine under load, 1 to 16 clients | 380 to 1,937 operations per second; searches 4.0 to 10.2 ms at the median; documents searchable 11–12 ms after their write at the median (embeddings replayed, not computed) | [Latency by number of clients](#latency-by-number-of-clients) |
 
 The one number that shapes the write path: **a write costs 0.75 ms because it
 waits for the disk to confirm the data is safe** (an fsync). The WAL append
-itself, without the fsync, takes 0.4–7 µs. That is a deliberate choice — a
+itself, without the fsync, takes 0.4–6 µs. That is a deliberate choice — a
 write that returns has survived a power cut. Concurrent writes share one fsync
 (*group commit*): each waits for an fsync that started after its own entry was
 written, and one fsync covers every writer that arrived while the previous one
@@ -56,10 +56,10 @@ ran. So more writers mean more writes per fsync, not a queue for the disk.
 | | |
 |---|---|
 | Machine | AMD Ryzen 9 9950X3D (16 cores), 96 GB RAM, NVMe SSD, bare metal |
-| OS | Ubuntu 26.04, Linux 7.0.0-42 |
+| OS | Ubuntu 26.04, Linux 7.0.0-43 |
 | Rust | 1.99.1 |
-| Code | commit `1b7e83e`; [Reads](#reads) at commit `fcf5172`; [The engine at work](#the-engine-at-work) at commit `ab1b605` |
-| Date | 2026-10-31; the engine at work 2026-11-01 |
+| Code | commit `9e8586a`; the range scans and typed iteration in [Scans](#scans) at commit `a11f16c`; [The engine at work](#the-engine-at-work) at commit `6daf8e4` |
+| Date | 2026-11-15 |
 
 To reproduce everything, including the charts:
 
@@ -98,46 +98,46 @@ A write's cost is the drive's fsync time, and value size hardly matters:
 
 ![Durable write latency by value size](docs/benchmarks/write.png)
 
-A 128-byte, a 4 KiB and a 64 KiB value cost 0.747, 0.749 and 0.789 ms: within
-6% of each other for 512 times the data.
+A 128-byte, a 4 KiB and a 64 KiB value cost 0.730, 0.738 and 0.785 ms: within
+8% of each other for 512 times the data.
 
 These writes go into a database that has been running for a while. A new
 database's first WAL segment is sparse, and there a write that starts a new
 4 KiB block of the file also pays for allocating it: a 4 KiB WAL append into a
 new log's first segment measured 2.3 ms. Every later segment is written with
 zeros before the log reaches it, so it costs nothing extra.
-(`write_first_put_into_new_db` measures a database's very first write: 0.75 ms
+(`write_first_put_into_new_db` measures a database's very first write: 0.76 ms
 at 128 bytes, which starts no new block.)
 
 The chart below shows what the fsync costs on its own. It times a single WAL
-append with and without the sync. Synced, an append takes 0.73–0.76 ms at every
-value size. Without the sync it takes 0.41 µs at 128 bytes, 0.77 µs at 4 KiB and
-6.5 µs at 64 KiB: the fsync is 100 to 1,800 times everything else the append
+append with and without the sync. Synced, an append takes 0.74–0.75 ms at every
+value size. Without the sync it takes 0.40 µs at 128 bytes, 0.76 µs at 4 KiB and
+6.0 µs at 64 KiB: the fsync is 120 to 1,900 times everything else the append
 does.
 
 ![A WAL append with and without the fsync](docs/benchmarks/wal_fsync.png)
 
-*Log scale: the synced bars are 100 to 1,800 times taller than the unsynced
+*Log scale: the synced bars are 120 to 1,900 times taller than the unsynced
 ones. Production writes always sync; the unsynced case exists only to measure
 the rest of the path.*
 
 Other write-path measurements:
 
-- **The full `put`** (WAL, value log and memtable together) measures 0.747 ms,
+- **The full `put`** (WAL, value log and memtable together) measures 0.754 ms,
   within noise of the WAL append alone: the value-log write and memtable
   insert are too small to see next to the fsync.
 - **Namespaces cost nothing.** Writing to the default namespace and to a named
-  one measure 0.746 and 0.717 ms, within the fsync's run-to-run spread.
+  one measure 0.754 and 0.749 ms, within the fsync's run-to-run spread.
 - **Mixed read/write workloads cost what their writes cost.** With 80% reads,
-  an operation averages 145 µs on a store held in memory and 194 µs on one held
-  on disk; with 50% reads, 372 and 480 µs. The writes account for nearly all
+  an operation averages 147 µs on a store held in memory and 198 µs on one held
+  on disk; with 50% reads, 373 and 490 µs. The writes account for nearly all
   of the in-memory figures (20% and 50% of a 0.75 ms write are 150 and 375 µs).
-  The on-disk store costs 49–108 µs more per operation than its reads explain
+  The on-disk store costs 51–117 µs more per operation than its reads explain
   (a read from disk takes about 3 µs); we have not measured why.
-- **Encoding a WAL entry** takes 46 ns (128 B) to 1.1 µs (64 KiB), and decoding
-  it 14 ns to 0.54 µs.
+- **Encoding a WAL entry** takes 48 ns (128 B) to 1.1 µs (64 KiB), and decoding
+  it 12 ns to 0.54 µs.
 - **Reading the WAL back** (crash recovery, field-index replay) reads 1,000
-  entries of 128 bytes in 79 µs, about 13 million a second, and 1,000 of 4 KiB
+  entries of 128 bytes in 78 µs, about 13 million a second, and 1,000 of 4 KiB
   in 0.24 ms. These scans vary more than the rest between runs, with what ran
   before them: run on their own, the same cases measured 55 µs and 0.64 ms.
 
@@ -152,22 +152,22 @@ the write latency:
 
 | Extra work `merge` does | Mean |
 |---|---:|
-| Reading the current value (a 2 KiB `get` from memory) | 434 ns |
-| Taking the per-key lock (hash plus uncontended lock) | 49 ns |
+| Reading the current value (a 2 KiB `get` from memory) | 418 ns |
+| Taking the per-key lock (hash plus uncontended lock) | 51 ns |
 | The closure: increment a counter | 10 ns |
-| The closure: insert into a 2 KiB sorted set | 179 ns |
+| The closure: insert into a 2 KiB sorted set | 176 ns |
 
 That adds up to 0.5–0.7 µs, about 0.1% of the fsync. The full operations,
 measured directly, cannot tell merge and put apart:
 
 | Operation | Mean |
 |---|---:|
-| `put`, 2 KiB | 0.749 ms |
-| `delete`, 2 KiB | 0.748 ms |
-| `get` then `put` by hand, 2 KiB sorted set (no atomicity) | 0.745 ms |
-| `merge`, 2 KiB sorted set | 0.732 ms |
-| `put`, 8 B | 0.716 ms |
-| `merge`, 8 B counter | 0.714 ms |
+| `put`, 2 KiB | 0.720 ms |
+| `delete`, 2 KiB | 0.749 ms |
+| `get` then `put` by hand, 2 KiB sorted set (no atomicity) | 0.728 ms |
+| `merge`, 2 KiB sorted set | 0.755 ms |
+| `put`, 8 B | 0.738 ms |
+| `merge`, 8 B counter | 0.723 ms |
 
 The rows differ by up to 5% (about 35 µs), fifty times the extra work `merge`
 does. So that spread is the drive's fsync time varying from run to
@@ -179,7 +179,7 @@ a `put` unless your closure does something expensive.
 ## Reads
 
 Reading a key from memory takes well under a microsecond. Reading the same key
-from disk adds about 2.3 µs: the check against the file's bloom filter, a
+from disk adds about 2.2 µs: the check against the file's bloom filter, a
 search of its index, and the read from the value log. That step is constant for
 small and medium values. At 64 KiB the value itself becomes big enough to add
 time on both tiers.
@@ -198,28 +198,28 @@ disk.
 
 ![Reading a key that exists, as the store grows](docs/benchmarks/lookup_hits.png)
 
-A read from disk barely slows as the store grows: 2.63 µs at 1,000 keys and
-2.78 µs at 100,000, 6% more for 100 times the keys. The on-disk lookup
+A read from disk barely slows as the store grows: 2.53 µs at 1,000 keys and
+2.75 µs at 100,000, 9% more for 100 times the keys. The on-disk lookup
 first rules files out by key range and bloom filter, then searches only a small
 bounded section of the file, so its work does not grow with file size. A read
-from memory rises 62% over the same range (0.37 to 0.59 µs), because the
+from memory rises 70% over the same range (0.34 to 0.58 µs), because the
 in-memory table is a skip list whose search deepens as it grows. Memory is
-still 4.7–7.2 times faster.
+still 4.7–7.4 times faster.
 
 The alternating workload costs more than the average of the two tiers would
-predict: 4% more at 1,000 keys, rising to 12% at 100,000. We have not measured
+predict: 5% more at 1,000 keys, rising to 11% at 100,000. We have not measured
 why.
 The two tiers use different code paths, and switching between them on every call
 may cost cache locality.
 
 ![Reading a key that does not exist, as the store grows](docs/benchmarks/lookup_misses.png)
 
-For a missing key the order flips: **disk is 1.4 to 2.2 times faster than
+For a missing key the order flips: **disk is 1.4 to 2.3 times faster than
 memory**. On disk, a bloom filter usually proves a key is absent without reading
 anything else, so a miss stays at about 0.2 µs at any store size. The in-memory
 table has no such filter. To prove a key is absent it walks the skip list just as
 far as it would to find one, so an in-memory miss grows with the store the way an
-in-memory hit does (0.26 to 0.47 µs). It costs about three quarters of a hit,
+in-memory hit does (0.26 to 0.47 µs). It costs about four fifths of a hit,
 because a hit then reads the value from the value log and a miss has none to
 read. Below the in-memory table, the miss also checks the on-disk level, which
 is empty in this test: an empty level carries an empty bloom filter, so that
@@ -228,25 +228,25 @@ check reads no file.
 ## Scans
 
 Four ways to read many keys at once, each measured in memory and on disk. On
-disk, a scan costs 1.05 to 1.6 times the in-memory scan. The ratio shrinks as
-the result grows, because most of the on-disk extra is a fixed setup cost per
-scan.
+disk, a scan costs between the same as and 1.6 times the in-memory scan. Where
+disk costs more, the ratio shrinks as the result grows, because most of the
+on-disk extra is a fixed setup cost per scan.
 
 ![Prefix scan by number of matching keys](docs/benchmarks/scan_prefix.png)
 
 *Prefix scan: all keys starting with a given prefix, returned with their
-values. On disk costs 1.59x memory at 100 keys and 1.25x at 5,000. Keys are 128
-bytes here; 32-byte keys measure within 8% of these.*
+values. On disk costs 1.60x memory at 100 keys and 1.19x at 5,000. Keys are 128
+bytes here; 32-byte keys measure within 4% of these.*
 
 ![Range scan by number of results](docs/benchmarks/scan_range.png)
 
-*Range scan: all keys between a start and end key, from a store of 2,000. On
-disk costs 1.57x memory at 100 results and 1.19x at 1,000.*
+*Range scan: all keys between a start and end key, from a store of 2,000. The
+two tiers are within 5% of each other at every result count.*
 
 ![Reading all keys with their values](docs/benchmarks/scan_iter.png)
 
-*Reading all 2,000 keys with their values. On disk costs 1.16x memory with
-128-byte values and 1.05x with 4 KiB values. The larger the values, the more of
+*Reading all 2,000 keys with their values. On disk costs 1.14x memory with
+128-byte values and 1.01x with 4 KiB values. The larger the values, the more of
 the time goes into reading them from the value log. That cost is the same on
 both tiers.*
 
@@ -255,16 +255,11 @@ both tiers.*
 *Cursor pagination: the first page of a paginated scan over 1,000 keys with
 256-byte values. This is how the REST API's list endpoints read.*
 
-Cursor pagination is the one scan where the tiers swap. At 100 keys per page,
-disk (68 µs) is twice as fast as memory (146 µs). At 500 per page they are close (234 µs on disk, 254 µs in memory), and at
-1,000 (the whole store) disk is slower, as expected. We have not established why
-small pages favour disk.
-
-A related cost is visible in the memory numbers. A 100-key page costs 37% of
-reading all 1,000 keys. Each page currently collects the keys from the cursor to
-the end of the range before it keeps the first `limit` of them. It loads values
-only for the page, but it still walks every key after the cursor. Bounding that
-walk is a known follow-up.
+A page costs about its own size, not the size of what lies after the cursor: a
+100-key page takes 63 µs in memory and 67 µs on disk, 17% of reading all 1,000
+keys as one page (379 and 441 µs). Each page reads at most a window of entries
+a little larger than the page from each layer of the store, and loads values
+only for the page.
 
 ## Typed API
 
@@ -274,35 +269,36 @@ it adds nothing measurable:
 
 | Operation | Raw bytes | Typed |
 |---|---:|---:|
-| `put`, 128 B | 0.747 ms | 0.728 ms |
-| `put`, 4 KiB | 0.749 ms | 0.744 ms |
-| `get` from memory, 128 B | 0.38 µs | 0.32 µs |
-| `get` from disk, 128 B | 2.63 µs | 2.56 µs |
-| `get` from disk, 4 KiB | 2.79 µs | 2.74 µs |
+| `put`, 128 B | 0.730 ms | 0.728 ms |
+| `put`, 4 KiB | 0.738 ms | 0.722 ms |
+| `get` from memory, 128 B | 0.36 µs | 0.32 µs |
+| `get` from disk, 128 B | 2.58 µs | 2.48 µs |
+| `get` from disk, 4 KiB | 2.74 µs | 2.69 µs |
 
 The differences between the two columns, in either direction, are within the
 noise.
 
-Scans cost more typed in memory, because every returned pair is deserialised.
-On disk the reads dominate and the difference is within noise:
+Scans cost 5–24% more typed, because every returned pair is deserialised. The
+extra is largest in memory, where nothing else in the scan is slow:
 
 | Scan | Raw bytes | Typed | Extra |
 |---|---:|---:|---:|
-| range, 100 results, in memory | 54 µs | 56 µs | +5% |
-| range, 1,000 results, in memory | 347 µs | 372 µs | +7% |
-| range, 100 results, on disk | 84 µs | 85 µs | +1% |
-| range, 1,000 results, on disk | 412 µs | 413 µs | 0% |
-| prefix, 100 keys, in memory | 51 µs | 56 µs | +9% |
-| prefix, 1,000 keys, in memory | 289 µs | 357 µs | +23% |
-| prefix, 100 keys, on disk | 81 µs | 84 µs | +3% |
-| prefix, 1,000 keys, on disk | 408 µs | 406 µs | −1% |
+| range, 100 results, in memory | 53 µs | 56 µs | +5% |
+| range, 1,000 results, in memory | 334 µs | 370 µs | +11% |
+| range, 100 results, on disk | 54 µs | 57 µs | +5% |
+| range, 1,000 results, on disk | 352 µs | 387 µs | +10% |
+| prefix, 100 keys, in memory | 49 µs | 55 µs | +13% |
+| prefix, 1,000 keys, in memory | 294 µs | 365 µs | +24% |
+| prefix, 100 keys, on disk | 78 µs | 82 µs | +6% |
+| prefix, 1,000 keys, on disk | 394 µs | 419 µs | +6% |
 
 One typed operation is slow for a structural reason. `keys_typed`, which lists
-keys without values, takes 255–258 µs even for 100 keys, in memory or on disk.
-That is nearly five times as long as reading the same 100 keys *with*
-their values from memory (56 µs). Key listing goes through the same full-store merge that value-log
-garbage collection uses. Reading with values uses the faster range scan. Until
-that changes, a range or prefix scan is the cheaper way to list keys.
+keys without values, takes 144–156 µs even for 100 keys, in memory or on disk.
+That is nearly three times as long as reading the same 100 keys *with*
+their values from memory (54 µs). Key listing goes through the whole-store
+merge that rebuilds the value log's accounting; reading with values uses the
+faster range scan. Until that changes, a range or prefix scan is the cheaper way
+to list keys.
 
 ## Field-index queries
 
@@ -327,21 +323,21 @@ until the next index checkpoint, every 1.75 seconds by default.
 The cost depends on **how many bitmaps the query has to load**, not on how many
 rows it matches:
 
-- **An equality test loads one bitmap.** `status = 'active'` takes 0.31 µs.
+- **An equality test loads one bitmap.** `status = 'active'` takes 0.35 µs.
   Combining two equality tests with AND or OR takes 2.0 µs.
 - **A range loads one bitmap per distinct value in the range.** `age >= 50` covers
   31 ages, so it merges 31 bitmaps. `age >= 30 AND age <= 50` is evaluated as
   two ranges, one over 51 values and one over 33, and then intersected. At
-  131 µs it is the most expensive query here, about 400 times an equality test.
+  130 µs it is the most expensive query here, about 370 times an equality test.
 
 So adding a range to a query makes it slower even when it narrows the result:
-`status = 'active' AND active = true` matches 12% of rows in 1.9 µs, and adding
-`AND age >= 50` halves that to 6% but takes 56 µs. For a field queried by
+`status = 'active' AND active = true` matches 12% of rows in 2.0 µs, and adding
+`AND age >= 50` halves that to 6% but takes 55 µs. For a field queried by
 range, fewer distinct values (bucketing ages into decades, say) make the query
 cheaper.
 
-Parsing the query text is negligible. A three-condition query takes 81 µs
-parsed from text and 78 µs pre-parsed.
+Parsing the query text is negligible. A three-condition query takes 77 µs
+whether parsed from text or pre-parsed (0.6 µs apart).
 
 ## Paging through query results
 
@@ -355,17 +351,17 @@ result of 200,000:
 
 | Page starts at row | Stepping through rows | Skipping containers (used) |
 |---|---:|---:|
-| 0 | 79 µs | 0.33 µs |
-| 1,000 | 79 µs | 0.67 µs |
-| 50,000 | 81 µs | 17.9 µs |
-| 199,000 | 248 µs | 0.24 µs |
+| 0 | 67 µs | 0.32 µs |
+| 1,000 | 67 µs | 0.68 µs |
+| 50,000 | 69 µs | 17.4 µs |
+| 199,000 | 212 µs | 0.24 µs |
 
 Container skipping still steps through the rows *inside* the container where the
 page starts. Row 50,000 is 50,000 rows into its container, which is why that page
 costs more than the others.
 
 Paging through a whole 20,000-row result, 200 rows at a time (100 pages), takes
-0.45 ms with container skipping and 2.52 ms by stepping through rows, which
+0.45 ms with container skipping and 2.16 ms by stepping through rows, which
 starts again from the first row on every page.
 
 ## Semantic search
@@ -385,8 +381,8 @@ every posting of a namespace that has fewer.
 ![Semantic search latency by chunks per document](docs/benchmarks/semantic_search.png)
 
 A document is split into overlapping chunks, and Pass 1 scores every chunk in
-the clusters it probes. So search time grows with chunks per document: 1.1 ms
-with one chunk, 2.8 ms with four, 4.9 ms with eight. Pass 2 re-scores a fixed
+the clusters it probes. So search time grows with chunks per document: 1.0 ms
+with one chunk, 2.9 ms with four, 4.8 ms with eight. Pass 2 re-scores a fixed
 number of candidates, so its cost does not grow.
 
 How these numbers relate to a real query:
@@ -415,8 +411,8 @@ documents arrived (what ordinary inserts leave).
 
 ![Semantic search over 100,000 documents on disk](docs/benchmarks/pass1_search.png)
 
-Time follows the postings read: 2.1 ms at 18% and 6.3 ms for all of them with
-adjacent codes. Spread codes cost 7–23% more, because Pass 1 reads a run of
+Time follows the postings read: 2.1 ms at 18% and 6.2 ms for all of them with
+adjacent codes. Spread codes cost 7–27% more, because Pass 1 reads a run of
 adjacent codes with one read and a spread posting takes more reads. The
 benchmark repeats each search, so the files are in the operating system's
 cache: this is the cost of the reads in the engine, not of the drive.
@@ -445,15 +441,15 @@ works, and what it leaves out, follows them.
 
 ### Latency by number of clients
 
-Code at commit `ab1b605`, on 2026-11-01, on the machine under [Setup](#setup),
+Code at commit `6daf8e4`, on 2026-11-15, on the machine under [Setup](#setup),
 with jemalloc as the allocator. Each cell ran once, and the soak lasted
 10 minutes ([What is measured](#what-is-measured) explains both). Every cell
 was valid.
 
 ![Operations per second, by number of clients](docs/benchmarks/engine_throughput.png)
 
-Throughput rises from 385 operations per second with one client to 2,022 with
-16, 5.3 times as many. Throughput times mean latency equals the number of
+Throughput rises from 380 operations per second with one client to 1,937 with
+16, 5.1 times as many. Throughput times mean latency equals the number of
 clients in every cell, as a closed loop requires.
 
 ![Latency of each operation, by number of clients](docs/benchmarks/engine_latency.png)
@@ -465,17 +461,18 @@ p99.9 included, is in [engine_latency.md](docs/benchmarks/engine_latency.md).*
 What the charts show:
 
 - **Reads stay fast.** `get` has a median of 0.02–0.03 ms at every client
-  count; its p99 rises from 0.04 to 0.51 ms. `scan`'s median goes from 0.85 to
-  4.9 ms, and `field_query`'s from 2.4 to 7.1 ms, with a p99 of 11–31 ms.
-- **Searches slow gradually.** The median `search` takes 3.9 ms with one client
-  and 10.5 ms with 16; its p99 goes from 4.8 to 19.4 ms. At most four searches
+  count; its p99 rises from 0.04 to 0.41 ms. `scan`'s median goes from 0.29 to
+  0.65 ms, and `field_query`'s from 2.5 to 8.8 ms, with a p99 of 12–37 ms.
+- **Searches slow gradually.** The median `search` takes 4.0 ms with one client
+  and 10.2 ms with 16; its p99 goes from 4.6 to 19.4 ms. At most four searches
   score their candidates at once, each spread over the cores, and the others
   wait their turn in order, so a search's time grows with the searches ahead
-  of it. `filtered_search` costs more than `search`: 1.0 ms more at the median
-  with one client, 5.0 ms with 16.
-- **Writes share fsyncs.** The median `insert` and `update` take 1.7 ms with
-  one client and 8.2 ms with 16, while the clients write about 465 documents a
-  second between them; `delete` takes 5.0 ms and 14.4 ms. A document write is at
+  of it. `filtered_search` costs more than `search`: 1.1 ms more at the median
+  with one client, 7.3 ms with 16.
+- **Writes share fsyncs.** The median `insert` and `update` take 1.7–1.8 ms
+  with one client; with 16, `insert` takes 10.1 ms and `update` 7.6 ms, while
+  the clients write about 440 documents a second between them; `delete` takes
+  4.9 ms and 16.1 ms. A document write is at
   least two WAL writes (the document, then its entry in the embedding queue),
   and concurrent writes share each fsync. A delete first removes the
   document's vector-index entries, each a durable delete of its own, which is
@@ -484,28 +481,28 @@ What the charts show:
   recorded from the embedding service, so this leaves out the service's own
   time (see [How it runs](#how-it-runs)). The time from a write's
   acknowledgement until its document is searchable has a median of 11 ms
-  with 1 to 8 clients and 22 ms with 16, and a p99 of 12–55 ms. In the 10-minute
-  soak at 4 clients (1,054 operations per second) the median stayed at 11 ms and
-  the indexing backlog at 3 documents. Disk use rose and fell between 255 and
-  430 MiB as garbage collection reclaimed space, with no upward trend, and
-  resident memory held at about 1.65 GiB (0.93 GiB of it the benchmark's replay
-  table).
+  with 1 to 8 clients and 12 ms with 16, and a p99 of 12–44 ms. In the 10-minute
+  soak at 4 clients (1,041 operations per second) the median stayed at 11 ms and
+  the indexing backlog at 2 documents (7 at most). Disk use rose and fell
+  between 265 and 482 MiB as garbage collection reclaimed space, with no upward
+  trend, and resident memory stayed between 1.45 and 1.60 GiB (0.93 GiB of it
+  the benchmark's replay table).
 - **Alone against in the mix.** Reads sent alone are faster than the same
-  reads in the 1-client mix (`get` 0.01 against 0.02 ms, `scan` 0.26 against
-  0.85 ms), where they share the machine with searches and indexing. We have not
+  reads in the 1-client mix (`get` 0.01 against 0.02 ms, `scan` 0.21 against
+  0.29 ms), where they share the machine with searches and indexing. We have not
   measured which part of that work slows them. Inserts sent alone are *slower*
-  (2.4 against 1.7 ms at the median): a client sending only inserts drove
-  45,000 document writes in 2 minutes 15 seconds, with 149,000 key-value puts
-  across the engine and 823 vector-partition splits as the store grew, against
-  42,000 puts and no split in the 3 minutes 15 seconds of the 1-client mix.
+  (2.5 against 1.7 ms at the median): a client sending only inserts drove
+  45,000 document writes in 2 minutes 15 seconds, with 146,000 key-value puts
+  across the engine and 809 vector-partition splits as the store grew, against
+  41,000 puts and no split in the 3 minutes 15 seconds of the 1-client mix.
 
 Search quality held through the run (nDCG, FiQA test queries):
 
 | | @10 | @20 | @30 | @40 | @50 | @100 |
 |---|---:|---:|---:|---:|---:|---:|
-| Before the run | 0.501 | 0.528 | 0.538 | 0.546 | 0.551 | 0.565 |
-| Under load, concurrent cells | 0.508 | 0.536 | 0.545 | 0.552 | 0.556 | 0.570 |
-| At rest after the run | 0.510 | 0.539 | 0.548 | 0.555 | 0.559 | 0.573 |
+| Before the run | 0.501 | 0.527 | 0.538 | 0.545 | 0.551 | 0.564 |
+| Under load, concurrent cells | 0.508 | 0.535 | 0.546 | 0.552 | 0.557 | 0.571 |
+| At rest after the run | 0.505 | 0.534 | 0.544 | 0.551 | 0.556 | 0.570 |
 
 The store changes during the run (documents are deleted, rewritten and
 inserted), so the rows measure slightly different stores, not only a busier
@@ -522,7 +519,7 @@ index.
   the API server.
 - **Every background worker runs**: memtable flushes, LSM compaction, value-log
   GC, WAL GC, the vector index WAL's GC, field-index checkpoints (every
-  1.75 s), the vector-index worker (up to 4 embedding calls in flight) and
+  1.75 s), the vector-index worker (up to 6 embedding calls in flight) and
   partition maintenance (2 threads).
 - **No external call: embeddings are replayed.** A document store with semantic
   search sends every new or changed document's text to an embedding service
