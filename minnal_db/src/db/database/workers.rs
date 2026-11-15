@@ -1,6 +1,8 @@
 //! What the background workers call: GC, compaction, and the `*Target` trait impls.
 
 use super::*;
+use crate::db::workers::index_apply::IndexApplyTarget;
+use crate::kv_store::index_queue::Applier;
 use crate::namespace::NamespaceId;
 
 impl Database {
@@ -63,6 +65,31 @@ impl Database {
     }
 }
 
+// ── IndexApplyTarget impl ─────────────────────────────────────────────────
+
+impl IndexApplyTarget for Database {
+    fn is_closed(&self) -> bool {
+        self.is_closed()
+    }
+
+    fn apply_field_index_queues(&self) -> usize {
+        let stores: Vec<Arc<KVStore>> = self.stores.read().values().cloned().collect();
+        stores.iter().map(|s| s.apply_index_queues()).sum()
+    }
+}
+
+impl Database {
+    /// Apply every field-index change queued so far, in every store: once it
+    /// returns, every write that returned before the call is in the field
+    /// indexes. The opt-in barrier for a caller that needs its writes visible
+    /// to queries (`AsyncDb::sync_field_indexes`); queries themselves never
+    /// wait for the queue. Returns the changes applied.
+    pub fn sync_field_indexes(&self) -> usize {
+        let stores: Vec<Arc<KVStore>> = self.stores.read().values().cloned().collect();
+        stores.iter().map(|s| s.sync_index_queues()).sum()
+    }
+}
+
 // ── IndexCheckpointTarget impl ────────────────────────────────────────────
 
 impl IndexCheckpointTarget for Database {
@@ -119,9 +146,18 @@ impl IndexCheckpointTarget for Database {
                     //   4. sync the key tables (read lock, below).
                     // A slot must never reach disk before its blob, and the kernel
                     // writes a shared map back in any order, hence the split.
-                    // Every write below `wal_tail` finished its index update
-                    // before `wal_tail` was taken (see above), so it is staged.
-                    let stage = entry.index.write().stage();
+                    // Every write below `wal_tail` had queued its index change
+                    // before `wal_tail` was taken (see above). The field-index
+                    // worker may not have applied it yet, so the queue is applied
+                    // here first, under the same hold that stages: recording
+                    // `wal_tail` with a change still queued would make crash
+                    // replay start past it, and the change would be lost.
+                    let (stage, applied) = {
+                        let mut idx = entry.index.write();
+                        let applied = entry.queue.apply_locked(&mut idx, Applier::Barrier, None);
+                        (idx.stage(), applied)
+                    };
+                    store.note_applied_index_changes(field_id, Applier::Barrier, applied.count, applied.rejected);
                     if let Err(e) = entry.index.read().sync_values() {
                         entry.index.write().abort(stage);
                         return Err(KVError::Io(e));

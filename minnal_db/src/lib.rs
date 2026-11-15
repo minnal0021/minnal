@@ -212,6 +212,7 @@ pub use crate::field_index::QueryOutcome;
 pub use db::indexing::manager::FieldIndexHealth;
 /// Why a field index is incomplete, and what repair it needs.
 pub use db::indexing::manager::{GapCause, GapRecord, RepairMode};
+pub use kv_store::index_queue::FieldQueueProgress;
 
 /// Extractor closure type: maps raw document bytes to an [`IndexValue`].
 pub use kv_store::index_set::ExtractorFn;

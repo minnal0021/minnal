@@ -167,6 +167,7 @@ impl Database {
                 .unwrap_or_default()
         };
 
+        let progress: std::collections::HashMap<_, _> = store.index_queue_progress().into_iter().collect();
         let ns_index = store.namespace_index.read();
         Ok(fields
             .into_iter()
@@ -182,6 +183,7 @@ impl Database {
                     checkpoint_offset,
                     active: ns_index.get(f.field_id).is_some(),
                     gap: self.index_manager.read_gap(namespace_id, f.field_id),
+                    apply_queue: progress.get(&f.field_id).copied(),
                 }
             })
             .collect())

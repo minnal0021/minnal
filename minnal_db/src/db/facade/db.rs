@@ -350,6 +350,15 @@ impl IndexCheckpointTarget for Db {
     }
 }
 
+impl crate::db::workers::index_apply::IndexApplyTarget for Db {
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+    fn apply_field_index_queues(&self) -> usize {
+        crate::db::workers::index_apply::IndexApplyTarget::apply_field_index_queues(&self.inner)
+    }
+}
+
 impl TtlTarget for Db {
     fn is_closed(&self) -> bool {
         self.inner.is_closed()

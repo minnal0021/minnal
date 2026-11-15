@@ -908,6 +908,15 @@ curl "http://localhost:8080/stores/users/docs/prefix?prefix=550e8400-e29b"
 
 Query documents using an index predicate. Only indexed fields may appear in the predicate.
 
+A write returns once it is durable; its field-index changes are applied a
+moment later by a background worker: it waits
+`scheduled_tasks.index_apply_delay_ms` (20 ms by default) after a write, so a
+burst of writes is applied in one pass. A
+query reads what the worker has applied, so one sent straight after a write may
+not see it yet, as with semantic search. Each field's `apply_queue` in
+[`GET /admin/indices/{ns}/health`](#get-adminindicesnshealth) shows how many
+changes are waiting and how long the oldest has.
+
 Offset-paginated (the bitmap index gives an exact `total` and random page access). Query params `page_no` / `page_size` (defaults 1 / 20) override the same-named body fields; `limit` is accepted as an alias for `page_size` (`page_size` wins if both are given).
 
 ```bash
@@ -1490,6 +1499,11 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `wal_commit_writes` | writes | Writes those rounds covered (engine-wide only) | **No** |
 | `writes_per_commit_round` | writes | `wal_commit_writes / wal_commit_rounds`: writes covered by one fsync on average; `null` before the first round | **No** |
 | `apply_failures` | writes | In-memory applies that failed after retry (data still durable in WAL) | **No** |
+| `index_changes_queued` | field index | Field-index changes writes queued (one per field a write changed) | **No** |
+| `index_changes_applied_by_worker` | field index | Queued changes the field-index worker applied | **No** |
+| `index_changes_applied_by_writers` | field index | Queued changes writers applied themselves (queue past its cap, or no worker running); a steady rate means the worker cannot keep up | **No** |
+| `index_changes_applied_by_barriers` | field index | Queued changes the index checkpoint or `sync_field_indexes` applied | **No** |
+| `index_apply_batches` | field index | Batches the field-index worker applied, one per hold of a field's lock | **No** |
 | `memtable_flushes` | compaction | Memtable → L0 SSTable flushes | **No** |
 | `l0_l1_compactions` | compaction | L0 → L1 compactions run | **No** |
 | `compaction_bytes_merged` | compaction | Total bytes merged during compactions | **No** |
@@ -1937,9 +1951,10 @@ Use `GET /admin/indices/{ns}/progress` for the same view scoped to one namespace
 
 #### `GET /admin/indices/{ns}/health`
 
-Reports every field index in a document store and whether it is missing
-updates. A field index is kept up to date in memory on every write and
-checkpointed to disk every couple of seconds; after a crash it replays the WAL
+Reports every field index in a document store: how far the field-index worker
+has applied recent writes, and whether the index is missing updates. A write
+queues its field-index changes and returns; a background worker applies them in
+memory, and the index is checkpointed to disk every couple of seconds; after a crash it replays the WAL
 from its checkpoint. If that replay cannot happen (the WAL it needed was
 reclaimed, for example), the index records a **gap**: which keys it may be
 missing, or that it needs a full rebuild. Queries that use such a field report
@@ -1955,15 +1970,35 @@ curl http://localhost:8080/admin/indices/users/health
   "degraded": false,
   "degraded_fields": [],
   "fields": [
-    {"field_id": 1025, "field_name": "status", "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null},
-    {"field_id": 1026, "field_name": "age",    "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null}
+    {"field_id": 1025, "field_name": "status", "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null,
+     "apply_queue": {"pending": 0, "oldest_pending_ms": 0, "applied_up_to_seq": 5120, "queued": 5000,
+                     "applied_by_worker": 4994, "applied_by_writers": 0, "applied_by_barriers": 6, "worker_batches": 2311}},
+    {"field_id": 1026, "field_name": "age",    "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null,
+     "apply_queue": {"pending": 2, "oldest_pending_ms": 1, "applied_up_to_seq": 5118, "queued": 5000,
+                     "applied_by_worker": 4992, "applied_by_writers": 0, "applied_by_barriers": 6, "worker_batches": 2309}}
   ]
 }
 ```
 
 `checkpoint_offset` is the WAL position the field's on-disk state reflects.
 `gap` is `null` for a healthy field; otherwise it describes what is missing and
-how it will be repaired. Returns `404` if the document store does not exist.
+how it will be repaired.
+
+`apply_queue` (`null` for an inactive field) is the field-index worker's
+progress on this field:
+
+| Field | Meaning |
+|---|---|
+| `pending` | Changes written but not yet applied; queries do not see them yet |
+| `oldest_pending_ms` | How long the oldest of them has waited: the field's lag |
+| `applied_up_to_seq` | The highest write sequence number whose change is applied |
+| `queued` | Changes queued since the field was activated (one per write that changed the field) |
+| `applied_by_worker` | Changes the worker applied |
+| `applied_by_writers` | Changes writers applied themselves, because the queue passed its cap of 65,536 (the worker had fallen behind) or no worker was running. A growing count means the worker cannot keep up |
+| `applied_by_barriers` | Changes applied by the index checkpoint (which applies the queue before recording `checkpoint_offset`) or an explicit `sync_field_indexes` |
+| `worker_batches` | Batches the worker applied, at most 1,024 changes each |
+
+Returns `404` if the document store does not exist.
 
 ---
 

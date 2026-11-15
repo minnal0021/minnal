@@ -31,6 +31,12 @@ pub struct ScheduledTaskConfig {
     /// The cost of a short interval is a flush of every field index plus a
     /// marker write (tmp + rename + two fsyncs) per field, per tick.
     pub(crate) index_checkpoint_interval: Duration,
+    /// How long the field-index worker waits, once a write wakes it, before it
+    /// applies what is queued: a burst of writes is applied in one pass, and
+    /// the field's lock is taken once for it rather than once per write, so
+    /// queries reading the field are interrupted less often. It is also the
+    /// least time a query lags a write. Zero applies as soon as woken.
+    pub(crate) index_apply_delay: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -213,6 +219,7 @@ impl Default for ScheduledTaskConfig {
             lsm_compaction_interval: defaults::scheduled_tasks::LSM_COMPACTION_INTERVAL,
             ttl_cleanup_interval: defaults::scheduled_tasks::TTL_CLEANUP_INTERVAL,
             index_checkpoint_interval: defaults::scheduled_tasks::INDEX_CHECKPOINT_INTERVAL,
+            index_apply_delay: defaults::scheduled_tasks::INDEX_APPLY_DELAY,
         }
     }
 }
@@ -243,6 +250,18 @@ impl ScheduledTaskConfig {
     /// The configured index checkpoint interval.
     pub fn index_checkpoint_interval(&self) -> Duration {
         self.index_checkpoint_interval
+    }
+
+    /// Set the field-index worker's delay. See
+    /// [`index_apply_delay`](Self::index_apply_delay).
+    pub fn with_index_apply_delay(mut self, delay: Duration) -> Self {
+        self.index_apply_delay = delay;
+        self
+    }
+
+    /// The configured field-index worker delay.
+    pub fn index_apply_delay(&self) -> Duration {
+        self.index_apply_delay
     }
 }
 

@@ -93,6 +93,7 @@ async fn test_drop_index_deactivates_in_memory_index() {
     store.put("ns", DocId::U64(2), serde_json::json!({"status": "inactive"})).await.unwrap();
 
     // Sanity: query works before drop.
+    store.sync_field_indexes().await.unwrap();
     let results = store.query("ns", "status = \"active\"", Pagination::default()).await.unwrap();
     assert_eq!(results.results.len(), 1, "should find one active doc before drop");
 

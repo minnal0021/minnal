@@ -9,6 +9,7 @@
 //! | [`value_log_gc`] | Rewrites value-log segments to reclaim dead space | here |
 //! | [`wal_gc`] | Deletes WAL segments nothing needs any more | here |
 //! | [`ttl`] | Removes expired entries from TTL namespaces | here |
+//! | [`index_apply`] | Applies the field-index changes writes queue, off the write path | here |
 //! | [`index_checkpoint`] | Spills field-index write buffers and records their WAL offset | here |
 //! | `vec_index` | Embeds documents from the vector-index queue | `semantic_search::workers` |
 //! | `ivf_maintenance` | Splits, merges and reassigns a namespace's postings | `semantic_search::workers` |
@@ -17,6 +18,7 @@
 //! and in-flight write tracking through `semantic_search::workers::WorkerHost`. `db`
 //! must not import `doc_store` or `semantic_search`.
 
+pub(crate) mod index_apply;
 pub(crate) mod index_checkpoint;
 pub(crate) mod lsm_compaction;
 pub(crate) mod ttl;

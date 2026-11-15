@@ -55,6 +55,7 @@ wal_gc_interval_secs = 12
 lsm_compaction_interval_secs = 13
 ttl_cleanup_interval_secs = 14
 index_checkpoint_interval_ms = 15
+index_apply_delay_ms = 16
 
 [wal]
 segment_size_bytes = 131072
@@ -165,12 +166,14 @@ fn every_key_reaches_the_engine_config() {
         lsm_compaction_interval,
         ttl_cleanup_interval,
         index_checkpoint_interval,
+        index_apply_delay,
     } = scheduled_task_config;
     assert_eq!(value_log_gc_interval, Duration::from_secs(11));
     assert_eq!(wal_gc_interval, Duration::from_secs(12));
     assert_eq!(lsm_compaction_interval, Duration::from_secs(13));
     assert_eq!(ttl_cleanup_interval, Duration::from_secs(14));
     assert_eq!(index_checkpoint_interval, Duration::from_millis(15));
+    assert_eq!(index_apply_delay, Duration::from_millis(16));
 
     // The directory, bucket count and capacity are set when the database
     // opens (`every_key_reaches_the_opened_database`).

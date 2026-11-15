@@ -23,6 +23,7 @@ use crate::db::stats::{GCStats, Stats};
 use crate::db::wal::segmented_log::LogError;
 use crate::db::wal::vector_index_wal::{VectorIndexWal, VectorIndexWalStats};
 use crate::db::wal::{Wal, WalEntry, WalError, WalMetadata};
+use crate::db::workers::index_apply::{IndexApplyWaker, IndexApplyWorker};
 use crate::db::workers::index_checkpoint::{IndexCheckpointTarget, IndexCheckpointTrigger, IndexCheckpointWorker};
 use crate::db::workers::lsm_compaction::{LsmCompactionCommand, LsmCompactionTarget, LsmCompactionWorker};
 use crate::db::workers::ttl::{TtlTarget, TtlWorker};
@@ -186,6 +187,12 @@ pub struct Database {
 
     // Background index checkpoint worker
     pub(crate) index_checkpoint_worker: Arc<tokio::sync::RwLock<Option<Arc<IndexCheckpointWorker>>>>,
+
+    // Background field-index worker, and the handle stores wake it through
+    // (kept so namespaces created later get it). While none is installed,
+    // writes apply their field-index changes themselves.
+    pub(crate) index_apply_worker: Arc<tokio::sync::RwLock<Option<Arc<IndexApplyWorker>>>>,
+    pub(crate) index_apply_waker: Arc<parking_lot::RwLock<Option<Arc<IndexApplyWaker>>>>,
 
     /// How many index checkpoints have started, and the highest-numbered one
     /// that finished; see [`Database::index_checkpoint_covers`].

@@ -230,6 +230,9 @@ pub struct FieldIndexHealth {
     /// Set when the index is missing updates it cannot recover on its own.
     /// `None` ⇒ healthy.
     pub gap: Option<GapRecord>,
+    /// How far the field-index worker has applied the changes writes queued:
+    /// queries read only what it has applied. `None` for an inactive field.
+    pub apply_queue: Option<crate::FieldQueueProgress>,
 }
 
 impl FieldIndexHealth {

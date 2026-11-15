@@ -157,6 +157,8 @@ impl Database {
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
+            index_apply_worker: Arc::new(tokio::sync::RwLock::new(None)),
+            index_apply_waker: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoints: Default::default(),
             next_seq,
             fail_log_dir,
@@ -223,6 +225,19 @@ impl Database {
                 Arc::clone(&kv_store.lsm_compaction_trigger),
             ));
             kv_store.set_flush_observer(Some(observer));
+        }
+    }
+
+    /// Wire every existing store to wake the field-index worker, and record the
+    /// handle so namespaces created later get it too; `None` unwires them, so
+    /// their writes apply their field-index changes themselves again.
+    pub(crate) fn wire_index_apply_waker(&self, waker: Option<Arc<IndexApplyWaker>>) {
+        let wake = waker.clone().map(|w| w as Arc<dyn crate::kv_store::index_set::IndexApplyWake>);
+        // Recorded first: a namespace created meanwhile reads it after it is
+        // in `stores`, or is in `stores` when the loop below runs.
+        *self.index_apply_waker.write() = waker;
+        for kv_store in self.stores.read().values() {
+            kv_store.set_index_apply_wake(wake.clone());
         }
     }
 

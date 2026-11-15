@@ -312,6 +312,8 @@ async fn reindex_all_under_concurrent_writes_leaves_no_stale_entries() {
     for w in writers {
         w.await.unwrap();
     }
+    // Field queries read what the field-index worker has applied: wait for it.
+    store.sync_field_indexes().await.unwrap();
     let mut stale = Vec::new();
     for v in 0..10 {
         let page = store.query("rw", &format!("y = {v}"), Pagination::new(1, 10_000)).await.unwrap();

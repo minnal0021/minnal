@@ -156,6 +156,9 @@ pub struct ScheduledTaskSection {
     pub ttl_cleanup_interval_secs: u64,
     /// Index checkpoint, in milliseconds: the crash-replay window.
     pub index_checkpoint_interval_ms: u64,
+    /// How long the field-index worker waits after a write wakes it, in
+    /// milliseconds, so a burst of writes is applied in one pass.
+    pub index_apply_delay_ms: u64,
 }
 
 impl Default for ScheduledTaskSection {
@@ -167,6 +170,7 @@ impl Default for ScheduledTaskSection {
             lsm_compaction_interval_secs: d::LSM_COMPACTION_INTERVAL.as_secs(),
             ttl_cleanup_interval_secs: d::TTL_CLEANUP_INTERVAL.as_secs(),
             index_checkpoint_interval_ms: d::INDEX_CHECKPOINT_INTERVAL.as_millis() as u64,
+            index_apply_delay_ms: d::INDEX_APPLY_DELAY.as_millis() as u64,
         }
     }
 }
@@ -251,6 +255,7 @@ impl super::ConfigFile {
                 lsm_compaction_interval: Duration::from_secs(s.lsm_compaction_interval_secs),
                 ttl_cleanup_interval: Duration::from_secs(s.ttl_cleanup_interval_secs),
                 index_checkpoint_interval: Duration::from_millis(s.index_checkpoint_interval_ms),
+                index_apply_delay: Duration::from_millis(s.index_apply_delay_ms),
             },
             lsm_config: LSMConfig::new(self.lsm.compaction_threshold_percent, PathBuf::from("lsm_data")),
             num_buckets: self.sharding.num_buckets,
@@ -289,6 +294,14 @@ impl super::ConfigFile {
             if value == 0 {
                 return Err(format!("scheduled_tasks.{key} must be at least 1"));
             }
+        }
+        // Queries lag writes by at least this much, and the worker's backstop
+        // runs a pass every 250 ms regardless.
+        if s.index_apply_delay_ms > 1000 {
+            return Err(format!(
+                "scheduled_tasks.index_apply_delay_ms must be at most 1000, got {}",
+                s.index_apply_delay_ms
+            ));
         }
         let t = &self.thresholds;
         for (key, value) in [

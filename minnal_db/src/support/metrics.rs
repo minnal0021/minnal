@@ -69,6 +69,20 @@ pub struct Metrics {
     /// In-memory applies that failed after retry (data still durable in the WAL).
     pub apply_failures: AtomicU64,
 
+    // ── Field-index changes (queued by writes, applied off the write path) ─
+    /// Field-index changes writes queued (one per field a write changed).
+    pub index_changes_queued: AtomicU64,
+    /// Queued changes the field-index worker applied.
+    pub index_changes_applied_by_worker: AtomicU64,
+    /// Queued changes writers applied themselves: a queue past its cap (the
+    /// worker behind), no worker running, or a field reindex. A steady rate
+    /// with the worker running means it cannot keep up.
+    pub index_changes_applied_by_writers: AtomicU64,
+    /// Queued changes the index checkpoint or `sync_field_indexes` applied.
+    pub index_changes_applied_by_barriers: AtomicU64,
+    /// Batches the field-index worker applied, one per hold of a field's lock.
+    pub index_apply_batches: AtomicU64,
+
     // ── Flush / compaction ──────────────────────────────────────────────
     pub memtable_flushes: AtomicU64,
     pub l0_l1_compactions: AtomicU64,
@@ -172,6 +186,11 @@ impl Metrics {
             wal_bytes_appended: g(&self.wal_bytes_appended),
             wal_writes: g(&self.wal_writes),
             apply_failures: g(&self.apply_failures),
+            index_changes_queued: g(&self.index_changes_queued),
+            index_changes_applied_by_worker: g(&self.index_changes_applied_by_worker),
+            index_changes_applied_by_writers: g(&self.index_changes_applied_by_writers),
+            index_changes_applied_by_barriers: g(&self.index_changes_applied_by_barriers),
+            index_apply_batches: g(&self.index_apply_batches),
             memtable_flushes: g(&self.memtable_flushes),
             l0_l1_compactions: g(&self.l0_l1_compactions),
             compaction_bytes_merged: g(&self.compaction_bytes_merged),
@@ -226,6 +245,11 @@ impl Metrics {
         a(&self.wal_bytes_appended, o.wal_bytes_appended);
         a(&self.wal_writes, o.wal_writes);
         a(&self.apply_failures, o.apply_failures);
+        a(&self.index_changes_queued, o.index_changes_queued);
+        a(&self.index_changes_applied_by_worker, o.index_changes_applied_by_worker);
+        a(&self.index_changes_applied_by_writers, o.index_changes_applied_by_writers);
+        a(&self.index_changes_applied_by_barriers, o.index_changes_applied_by_barriers);
+        a(&self.index_apply_batches, o.index_apply_batches);
         a(&self.memtable_flushes, o.memtable_flushes);
         a(&self.l0_l1_compactions, o.l0_l1_compactions);
         a(&self.compaction_bytes_merged, o.compaction_bytes_merged);
@@ -272,6 +296,11 @@ pub struct MetricsSnapshot {
     pub wal_bytes_appended: u64,
     pub wal_writes: u64,
     pub apply_failures: u64,
+    pub index_changes_queued: u64,
+    pub index_changes_applied_by_worker: u64,
+    pub index_changes_applied_by_writers: u64,
+    pub index_changes_applied_by_barriers: u64,
+    pub index_apply_batches: u64,
     pub memtable_flushes: u64,
     pub l0_l1_compactions: u64,
     pub compaction_bytes_merged: u64,
@@ -320,6 +349,11 @@ impl MetricsSnapshot {
         self.wal_bytes_appended += o.wal_bytes_appended;
         self.wal_writes += o.wal_writes;
         self.apply_failures += o.apply_failures;
+        self.index_changes_queued += o.index_changes_queued;
+        self.index_changes_applied_by_worker += o.index_changes_applied_by_worker;
+        self.index_changes_applied_by_writers += o.index_changes_applied_by_writers;
+        self.index_changes_applied_by_barriers += o.index_changes_applied_by_barriers;
+        self.index_apply_batches += o.index_apply_batches;
         self.memtable_flushes += o.memtable_flushes;
         self.l0_l1_compactions += o.l0_l1_compactions;
         self.compaction_bytes_merged += o.compaction_bytes_merged;

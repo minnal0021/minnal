@@ -156,7 +156,9 @@ async fn test_predicate_query_after_delete_survives_restart() {
             .await
             .unwrap();
 
-        // Sanity: 3 active docs before delete.
+        // Sanity: 3 active docs before delete. Field queries read what the
+        // field-index worker has applied, so wait for it first.
+        store.sync_field_indexes().await.unwrap();
         let before = store.query("users", "active = true", Pagination::default()).await.unwrap();
         assert_eq!(before.total, 3);
 
@@ -164,6 +166,7 @@ async fn test_predicate_query_after_delete_survives_restart() {
         store.delete("users", DocId::U64(2)).await.unwrap();
 
         // Same session: only 2 active docs.
+        store.sync_field_indexes().await.unwrap();
         let after = store.query("users", "active = true", Pagination::default()).await.unwrap();
         assert_eq!(after.total, 2);
     }

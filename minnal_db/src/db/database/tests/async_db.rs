@@ -86,7 +86,7 @@ async fn an_open_starts_every_worker_and_a_shutdown_stops_them() {
         .unwrap();
     assert_eq!(
         db.running_workers().await,
-        ["wal_gc", "lsm_compaction", "value_log_gc", "index_checkpoint"],
+        ["wal_gc", "lsm_compaction", "value_log_gc", "index_checkpoint", "index_apply"],
         "every worker runs from the open"
     );
 

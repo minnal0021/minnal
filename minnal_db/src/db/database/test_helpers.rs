@@ -96,6 +96,8 @@ impl Database {
             ttl_worker: Arc::new(tokio::sync::RwLock::new(None)),
             index_manager,
             index_checkpoint_worker: Arc::new(tokio::sync::RwLock::new(None)),
+            index_apply_worker: Arc::new(tokio::sync::RwLock::new(None)),
+            index_apply_waker: Arc::new(parking_lot::RwLock::new(None)),
             index_checkpoints: Default::default(),
             next_seq,
             fail_log_dir,

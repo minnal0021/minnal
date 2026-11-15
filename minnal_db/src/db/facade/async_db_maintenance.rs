@@ -57,6 +57,22 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
+    /// Make every write that has returned visible to field-index queries.
+    ///
+    /// A write queues its field-index changes and returns; a background worker
+    /// applies them after a short delay (`scheduled_tasks.index_apply_delay_ms`,
+    /// 20 ms by default, so a burst of writes is applied at once), and queries read only
+    /// what it has applied, so a query straight after a write may not see it
+    /// (as with vector search). This applies everything queued so far, on the
+    /// calling task's blocking thread, and returns how many changes it applied.
+    /// For a caller that needs read-your-writes; nothing else waits for it.
+    pub async fn sync_field_indexes(&self) -> Result<usize> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.inner.sync_field_indexes())
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))
+    }
+
     /// Force an index checkpoint across all namespaces: flush each namespace's
     /// dense row map and all active field indexes to disk, compacting any
     /// field-index bitmap store whose waste exceeds the configured

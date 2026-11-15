@@ -599,7 +599,7 @@ merge(key, operand, closure)
 Three things fall out of that shape:
 
 - **The WAL never learns a merge happened.** It records the *result* as an ordinary `Upsert` or `Delete`, so recovery, WAL GC and index replay are byte-for-byte unchanged, and nothing re-runs the closure at replay — which is what makes an arbitrary Rust closure usable here at all.
-- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway. Field-index changes are queued under the bucket lock and applied in that order just after it, so a key's index changes land in the order its versions do even for TTL expiry, which takes no stripe, and no write waits under the bucket lock for a field index a query is reading.
+- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway. Field-index changes are queued under the bucket lock, so a key's index changes are queued in the order its versions are written, even for TTL expiry, which takes no stripe. The write then returns: the **field-index worker** applies each field's queue in that order, waiting `scheduled_tasks.index_apply_delay_ms` (20 ms by default) after a write wakes it so a burst is applied in one pass, a batch at a time under the field's lock, so no write waits for a field index a query is reading or the checkpoint is writing out. Queries read what the worker has applied, so a query sent straight after a write may not see it yet; each field's `apply_queue` in the index health report shows how many changes wait and how long the oldest has. The index checkpoint applies a field's queue before it records the WAL offset the field reflects, since crash replay starts there.
 - **`put` and `delete` take the stripe too**, so a blind write cannot land between a merge's read and its write. The guarantee is per key: this is not a transaction.
 
 ### Read Path
@@ -704,13 +704,18 @@ There is deliberately **no value-log GC recovery step**. GC unlinks a segment on
 
 ## MinnalDB as an Embedded Store
 
-MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `AsyncDb::open` on a directory path (the API is async, on tokio), and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, GC of both write-ahead logs, field-index checkpoints, TTL) running inside your process, started by the open.
+MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `AsyncDb::open` on a directory path (the API is async, on tokio), and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, GC of both write-ahead logs, applying field-index changes, field-index checkpoints, TTL) running inside your process, started by the open.
 
 `minnal_db` is a **single crate**; the document and semantic-search layers are
 provided as cargo features (`doc-store`, `semantic-search`) that you opt into.
 The base (`kv-store`, default) is the KV engine plus **built-in field indexing** —
 secondary (field-level) indexing is a capability of the engine itself, not
-something layered on by the document store.
+something layered on by the document store. A write queues its field-index
+changes and returns; a background worker applies them a short delay later
+(`scheduled_tasks.index_apply_delay_ms`, 20 ms by default, so a burst of writes
+is applied in one pass), so queries can lag writes as semantic search does, and
+`sync_field_indexes` waits for the worker when a caller needs to read its own
+writes.
 
 Crucially, MinnalDB stores **opaque value bytes** — it never assumes a format. The field index is driven by an *extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of your own value encoding (JSON, Protocol Buffers, a fixed binary layout, …). Deriving those extractors from a JSON schema is precisely what the `doc-store` feature adds on top; the indexing machinery itself is engine-level.
 

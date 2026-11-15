@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::field_index::{DynFieldIndex, FieldId};
-use crate::kv_store::index_queue::{ChangeOutcome, ChangeQueue, QueuedChange};
+use crate::kv_store::index_queue::{ChangeOutcome, ChangeQueue, QUEUE_CAP, QueuedChange};
 use crate::kv_store::index_set::IndexEntry;
 
 /// Where a put comes from, which decides what replay does with it and whether
@@ -28,20 +28,27 @@ enum ReplayDecision {
     Heal(Version),
 }
 
-/// The fields a write queued index changes on under its bucket lock, for
-/// [`KVStore::finish_index_follow_up`] to apply once the lock is released
-/// (see `kv_store/index_queue.rs`).
+/// One field's index and its queue of changes.
+pub(super) type FieldQueue = (FieldId, Arc<parking_lot::RwLock<DynFieldIndex>>, Arc<ChangeQueue>);
+
+/// The fields a write queued index changes on under its bucket lock, handed
+/// to the field-index worker once the lock is released
+/// ([`KVStore::hand_off_index_follow_up`]; see `kv_store/index_queue.rs`).
 #[derive(Default)]
 pub(super) struct IndexFollowUp {
-    fields: Vec<(FieldId, Arc<parking_lot::RwLock<DynFieldIndex>>, Arc<ChangeQueue>)>,
+    pub(super) fields: Vec<FieldQueue>,
+    /// Whether a queue this write pushed to is past [`QUEUE_CAP`].
+    pub(super) over_cap: bool,
 }
 
 impl IndexFollowUp {
-    /// Queue `change` to `key`'s row in `entry`'s field. Called under the key's
-    /// bucket lock; memory only. A rejection is recorded as an index gap, or
-    /// left in `outcome` for a caller that reports it itself.
-    fn queue(&mut self, entry: &IndexEntry, key: &[u8], row_id: u128, change: QueuedChange, outcome: Option<ChangeOutcome>) {
-        entry.queue.push(key, row_id, change, outcome);
+    /// Queue `change` to `key`'s row in `entry`'s field, for the write at user
+    /// seq `seq` (0 for a reindex). Called under the key's bucket lock; memory
+    /// only. A rejection is recorded as an index gap, or left in `outcome` for
+    /// a caller that reports it itself.
+    fn queue(&mut self, entry: &IndexEntry, key: &[u8], row_id: u128, change: QueuedChange, outcome: Option<ChangeOutcome>, seq: u64) {
+        let len = entry.queue.push(key, row_id, change, outcome, seq);
+        self.over_cap |= len > QUEUE_CAP;
         self.fields.push((entry.field_id, Arc::clone(&entry.index), Arc::clone(&entry.queue)));
     }
 }
@@ -149,21 +156,21 @@ impl KVStore {
         // A lost write is not the key's current value, so it must not touch the
         // indices. (With no index this returns at once.)
         let follow_up = if wins {
-            self.update_indices_on_put(key, row_id, value, old_value.as_deref(), key_existed)
+            self.update_indices_on_put(key, row_id, value, old_value.as_deref(), key_existed, seq)
         } else {
             IndexFollowUp::default()
         };
         drop(bucket_guard);
         // A user write supersedes any earlier one to the key that never applied.
         self.take_unapplied_write(key);
-        self.finish_index_follow_up(follow_up);
+        self.hand_off_index_follow_up(follow_up);
 
         Ok(())
     }
 
-    /// Queue the field indices' changes for a put. Called under the key's
-    /// bucket lock, memory only; [`finish_index_follow_up`](Self::finish_index_follow_up)
-    /// applies them once the lock is released.
+    /// Queue the field indices' changes for a put at user seq `seq`. Called
+    /// under the key's bucket lock, memory only; the field-index worker applies
+    /// them ([`hand_off_index_follow_up`](Self::hand_off_index_follow_up)).
     ///
     /// `old_value` is the document's *prior* stored bytes when this put replaced
     /// an existing key (`None` for a fresh insert, or when the prior bytes could
@@ -174,7 +181,15 @@ impl KVStore {
     /// we fall back to the scan so the row never lingers in a stale bucket.
     /// `row_id` is the key's, resolved before the lock (`None` if no index
     /// existed then).
-    fn update_indices_on_put(&self, key: &[u8], row_id: Option<u128>, value: &[u8], old_value: Option<&[u8]>, key_existed: bool) -> IndexFollowUp {
+    fn update_indices_on_put(
+        &self,
+        key: &[u8],
+        row_id: Option<u128>,
+        value: &[u8],
+        old_value: Option<&[u8]>,
+        key_existed: bool,
+        seq: u64,
+    ) -> IndexFollowUp {
         let ns_index = self.namespace_index.read();
         let mut follow_up = IndexFollowUp::default();
         if ns_index.is_empty() {
@@ -205,56 +220,9 @@ impl KVStore {
                     None => QueuedChange::RemoveAll,
                 },
             };
-            follow_up.queue(entry, key, row_id, change, None);
+            follow_up.queue(entry, key, row_id, change, None, seq);
         }
         follow_up
-    }
-
-    /// Apply the index changes a write queued under its bucket lock, once that
-    /// lock is released: under each field's write lock, with whatever other
-    /// writes queued before it (`ChangeQueue::apply_queued`, which also spills a
-    /// field past the overlay budget's hard limit). Then report rejected
-    /// updates, and ask for an early checkpoint when a field's write buffers or
-    /// dead space call for one. The write returns only after this, so its
-    /// change is in the index when it does.
-    fn finish_index_follow_up(&self, follow_up: IndexFollowUp) {
-        for (field_id, index, queue) in follow_up.fields {
-            let applied = queue.apply_queued(&index);
-            for key in applied.rejected {
-                // A rejected update leaves this row absent from the field for
-                // good. Report it so it becomes a durable gap record, which index
-                // health reports and a repair fixes, rather than only a log line.
-                if let Some(sink) = self.index_gap_sink.read().as_ref() {
-                    sink.note_rejected_update(self.namespace_id, field_id, &key);
-                }
-            }
-            // Disk: if the field's blob store has piled up enough dead space (old
-            // bitmap copies left by spills), ask the checkpoint worker to compact
-            // early instead of waiting for the next tick (debounced inside the
-            // trigger).
-            self.request_checkpoint_if_over_cap(applied.dead_bytes);
-            // Memory: past the write buffers' soft limit, ask for a checkpoint to
-            // write them out.
-            if applied.overlay_full {
-                self.request_checkpoint_now();
-            }
-        }
-    }
-
-    /// Request an index checkpoint now, if the checkpoint worker is running.
-    /// Debounced inside the trigger. O(1) and non-blocking.
-    fn request_checkpoint_now(&self) {
-        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
-            trigger.request();
-        }
-    }
-
-    /// Signal the index-checkpoint backpressure valve, if wired, with a field's
-    /// current reclaimable dead blob bytes. O(1) and non-blocking.
-    fn request_checkpoint_if_over_cap(&self, dead_bytes: u64) {
-        if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
-            trigger.request_if_over_cap(dead_bytes);
-        }
     }
 
     /// Reindex a single field for a single key: re-derive the field value from
@@ -336,7 +304,7 @@ impl KVStore {
             let outcome = match (&value, row_id) {
                 (None, None) => FieldReindexOutcome::KeyNotFound,
                 (None, Some(row_id)) => {
-                    follow_up.queue(entry, key, row_id, QueuedChange::RemoveAll, None);
+                    follow_up.queue(entry, key, row_id, QueuedChange::RemoveAll, None, 0);
                     FieldReindexOutcome::KeyNotFound
                 }
                 // Same per-field ops as `update_indices_on_put`'s
@@ -348,12 +316,15 @@ impl KVStore {
                         Some(v) => QueuedChange::Set(v),
                         None => QueuedChange::RemoveAll,
                     };
-                    follow_up.queue(entry, key, row_id, change, Some(Arc::clone(&rejection)));
+                    follow_up.queue(entry, key, row_id, change, Some(Arc::clone(&rejection)), 0);
                     FieldReindexOutcome::Reindexed
                 }
             };
             drop(ns_index);
             drop(bucket_guard);
+            // Applied now, not left to the worker: the caller is told whether
+            // the field rejected the change. A reindex is repair or a build,
+            // never a user write.
             self.finish_index_follow_up(follow_up);
             if let Some(e) = rejection.lock().take() {
                 return Err(KVError::Io(std::io::Error::other(e)));
@@ -525,12 +496,12 @@ impl KVStore {
         // and repair, not for every delete of an absent key. Without indexes this
         // is a no-op, unless one appeared mid-delete: then it clears the row.
         let follow_up = if displaced.is_some() || !indexed {
-            self.update_indices_on_delete(key, row_id, old_value.as_deref())
+            self.update_indices_on_delete(key, row_id, old_value.as_deref(), seq.user)
         } else {
             IndexFollowUp::default()
         };
         drop(bucket_guard);
-        self.finish_index_follow_up(follow_up);
+        self.hand_off_index_follow_up(follow_up);
 
         Ok(())
     }
@@ -542,7 +513,7 @@ impl KVStore {
     /// removes the row from just its old value's bucket — `O(1)` instead of the
     /// `O(distinct values)` scan. Falls back to the scan only when those bytes
     /// could not be read, so a row never lingers in a stale bucket.
-    fn update_indices_on_delete(&self, key: &[u8], row_id: Option<Option<u128>>, old_value: Option<&[u8]>) -> IndexFollowUp {
+    fn update_indices_on_delete(&self, key: &[u8], row_id: Option<Option<u128>>, old_value: Option<&[u8]>, seq: u64) -> IndexFollowUp {
         let ns_index = self.namespace_index.read();
         let mut follow_up = IndexFollowUp::default();
         if ns_index.is_empty() {
@@ -562,7 +533,7 @@ impl KVStore {
                 // Prior bytes unavailable → scan to be safe.
                 None => QueuedChange::RemoveAll,
             };
-            follow_up.queue(entry, key, row_id, change, None);
+            follow_up.queue(entry, key, row_id, change, None, seq);
         }
         follow_up
     }

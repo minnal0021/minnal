@@ -340,6 +340,7 @@ async fn an_interrupted_drop_is_finished_by_a_retry_or_the_next_open() {
         // The names are free again.
         store.create(make_schema("docs", vec![index()])).await.unwrap();
         store.put("docs", DocId::U64(2), serde_json::json!({"active": true})).await.unwrap();
+        store.sync_field_indexes().await.unwrap();
         assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
         store.shutdown().await.unwrap();
     }

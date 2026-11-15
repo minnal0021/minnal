@@ -46,6 +46,15 @@ pub(crate) trait CheckpointRequests: Send + Sync {
     fn request(&self);
 }
 
+/// Wakes the field-index worker when a write leaves changes in a field's
+/// queue. O(1), non-blocking and debounced by the worker. Installed on every
+/// store while the worker runs; a store without one applies its writes' changes
+/// itself (`KVStore::hand_off_index_follow_up`).
+pub(crate) trait IndexApplyWake: Send + Sync {
+    /// Some field of this store has changes waiting.
+    fn wake(&self);
+}
+
 // ── Extractor closure ──────────────────────────────────────────────────────
 
 /// Caller-provided closure that extracts an indexed value from raw document

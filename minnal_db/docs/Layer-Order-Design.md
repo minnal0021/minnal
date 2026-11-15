@@ -123,17 +123,29 @@ index the wrong way round: the put adds the row, then the expiry's removal
 takes it out again, and a live document is missing from every query on the
 field.
 
-The change is applied after the bucket lock is released, not under it. The
-field's own lock can be held for milliseconds (a query merging many values'
-bitmaps, the index checkpoint's `msync`), and a writer waiting for it under the
-bucket lock would hold up every write to the bucket, GC and TTL with it. After
-releasing the bucket lock, the writer takes the field's write lock and applies
-every change queued so far, in queue order. Changes leave the queue only under
-that lock, so a writer that gets it finds its own change applied, by itself or
-by an earlier writer, and a write returns only once its change is in the index.
-A spill of a field past the overlay budget's hard limit follows, under the
-field's lock only; allocating a new key's row id (which can wait for a row-map
-flush) is done before the bucket lock is taken.
+The change is applied off the write path, by the field-index worker, not under
+the bucket lock or after it. The field's own lock can be held for milliseconds
+(a query merging many values' bitmaps, the index checkpoint's `msync`), and a
+writer waiting for it would hold up its own write, and under the bucket lock
+every write to the bucket, GC and TTL with it. So a write queues its change and
+returns; the worker takes each field's write lock and applies a batch of queued
+changes in queue order. Changes leave the queue only under that lock, so they
+apply in queue order whoever applies them. Queries read only what has been
+applied, so a query sent straight after a write can miss it until the worker
+reaches it: the worker waits `scheduled_tasks.index_apply_delay_ms` (20 ms by
+default) after a write wakes it, so a burst of writes is applied in one pass
+and the field's lock is taken once for it (`sync_field_indexes` waits for it). Each field's queue progress is in the index health report.
+
+Three other things apply a field's queue. The index checkpoint applies it before
+it records the WAL offset the field reflects, since crash replay starts at that
+offset: a change still queued behind it would be lost to a crash. A writer that
+finds a field's queue past its cap (the worker has fallen behind) applies
+batches until it is back under, which bounds the queue's memory and lag. And a
+store with no worker running, such as during recovery at open, applies its
+writes' changes as they are made. A spill of a field past the overlay budget's
+hard limit follows whoever applied, under the field's lock only; allocating a
+new key's row id (which can wait for a row-map flush) is done before the bucket
+lock is taken.
 
 A field reindex (`KVStore::reindex_field`: repair, a new index's build) reads
 the key's value with no lock and queues its row by compare-and-set: under the
@@ -278,6 +290,11 @@ the highest version.
 | `an_l0_file_never_points_at_an_unlogged_value_a_power_loss_could_take` | a flush writes an L0 file pointing at a no-WAL value or a GC copy before fsyncing it |
 | `ttl_expiry_and_reindexing_racing_puts_keep_the_index_in_step` | an index change is applied out of the order the bucket lock gives, or a reindex sets its row unchecked |
 | `a_write_waiting_for_a_field_index_does_not_hold_its_bucket_lock` | a write waits for a field's lock while holding its bucket lock |
+| `a_write_returns_with_its_field_index_change_queued` | a write applies its field-index change before it returns |
+| `queued_changes_apply_in_the_order_their_writes_did` | queued changes of a key apply out of the order its writes did |
+| `the_checkpoint_applies_queued_changes_before_it_records_its_offset` | the checkpoint records an offset past a change still queued |
+| `a_writer_applies_its_fields_queue_once_it_is_past_the_cap` | a field's queue grows past its cap |
+| `the_worker_applies_queued_changes_in_the_background` | the field-index worker applies nothing |
 | `gc_releases_the_bucket_lock_between_batches_of_survivors` | GC re-points a whole segment under one hold of the lock |
 | `a_damaged_merged_through_fails_the_open_and_deletes_nothing` | the L1 header's CRC is not checked |
 | `an_aborted_merge_keeps_the_unapplied_marker` | a merge clears the unapplied mark before it writes |

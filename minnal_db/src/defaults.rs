@@ -125,6 +125,17 @@ pub mod scheduled_tasks {
     /// rename, two fsyncs) per field, small beside the WAL's fsync on every
     /// write.
     pub const INDEX_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(1750);
+    /// `index_apply_delay_ms`: 20 ms.
+    ///
+    /// How long the field-index worker waits, once a write wakes it, before it
+    /// applies what is queued, so a burst of writes is applied in one pass
+    /// instead of one pass each, and a field's lock is taken once for it. It
+    /// is also about how long a query can lag a write. Chosen by measurement
+    /// (engine benchmark, 2026-11-15, 8 and 16 clients): field queries got
+    /// steadily faster from 0 to 20 ms (median 6.4 → 4.2 ms at 8 clients,
+    /// against 4.5 ms with writes applying their own changes), and writes
+    /// were unchanged. 0 applies as soon as the worker is woken.
+    pub const INDEX_APPLY_DELAY: Duration = Duration::from_millis(20);
 }
 
 /// `[wal]`: the main write-ahead log.

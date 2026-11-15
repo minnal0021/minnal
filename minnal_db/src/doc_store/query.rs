@@ -713,6 +713,8 @@ mod tests {
             .put("users", DocId::U64(3), serde_json::json!({"active": true,  "name": "Carol"}))
             .await
             .unwrap();
+        // Field queries read what the field-index worker has applied: wait for it.
+        store.sync_field_indexes().await.unwrap();
 
         let active = store.query("users", "active = true", Pagination::default()).await.unwrap();
         let mut ids: Vec<u64> = active

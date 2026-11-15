@@ -86,6 +86,8 @@ async fn paged_query_matches_full_query_via_dense_row_map() -> Result<(), KVErro
         let status = if i.is_multiple_of(3) { "inactive" } else { "active" };
         db.put(i.to_be_bytes().to_vec(), status.as_bytes().to_vec()).await?;
     }
+    // Queries read what the field-index worker has applied: wait for it.
+    db.sync_field_indexes().await?;
 
     for page_size in [1, 7, 64, 333, 10_000] {
         assert_paged_walk_matches_full_query(&db, page_size).await?;
@@ -123,6 +125,8 @@ async fn paged_query_matches_full_query_via_row_id_fn_across_containers() -> Res
             db.put(key.to_be_bytes().to_vec(), status.as_bytes().to_vec()).await?;
         }
     }
+    // Queries read what the field-index worker has applied: wait for it.
+    db.sync_field_indexes().await?;
 
     for page_size in [1, 5, 50, 400, 10_000] {
         assert_paged_walk_matches_full_query(&db, page_size).await?;

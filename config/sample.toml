@@ -248,6 +248,17 @@ ttl_cleanup_interval_secs = 3_600
 # few seconds. Default: 1750.
 index_checkpoint_interval_ms = 1750
 
+# How long the field-index worker waits, in MILLISECONDS, after a write wakes
+# it, before it applies what is queued.
+#
+# A write queues its field-index changes and returns; the worker applies them.
+# Waiting a little lets a burst of writes be applied in one pass, taking each
+# field's lock once instead of once per write, so queries on the field are
+# interrupted less. It is also the least time a query lags a write. 0 applies
+# as soon as the worker is woken. At most 1000. Default: 20 (chosen by
+# measurement: field-query latency fell steadily up to 20 ms, writes unchanged).
+index_apply_delay_ms = 20
+
 # ---------------------------------------------------------------------------
 # [wal] — Write-Ahead Log
 # ---------------------------------------------------------------------------

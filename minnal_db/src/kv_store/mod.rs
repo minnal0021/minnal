@@ -6,6 +6,7 @@
 
 use crate::namespace::NamespaceId;
 mod gc;
+mod index_apply;
 pub(crate) mod index_queue;
 pub mod index_set;
 pub(crate) mod key_locks;
@@ -36,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::support::metrics::Metrics;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::kv_store::index_set::{CheckpointRequests, IndexGapSink, NamespaceIndexSet, RowIdFn, RowToKeyFn};
+use crate::kv_store::index_set::{CheckpointRequests, IndexApplyWake, IndexGapSink, NamespaceIndexSet, RowIdFn, RowToKeyFn};
 use std::time::Duration;
 
 /// A resolved key/value pair: both the key and the value bytes read from the value log.
@@ -173,6 +174,10 @@ pub struct KVStore {
     // buffers pass the overlay budget's soft limit. `None` until
     // the checkpoint worker is enabled (set via `set_index_checkpoint_trigger`).
     pub(crate) index_checkpoint_trigger: Arc<RwLock<Option<Arc<dyn CheckpointRequests>>>>,
+    // Wakes the field-index worker when a write leaves changes in a field's
+    // queue. `None` while no worker runs: writes then apply their changes
+    // themselves (set via `set_index_apply_wake`).
+    pub(crate) index_apply_wake: Arc<RwLock<Option<Arc<dyn IndexApplyWake>>>>,
     // Where rejected field-index updates are reported so they become durable gap
     // records instead of a log line (set via `set_index_gap_sink`).
     pub(crate) index_gap_sink: Arc<RwLock<Option<Arc<dyn IndexGapSink>>>>,
@@ -316,6 +321,7 @@ impl KVStore {
             value_log_gc_in_progress: Arc::new(AtomicBool::new(false)),
             lsm_compaction_trigger: Arc::new(RwLock::new(None)),
             index_checkpoint_trigger: Arc::new(RwLock::new(None)),
+            index_apply_wake: Arc::new(RwLock::new(None)),
             index_gap_sink: Arc::new(RwLock::new(None)),
             ttl,
             namespace_index: Arc::new(RwLock::new(NamespaceIndexSet::new())),
@@ -485,6 +491,12 @@ impl KVStore {
     /// Set (or clear) the index-checkpoint backpressure valve for this store.
     pub(crate) fn set_index_checkpoint_trigger(&self, trigger: Option<Arc<dyn CheckpointRequests>>) {
         *self.index_checkpoint_trigger.write() = trigger;
+    }
+
+    /// Set (or clear) how this store wakes the field-index worker. With none,
+    /// a write applies its field-index changes itself before it returns.
+    pub(crate) fn set_index_apply_wake(&self, wake: Option<Arc<dyn IndexApplyWake>>) {
+        *self.index_apply_wake.write() = wake;
     }
 
     /// Wire where rejected field-index updates are reported. See
