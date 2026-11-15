@@ -85,10 +85,10 @@ impl AsyncDb {
         self.inner.inner.rowmap_ids_allocated(namespace_id)
     }
 
-    /// Register a custom row-ID function (and optionally its inverse) for a namespace.
+    /// Register a custom row-ID function and its inverse for a namespace.
     ///
     /// Call this before `activate_field_index` so WAL replay uses consistent row IDs.
-    /// Providing `row_to_key_fn` enables O(|hits|) query resolution with zero memory overhead.
+    /// Queries resolve each matching row ID back to its key with `row_to_key_fn`.
     ///
     /// See [`Database::set_row_id_fn`][crate::db::database::Database::set_row_id_fn]
     /// for full documentation.
@@ -96,7 +96,7 @@ impl AsyncDb {
         &self,
         namespace_id: NamespaceId,
         row_id_fn: crate::kv_store::index_set::RowIdFn,
-        row_to_key_fn: Option<crate::kv_store::index_set::RowToKeyFn>,
+        row_to_key_fn: crate::kv_store::index_set::RowToKeyFn,
     ) -> Result<()> {
         let db = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || db.inner.set_row_id_fn(namespace_id, row_id_fn, row_to_key_fn))

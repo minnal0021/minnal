@@ -284,11 +284,14 @@ async fn main() -> Result<(), KVError> {
     db.activate_field_index(DEFAULT_NAMESPACE_ID, status_field, IndexValueType::Str, status_extractor).await?;
     db.activate_field_index(DEFAULT_NAMESPACE_ID, age_field,    IndexValueType::Int, age_extractor).await?;
 
-    // 3. Write records — each put updates the RoaringBitmap indices automatically.
+    // 3. Write records. Each put queues its index changes; a background worker
+    //    applies them to the RoaringBitmap indices about 20 ms later.
     db.put(b"user:1".to_vec(), br#"{"status":"active","age":30}"#.to_vec()).await?;
     db.put(b"user:2".to_vec(), br#"{"status":"inactive","age":25}"#.to_vec()).await?;
     db.put(b"user:3".to_vec(), br#"{"status":"active","age":42}"#.to_vec()).await?;
     db.put(b"user:4".to_vec(), br#"{"status":"active","age":18}"#.to_vec()).await?;
+    // Queries read what the worker has applied: wait for it, to read your writes.
+    db.sync_field_indexes().await?;
 
     // 4. Query with the predicate DSL (=, !=, <, <=, >, >=, IN, AND, OR, NOT).
     let outcome = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#).await?;
@@ -315,6 +318,13 @@ A few things are worth knowing before you build on this:
   matches, and `degraded_fields`. A field lands in `degraded_fields` when its
   index is known to be missing updates (after a crash that outran its WAL
   retention, say), so a non-empty list means the result may be incomplete.
+- A query reads what the field-index worker has applied, so a query sent
+  straight after a write may not see it yet, as with semantic search. The lag
+  is about `scheduled_tasks.index_apply_delay_ms` (20 ms by default: the worker
+  waits that long after a write so a burst is applied at once);
+  `sync_field_indexes()` waits it out when you
+  need to read your own writes, and each field's `apply_queue` in
+  `index_health` shows what is pending.
 - When a query can match many records, use
   `query_index_paginated(ns, predicate, offset, limit)`: it resolves only the
   requested window of keys rather than the whole match set.
@@ -361,6 +371,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     store.put("users", DocId::U64(1), serde_json::json!({ "status": "active", "age": 30 })).await?;
     let doc = store.get("users", DocId::U64(1)).await?;
 
+    // Field queries lag writes by the time the field-index worker takes;
+    // `sync_field_indexes` waits for it (see §4).
+    store.sync_field_indexes().await?;
     let page = store.query("users", r#"status = "active" AND age > 20"#, Pagination::default()).await?;
     for (id, doc) in page.results { println!("{id:?} => {doc}"); }
 

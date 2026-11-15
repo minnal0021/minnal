@@ -1,4 +1,4 @@
-//! A record of what a namespace's partition looked like over time (FR-007).
+//! A record of what a namespace's partition looked like over time.
 //!
 //! Code health (`?codes=true`) and the recall check each read every chunk code
 //! or search many times, so they are too costly to compute on every request.
@@ -12,7 +12,7 @@
 //! Writes are WAL-backed: they are rare and small, and a history that loses its
 //! newest entry to a crash would misreport the state an operator acted on.
 //! Records expire after a TTL the server sets (`[semantic_search]
-//! partition_history_ttl_secs`, default [`DEFAULT_HISTORY_TTL`]). Dropping a namespace leaves its records
+//! partition_history_ttl_secs`, default [`crate::defaults::semantic_search::PARTITION_HISTORY_TTL`]). Dropping a namespace leaves its records
 //! to expire; a namespace re-created under the same name shows them until then,
 //! each stamped with when it was taken.
 
@@ -26,9 +26,6 @@ use crate::AsyncDb;
 
 /// The TTL namespace holding every namespace's records.
 pub const HISTORY_NS: &str = "system_partition_history";
-
-/// How long a record is kept unless configured otherwise: 30 days.
-pub const DEFAULT_HISTORY_TTL: Duration = Duration::from_secs(30 * 86_400);
 
 /// Most records the TTL worker deletes per pass.
 const HISTORY_MAX_DELETES: usize = 10_000;
@@ -136,27 +133,66 @@ mod tests {
         let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
             .await
             .unwrap();
-        record(&db, "a", RecordKind::Codes, &serde_json::json!({"n": 1}), DEFAULT_HISTORY_TTL)
-            .await
-            .unwrap();
+        record(
+            &db,
+            "a",
+            RecordKind::Codes,
+            &serde_json::json!({"n": 1}),
+            crate::defaults::semantic_search::PARTITION_HISTORY_TTL,
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(3)).await;
-        record(&db, "a", RecordKind::RecallCheck, &serde_json::json!({"n": 2}), DEFAULT_HISTORY_TTL)
-            .await
-            .unwrap();
+        record(
+            &db,
+            "a",
+            RecordKind::RecallCheck,
+            &serde_json::json!({"n": 2}),
+            crate::defaults::semantic_search::PARTITION_HISTORY_TTL,
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(3)).await;
-        record(&db, "a", RecordKind::Codes, &serde_json::json!({"n": 3}), DEFAULT_HISTORY_TTL)
-            .await
-            .unwrap();
+        record(
+            &db,
+            "a",
+            RecordKind::Codes,
+            &serde_json::json!({"n": 3}),
+            crate::defaults::semantic_search::PARTITION_HISTORY_TTL,
+        )
+        .await
+        .unwrap();
         // A namespace whose name extends another's is not mixed in.
-        record(&db, "ab", RecordKind::Codes, &serde_json::json!({"n": 9}), DEFAULT_HISTORY_TTL)
+        record(
+            &db,
+            "ab",
+            RecordKind::Codes,
+            &serde_json::json!({"n": 9}),
+            crate::defaults::semantic_search::PARTITION_HISTORY_TTL,
+        )
+        .await
+        .unwrap();
+        let all = read(&db, "a", None, 10, crate::defaults::semantic_search::PARTITION_HISTORY_TTL)
             .await
             .unwrap();
-        let all = read(&db, "a", None, 10, DEFAULT_HISTORY_TTL).await.unwrap();
         let ns: Vec<i64> = all.iter().map(|r| r.data["n"].as_i64().unwrap()).collect();
         assert_eq!(ns, [3, 2, 1]);
-        let codes = read(&db, "a", Some(RecordKind::Codes), 1, DEFAULT_HISTORY_TTL).await.unwrap();
+        let codes = read(
+            &db,
+            "a",
+            Some(RecordKind::Codes),
+            1,
+            crate::defaults::semantic_search::PARTITION_HISTORY_TTL,
+        )
+        .await
+        .unwrap();
         assert_eq!((codes.len(), codes[0].data["n"].as_i64()), (1, Some(3)));
-        assert!(read(&db, "none", None, 10, DEFAULT_HISTORY_TTL).await.unwrap().is_empty());
+        assert!(
+            read(&db, "none", None, 10, crate::defaults::semantic_search::PARTITION_HISTORY_TTL)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         db.shutdown().await.unwrap();
     }
 }

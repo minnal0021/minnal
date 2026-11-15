@@ -469,9 +469,9 @@ mod tests {
         assert_eq!(collected, vec![1, 2, 3, 10, 11]);
     }
 
-    // Regression: a run ending at u16::MAX must terminate. The old u16 cursor
-    // wrapped 65535 -> 0 after yielding the last value, and since 0 <= end the
-    // iterator re-entered the run forever.
+    // A run ending at u16::MAX must terminate. A u16 cursor would wrap
+    // 65535 -> 0 after yielding the last value, and since 0 <= end the
+    // iterator would re-enter the run forever.
     #[test]
     fn iter_run_ending_at_u16_max() {
         let c = RunContainer::from_sorted_values(&[65534, 65535]);

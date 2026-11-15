@@ -102,7 +102,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
 ┌──────────────────────────────────┐  ┌────────────────────────────────────┐
 │ LSM tree (keys + pointers)       │  │ Value log (values)                 │
 │                                  │  │                                    │
-│ MemTable: a skip list in memory, │  │ 16 buckets, each a series of       │
+│ MemTable: a skip list in memory, │  │ 8 buckets, each a series of        │
 │   up to 100k entries             │  │ 256 MB segment files               │
 │       │ flush when full          │  │                                    │
 │       ▼                          │  │ • append-only; sealed segments     │
@@ -126,7 +126,7 @@ A few things are worth pulling out of the diagram, because they shape everything
 - **A write fans out into two stores.** The LSM tree records the *key* and a pointer; the value log holds the *value*. A read reverses this: find the pointer in the LSM, then follow it into the value log.
 - **Background workers do the slow work off the critical path** — compaction, garbage collection, WAL cleanup, and TTL expiry all run on their own schedules so foreground reads and writes stay fast. Each is a single task for the whole database that visits every namespace in turn.
 
-> **A note on bucket count.** Throughout this document we use **16 buckets** as a concrete example, because that is the default. The count is actually set by `num_buckets`, fixed once at database creation, and everything that is "16-wide" here — the value-log shards, the L1 SSTables, and bucket routing — scales to whatever you configure.
+> **A note on bucket count.** Throughout this document we use **8 buckets** as a concrete example, because that is the default. The count is actually set by `num_buckets`, fixed once at database creation, and everything that is "8-wide" here — the value-log shards, the L1 SSTables, and bucket routing — scales to whatever you configure.
 
 ---
 
@@ -142,17 +142,13 @@ Data moves through three levels, from fast-and-volatile to slow-and-durable — 
 
 ![Animated diagram of the LSM tiers: keys land in the in-memory MemTable, which is sealed and flushed to an L0 file when it fills; accumulated L0 files are merge-sorted by background compaction into one sorted L1 SSTable per bucket, collapsing duplicate keys and dropping tombstoned ones](docs/lsm-tiers.svg)
 
-A write first lands in the in-memory **MemTable** (a skip list). At 95% capacity it is sealed read-only, a fresh MemTable takes over writes, and the sealed one is flushed to disk as an **L0 file** for the relevant bucket. L0 files accumulate and *overlap* — the same key can appear in several of them — so a background worker periodically merge-sorts a bucket's L0 files together with its L1 file into a single, sorted **L1 SSTable**. That merge is where the tree shrinks: duplicate versions of a key collapse to the newest one, and a tombstone drops the key entirely, so L1 holds fewer entries than the inputs it was built from.
+A write first lands in the in-memory **MemTable** (a skip list). At 95% capacity it is sealed read-only, a fresh MemTable takes over writes, and the sealed one is flushed to disk as an **L0 file** for the relevant bucket. L0 files accumulate and *overlap* — the same key can appear in several of them — so once a bucket's L0 files hold 10% as many entries as its L1 file, or number 8, a background worker merge-sorts them together with that L1 file into a single, sorted **L1 SSTable**. That merge is where the tree shrinks: duplicate versions of a key collapse to the newest one, and a tombstone drops the key entirely, so L1 holds fewer entries than the inputs it was built from.
 
-Because the same key can exist in several tiers at once, a read must decide which copy is current. It does that by **write sequence, not by layer order**:
+Because the same key can exist in several tiers at once, a read must decide which copy is current. It takes the **first copy it finds, newest layer first**: the active MemTable, the sealed read-only MemTables (newest first), the bucket's L0 files (newest first), then its L1 SSTable. A tombstone found first means "not found"; a pointer is followed into the value log for the bytes. Each L0 file and L1 file is skipped unread when its key range or Bloom filter rules the key out.
 
-1. **Fast path.** Look up the key in the active MemTable (an `O(log n)` skip-list lookup). Each tree tracks the highest sequence held anywhere below that MemTable, so if the hit's sequence beats it, no lower tier can hold anything newer and the read returns straight away. Ordinary writes always carry the newest sequence, so this is the common case.
-2. **Full resolution.** Otherwise, gather the key's entry from *every* layer — the active MemTable, each sealed read-only MemTable, the bucket's L0 files, and its L1 SSTable — and keep the one with the **highest sequence**. A tombstone winning means "not found".
-3. Follow the winning pointer into the value log to fetch the actual bytes.
+That is correct because every writer keeps a newer layer holding a newer **version** of a key ([Layer-Order-Design.md](docs/Layer-Order-Design.md)). A version is a user write's sequence plus a small counter for the engine's own rewrites (value-log GC moving a record, TTL expiring one): those keep the write's sequence and raise the counter, so they are newer than what they replace and older than any later user write. User writes take a per-key lock while they draw their sequence, recovery drops a replayed record that is not newer than what is stored, and MemTables reach L0 in the order they were frozen. Scans and the L0→L1 merge follow the same rule: the newer layer's copy of a key wins.
 
-Step 2 exists because layer order is not a safe proxy for recency. Value-log GC relocates a value and re-points its key while *preserving that key's original sequence*, so an older version can end up in a newer layer, sitting above a newer tombstone — and a read that stopped at the first hit would resurrect the deleted key. Resolving by sequence everywhere (reads, the GC liveness scan, and the L0→L1 merge alike) is what rules that out, at a cost of roughly 5–10% on reads.
-
-Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash of their first 8 bytes**, so any given lookup only ever touches one bucket's L1 file — a single 1/16th-sized slice of the data rather than the whole tree.
+Two details make this efficient. First, each LSM entry stores its key alongside a compact **`u128` pointer** that packs the value's location — `bucket (32b) | segment_id (32b) | rec_offset (32b) | value_len (32b)` — and is extracted in `O(1)` from the skip-list node. Second, keys are **routed to buckets by a Murmur3 hash of their first 8 bytes**, so any given lookup only ever touches one bucket's L1 file — a single 1/8th-sized slice of the data rather than the whole tree.
 
 #### Skip List
 
@@ -161,7 +157,7 @@ Two details make this efficient. First, each LSM entry stores its key alongside 
 The MemTable — the in-memory tier of every LSM tree — is a custom **arena-allocated skip list** tuned for CPU cache efficiency. Rather than allocating each node on the heap (which scatters related data across memory), it packs everything into three flat, contiguous buffers:
 
 ```
-nodes[]   — Node structs (height, key_offset, key_len, value, tombstone, seq)
+nodes[]   — Node structs (height, key_offset, key_len, key_prefix, value, tombstone, seq)
 keys[]    — Raw key bytes, packed contiguously (nodes index by offset+len)
 links[]   — Forward pointer arrays (u32 node indices, packed per-node)
 ```
@@ -185,7 +181,7 @@ The structure's other properties:
 
 - Up to **32 levels**, with probabilistic height assignment.
 - Up to **100,000 entries** by default (configurable), flushing at **95% capacity**.
-- **Tombstones are counted separately** from live entries, and capacity is measured against live entries only.
+- **Tombstones count toward capacity** just as live entries do (each is tracked in its own counter), so a delete frees no room. The table is also sealed early if its arenas could not fit one more full-height node with a 256-byte key, or any arena reaches half its `u32` index range.
 - Key ordering uses **SIMD-accelerated byte comparison** — AVX-512/AVX2 on x86_64, NEON on Apple Silicon (see [SIMD coverage by architecture](#simd-coverage-by-architecture)). Bucket assignment uses a separate, also SIMD-accelerated hash of the key prefix.
 - Every node carries its write's **`u64` sequence number** — the same global number the WAL and SSTables use — which is what resolves two writes to the same key.
 
@@ -205,11 +201,11 @@ Two properties make everything else fall out:
 ```
 segment file:  [file header 16B] [record] [record] ...
 
-record:        [header 36B][value bytes][key bytes]
+record:        [header 32B][value bytes][key bytes]
                 ^ rec_offset
 ```
 
-The header holds `total_len`, `version`, `epoch_ms`, the write `seq`, `key_len`, `value_len`, and a CRC32 of the value. A key's pointer — the `u128` the LSM stores — is:
+The header holds `total_len`, `epoch_ms`, the write `seq`, `key_len`, `value_len`, and a CRC32 of the value. A key's pointer — the `u128` the LSM stores — is:
 
 ```
  127            96 95            64 63            32 31             0
@@ -218,15 +214,15 @@ The header holds `total_len`, `version`, `epoch_ms`, the write `seq`, `key_len`,
 └────────────────┴────────────────┴────────────────┴────────────────┘
 ```
 
-Two details in there earn their keep. The **value sits before the key** in the record, and the pointer **carries `value_len`** — so reading a value is **one `pread` of exactly `36 + value_len` bytes**. There is no page header to consult and no slot directory to walk. And the **key is stored in the record**, which is what lets GC decide what a segment still owes without inverting the entire LSM (see below).
+Two details in there earn their keep. The **value sits before the key** in the record, and the pointer **carries `value_len`** — so reading a value is **one `pread` of exactly `32 + value_len` bytes**. There is no page header to consult and no slot directory to walk. And the **key is stored in the record**, which is what lets GC decide what a segment still owes without inverting the entire LSM (see below).
 
-Every record also carries an **`epoch_ms` timestamp**. This is what makes TTL cheap: the TTL worker reads a record's creation time straight from its 36-byte header, without touching the value or the LSM.
+Every record also carries an **`epoch_ms` timestamp**. This is what lets TTL skip the values: the TTL worker walks the LSM's keys and pointers and reads each record's creation time straight from its 32-byte header, never the value bytes.
 
 #### Writes, deletes, and garbage
 
 Writes only ever append, which turns all value writes into sequential I/O — exactly what SSDs and NVMe drives are fastest at. Nothing is ever rewritten in place, and — unlike most log-structured stores — **records carry no tombstone or "superseded" flags at all**. The LSM is the sole authority on what is live.
 
-So an update appends a *new* record and a delete writes an LSM tombstone; in both cases the displaced record is simply **added to its segment's garbage counter**. That accounting costs **zero I/O**: the writer already holds the old pointer, and the pointer carries `value_len`, so the record's size is known without reading it. (The alternative — flipping a flag inside the old record — is a read-modify-write of a header at a random, possibly-cold offset on *every* overwrite and delete, and it cannot work at all when the record lives in a sealed, immutable segment.)
+So an update appends a *new* record and a delete writes an LSM tombstone; in both cases the displaced record is simply **added to its segment's garbage counter** once no LSM entry points at it any more. That happens in one of two places. If the key's old entry is in the MemTable, the write replaces it there, and the insert reports the pointer it replaced. If the old entry is in an L0 or L1 file, it stays there, shadowed, until the next L0→L1 merge drops it, and the merge reports every pointer it drops. Either way the accounting costs **no I/O**: the pointer carries `value_len`, so the record's size is known without reading it, and the writer never has to look up the pointer it replaces. A namespace with no field indexes therefore writes and deletes blind. (Field indexes do need the old value, to move the row out of its old value's bitmap, so an indexed namespace looks the key up first.) The cost is that garbage shows up in the counters only when the merge runs, so GC sees it a little later. (The alternative — flipping a flag inside the old record — is a read-modify-write of a header at a random, possibly-cold offset on *every* overwrite and delete, and it cannot work at all when the record lives in a sealed, immutable segment.)
 
 #### Garbage collection
 
@@ -234,7 +230,7 @@ GC's unit is a **segment**, never the whole bucket:
 
 1. **Pick** the sealed segments whose garbage ratio is over the per-segment selection bar, worst first. The active tail is never a candidate.
 2. **Scan** the segment sequentially, *without holding any lock*. Each record carries its key, so GC looks all of the segment's keys up in the LSM in one batched lookup: a record survives if the LSM still points at exactly this location.
-3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. The re-insert preserves the key's existing sequence, so relocating a record never changes its version.
+3. **Relocate** the survivors into the active tail and re-point their keys — under the bucket lock, as a **compare-and-set**: a key is only moved if it *still* maps to the old location, so a key overwritten or deleted since step 2 is left alone. Each copy keeps the write's sequence and takes the next system version, so it is newer than the copy it replaces and older than any user write still to land; GC takes no per-key lock. The lock is taken once per batch of survivors (at most 1,024 records or 1 MiB of values) and released between batches, so writers to the bucket wait for a batch, not for a whole segment.
 4. **Flush** the memtable to L0, making the re-point durable.
 5. **Unlink** the old segment file.
 
@@ -246,7 +242,7 @@ The cost of a pass is therefore proportional to *one segment's survivors*, not t
 
 A read is two steps — ask the LSM where the value is, then read it there — and GC can relocate the value in between. It cannot, however, make the read *wrong*:
 
-- A pointer GC has already superseded still resolves to **that key's own bytes**. The record is still sitting in the old segment, and GC re-points under the key's existing sequence, so the relocated copy is the same write.
+- A pointer GC has already superseded still resolves to **that key's own bytes**. The record is still sitting in the old segment, and the relocated copy holds the same value.
 - A pointer into a segment GC has already **unlinked** fails loudly (`SegmentMissing`) — never silently against some other key's record, because that id will never be handed out again. The reader re-resolves through the LSM, which by then holds the new pointer, and retries.
 
 That is the whole protocol. There is **no seqlock, no generation counter, and no per-record sequence check on the read path** — a stale pointer is *stale*, never *wrong*. A read that keeps losing the race falls back, after a few attempts, to a read holding the bucket write lock, which excludes GC entirely and guarantees progress.
@@ -285,7 +281,7 @@ A segment is **sealed** with the end marker, and fsynced, before the next one is
 
 A **position** in either log is `(segment_id << 32) | byte`, so the segment size is not encoded in positions: it can change from one start to the next (`wal.segment_size_bytes`, at most 4 GiB; a record must fit one segment). The admin API shows positions as `{segment_id, byte}`.
 
-The **`sequence` number** is what keeps recovery correct. It is allocated under the WAL append lock, so it always matches the order entries were written to disk. On recovery, MinnalDB sorts every eligible entry by sequence and replays them in that one global order — so the last write to any key wins after a crash just as it did before.
+The **`sequence` number** is what keeps recovery correct. It is allocated under the WAL append lock, so it always matches the order entries were written to disk. On recovery, MinnalDB sorts every eligible entry by sequence and replays them in that one global order, applying each only if it is newer than the key's current copy — so the last write to any key wins after a crash just as it did before.
 
 The WAL knows how far it is no longer needed through its **cut**: every entry below that position is safely in an L0 or L1 SSTable on disk. Each namespace also has a **safe offset** — all of *its* entries below it are in SSTables — which can be ahead of the cut (the cut is the slowest namespace's). Both are kept in the WAL metadata file, saved by the flush that moves them, before the flush's L0 files become readable. Recovery replays each namespace's entries from its own safe offset (or the cut), and nothing below.
 
@@ -340,11 +336,15 @@ sequenceDiagram
     participant G as WAL GC (every 60 s)
     M->>F: memtable full: seal it (read-only)
     F->>W: sealed event: note how far this memtable reaches in the WAL
+    F->>F: fsync any value no log covers (no-WAL writes, GC copies)
     F->>F: write and fsync its L0 files (not yet readable)
+    F->>F: fsync the value log (every value the L0 files point at)
     F->>W: written event: move this namespace's safe offset and the cut, save them
     F->>F: register the L0 files
     G->>W: delete every segment wholly below the cut
 ```
+
+The value log is made durable before the WAL entries that could rewrite its values are retired. A power loss after an L0 file is written but before that fsync can leave the file pointing at a lost value; replay, which still has the entry, writes the value again and points the key at it. Values no log covers are fsynced before any L0 file points at them, since nothing could rewrite them.
 
 The WAL lock is held only to append, never across an fsync. On the NVMe drive the benchmarks here were measured on, a single client's writes take about 0.75 ms each once the log is on zero-filled segments (measured: 0.73–0.75 ms per `put` for 128 B to 8 KiB values, about 1,350 a second); concurrent clients share each fsync, so together they make many more. A segment is fsynced as it is left (commit rounds fsync only the active segment), so everything below the active segment is always durable.
 
@@ -408,8 +408,8 @@ The design and its measurements are in `src/semantic_search/docs/Vector-Index-WA
 - **WAL lock** (`Database::wal_metadata`) — the lock every main-WAL write takes to take its seq and append its entry, so seq order is log order. Inside it the append takes the log's own append lock, which is never contended (every main-WAL append already holds the WAL lock) and which a commit round takes briefly to read the tail. Both are released before the fsync.
 - **Group commit** — several concurrent writers sharing one fsync. Each still returns only after an fsync that covers its own entry (see *Durability model* above).
 - **Commit round** — one fsync and the callers it releases, in either log (`db/wal/commit_rounds.rs`): the caller that finds no round running leads one, fsyncing the active segment up to the tail it read; callers whose bytes came later wait for, or lead, the next. The main WAL commits per write (`wal_commit_rounds` / `wal_commit_writes` count them); the vector index WAL per `sync`.
-- **Sequence (seq)** — the global write counter (`next_seq`) every write draws from, whichever log it uses. The highest seq for a key wins everywhere: memtable, L0, L1, and replay of either log.
-- **Key stripe lock** (`db/database/key_locks.rs`) — a fixed array of 1,024 locks; each key hashes to one, its *stripe*, so two keys may share one. Every write takes its key's stripe first, before any log lock. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs.
+- **Sequence (seq)** — the global write counter (`next_seq`) every user write draws from, whichever log it uses. With the system seq of GC and TTL rewrites it makes a copy's version; a newer layer always holds a newer version, and replay of either log applies a record only if it is newer than the key's current copy.
+- **Key stripe lock** (`kv_store/key_locks.rs`) — a fixed array of 1,024 locks per namespace; each key hashes to one, its *stripe*, so two keys of a namespace may share one. Every user write takes its key's stripe first, before any log lock, and holds it until the write is in the memtable. It is what makes `merge` (read, decide, write) indivisible for one key, and it orders a key's writes across both logs. Value-log GC and TTL expiry take none.
 - **Memtable** — a namespace's in-memory sorted buffer of recent writes (a skip list). **Seal:** turning a full one read-only so it can be flushed. **Flush:** writing a sealed memtable to L0 files and fsyncing them.
 - **L0 / L1** — the LSM tree's on-disk levels: L0 holds one file per flush per bucket, L1 one merged file per bucket. **Compaction** merges L0 into L1 and may drop tombstones there.
 - **Tombstone** — the record a delete leaves, so the key reads as absent until compaction removes both.
@@ -435,10 +435,10 @@ The design and its measurements are in `src/semantic_search/docs/Vector-Index-WA
 
 ### Sharding
 
-Sharding is what lets MinnalDB do its slow work in parallel. Every storage component is split across **16 buckets** (set at creation and fixed thereafter), which means:
+Sharding is what lets MinnalDB do its slow work in parallel. Every storage component is split across **8 buckets** by default (set at creation and fixed thereafter), which means:
 
-- Garbage collection runs across 16 independent value-log files at once.
-- Compaction runs across 16 independent L1 SSTables at once.
+- Garbage collection runs across 8 independent value-log files at once.
+- Compaction runs across 8 independent L1 SSTables at once.
 - Value-log writes take a **per-bucket lock** rather than one global value-log lock.
 
 Sharding does not parallelise durable writes, though. Every write appends to the one shared WAL and waits for an fsync that covers it; concurrent writes from all threads and namespaces share each fsync (group commit). Write throughput is set by the drive's fsync latency and how many writes share each fsync, not by the bucket count (see [Performance](#performance)).
@@ -541,10 +541,9 @@ Putting the pieces together, here is how a database lays itself out on disk. The
 │       ├── level0/
 │       │   ├── level0_0/       # L0 files for bucket 0
 │       │   └── ...
-│       ├── level1/
-│       │   ├── level1_0.dat    # L1 SSTable for bucket 0
-│       │   └── ...
-│       └── manifest
+│       └── level1/
+│           ├── level1_0.dat    # L1 SSTable for bucket 0
+│           └── ...
 │
 └── ns_<name>/                  # Each named namespace (e.g. ns_orders), same shape
 ```
@@ -600,36 +599,31 @@ merge(key, operand, closure)
 Three things fall out of that shape:
 
 - **The WAL never learns a merge happened.** It records the *result* as an ordinary `Upsert` or `Delete`, so recovery, WAL GC and index replay are byte-for-byte unchanged, and nothing re-runs the closure at replay — which is what makes an arbitrary Rust closure usable here at all.
-- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway.
+- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway. Field-index changes are queued under the bucket lock, so a key's index changes are queued in the order its versions are written, even for TTL expiry, which takes no stripe. The write then returns: the **field-index worker** applies each field's queue in that order, waiting `scheduled_tasks.index_apply_delay_ms` (20 ms by default) after a write wakes it so a burst is applied in one pass, a batch at a time under the field's lock, so no write waits for a field index a query is reading or the checkpoint is writing out. Queries read what the worker has applied, so a query sent straight after a write may not see it yet; each field's `apply_queue` in the index health report shows how many changes wait and how long the oldest has. The index checkpoint applies a field's queue before it records the WAL offset the field reflects, since crash replay starts there.
 - **`put` and `delete` take the stripe too**, so a blind write cannot land between a merge's read and its write. The guarantee is per key: this is not a transaction.
 
 ### Read Path
 
-A read resolves the key's current version by **highest write sequence**, then follows that pointer into the value log:
+A read takes the first copy of the key it finds, newest layer first, then follows that pointer into the value log:
 
 ```
 get(key)
         │
-        ├──► SkipList.get(key)  → hit whose seq beats every lower tier?
-        │                            └─► yes: nothing below can be newer, return it  (fast path)
-        │
-        │    otherwise gather candidates from every layer and keep the highest seq:
-        ├──► active MemTable            → (pointer | tombstone, seq)
-        ├──► read-only MemTables         → (pointer | tombstone, seq)
-        ├──► L0 files for bucket         → (pointer | tombstone, seq)
-        ├──► L1 SSTable for bucket       → (pointer | tombstone, seq)
-        │                                            │
-        │                          winner = max by seq
+        ├──► active MemTable           → hit? (pointer | tombstone)
+        ├──► read-only MemTables        → hit?   newest first
+        ├──► L0 files for bucket        → hit?   newest first, skipped unread
+        │                                        when range or Bloom filter rule it out
+        ├──► L1 SSTable for bucket      → hit?   min/max, Bloom filter, sparse index
         │                                            │
         │                    tombstone ──► None      │ pointer
         │                                            ▼
         │                            ValueLog.read(segment, offset, len)
         │                                     └─► value bytes
         │
-        └──► no candidate → return None
+        └──► no layer holds it → return None
 ```
 
-Layer order is deliberately *not* the tie-breaker: value-log GC re-points a relocated key under its original sequence, so a newer layer can legitimately hold an older version. See [LSM Tree](#lsm-tree) for why first-hit-wins would resurrect deleted keys.
+The first copy is the current one because every writer keeps newer versions in newer layers ([Layer-Order-Design.md](docs/Layer-Order-Design.md)). See [LSM Tree](#lsm-tree).
 
 ---
 
@@ -643,8 +637,8 @@ LSM compaction runs when a memtable fills (95% capacity) or on the compaction wo
 
 1. The active MemTable is sealed, becoming a read-only table.
 2. A background worker flushes that sealed table to per-bucket L0 files.
-3. All of a bucket's L0 files are merge-sorted into a new L1 SSTable.
-4. The old L0 files are removed only once every in-flight read has finished with them, so a concurrent read is never pulled out from under.
+3. All of a bucket's L0 files are merge-sorted into a new L1 SSTable; for a key in several, the newest file's copy is kept, and a tombstone drops the key. The new file's header records the newest L0 file merged into it.
+4. The old L0 files are removed oldest first, each only once every in-flight read has finished with it, so a concurrent read is never pulled out from under. If a crash comes before they are all gone, the next open deletes every L0 file the bucket's L1 header says is already merged, rather than reading it again.
 
 The [LSM tier animation](#lsm-tree) walks through a full cycle of this — flush, accumulate, merge — including how duplicate keys and tombstones make L1 smaller than the files it was built from.
 
@@ -658,7 +652,7 @@ The pass itself is described in full under [Value Log](#value-log): pick the wor
 
 Two consequences worth stating plainly:
 
-- **Cost is proportional to what is being reclaimed**, not to the size of the bucket. Segments GC didn't select are never read or written, and the bucket lock is held only across the CAS re-point loop — not across the copying.
+- **Cost is proportional to what is being reclaimed**, not to the size of the bucket. Segments GC didn't select are never read or written, and the bucket lock is held only across one batch of the CAS re-point at a time — not across the scan.
 - **A crash mid-GC needs no repair**, because the old segment is unlinked only after the re-point is durable (see [Garbage collection](#garbage-collection)).
 
 ### WAL GC
@@ -693,7 +687,7 @@ The components above were each designed with one shared goal: surviving a crash 
 
 1. Load the WAL metadata (the cut, each namespace's safe offset, and the sequence high-water mark), then open the WAL from its cut: check every segment from there on, find the tail (zeroing a torn one), and read each entry's sequence number. Segments below the cut are not read; the head is the oldest segment on disk. If the saved progress names positions past what survived a power loss, new writes start in a new segment, above all of them.
 2. Open the `system_catalog` namespace, replay its WAL entries, and load the list of namespaces from it.
-3. For every namespace it lists, load the LSM manifest and reopen the L0/L1 SSTables.
+3. For every namespace it lists, reopen the L0/L1 SSTables in its `lsm/` directory.
 4. Open each bucket's value-log segments: reconcile the segment files on disk against the recorded inventory, and seed the segment-id allocator from `max(persisted high-water mark, highest existing id + 1)` so an id is never reused. A bucket whose metadata was lost has its live/garbage accounting recomputed exactly from the LSM's pointers.
 5. Replay the vector index WAL: every record at or above its namespace's safe offset, with its original seq. Then flush the namespaces it replayed into and record them as retired, before anything below can compact (see [Vector index WAL](#vector-index-wal)).
 6. Replay the WAL entries at or above their namespace's safe offset (or the cut):
@@ -710,13 +704,18 @@ There is deliberately **no value-log GC recovery step**. GC unlinks a segment on
 
 ## MinnalDB as an Embedded Store
 
-MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `AsyncDb::open` on a directory path (the API is async, on tokio), and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, GC of both write-ahead logs, field-index checkpoints, TTL) running inside your process, started by the open.
+MinnalDB is the **base storage layer** of the minnal stack and is designed to be embedded directly inside any Rust process — no server, no separate daemon. You depend on the `minnal_db` crate, call `AsyncDb::open` on a directory path (the API is async, on tokio), and get a durable, namespaced key-value store with all background workers (compaction, value-log GC, GC of both write-ahead logs, applying field-index changes, field-index checkpoints, TTL) running inside your process, started by the open.
 
 `minnal_db` is a **single crate**; the document and semantic-search layers are
 provided as cargo features (`doc-store`, `semantic-search`) that you opt into.
 The base (`kv-store`, default) is the KV engine plus **built-in field indexing** —
 secondary (field-level) indexing is a capability of the engine itself, not
-something layered on by the document store.
+something layered on by the document store. A write queues its field-index
+changes and returns; a background worker applies them a short delay later
+(`scheduled_tasks.index_apply_delay_ms`, 20 ms by default, so a burst of writes
+is applied in one pass), so queries can lag writes as semantic search does, and
+`sync_field_indexes` waits for the worker when a caller needs to read its own
+writes.
 
 Crucially, MinnalDB stores **opaque value bytes** — it never assumes a format. The field index is driven by an *extractor closure* you supply (`&[u8] -> Option<IndexValue>`), so you decide how to pull an indexed field out of your own value encoding (JSON, Protocol Buffers, a fixed binary layout, …). Deriving those extractors from a JSON schema is precisely what the `doc-store` feature adds on top; the indexing machinery itself is engine-level.
 
@@ -761,7 +760,7 @@ Each design choice in MinnalDB pays off as a specific performance property:
 |---|---|
 | Key/value separation (WiscKey) | Low write amplification — LSM compaction never rewrites values |
 | Arena skip list | Reduced GC pressure and high cache locality for key lookups |
-| 16-bucket sharding | GC and compaction work on 16 independent shards; value-log writes lock one bucket, not the whole log |
+| Bucket sharding (8 by default) | GC and compaction work on independent shards; value-log writes lock one bucket, not the whole log |
 | Append-only value log | Sequential write I/O; ideal for SSDs and NVMe |
 | SIMD key comparison | Faster skip-list traversal on x86_64 (AVX-512/AVX2) and Apple Silicon (NEON). See [SIMD coverage by architecture](#simd-coverage-by-architecture) below. |
 | `rkyv` serialization | Typed reads and writes cost the same as raw-byte ones (within noise in [`benchmark.md`](benchmark.md#typed-api)) |
@@ -789,13 +788,13 @@ These are ballpark figures; treat them as orders of magnitude rather than guaran
 | `put` (small values) | ~1,350 ops/s for one writer on an NVMe drive without power-loss protection (0.73–0.75 ms each for 128 B–8 KiB values, measured on zero-filled WAL segments): each write waits for its own fsync. Concurrent writers share fsyncs, so together they do more (about 1,400 documents/s, each three WAL writes, with 16 clients in the semantic-search ingest benchmark). |
 | `delete` | ~1,350 ops/s for one writer — same fsync bound as `put` |
 | `merge` (small values) | ~1,350 ops/s for one writer — the read-modify-write and its per-key lock add ~0.5–0.7 µs, small next to the fsync it pays anyway |
-| `get` from memory | 1M–2.5M ops/s per thread |
-| `get` from disk (L1 SSTable) | 100k–300k ops/s per thread |
+| `get` from memory | 1.5M–3M ops/s per thread |
+| `get` from disk (L1 SSTable) | 170k–400k ops/s per thread |
 | Range / prefix scan | Proportional to the number of results |
 
-Actual numbers depend mostly on value size and the drive's fsync latency. [`benchmark.md`](benchmark.md) measures every figure above, with the hardware it ran on. Be suspicious of any write figure measured without the fsync: the same WAL append runs about 3,000 times faster with the sync left out, so it is easy to publish a write throughput that quietly assumes it away.
+Actual numbers depend mostly on value size and the drive's fsync latency. [`benchmark.md`](benchmark.md) measures every figure above, with the hardware it ran on. Be suspicious of any write figure measured without the fsync: the same WAL append runs up to about 1,900 times faster with the sync left out, so it is easy to publish a write throughput that quietly assumes it away.
 
-**For one writer, every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 2.8% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
+**For one writer, every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 5% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
 
 ---
 

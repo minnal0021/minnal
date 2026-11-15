@@ -1,3 +1,6 @@
+//! Document ids at the REST boundary: turning a path or JSON id into a
+//! [`DocId`](minnal_db::DocId) for the store's key type, and back into JSON.
+
 use minnal_db::{DocId, DocStoreError, KeyType, StrKey};
 
 use crate::error::AppError;

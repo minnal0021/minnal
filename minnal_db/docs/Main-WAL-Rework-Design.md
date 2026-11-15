@@ -427,9 +427,12 @@ as the vector index WAL's did:
 
 If the save fails, the event returns an error and the LSM undoes the flush
 (nothing registered, the memtable kept for a retry), which the flush events
-already support. The event runs behind `SyncValueLogBeforePersist`, so the
-values these entries point at are fsynced first, as they must be before the
-entries stop being replayed.
+already support. The value log is fsynced just before the save
+(`SyncValueLogBeforePersist`), so the values these entries point at are
+durable, as they must be before the entries stop being replayed. A power loss
+before then can leave a written L0 file pointing at a value that was lost;
+replay, which still has the entry, writes the value again
+(`Layer-Order-Design.md` → *Replay drops what is not newer*).
 
 A crash after the save but before registration leaves durable L0 files that
 open finds by listing the level directory, so their writes are not lost; a

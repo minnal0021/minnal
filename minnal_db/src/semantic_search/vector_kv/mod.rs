@@ -115,8 +115,8 @@ pub fn ivf_postings_ns(namespace: &str) -> String {
     format!("{}_ivf_postings", namespace)
 }
 
-/// Internal namespace for a namespace's maintenance journal (design doc M3a):
-/// `op_id (8B BE) → record`, WAL-backed.
+/// Internal namespace for a namespace's maintenance journal
+/// (`Dynamic-RaBitQ-Index-Design.md` → M3a): `op_id (8B BE) → record`, WAL-backed.
 pub fn ivf_journal_ns(namespace: &str) -> String {
     format!("{}_ivf_journal", namespace)
 }
@@ -126,8 +126,8 @@ pub fn ivf_journal_ns(namespace: &str) -> String {
 pub const COMPANION_SUFFIXES: [&str; 6] = crate::namespace::VECTOR_COMPANION_SUFFIXES;
 
 /// The companions removed when the vector index is dropped: all of them. The
-/// partition is derived from the data since M3 (a namespace grows it by
-/// splitting), so it goes with the data and re-enabling starts from the root.
+/// partition is derived from the data (a namespace grows it by splitting), so
+/// it goes with the data and re-enabling starts from the root.
 pub const VECTOR_DATA_SUFFIXES: [&str; 6] = COMPANION_SUFFIXES;
 
 /// Every companion namespace name of `namespace`.
@@ -156,9 +156,9 @@ pub fn vector_data_base(name: &str) -> Option<&str> {
 /// If `name` is a vector companion namespace, the base namespace it belongs to.
 ///
 /// The inverse of [`sparse_vectors_ns`] and friends. It lives here so the naming
-/// rule has exactly one owner: the admin API used to strip its own hard-coded
-/// copy of these suffixes, so renaming one would have silently stopped companion
-/// namespaces being recognised as such.
+/// rule has exactly one owner: a second hard-coded copy of these suffixes (in
+/// the admin API, say) would silently stop recognising companion namespaces
+/// once one was renamed.
 pub fn companion_base(name: &str) -> Option<&str> {
     COMPANION_SUFFIXES.iter().find_map(|suffix| name.strip_suffix(suffix))
 }
@@ -375,7 +375,8 @@ const DOC_VECTOR_LOCK_STRIPES: usize = 4096;
 /// the old list, then delete the list the upsert had just replaced — leaving the
 /// upsert's new cluster keys with nothing recording them. Every later clean-up
 /// (the worker's `process_clear`, the next delete) finds keys through the list, so
-/// those keys were orphaned for good: measured 260 orphans in 300 racing rounds.
+/// those keys would be orphaned for good (260 orphans in 300 racing rounds,
+/// unlocked).
 /// A document delete racing the vector worker is exactly this shape. The database
 /// has a single owning process (the directory lock), so an in-process lock
 /// suffices; the stripes are shared across namespaces and databases, which only

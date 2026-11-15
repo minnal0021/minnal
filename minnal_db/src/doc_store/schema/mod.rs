@@ -1,3 +1,8 @@
+//! Store schemas: what a document store ([`DocStoreSchema`]) or a key-value
+//! store ([`KvStoreSchema`]) is, as created, persisted and amended. `store`
+//! keeps every schema (`SchemaStore`, the only reader and writer of the
+//! `system_schema` namespace); `kv` holds the key-value schema.
+
 use crate::namespace::NamespaceId;
 pub mod kv;
 pub mod store;
@@ -9,11 +14,8 @@ use serde::{Deserialize, Serialize};
 use self::vector_settings::{IndexDefaults, MaintenanceSpec, SearchSpec, VectorIndexSettings, VectorIndexSpec};
 use crate::doc_store::error::SchemaError;
 
-/// The raw key-value store schema, split into its own module.
-///
-/// Re-exported here because `doc_store::schema::KvStoreSchema` is an established
-/// path used across the API layer; the split is about where the code lives, not
-/// about renaming anything.
+/// The key-value store schema (defined in `kv`), re-exported so both schema
+/// families are reached through `doc_store::schema`.
 pub use crate::doc_store::schema::kv::{KvKeyType, KvStoreSchema, KvValueType};
 
 /// Maximum number of indices allowed per document store.
@@ -23,10 +25,10 @@ pub const MAX_INDICES: usize = 5;
 ///
 /// This is the **explicit, mandatory** discriminant between the two schema
 /// families — a document store ([`DocStoreSchema`]) versus a raw key-value store
-/// ([`KvStoreSchema`]). It replaces the historical practice of inferring the kind
-/// from the (incidentally disjoint) `key_type` values, which was fragile and
-/// accidental. Every persisted schema and every create/import payload must carry
-/// a `store_type` that parses into this enum.
+/// ([`KvStoreSchema`]). The kind is never inferred from `key_type`: the two
+/// families' key types happen to be disjoint, which is no contract. Every
+/// persisted schema and every create/import payload must carry a `store_type`
+/// that parses into this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StoreType {
@@ -693,9 +695,9 @@ mod tests {
     use std::collections::HashSet;
 
     /// An index field name must be something a query can reference and the
-    /// extractor can read: dotted, hyphenated, digit-leading or keyword names
-    /// used to be accepted, giving an index no query could name — and, for a
-    /// dotted name, one the extractor never populated.
+    /// extractor can read. A dotted, hyphenated, digit-leading or keyword name
+    /// would give an index no query could name and, for a dotted name, one the
+    /// extractor never populates.
     #[test]
     fn index_field_names_must_be_query_identifiers() {
         for bad in ["address.city", "created-at", "has space", "1st", "in", "NOT", "True", "false", "é"] {
@@ -1608,8 +1610,8 @@ mod tests {
     // ── On-disk type discrimination ───────────────────────────────────────────
     // The authoritative discriminant is the mandatory `store_type` field; the
     // loaders dispatch on it via `peek_store_type`, and the typed `load`/`validate`
-    // reject the wrong kind. (The key_type sets remain incidentally disjoint, but
-    // that is no longer what tells the two schemas apart.)
+    // reject the wrong kind. (The key_type sets happen to be disjoint, but that
+    // is not what tells the two schemas apart.)
 
     #[test]
     fn peek_store_type_reads_the_discriminant() {

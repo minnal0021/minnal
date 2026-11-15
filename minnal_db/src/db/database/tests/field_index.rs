@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Regression: activating the same field index from several threads must not
+/// Activating the same field index from several threads must not
 /// kill the process.
 ///
 /// `activate_field_index` creates memory-mapped files — the field's `BlobStore`
@@ -15,17 +15,15 @@ use super::*;
 ///
 /// Reachable from an ordinary client: two concurrent `POST /stores` for one
 /// namespace (a timeout plus a retry is enough) each activate the same fields.
-/// Measured before the fix, against the stress server: 8 racing creates killed
-/// it on **every** attempt — `Bus error (core dumped)`, exit 135 — and a
-/// different interleaving surfaced instead as
-/// `range end index 8 out of range for slice of length 0` writing the 64-byte
-/// header into a zero-length map.
+/// Without `index_activate_lock`, 8 racing creates killed the server on
+/// **every** attempt (`Bus error (core dumped)`, exit 135), or, in a different
+/// interleaving, panicked with `range end index 8 out of range for slice of
+/// length 0` writing the 64-byte header into a zero-length map.
 ///
-/// **Reverting the fix does not make this test fail — it makes the test binary
-/// die.** That is the honest reproduction; there is nothing to assert against a
-/// signal. What the assertions below add is that serialising activation did not
-/// break it: every thread returns `Ok`, and the index answers correctly
-/// afterwards.
+/// **Without the lock this test does not fail: the test binary dies.** There is
+/// nothing to assert against a signal. What the assertions below add is that
+/// serialising activation did not break it: every thread returns `Ok`, and the
+/// index answers correctly afterwards.
 #[test]
 fn test_concurrent_activation_of_one_field_index_does_not_kill_the_process() {
     use std::sync::Barrier;
@@ -572,7 +570,7 @@ fn test_activate_field_index_replays_wal_after_crash() {
     }
 }
 
-/// Item 13 regression: replaying an **update** (same key, changed field
+/// Replaying an **update** (same key, changed field
 /// value) must reconcile via the targeted O(1) path — during replay
 /// `lsm.get` returns the replay-so-far value, so the second put moves the
 /// row off the old value. A bug here would leave the key matching BOTH the
@@ -626,7 +624,7 @@ fn test_field_index_replays_updates_after_crash() {
     }
 }
 
-/// Regression for the O(1) targeted field-index update/delete (item 13): a
+/// The O(1) targeted field-index update and delete: a
 /// document update must move its row from the old value's bucket to the new
 /// one (the prior value must stop matching), and a delete must remove it —
 /// driven by the prior document bytes read in the put/delete path, not a
@@ -671,7 +669,7 @@ fn test_field_index_targeted_update_and_delete() {
     db.shutdown().unwrap();
 }
 
-/// FR-006: once every field index of a namespace is dropped, its row map can be
+/// Once every field index of a namespace is dropped, its row map can be
 /// reset, freeing every row ID; the rebuilt index then packs the live keys into
 /// IDs 0..live. While any field still exists the reset is refused.
 #[test]
@@ -720,5 +718,55 @@ fn reset_rowmap_frees_every_row_id_once_no_field_exists() {
     activate_named_index(&db, ns, "status");
     assert_eq!(db.rowmap_ids_allocated(ns).unwrap(), Some(500), "the compacted map survives a restart");
     assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 500);
+    db.shutdown().unwrap();
+}
+
+/// A write waiting for a field index's lock does not hold its value-log
+/// bucket lock meanwhile. A query or the index checkpoint can hold a field's
+/// lock for milliseconds (a range merging many values' bitmaps, an `msync`),
+/// and a writer that waited for it under the bucket lock held up every other
+/// write to the bucket, GC and TTL with it: 16 clients lost a sixth of their
+/// throughput in the engine benchmark. The write queues its change under the
+/// bucket lock and applies it after (`kv_store/index_queue.rs`).
+#[test]
+fn a_write_waiting_for_a_field_index_does_not_hold_its_bucket_lock() {
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = DEFAULT_NAMESPACE_ID;
+    let field_id = activate_status_index(&db, ns);
+    let store = db.get_store(ns).unwrap();
+    let (index, queue) = {
+        let ns_index = store.namespace_index.read();
+        let entry = ns_index.get(field_id).unwrap();
+        (Arc::clone(&entry.index), Arc::clone(&entry.queue))
+    };
+    let key = b"doc:A";
+    let bucket = store.value_log.bucket_for_key(key);
+
+    // Held as the checkpoint holds it across an `msync`.
+    let held = index.read();
+    std::thread::scope(|s| {
+        let writer = s.spawn(|| db.put(key, br#"{"status":"active"}"#).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.len() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        // The writer is past its bucket lock, waiting for the field's: the
+        // bucket is free for anyone else.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let store = &store;
+        s.spawn(move || {
+            drop(store.value_log.lock_bucket_for_write(bucket).unwrap());
+            tx.send(()).unwrap();
+        });
+        let free = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(held);
+        writer.join().unwrap();
+        assert!(free, "the writer held its bucket lock while waiting for the field index");
+    });
+    // And the write's change is in the index once the write returns.
+    assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![key.to_vec()]);
     db.shutdown().unwrap();
 }

@@ -90,6 +90,7 @@ async fn field_index_over_typed_struct_value() -> Result<(), KVError> {
     .await?;
 
     // 4. Query the index with the predicate DSL. Returns the raw (rkyv) key bytes.
+    db.sync_field_indexes().await?;
     let keys = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#).await?.keys;
 
     // 5. Resolve each matched key: decode the archived u64, then `get_typed`.
@@ -164,6 +165,7 @@ async fn field_index_writes_are_buffered_until_the_checkpoint() -> Result<(), KV
         .await?;
     }
     // Queries see the buffered changes before any checkpoint.
+    db.sync_field_indexes().await?;
     let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#).await?.keys;
     assert_eq!(active.len() as u64, n / 2, "buffered writes must be visible to queries");
     // Before the checkpoint the store has not grown (a background checkpoint

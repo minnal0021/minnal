@@ -1,4 +1,4 @@
-//! Queue race tests (R1–R3).
+//! Queue race tests: the conditional rules R1–R3 in `vector_kv/queue.rs`.
 //!
 //! The worker snapshots the whole queue at the start of a pass, then embeds each
 //! snapshot entry. These tests stand in for the embedding step: they take the
@@ -38,8 +38,8 @@ async fn dense_tag(db: &AsyncDb, doc: &[u8]) -> Option<f32> {
 }
 
 /// R1: an upsert that lands while its doc's older text is being embedded must
-/// not be lost. The worker used to delete the queue key unconditionally after
-/// writing the stale vectors, destroying the newer entry.
+/// not be lost: a worker that deleted the queue key unconditionally after
+/// writing the stale vectors would destroy the newer entry.
 #[tokio::test]
 async fn r1_upsert_during_embed_is_not_lost() {
     let dir = TempDir::new().unwrap();
@@ -421,7 +421,7 @@ async fn a_newer_entry_is_never_rewritten() {
     assert_eq!((kept.kind, kept.text.as_str()), (QueueEntryKind::Embed, "newer"));
 }
 
-// ── Completion waits for durability (design doc M0-1) ──
+// ── Completion waits for durability (`Dynamic-RaBitQ-Index-Design.md` → M0-1) ──
 
 /// Like [`vectors_for`], but the sparse chunk lands in cluster 4 instead of 3,
 /// as a re-embedded document's chunks can.
@@ -460,11 +460,11 @@ async fn sparse_state(db: &AsyncDb, doc: &[u8]) -> (Vec<u32>, Option<Vec<u32>>) 
     (present, meta.as_deref().and_then(decode_sparse_meta).map(|m| m.cluster_ids()))
 }
 
-/// A re-embed must be durable before its queue entry is completed. The worker
-/// used to complete it (WAL-backed, durable at once) while the new vectors were
-/// still no-WAL in memory, so a crash kept the completion and the stale-key
-/// deletes but lost the new vectors: the document kept its old dense entry and
-/// lost its moved chunk, with nothing queued to repair it.
+/// A re-embed must be durable before its queue entry is completed. Completed
+/// while the new vectors were still unsynced, a crash could keep the
+/// completion and the stale-key deletes but lose the new vectors: the document
+/// would keep its old dense entry and lose its moved chunk, with nothing queued
+/// to repair it.
 ///
 /// The completion now skips the WAL, so it survives the crash only if the
 /// queue was flushed; both cases are checked. The new vectors must be on disk

@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! query     = expr EOF
-//! expr      = term ( ("AND" | "OR") term )*
+//! expr      = and ( "OR" and )*
+//! and       = term ( "AND" term )*
 //! term      = "NOT" term | "(" expr ")" | predicate
 //! predicate = FIELD OP VALUE
 //! OP        = "=" | "!=" | "<" | "<=" | ">" | ">=" | "IN"

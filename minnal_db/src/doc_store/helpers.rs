@@ -64,9 +64,9 @@ pub(super) async fn activate_indices(db: &AsyncDb, ns_id: NamespaceId, schema: &
     //
     // `activate_field_index` replays the WAL tail and resolves each affected
     // key's row ID through the store's *current* resolver. The resolver
-    // precedence is RowIdFn > dense RowMap > legacy hash, so if the custom
-    // key-derived RowIdFn is not yet installed, replay would fall back to the
-    // RowMap and index those WAL-tail keys under dense IDs that disagree with
+    // precedence is RowIdFn > dense RowMap, so if the custom key-derived
+    // RowIdFn is not yet installed, replay would fall back to the RowMap and
+    // index those WAL-tail keys under dense IDs that disagree with
     // the key-derived IDs used by prior persisted entries and all future writes
     // — mixing two row-ID schemes in one field index (stale hits, wrong key
     // resolution). The engine documents this ordering requirement on
@@ -101,7 +101,7 @@ pub(super) async fn activate_indices(db: &AsyncDb, ns_id: NamespaceId, schema: &
         KeyType::U128 | KeyType::Uuid | KeyType::Str => None,
     };
     if let Some((row_id_fn, row_to_key_fn)) = fns {
-        db.set_row_id_fn(ns_id, row_id_fn, Some(row_to_key_fn)).await.map_err(DocStoreError::Db)?;
+        db.set_row_id_fn(ns_id, row_id_fn, row_to_key_fn).await.map_err(DocStoreError::Db)?;
     }
 
     for spec in &schema.indices {

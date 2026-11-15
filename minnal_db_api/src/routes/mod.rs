@@ -1,3 +1,5 @@
+//! The REST API: every route and the handler module it goes to.
+
 pub mod admin_indices;
 pub mod admin_storage;
 pub mod admin_stores;
@@ -96,7 +98,7 @@ pub fn router() -> Router<AppState> {
             post(admin_indices::attribute_reindex_doc),
         )
         .route("/admin/indices/{ns}/{field}/blob-stats", get(admin_indices::field_blob_stats))
-        // Admin / indices — field-index health and repair (FR-001)
+        // Admin / indices — field-index health and repair
         .route("/admin/indices/{ns}/health", get(admin_indices::index_health))
         .route("/admin/indices/{ns}/rowmap", get(admin_indices::rowmap_stats))
         .route("/admin/indices/{ns}/attribute/{field}/repair", post(admin_indices::attribute_repair))
@@ -104,7 +106,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/indices/{ns}/vector/reindex/{doc_id}", post(admin_indices::vector_reindex_doc))
         .route("/admin/indices/{ns}/vector/reindex-failed", post(admin_indices::vector_reindex_failed))
         .route("/admin/indices/{ns}/vector/drop-all", delete(admin_indices::vector_drop_all))
-        // Admin / indices — vector partition (design doc M3a, partition health)
+        // Admin / indices — vector partition and its health
         .route("/admin/indices/{ns}/vector/partition", get(admin_indices::vector_partition))
         .route("/admin/indices/{ns}/vector/postings", get(admin_indices::vector_postings))
         .route("/admin/indices/{ns}/vector/centres", get(admin_indices::vector_centres))

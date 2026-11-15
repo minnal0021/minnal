@@ -60,7 +60,7 @@ use tokio::task::JoinSet;
 use crate::namespace_lifecycle::{AuditEvent, JobKey, Jobs, LifecycleError, LifecycleHost, NamespaceState};
 
 /// How the governor restarts what fails.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleConfig {
     /// Runs again of a failed task before it is given up on.
     pub max_restarts: u32,
@@ -75,9 +75,9 @@ pub struct LifecycleConfig {
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
-            max_restarts: 3,
-            restart_backoff: Duration::from_secs(1),
-            restart_window: Duration::from_secs(600),
+            max_restarts: crate::defaults::lifecycle::MAX_RESTARTS,
+            restart_backoff: crate::defaults::lifecycle::RESTART_BACKOFF,
+            restart_window: crate::defaults::lifecycle::RESTART_WINDOW,
         }
     }
 }

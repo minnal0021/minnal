@@ -122,7 +122,7 @@ async fn a_new_partition_is_one_root_posting_at_the_zero_centre() {
 }
 
 #[test]
-fn posting_rows_round_trip_and_pre_m3_rows_still_decode() {
+fn posting_rows_round_trip() {
     use crate::semantic_search::{Posting, PostingOrigin, PostingState};
     let p = Posting {
         posting_id: 5,
@@ -152,16 +152,11 @@ fn posting_rows_round_trip_and_pre_m3_rows_still_decode() {
             ..retired
         })
     );
-    // centre_id ‖ state ‖ centroid, as seeded before M3.
-    let mut old = 9u32.to_be_bytes().to_vec();
-    old.push(0);
-    old.extend(f32s_to_bytes(&[0.5, -1.0, 2.0, 0.0]));
-    let o = decode_posting(5, &old).unwrap();
-    assert_eq!(
-        (o.centre_id, o.state, o.origin, o.parent_id),
-        (9, PostingState::Active, PostingOrigin::Seed, None)
-    );
-    assert_eq!(o.routing_centroid, vec![0.5, -1.0, 2.0, 0.0]);
+    // A row without the format byte is not a posting.
+    let mut unmarked = 9u32.to_be_bytes().to_vec();
+    unmarked.push(0);
+    unmarked.extend(f32s_to_bytes(&[0.5, -1.0, 2.0, 0.0]));
+    assert_eq!(decode_posting(5, &unmarked), None);
 }
 
 /// The entry counts a search budgets by: counted from the keys at load, and

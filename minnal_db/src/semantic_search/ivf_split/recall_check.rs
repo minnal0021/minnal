@@ -1,5 +1,5 @@
 //! Does a namespace's search miss what a full read finds? The check behind
-//! "should I rebuild" (FR-007).
+//! "should I rebuild".
 //!
 //! A rebuild changes one thing: which postings hold which chunks, and so which
 //! documents a search reaches among the postings it probes (`max_probes`). When a search already
@@ -28,8 +28,8 @@
 //! the same seed (the same queries). A rise is what the rebuild gained.
 //!
 //! Chunk queries are not real queries: they are noisy reconstructions of
-//! document text, and they do not see everything a rebuild does for real ones
-//! (FR-007, *Calibration*). Use them when no queries are cached.
+//! document text, and they do not see everything a rebuild does for real ones.
+//! Use them when no queries are cached.
 
 use std::collections::HashSet;
 use std::time::Instant;

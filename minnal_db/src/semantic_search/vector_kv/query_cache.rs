@@ -27,12 +27,7 @@ use crate::AsyncDb;
 /// flushed to disk, so a no-WAL tombstone lost to a crash before the next flush
 /// tick would resurrect an entry the operator explicitly cleared — and keep
 /// serving it until the TTL expires.
-const SYSTEM_QUERY_EMB_CACHE_NS: &str = "system_qemb_cache";
-
-/// Fallback TTL for cached query embeddings (1 day) when no configured value is
-/// available — e.g. clearing the cache on a store without semantic search
-/// configured.
-pub const DEFAULT_QUERY_EMBEDDING_CACHE_TTL: Duration = Duration::from_secs(86_400);
+pub(super) const SYSTEM_QUERY_EMB_CACHE_NS: &str = "system_qemb_cache";
 
 /// Maximum records the TTL worker will delete per pass.
 const QUERY_EMBEDDING_CACHE_MAX_DELETES: usize = 10_000;
@@ -94,7 +89,7 @@ pub async fn put_cached_query_embedding(db: &AsyncDb, model: &str, query_text: &
 }
 
 /// Up to `limit` cached whole-query embeddings of `model` at `dim` dimensions:
-/// real queries recently searched, which the recall check (FR-007) prefers to
+/// real queries recently searched, which the recall check prefers to
 /// queries made from stored chunks. One bounded page read, starting at a point
 /// in the key space chosen by `seed` and wrapping once, so a large cache is not
 /// read in full and the page does not always begin at the same query text.
@@ -146,17 +141,23 @@ pub async fn clear_cached_query_embeddings(db: &AsyncDb, ttl: Duration) -> Resul
         .namespace_with_ttl(SYSTEM_QUERY_EMB_CACHE_NS.to_string(), ttl, QUERY_EMBEDDING_CACHE_MAX_DELETES)
         .await?;
 
-    let keys = cache_ns.keys().await?;
     let mut deleted = 0usize;
-    for key in keys {
-        // WAL-backed, unlike the populate path: the entries being cleared may
-        // already be flushed to disk, so a no-WAL tombstone lost to a crash
-        // before the next flush tick would bring them back. A clear is a rare
-        // admin operation; the per-delete fsync is off the query path.
-        cache_ns.delete(key).await?;
-        deleted += 1;
+    let mut cursor = None;
+    loop {
+        let (keys, next) = cache_ns.key_page(cursor, None, crate::kv_store::KEY_PAGE).await?;
+        for key in keys {
+            // WAL-backed, unlike the populate path: the entries being cleared may
+            // already be flushed to disk, so a no-WAL tombstone lost to a crash
+            // before the next flush tick would bring them back. A clear is a rare
+            // admin operation; the per-delete fsync is off the query path.
+            cache_ns.delete(key).await?;
+            deleted += 1;
+        }
+        match next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(deleted),
+        }
     }
-    Ok(deleted)
 }
 
 /// Encode a list of `Vec<f32>` embeddings as bytes.

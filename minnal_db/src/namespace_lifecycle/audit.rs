@@ -26,9 +26,6 @@ use crate::{AsyncDb, AsyncNamespace};
 /// The TTL namespace holding the audit log.
 pub const AUDIT_NAMESPACE: &str = "system_lifecycle_audit";
 
-/// How long a record is kept unless the server sets another retention.
-pub const DEFAULT_AUDIT_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
-
 /// Expired records the TTL worker deletes per pass.
 const MAX_DELETES_PER_RUN: usize = 10_000;
 

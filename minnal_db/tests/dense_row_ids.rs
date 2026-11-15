@@ -100,6 +100,7 @@ async fn dense_bitmap_stays_compact() -> Result<(), KVError> {
     );
 
     // Sanity: the query still returns every doc.
+    db.sync_field_indexes().await?;
     let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#).await?.keys;
     assert_eq!(active.len(), n as usize);
 
@@ -140,6 +141,8 @@ async fn ids_survive_clean_restart() -> Result<(), KVError> {
 
     // An update after restart must reuse the doc's existing ID, not duplicate it.
     put_user(&db, 0, "inactive").await?;
+    // The change reaches the index through the field-index worker: wait for it.
+    db.sync_field_indexes().await?;
     let active_after = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#).await?.keys;
     assert_eq!(active_after.len(), 99, "doc 0 must move out of 'active', not linger under a stale id");
 

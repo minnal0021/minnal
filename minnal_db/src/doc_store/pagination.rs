@@ -1,9 +1,14 @@
+//! Paging of query and scan results: page-number pagination for queries
+//! ([`Pagination`]) and the cursor clamp for cursor-paginated scans.
+
 /// Pagination parameters for query endpoints.
 ///
 /// `page_no` is 1-based; `page_size` controls how many results are returned.
 #[derive(Debug, Clone, Copy)]
 pub struct Pagination {
+    /// The page to return, from 1.
     pub page_no: usize,
+    /// Results per page.
     pub page_size: usize,
 }
 
@@ -43,9 +48,9 @@ pub struct Page<T> {
     /// healthy index, and always empty for scans (which read documents directly
     /// rather than through an index).
     ///
-    /// See `FEATURE-REQUEST.md` (FR-001): a degraded index stays queryable, but
-    /// the answer has to say so, or a complete-looking result set over an
-    /// incomplete index reproduces the original silent-wrong-answer bug.
+    /// A degraded index stays queryable, but the answer has to say so: a
+    /// complete-looking result over an incomplete index would be a silent wrong
+    /// answer.
     pub degraded_fields: Vec<String>,
 }
 
@@ -106,10 +111,10 @@ impl<T> CursorPage<T> {
 /// but never before `start`.
 ///
 /// A cursor is opaque client input. One from a different query (another
-/// prefix), a stale one, or a hand-edited one used to be taken as-is, so the
-/// scan began below `start` and returned keys outside the requested range — for
-/// a prefix scan, keys that do not even have the prefix. The end bound was
-/// already enforced; this enforces the start.
+/// prefix), a stale one, or a hand-edited one, taken as-is, would start the scan
+/// below `start` and return keys outside the requested range (for a prefix
+/// scan, keys that do not even have the prefix). The end bound is enforced by
+/// the scan; this enforces the start.
 pub fn clamp_cursor(cursor: Option<Vec<u8>>, start: Vec<u8>) -> Vec<u8> {
     match cursor {
         Some(c) if c > start => c,

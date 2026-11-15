@@ -3,7 +3,7 @@
 //! Assigns **dense, monotonic** row IDs (0, 1, 2, …) to keys so the field-index
 //! [`RoaringBitmap`](crate::field_index::RoaringBitmap)s pack densely — consecutive IDs share
 //! a high key and fill a container instead of scattering one-per-doc the way
-//! random hash IDs do. Replaces the stateless hash row-ID derivation.
+//! random hash IDs do.
 //!
 //! Two directions plus a counter, persisted as an mmap sidecar that is flushed
 //! at the index checkpoint and rebuilt by WAL replay on open (the same
@@ -44,8 +44,8 @@
 //! `rows.slots` is mapped from a file purely to keep it off the heap: a slot is
 //! 24 bytes held under a 0.7 load factor, so ~34–69 bytes are resident per
 //! distinct key ever written — 384 MiB at 10M keys. Anonymous pages can be
-//! swapped but never *dropped*, so that was unreclaimable while the store was
-//! open; file-backed pages the kernel can evict and re-read.
+//! swapped but never *dropped*, so on the heap that memory would be held for as
+//! long as the store is open; file-backed pages the kernel can evict and re-read.
 //!
 //! Nothing ever reads those bytes back across a restart. [`open`] recreates the
 //! file with `.truncate(true)` and rebuilds from `idarray[0..next_id]`, and that
@@ -62,8 +62,8 @@
 //! makes `get_or_alloc` hand back 7 without allocating, so the field index sets
 //! bit 7 while `key_for(7)` resolves to nothing — and the next genuine
 //! allocation reuses that id for a different key. **WAL replay cannot heal this:
-//! replay adds entries, it never removes them.** Note this is *not* fixed by
-//! guaranteeing the WAL tail survives (FR-001): that solves a missing tail, and
+//! replay adds entries, it never removes them.** Keeping every WAL entry since
+//! the last checkpoint does not help either: that recovers a missing tail, and
 //! this is unproven content.
 //!
 //! Trusting the file at open is possible, but it needs a real commit protocol —
@@ -118,7 +118,7 @@ const INITIAL_IDARRAY: usize = INITIAL_SLOT_CAP * ID_ENTRY_SIZE;
 // truncate produce a valid empty table for free. Row IDs are dense from 0, so a
 // raw `id` cannot be the sentinel — hence the `+ 1` encoding.
 //
-// The previous layout was 40 bytes, 11 of them padding that bought nothing.
+// 24 bytes with no padding, so the table holds as many slots per page as it can.
 
 #[derive(Clone, Copy)]
 struct Slot {

@@ -1,4 +1,5 @@
-//! Background maintenance of every namespace's partition (design doc M3a, M3b).
+//! Background maintenance of every namespace's partition
+//! (`Dynamic-RaBitQ-Index-Design.md` → M3a, M3b).
 //!
 //! One task per process. The vector worker wakes it with a namespace's name
 //! whenever a write leaves a posting over its namespace's split limit, or a
@@ -25,9 +26,6 @@ use super::{WorkerError, WorkerHost};
 use crate::AsyncDb;
 use crate::semantic_search::context::{ContextError, SemanticSearchContext};
 use crate::semantic_search::ivf_split;
-
-/// Default maintenance threads per process.
-pub const DEFAULT_MAINTENANCE_THREADS: usize = 2;
 
 /// A running maintenance task. [`shutdown`](Self::shutdown) stops it after the
 /// split or merge in progress in each namespace finishes, leaving the rest for

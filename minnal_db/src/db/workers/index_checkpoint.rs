@@ -7,7 +7,7 @@
 //! nothing about [`IndexManager`] or [`NamespaceRegistry`] directly — it
 //! calls through [`IndexCheckpointTarget`], which [`Database`] implements.
 //!
-//! Default interval: [`DEFAULT_INDEX_CHECKPOINT_INTERVAL`](crate::db::config::DEFAULT_INDEX_CHECKPOINT_INTERVAL)
+//! Default interval: [`crate::defaults::scheduled_tasks::INDEX_CHECKPOINT_INTERVAL`](crate::defaults::scheduled_tasks::INDEX_CHECKPOINT_INTERVAL)
 //! (1750 ms) — the interval is the crash-replay window, so it is deliberately short.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -365,7 +365,8 @@ mod tests {
     }
 
     /// The checkpoint is a pass of fsyncs; on a runtime thread it held up the
-    /// requests scheduled behind it (M5: get p99 4-10 ms, every 1.75 s).
+    /// requests scheduled behind it (measured in the system benchmark: get p99
+    /// 4-10 ms, every 1.75 s).
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_checkpoint_does_not_block_the_runtime() {
         use crate::support::runtime_probe::{Busy, assert_runtime_free_during_pass};
@@ -378,9 +379,7 @@ mod tests {
     }
 
     /// Uses the write-path trigger handle, which is how an immediate checkpoint
-    /// is actually requested in production. (This previously called a
-    /// `Worker::trigger` method whose only other caller was a since-deleted
-    /// async wrapper — so it tested a path nothing shipped.)
+    /// is requested in production.
     #[tokio::test]
     async fn test_trigger_calls_checkpoint() {
         let target = FakeTarget::new();

@@ -1,5 +1,6 @@
-//! Merging a posting that deletes or moves have shrunk (design doc *M3 split
-//! algorithm (LIRE)*, *Merge posting P*; M3b).
+//! Merging a posting that deletes or moves have shrunk
+//! (`Dynamic-RaBitQ-Index-Design.md` → *M3 split algorithm (LIRE)*, *Merge
+//! posting P*).
 //!
 //! A posting with `merge_limit` chunks or fewer costs a probe for little to
 //! read. It is folded into the first of the 64 active postings nearest its

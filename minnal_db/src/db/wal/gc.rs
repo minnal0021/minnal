@@ -1,8 +1,8 @@
 //! WAL garbage collection, gated on the index-replay watermark.
 //!
-//! Split out of `database/`. WAL GC must not reclaim a segment an active field
-//! index still needs to replay after a crash -- without that gate the index
-//! silently loses those documents for the life of the database (FR-001).
+//! WAL GC must not reclaim a segment an active field index still needs to replay
+//! after a crash: without that gate the index silently loses those documents
+//! for the life of the database.
 //!
 //! The watermark comes from the WAL observer's field consumers, kept by events
 //! (activation, each checkpoint, deactivation and drops), not from reading
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_wal_gc_eligible_after_namespace_drop() {
-        // Regression test: a dropped namespace's WAL entries must stop holding
+        // A dropped namespace's WAL entries must stop holding
         // the cut, so that WAL GC can reclaim the segments they occupy. Recovery
         // skips them anyway (their namespace is gone from the registry).
         let dir = TempDir::new().unwrap();
@@ -575,15 +575,12 @@ mod tests {
     /// The replay-gap condition is reachable through the ordinary write → persist
     /// → WAL-GC path, with nothing corrupted or hand-punched.
     ///
-    /// WAL GC reclaims a segment once its entries are persisted to the **LSM**;
-    /// it never consults the field-index checkpoint markers. So a field whose
-    /// checkpoint still points into a reclaimed segment can no longer be repaired
-    /// by replay — `scan_entries` skips the missing segments as holes and returns
-    /// a partial result with no error, which is how this stayed invisible.
-    ///
-    /// This pins the *detectability* of that condition (the logging added at
-    /// `activate_field_index` keys on exactly these two inputs), not a fix.
-    /// Remediation is tracked in `FEATURE-REQUEST.md` (FR-001).
+    /// No field is active here, so WAL GC, which holds segments only for active
+    /// fields, reclaims every segment persisted to the LSM, including those after
+    /// a checkpoint offset taken earlier. A field checkpointed there could no
+    /// longer be repaired by replay, and `scan_entries` skips the missing
+    /// segments as holes and returns a partial result with no error. This pins
+    /// that `detect_replay_gap` (what `activate_field_index` logs on) reports it.
     #[test]
     fn wal_gc_can_strand_a_field_index_checkpoint_and_the_gap_is_detectable() -> Result<()> {
         use crate::db::indexing::manager::{CheckpointState, detect_replay_gap};
@@ -646,11 +643,11 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 2, the inverse of the repro above: with a **real activated
+    /// The inverse of the test above: with a **real activated
     /// field index**, WAL GC must refuse to reclaim the segments that index still
     /// needs to replay, so no gap is detectable at all.
     ///
-    /// The repro above works only because it has no active field index — the
+    /// The test above works only because it has no active field index — the
     /// `checkpoint_offset` it strands is hypothetical. Here the index is genuinely
     /// active and checkpointed, which is what arms the watermark.
     #[test]
@@ -709,7 +706,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 2: a namespace whose only field index has never been
+    /// A namespace whose only field index has never been
     /// checkpointed and holds no data must not pin the WAL.
     ///
     /// A first-time build has no `checkpoint` marker, so it reads as "replay from
@@ -744,7 +741,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 2: a namespace with no field indices keeps its previous WAL
+    /// A namespace with no field indices keeps its previous WAL
     /// retention exactly — the watermark is inert.
     #[test]
     fn wal_retention_is_unchanged_without_field_indices() -> Result<()> {
@@ -765,7 +762,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 3: the backstop records a durable, key-level gap.
+    /// The backstop records a durable, key-level gap.
     ///
     /// This is the whole point of harvesting inside GC: the affected keys live in
     /// the segments being unlinked, so a record written any later could never
@@ -817,7 +814,7 @@ mod tests {
         Ok(())
     }
 
-    /// FR-001 step 2: the backstop bounds pinned WAL.
+    /// The backstop bounds pinned WAL.
     ///
     /// With the checkpoint worker never running, the watermark would otherwise
     /// hold every segment after the first checkpoint forever. Past
@@ -861,8 +858,8 @@ mod tests {
             "pinned segments should be capped at max_pinned_wal_segments, got {pinned_after}"
         );
 
-        // ...and the cost is exactly what FR-001 says it is: a real gap, which is
-        // why the detection and repair arms still have to exist.
+        // ...and the cost is a real gap, which is why gaps are recorded, reported
+        // and repairable.
         assert!(
             !db.wal.missing_segments(checkpoint_offset, wal_tail).is_empty(),
             "the backstop reclaims pinned segments, so a gap is expected here"

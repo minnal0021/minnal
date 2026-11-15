@@ -260,10 +260,9 @@ mod tests {
 
     /// The worker performs GC checks on its interval.
     ///
-    /// Previously drove this through an explicit `trigger_gc()` whose only other
-    /// caller was a since-deleted async wrapper. On-demand WAL GC ships as the
-    /// synchronous `Db::garbage_collect_wal`, which returns its result to the
-    /// caller — so the interval is the worker behaviour worth pinning here.
+    /// On-demand WAL GC is the synchronous `Db::garbage_collect_wal`, which
+    /// returns its result to the caller, so the interval is the worker behaviour
+    /// to pin here.
     #[tokio::test]
     async fn test_wal_gc_worker_runs_on_its_interval() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");

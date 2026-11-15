@@ -55,9 +55,8 @@ pub async fn import_schema(State(state): State<AppState>, Json(body): Json<serde
             // carried in the exported file so the store assigns a fresh one.
             schema.ns_id = None;
             // A field that has been indexed must not also appear in attributes
-            // (attributes is the non-indexed list). Schemas written before this
-            // invariant was enforced may carry the field in both; drop it so
-            // validate() passes.
+            // (attributes is the non-indexed list). An exported file may carry
+            // the field in both; drop it so validate() passes.
             let indexed: std::collections::HashSet<&str> = schema.indices.iter().map(|i| i.field.as_str()).collect();
             schema.attributes.retain(|a| !indexed.contains(a.name.as_str()));
             create_doc_schema(&state, schema).await?

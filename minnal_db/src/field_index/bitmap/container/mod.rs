@@ -1,3 +1,7 @@
+//! The three container kinds a `RoaringBitmap` stores per high key (`array`,
+//! `bitset`, `run`), the `Container` enum that dispatches between them, and the
+//! set operations across kinds (`ops`).
+
 pub mod array;
 pub mod bitset;
 pub mod ops;

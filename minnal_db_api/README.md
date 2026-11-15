@@ -191,6 +191,11 @@ Every endpoint at a glance, grouped by task. The [REST API reference](#rest-api-
 ## Configuration
 
 All settings have built-in defaults so no config file is required to get started.
+[`config/sample.toml`](../config/sample.toml) lists every key with its default and
+what it does. A key or table the server does not know stops it at startup, so a
+misspelt key cannot silently fall back to its default. The same file opens an
+embedded database (`minnal_db::ConfigFile`, or `AsyncDb::open_with_config_file`),
+which reads every table but `[api]` and `[logging]`.
 
 ```toml
 # minnal_db_api.toml
@@ -903,6 +908,15 @@ curl "http://localhost:8080/stores/users/docs/prefix?prefix=550e8400-e29b"
 
 Query documents using an index predicate. Only indexed fields may appear in the predicate.
 
+A write returns once it is durable; its field-index changes are applied a
+moment later by a background worker: it waits
+`scheduled_tasks.index_apply_delay_ms` (20 ms by default) after a write, so a
+burst of writes is applied in one pass. A
+query reads what the worker has applied, so one sent straight after a write may
+not see it yet, as with semantic search. Each field's `apply_queue` in
+[`GET /admin/indices/{ns}/health`](#get-adminindicesnshealth) shows how many
+changes are waiting and how long the oldest has.
+
 Offset-paginated (the bitmap index gives an exact `total` and random page access). Query params `page_no` / `page_size` (defaults 1 / 20) override the same-named body fields; `limit` is accepted as an alias for `page_size` (`page_size` wins if both are given).
 
 ```bash
@@ -1426,7 +1440,7 @@ value. There are two distinct kinds:
   `GET /admin/storage/stores/{ns}/ops-metrics` (see below).
 - **Storage metrics** (the other `/admin/storage/*` GET endpoints) — structural
   snapshots of *how big the engine is* and *how much dead space it holds*. These
-  are **recomputed from on-disk state** (WAL metadata, LSM manifests, value-log
+  are **recomputed from on-disk state** (WAL metadata, the LSM's SSTable files, value-log
   metadata, index blob stores) on every request, so a restart does not reset them
   — they reflect whatever is durably on disk.
 
@@ -1468,13 +1482,12 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `scans` | reads | Multi-key scans (range/prefix) executed | **No** |
 | `scan_rows` | reads | Total rows returned across all scans | **No** |
 | `lookups` | lsm_lookups | LSM point lookups (≥ `reads` — also counts GC-validation reads and WAL-replay probes) | **No** |
-| `fast_path_hits` | lsm_lookups | Lookups served by the active-memtable fast path (no lower-layer scan) | **No** |
+| `fast_path_hits` | lsm_lookups | Lookups answered by the active memtable (no lower layer read) | **No** |
 | `fast_path_hit_ratio` | lsm_lookups | `fast_path_hits / lookups` (derived) | **No** |
 | `l0_probes` | lsm_lookups | Lookups that scanned at least one L0 SSTable | **No** |
 | `l1_probes` | lsm_lookups | Lookups that scanned the L1 SSTable (not bloom-rejected) | **No** |
 | `bloom_rejects` | lsm_lookups | L1 lookups short-circuited by the bloom filter ("definitely absent") | **No** |
 | `l0_bloom_rejects` | lsm_lookups | L0 files a lookup skipped unread: key outside the file's key range, or its bloom filter says "definitely absent" | **No** |
-| `seq_prunes` | lsm_lookups | SSTables (L0 files or the L1 file) a lookup skipped unread because a newer layer already held a copy at least as new as anything in them | **No** |
 | `sparse_hint_rejects` | lsm_lookups | Lookups whose sparse-index hint failed validation, so the scan restarted from the top of the file. Answers stay correct but slow. Expect it only briefly for L1 during a compaction; a steady rate means the index offsets disagree with the files | **No** |
 | `puts` | writes | WAL-backed upserts applied | **No** |
 | `deletes` | writes | WAL-backed deletes applied | **No** |
@@ -1486,6 +1499,11 @@ in the response under `reads`, `lsm_lookups`, `writes`, `compaction`, `gc`,
 | `wal_commit_writes` | writes | Writes those rounds covered (engine-wide only) | **No** |
 | `writes_per_commit_round` | writes | `wal_commit_writes / wal_commit_rounds`: writes covered by one fsync on average; `null` before the first round | **No** |
 | `apply_failures` | writes | In-memory applies that failed after retry (data still durable in WAL) | **No** |
+| `index_changes_queued` | field index | Field-index changes writes queued (one per field a write changed) | **No** |
+| `index_changes_applied_by_worker` | field index | Queued changes the field-index worker applied | **No** |
+| `index_changes_applied_by_writers` | field index | Queued changes writers applied themselves (queue past its cap, or no worker running); a steady rate means the worker cannot keep up | **No** |
+| `index_changes_applied_by_barriers` | field index | Queued changes the index checkpoint or `sync_field_indexes` applied | **No** |
+| `index_apply_batches` | field index | Batches the field-index worker applied, one per hold of a field's lock | **No** |
 | `memtable_flushes` | compaction | Memtable → L0 SSTable flushes | **No** |
 | `l0_l1_compactions` | compaction | L0 → L1 compactions run | **No** |
 | `compaction_bytes_merged` | compaction | Total bytes merged during compactions | **No** |
@@ -1638,11 +1656,11 @@ On a database whose vector worker has written nothing:
 }
 ```
 
-**`GET /admin/storage/lsm`** — per-namespace LSM manifest:
+**`GET /admin/storage/lsm`** — per-namespace LSM manifest, a list of each level's SSTable files built from what is on disk:
 
 | Field | Meaning | Survives restart? |
 |-------|---------|-------------------|
-| `manifest_version`, `created_at_ms` | Manifest version + creation time | **Yes** |
+| `manifest_version`, `created_at_ms` | The response format's version, and when this snapshot was built | **Yes** |
 | `level_count`, `total_entries`, `total_size_bytes` | Levels, key count, on-disk SSTable bytes | **Yes** |
 | `levels[].buckets[].files[]` | Per-file `{path, created_at_ms, entry_count, size_bytes}` | **Yes** |
 | `in_memory.memtable_entries` | Live active-memtable entry count | **No** |
@@ -1933,9 +1951,10 @@ Use `GET /admin/indices/{ns}/progress` for the same view scoped to one namespace
 
 #### `GET /admin/indices/{ns}/health`
 
-Reports every field index in a document store and whether it is missing
-updates. A field index is kept up to date in memory on every write and
-checkpointed to disk every couple of seconds; after a crash it replays the WAL
+Reports every field index in a document store: how far the field-index worker
+has applied recent writes, and whether the index is missing updates. A write
+queues its field-index changes and returns; a background worker applies them in
+memory, and the index is checkpointed to disk every couple of seconds; after a crash it replays the WAL
 from its checkpoint. If that replay cannot happen (the WAL it needed was
 reclaimed, for example), the index records a **gap**: which keys it may be
 missing, or that it needs a full rebuild. Queries that use such a field report
@@ -1951,15 +1970,35 @@ curl http://localhost:8080/admin/indices/users/health
   "degraded": false,
   "degraded_fields": [],
   "fields": [
-    {"field_id": 1025, "field_name": "status", "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null},
-    {"field_id": 1026, "field_name": "age",    "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null}
+    {"field_id": 1025, "field_name": "status", "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null,
+     "apply_queue": {"pending": 0, "oldest_pending_ms": 0, "applied_up_to_seq": 5120, "queued": 5000,
+                     "applied_by_worker": 4994, "applied_by_writers": 0, "applied_by_barriers": 6, "worker_batches": 2311}},
+    {"field_id": 1026, "field_name": "age",    "namespace_id": 1024, "active": true, "checkpoint_offset": 396, "gap": null,
+     "apply_queue": {"pending": 2, "oldest_pending_ms": 1, "applied_up_to_seq": 5118, "queued": 5000,
+                     "applied_by_worker": 4992, "applied_by_writers": 0, "applied_by_barriers": 6, "worker_batches": 2309}}
   ]
 }
 ```
 
 `checkpoint_offset` is the WAL position the field's on-disk state reflects.
 `gap` is `null` for a healthy field; otherwise it describes what is missing and
-how it will be repaired. Returns `404` if the document store does not exist.
+how it will be repaired.
+
+`apply_queue` (`null` for an inactive field) is the field-index worker's
+progress on this field:
+
+| Field | Meaning |
+|---|---|
+| `pending` | Changes written but not yet applied; queries do not see them yet |
+| `oldest_pending_ms` | How long the oldest of them has waited: the field's lag |
+| `applied_up_to_seq` | The highest write sequence number whose change is applied |
+| `queued` | Changes queued since the field was activated (one per write that changed the field) |
+| `applied_by_worker` | Changes the worker applied |
+| `applied_by_writers` | Changes writers applied themselves, because the queue passed its cap of 65,536 (the worker had fallen behind) or no worker was running. A growing count means the worker cannot keep up |
+| `applied_by_barriers` | Changes applied by the index checkpoint (which applies the queue before recording `checkpoint_offset`) or an explicit `sync_field_indexes` |
+| `worker_batches` | Batches the worker applied, at most 1,024 changes each |
+
+Returns `404` if the document store does not exist.
 
 ---
 
@@ -2724,7 +2763,7 @@ Lines with a missing or unparseable `id_field`, invalid JSON, or a rejected `PUT
   fail_logs/                  ← written only if WAL recovery could not apply an entry
   ns_system_catalog/          ← every namespace's id and TTL settings, every field index's id and type, the id counter
   ns_{namespace}/             ← one directory per namespace (doc store, KV store, or vector companion)
-    lsm/                      ← keys: level0/, level1/level1_{bucket}.dat, manifest
+    lsm/                      ← keys: level0/, level1/level1_{bucket}.dat
     value_logs/               ← values: value_log_{bucket}.seg{id}, value_log_{bucket}.metadata
   ns_{namespace}_sparse_vector/      ← chunk embeddings (1, 2 or 4 bits), keyed by [posting_id ‖ doc_id] (Pass 1)
   ns_{namespace}_dense_vector/       ← multi-bit whole-document embeddings, keyed by doc_id (Pass 2)

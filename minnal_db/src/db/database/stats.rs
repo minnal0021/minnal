@@ -45,7 +45,7 @@ impl Database {
     /// Per-segment live/garbage breakdown for one namespace's value-log shards.
     ///
     /// Cheap: the counters are maintained in memory by writers, so this reads no
-    /// segment data at all (the old per-page version had to scan every record).
+    /// segment data at all.
     pub fn value_log_segment_stats(&self, namespace: &str) -> Result<Vec<(u32, Vec<crate::storage::value_log::SegmentStats>)>> {
         let store = self.get_store_by_name(namespace)?;
         Ok(store.value_log.all_segment_stats())

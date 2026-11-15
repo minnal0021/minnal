@@ -36,7 +36,6 @@ impl Database {
             ttl,
         )?;
         kv_store.set_verify_checksums_on_read(config.verify_checksums_on_read);
-        kv_store.cleanup_old_files_on_startup()?;
         Ok(kv_store)
     }
 

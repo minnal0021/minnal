@@ -148,7 +148,7 @@ async fn test_import_schema_duplicate_index_field_rejected() {
     ));
 }
 
-/// Regression: a field that was originally declared as an attribute and later
+/// A field that was first declared as an attribute and later
 /// indexed ends up in both `attributes` and `indices` in the saved schema.
 /// `add_index` must move it out of `attributes`; importing such a schema must
 /// also survive without a DuplicateFieldName error.
@@ -186,7 +186,7 @@ async fn test_add_index_removes_field_from_attributes() {
     assert!(stored.indices.iter().any(|i| i.field == "agency"), "agency must be in indices");
 }
 
-/// Regression: importing an existing schema (with a new name) where a field
+/// Importing an existing schema (with a new name) where a field
 /// appears in both `attributes` and `indices` must not fail with DuplicateFieldName.
 /// The import handler normalises the schema by dropping indexed fields from
 /// attributes before calling create.

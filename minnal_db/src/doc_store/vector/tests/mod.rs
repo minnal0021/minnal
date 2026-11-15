@@ -1,6 +1,7 @@
 //! Tests of the vector-index administration, one file per topic, and the
-//! helpers they share. The queue races through the store's write paths (R3,
-//! R4) are in `reindex` and `writes`.
+//! helpers they share. The queue races through the store's write paths (a
+//! delete or an emptied embedding field during an embed) are in `reindex` and
+//! `writes`.
 
 #[cfg(feature = "semantic-search")]
 use super::*;

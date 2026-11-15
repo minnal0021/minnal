@@ -1,8 +1,7 @@
 //! Shared fixtures for the `db` module's unit tests.
 //!
-//! These used to live inside `database/`'s test module, which is why every
-//! test needing one had to live there too — that is what kept a 3,300-line test
-//! block attached to a file whose code had already been split up.
+//! They live here, not in one test module, so a test of any part of `db` can
+//! sit beside the code it tests.
 //!
 //! The whole module is `#[cfg(test)]`, so none of it reaches a release build.
 

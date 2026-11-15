@@ -249,7 +249,23 @@ containers are (§5).
 
 ### Writes go to an in-memory overlay
 
-A write does not touch the `BlobStore`. Inserting `(value, row_id)`:
+A document write does not change the index itself. Under its value-log bucket
+lock it queues each field's change (move the row from the old value's bitmap to
+the new one's) on that field's queue, in the order the key's versions are
+written, and returns. The **field-index worker** applies the queues, a batch of
+up to 1,024 changes per hold of the field's write lock. Queries read only what
+it has applied, so they can miss a write for the moment it waits: the worker
+waits `scheduled_tasks.index_apply_delay_ms` (20 ms by default) after a write
+wakes it, so a burst of writes is applied in one pass and the field's lock is
+taken once for it, and queries on the field are interrupted less. Each field's `apply_queue` in `GET /admin/indices/{ns}/health`
+shows how many changes wait and how long the oldest has, and
+`sync_field_indexes` waits for the worker when a caller needs to read its own
+writes. The index checkpoint applies a field's queue before it records the WAL
+offset the field reflects (§7), so crash replay never starts past a queued
+change. A writer applies its field's queue itself only when the worker has
+fallen behind (65,536 changes queued) or is not running (recovery at open).
+
+Applying a change does not touch the `BlobStore` either. Inserting `(value, row_id)`:
 
 1. Find or allocate the `slot_id` for `value` in `ordering`.
 2. Split `row_id` into its container key (upper 112 bits) and its low 16 bits.
@@ -262,7 +278,7 @@ A write does not touch the `BlobStore`. Inserting `(value, row_id)`:
 4. Insert the low 16 bits into the overlay's copy of the container, in place.
 
 Reads consult the overlay first and fall back to the store, container by
-container, so a query always sees every write. Removal is the mirror image; a
+container, so a query sees every applied change. Removal is the mirror image; a
 container that empties is recorded as removed, and a bitmap whose containers
 have all gone is empty. A document **update** removes the row from its old
 value's bitmap and inserts it under the new one. When the caller knows the old
@@ -284,12 +300,13 @@ Every field of a database charges its overlay to one shared counter (an
 
 | Setting (TOML `[thresholds]`) | Default | When crossed |
 |---|---|---|
-| `index_overlay_soft_bytes` | 32 MiB | the write path asks for an index checkpoint now, which spills every field |
-| `index_overlay_hard_bytes` | 64 MiB | the write that crossed it spills its own field before returning |
+| `index_overlay_soft_bytes` | 32 MiB | whoever applied the change asks for an index checkpoint now, which spills every field |
+| `index_overlay_hard_bytes` | 64 MiB | whoever applied the change that crossed it (normally the field-index worker) spills that field |
 
 The hard limit keeps memory bounded even when checkpoints fall behind, at a
-cost to that one write: it appends and syncs the field's changes while holding
-the field's write lock. Total overlay memory stays below the hard limit plus,
+cost to that one apply: it appends and syncs the field's changes while holding
+the field's write lock, so queries on the field wait for it; writes do not,
+since they only queue. Total overlay memory stays below the hard limit plus,
 for each field written after it was crossed, the containers that one write
 changed (a container is at most 8 KB).
 

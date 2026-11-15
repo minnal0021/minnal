@@ -152,10 +152,8 @@ mod tests {
 
     /// The worker runs expiry passes on its interval.
     ///
-    /// Previously drove this through an explicit `trigger()` whose only other
-    /// caller was a since-deleted async wrapper; nothing shipping ever asked the
-    /// TTL worker for an immediate pass, so the interval is the real behaviour
-    /// to pin.
+    /// Nothing asks the TTL worker for an immediate pass, so the interval is
+    /// the behaviour to pin.
     #[tokio::test]
     async fn test_ttl_worker_runs_passes_on_its_interval() {
         let target = Arc::new(CountingTarget {
@@ -188,7 +186,7 @@ mod tests {
                 &path,
                 lsm_config,
                 sync_config,
-                crate::storage::value_log::DEFAULT_SEGMENT_SIZE_BYTES,
+                crate::defaults::value_log::SEGMENT_SIZE_BYTES,
             )
             .unwrap(),
         )
@@ -243,10 +241,30 @@ mod tests {
         assert_eq!(store.get(b"key1").unwrap(), Some(b"value1".to_vec()));
     }
 
+    /// A pass reads the keys a page at a time: it must reach keys past the
+    /// first page, and its delete cap must hold across pages.
+    #[test]
+    fn test_expire_records_reaches_every_page_and_caps_across_them() {
+        use crate::kv_store::KEY_PAGE;
+        let dir = TempDir::new().unwrap();
+        let store = create_test_store(&dir);
+        let n = KEY_PAGE * 2 + 5;
+        for i in 0..n {
+            store.put_to_storage(format!("key{i:06}").as_bytes(), b"value").unwrap();
+        }
+
+        let cap = KEY_PAGE + 3;
+        assert_eq!(store.expire_records(Duration::from_millis(0), cap).unwrap(), cap);
+        assert_eq!(store.count_keys().unwrap(), n - cap);
+
+        assert_eq!(store.expire_records(Duration::from_millis(0), usize::MAX).unwrap(), n - cap);
+        assert_eq!(store.count_keys().unwrap(), 0);
+    }
+
     // A TTL pass decides a record has expired, then deletes it. A write that lands
     // in between replaced the expired record with a fresh one that was just
-    // acknowledged to its writer; the pass must leave it alone. It used to delete
-    // whatever the key held by then. `lock_key` runs exactly in that window (after
+    // acknowledged to its writer; the pass must leave it alone, not delete
+    // whatever the key holds by then. `before_delete` runs exactly in that window (after
     // the verdict, before the delete), so it is where this test lands the write.
     #[test]
     fn test_expiry_spares_a_value_rewritten_after_it_was_judged_expired() {
@@ -257,7 +275,7 @@ mod tests {
 
         let locked = std::sync::atomic::AtomicUsize::new(0);
         let deleted = store
-            .expire_records_locked(Duration::from_millis(0), 1000, |key| {
+            .expire_records_with(Duration::from_millis(0), 1000, |key| {
                 locked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if key == b"key1" {
                     store.put_to_storage(key, b"fresh").unwrap();
@@ -268,6 +286,6 @@ mod tests {
         assert_eq!(store.get(b"key1").unwrap(), Some(b"fresh".to_vec()), "a fresh write was expired");
         assert_eq!(store.get(b"key2").unwrap(), None, "the untouched expired key must still go");
         assert_eq!(deleted, 1, "only the untouched key counts as deleted");
-        assert_eq!(locked.into_inner(), 2, "every delete must run under the caller's key lock");
+        assert_eq!(locked.into_inner(), 2, "the hook must run before every delete");
     }
 }

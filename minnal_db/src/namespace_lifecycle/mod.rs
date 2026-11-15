@@ -37,7 +37,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use audit::{AUDIT_NAMESPACE, AuditEvent, AuditLog, AuditRecord, DEFAULT_AUDIT_RETENTION, MAX_AUDIT_LIMIT};
+pub use audit::{AUDIT_NAMESPACE, AuditEvent, AuditLog, AuditRecord, MAX_AUDIT_LIMIT};
 pub use error::LifecycleError;
 pub(crate) use governor::{Governor, TaskDone};
 pub use governor::{LifecycleConfig, Task};

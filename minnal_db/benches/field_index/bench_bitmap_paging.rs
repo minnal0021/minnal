@@ -1,16 +1,16 @@
 //! Offset paging over a `RoaringBitmap`: `iter().skip(n)` vs `iter_page(n)`.
 //!
 //! `query_keys_paginated` resolves a page by windowing the bitmap that query
-//! evaluation produced. It used to do that with `iter().skip(offset)`, which is
-//! `O(offset)` — and worse than it sounds, because `iter` copies and
+//! evaluation produced, with `iter_page`. The baseline, `iter().skip(offset)`,
+//! is `O(offset)`, and worse than it sounds, because `iter` copies and
 //! collects a `Vec<u16>` for every container it passes over. `iter_page`
 //! skips whole containers on their cached cardinality instead, and materialises
 //! at most `limit` values from each container it opens.
 //!
 //! Two shapes are measured:
 //!
-//! - **single page** at increasing offsets — the old path degrades linearly with
-//!   the offset.
+//! - **single page** at increasing offsets — the `skip` baseline degrades
+//!   linearly with the offset.
 //! - **full paged walk** — every page of a result set, which is what a client
 //!   paginating through query results actually does. Quadratic vs linear.
 //!
@@ -67,7 +67,7 @@ fn bench_single_page(c: &mut Criterion) {
 }
 
 fn bench_full_walk(c: &mut Criterion) {
-    // Smaller set: the old path is quadratic here, so a full-size walk would
+    // Smaller set: the `skip` baseline is quadratic here, so a full-size walk would
     // dominate the whole bench run for no extra signal.
     let bm = RoaringBitmap::from_sorted_iter(0..20_000u128);
     let total = 20_000usize;

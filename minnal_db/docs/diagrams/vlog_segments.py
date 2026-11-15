@@ -5,7 +5,8 @@
 Follows `KVStore::compact_bucket` and `garbage_collect_with_threshold`:
 GC reads a sealed segment without a lock, decides liveness with one batched
 LSM lookup (each record stores its key), appends the survivors to the active
-tail and re-points them under the bucket lock with a compare-and-set, flushes
+tail and re-points them under the bucket lock with a compare-and-set (each copy
+at the current copy's next system version: `docs/Layer-Order-Design.md`), flushes
 the memtable so the re-point is durable, and only then deletes the file.
 Segment ids are never reused.
 """
@@ -46,16 +47,16 @@ def steps():
 
     snap("Values live in numbered segment files. Only the active tail is appended to; sealed segments never change.", GREY)
     seg[14][1].append(["k2′", LIVE]); mark(12, "k2", GARBAGE); lsm["k2"] = "seg 14"
-    snap("put(k2) appends the new value to the tail. The old record is not touched; its size is added to segment 12's garbage count.", GREEN)
+    snap("put(k2) appends the new value to the tail. The old record is not touched; once the LSM drops its entry, it counts as garbage.", GREEN)
     mark(12, "k3", GARBAGE); lsm["k3"] = "deleted"
     snap("delete(k3) removes the key from the LSM. Its record becomes garbage too: segment 12 is now half garbage.", ORANGE)
     snap("GC picks the segment with the most garbage, 12. Segment 13 has none, so GC never reads it.", GREY, 0)
     snap("GC reads segment 12 with no lock held. Each record stores its key, so one batched LSM lookup finds k1 and k4 live.", GREY, 1)
     seg[14][1] += [["k1", MOVED], ["k4", MOVED]]; mark(12, "k1", GARBAGE); mark(12, "k4", GARBAGE)
     lsm["k1"] = lsm["k4"] = "seg 14"
-    snap("Under the bucket lock, k1 and k4 are appended to the tail and re-pointed, each only if it still points at segment 12.", BLUE, 2)
+    snap("Under the bucket lock, k1 and k4 move to the tail (same write, next system version), each only if still at segment 12.", BLUE, 2)
     snap("The reader uses its old pointer and gets k1's own value from segment 12. The pointer is stale, not wrong.", GREEN, 2,
-         ("ok", "reads segment 12: k1's own value, same version"))
+         ("ok", "reads segment 12: k1's own value, the same write"))
     snap("A memtable flush makes the re-pointed entries durable in an SSTable.", GREY, 3)
     seg[12][0] = "deleted"
     snap("Only now is segment 12 deleted. A crash at any earlier step leaves every pointer on a file that exists.", GREY, 4)

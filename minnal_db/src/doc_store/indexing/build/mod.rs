@@ -232,10 +232,10 @@ impl DocStore {
     /// Take `field`'s index out of the schema, demoted to a plain attribute,
     /// then drop it in the engine. Done already, nothing changes.
     ///
-    /// The schema goes first. The other order had a crash window in which the
-    /// files were gone but the schema still listed the index: the field was
-    /// activated again at the next open, found no checkpoint and no data, and
-    /// read as a new, empty index — silently incomplete (FR-001). The engine
+    /// The schema goes first. The other order has a crash window in which the
+    /// files are gone but the schema still lists the index: the field would be
+    /// activated again at the next open, find no checkpoint and no data, and
+    /// read as a new, empty index, silently incomplete. The engine
     /// persists the field's `dropped` flag before it deletes anything, so a
     /// crash part-way through its drop is finished at the next open.
     pub(in crate::doc_store) fn unlist_index(&self, namespace: &str, ns_id: NamespaceId, field: &str) -> Result<(), DocStoreError> {

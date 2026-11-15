@@ -215,9 +215,9 @@ fn flip_matches_independent_complement_reference() {
     let initial: Vec<u128> = vec![0, 5, 0xFFFE, 0xFFFF, 0x1_0000, 0x1_0001, 0x1_FFFF, 0x2_0000, 0x2_0001];
     // Anchors adjacent to container boundaries; widths stay small so each range
     // touches at most two containers with only a few values. `0x5_0000` lands in
-    // an empty container so the missing-container creation path (the original
-    // bug) is exercised here too — under the old only-existing-containers code
-    // those ranges produced nothing and this assertion would fail.
+    // an empty container so the missing-container creation path is exercised
+    // too: code that touched only existing containers would produce nothing for
+    // those ranges and fail this assertion.
     let anchors: [u128; 7] = [0, 0xFFFD, 0xFFFF, 0x1_0000, 0x1_FFFE, 0x2_0000, 0x5_0000];
 
     for &lo in &anchors {

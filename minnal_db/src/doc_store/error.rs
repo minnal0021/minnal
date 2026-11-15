@@ -1,3 +1,7 @@
+//! The document store's errors: schema validation and persistence
+//! ([`SchemaError`]) and everything a store operation can fail with
+//! ([`DocStoreError`]).
+
 use std::path::PathBuf;
 
 use thiserror::Error;

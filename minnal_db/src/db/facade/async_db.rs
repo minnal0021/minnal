@@ -67,7 +67,7 @@ pub struct AsyncDb {
     pub(super) inner: Arc<Db>,
 }
 
-#[cfg(all(test, feature = "semantic-search"))]
+#[cfg(test)]
 impl AsyncDb {
     /// Test-only access to the internal coordinator. See
     /// [`Db::coordinator_for_test`].
@@ -92,11 +92,15 @@ impl AsyncDb {
         Self::open_with_config(path, DbConfig::default()).await
     }
 
-    /// Open a database using a `minnal.toml` configuration file, with every
-    /// background worker started (see [`open_with_config`](Self::open_with_config)).
+    /// Open the database a config file describes (see
+    /// [`ConfigFile`](crate::ConfigFile)), with every background worker
+    /// started (see [`open_with_config`](Self::open_with_config)). The API
+    /// server's own tables (`[api]`, `[logging]`) are allowed and ignored, so
+    /// the server's file opens here too.
     pub async fn open_with_config_file<P: AsRef<Path> + Send + 'static>(config_path: P) -> Result<Self> {
-        let toml_config = crate::db::config::toml::MinnalTomlConfig::from_file(config_path.as_ref())?;
-        Self::open_with_config(toml_config.db_path(), toml_config.to_db_config()).await
+        let (config, _) = crate::ConfigFile::from_file(config_path.as_ref(), crate::config_file::API_SERVER_TABLES)
+            .map_err(|e| KVError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+        Self::open_with_config(config.db_path(), config.db_config()).await
     }
 
     /// Open a database with the given config, with every background worker
@@ -131,7 +135,7 @@ impl AsyncDb {
         tokio::task::spawn_blocking(move || {
             // Flush index state on clean shutdown, now that no worker can race
             // with it. This is also what clears the no-WAL markers, so a clean
-            // shutdown reports no gap on the next open (FR-001).
+            // shutdown reports no gap on the next open.
             if let Err(e) = db.inner.run_index_checkpoint() {
                 log::warn!("[AsyncDb] Final index checkpoint failed: {:?}", e);
             }
@@ -195,6 +199,17 @@ impl AsyncDb {
             }
         }
 
+        // Shutdown the field-index worker. The stores are unwired first, so a
+        // write from here on applies its own field-index changes; what is still
+        // queued, the final checkpoint applies before it records its offset.
+        if self.inner.inner.index_apply_worker.read().await.is_some() {
+            info!("[AsyncDb] Shutting down field-index worker...");
+            self.inner.inner.wire_index_apply_waker(None);
+            if let Some(w) = self.inner.inner.index_apply_worker.write().await.take() {
+                w.shutdown().await;
+            }
+        }
+
         // Shutdown the index checkpoint worker. Stopped *before* the final
         // checkpoint below so the two cannot run concurrently, and so a tick
         // cannot land on an already-closed database.
@@ -233,6 +248,9 @@ impl AsyncDb {
         if db.index_checkpoint_worker.read().await.is_some() {
             running.push("index_checkpoint");
         }
+        if db.index_apply_worker.read().await.is_some() {
+            running.push("index_apply");
+        }
         running
     }
 
@@ -255,6 +273,17 @@ impl AsyncDb {
         // Milliseconds, not seconds: the default is 1750 ms, which `as_secs()`
         // truncated to a misleading "1s".
         info!("[AsyncDb] Index checkpoint worker enabled with {}ms interval", interval.as_millis());
+        Ok(())
+    }
+
+    /// Start the field-index worker, and wire every store to wake it: from then
+    /// on a write queues its field-index changes and returns, and the worker
+    /// applies them (`kv_store/index_queue.rs`).
+    pub(crate) async fn enable_index_apply_worker(&self, delay: Duration) -> Result<()> {
+        let worker = IndexApplyWorker::new(Arc::clone(&self.inner), delay);
+        self.inner.inner.wire_index_apply_waker(Some(worker.waker()));
+        *self.inner.inner.index_apply_worker.write().await = Some(Arc::new(worker));
+        info!("[AsyncDb] Field-index worker enabled ({} ms delay)", delay.as_millis());
         Ok(())
     }
 
@@ -320,6 +349,7 @@ impl AsyncDb {
         self.enable_value_log_gc_worker(st.value_log_gc_interval, threshold).await?;
         self.enable_index_checkpoint_worker(config.scheduled_task_config.index_checkpoint_interval())
             .await?;
+        self.enable_index_apply_worker(config.scheduled_task_config.index_apply_delay()).await?;
         // Restore TTL: if any namespace has a persisted TTL config, start the
         // single global TTL worker so expiry resumes across restarts.
         if !self.inner.inner.registry.read().ttl_configs().is_empty() {

@@ -1,5 +1,5 @@
 //! What a namespace's partition looks like: posting sizes, lineage, and how far
-//! moved codes have drifted from their posting's centre (design doc M3a,
+//! moved codes have drifted from their posting's centre (`Dynamic-RaBitQ-Index-Design.md` → M3a,
 //! *Partition health*).
 //!
 //! Sizes, states and lineage come from memory (the partition snapshot and its
@@ -256,8 +256,8 @@ pub async fn partition_health(
 }
 
 /// One centre: what names it and, when asked for, what still decodes against
-/// it. A centre no posting that is not retired names and no code uses is what
-/// FR-008 would collect.
+/// it. A centre that no live posting names and no code uses could be
+/// reclaimed; nothing collects centres yet (they are append-only).
 #[derive(Debug, Clone, Serialize)]
 pub struct CentreHealth {
     /// Its id (what codes store as `centre_id`).

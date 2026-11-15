@@ -1,6 +1,8 @@
 //! What the background workers call: GC, compaction, and the `*Target` trait impls.
 
 use super::*;
+use crate::db::workers::index_apply::IndexApplyTarget;
+use crate::kv_store::index_queue::Applier;
 use crate::namespace::NamespaceId;
 
 impl Database {
@@ -63,6 +65,31 @@ impl Database {
     }
 }
 
+// ── IndexApplyTarget impl ─────────────────────────────────────────────────
+
+impl IndexApplyTarget for Database {
+    fn is_closed(&self) -> bool {
+        self.is_closed()
+    }
+
+    fn apply_field_index_queues(&self) -> usize {
+        let stores: Vec<Arc<KVStore>> = self.stores.read().values().cloned().collect();
+        stores.iter().map(|s| s.apply_index_queues()).sum()
+    }
+}
+
+impl Database {
+    /// Apply every field-index change queued so far, in every store: once it
+    /// returns, every write that returned before the call is in the field
+    /// indexes. The opt-in barrier for a caller that needs its writes visible
+    /// to queries (`AsyncDb::sync_field_indexes`); queries themselves never
+    /// wait for the queue. Returns the changes applied.
+    pub fn sync_field_indexes(&self) -> usize {
+        let stores: Vec<Arc<KVStore>> = self.stores.read().values().cloned().collect();
+        stores.iter().map(|s| s.sync_index_queues()).sum()
+    }
+}
+
 // ── IndexCheckpointTarget impl ────────────────────────────────────────────
 
 impl IndexCheckpointTarget for Database {
@@ -110,7 +137,6 @@ impl IndexCheckpointTarget for Database {
             if let Some(store) = stores.get(&ns_id) {
                 let ns_index = store.namespace_index.read();
                 if let Some(entry) = ns_index.get(field_id) {
-                    let field_path = self.index_manager.field_path(ns_id, field_id);
                     // Write the field's buffered changes out, crash-ordered and
                     // with no fsync under the write lock:
                     //   1. stage  (write lock): append the changed blobs; no slot
@@ -120,9 +146,18 @@ impl IndexCheckpointTarget for Database {
                     //   4. sync the key tables (read lock, below).
                     // A slot must never reach disk before its blob, and the kernel
                     // writes a shared map back in any order, hence the split.
-                    // Every write below `wal_tail` finished its index update
-                    // before `wal_tail` was taken (see above), so it is staged.
-                    let stage = entry.index.write().stage();
+                    // Every write below `wal_tail` had queued its index change
+                    // before `wal_tail` was taken (see above). The field-index
+                    // worker may not have applied it yet, so the queue is applied
+                    // here first, under the same hold that stages: recording
+                    // `wal_tail` with a change still queued would make crash
+                    // replay start past it, and the change would be lost.
+                    let (stage, applied) = {
+                        let mut idx = entry.index.write();
+                        let applied = entry.queue.apply_locked(&mut idx, Applier::Barrier, None);
+                        (idx.stage(), applied)
+                    };
+                    store.note_applied_index_changes(field_id, Applier::Barrier, applied.count, applied.rejected);
                     if let Err(e) = entry.index.read().sync_values() {
                         entry.index.write().abort(stage);
                         return Err(KVError::Io(e));
@@ -163,7 +198,7 @@ impl IndexCheckpointTarget for Database {
                     if over_threshold {
                         let mut idx = entry.index.write();
                         if idx.maybe_compact(waste_threshold).map_err(KVError::Io)? {
-                            idx.flush(&field_path).map_err(KVError::Io)?;
+                            idx.flush().map_err(KVError::Io)?;
                             debug!("[IndexCheckpoint] compacted field-index stores ns={ns_id} field={field_id}");
                         }
                     }
@@ -256,8 +291,8 @@ impl ValueLogGcTarget for Database {
 
     /// `waste_threshold` decides **whether** a namespace is collected; the separate,
     /// lower `segment_gc_threshold` then decides **which sealed segments** get rewritten.
-    /// Passing the trigger through as the selection threshold (as this used to) makes
-    /// garbage sitting just under it uncollectable: those segments read as "clean", are
+    /// Passing the trigger through as the selection threshold would make garbage
+    /// sitting just under it uncollectable: those segments read as "clean", are
     /// left in place with their garbage intact, and keep the bucket over its trigger
     /// forever.
     fn run_gc_if_needed(&self, waste_threshold: f64) {
@@ -338,9 +373,13 @@ impl TtlTarget for Database {
             let Some(store) = self.stores.read().get(&ns_id).cloned() else {
                 continue;
             };
-            // The key stripe keeps expiry out of every same-key write's
-            // seq-to-apply window (see `KVStore::expire_records_locked`).
-            match store.expire_records_locked(ttl, max_deletes, |key| self.key_locks.guard(ns_id, key)) {
+            // Expiry takes no key stripe: each delete is a compare-and-set at
+            // the expired copy's next system version (`KVStore::expire_records_with`).
+            // Its tombstones are in no WAL, so a field index on the namespace
+            // could not replay them after a crash: mark the namespace before the
+            // first delete, as every no-WAL write does, so an unclean shutdown
+            // records a gap instead of leaving a deleted key's row in the index.
+            match store.expire_records_with(ttl, max_deletes, |_| self.note_no_wal_index_exposure(ns_id)) {
                 Ok(deleted) => {
                     if deleted > 0 {
                         info!("[TtlWorker] ns_id={} expired {} record(s)", ns_id, deleted);

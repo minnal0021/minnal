@@ -18,10 +18,7 @@ pub struct Db {
     pub(super) dir_lock: parking_lot::Mutex<Option<crate::support::file_lock::DirLock>>,
 }
 
-// Gated on `semantic-search` as well as `test` because that is the only feature
-// combination with a test that needs it; an unconditional `cfg(test)` is dead
-// code under the other combinations, which clippy rejects at `-D warnings`.
-#[cfg(all(test, feature = "semantic-search"))]
+#[cfg(test)]
 impl Db {
     /// Test-only access to the internal coordinator.
     ///
@@ -350,6 +347,15 @@ impl IndexCheckpointTarget for Db {
     }
     fn run_index_checkpoint(&self) -> Result<usize> {
         self.inner.run_index_checkpoint()
+    }
+}
+
+impl crate::db::workers::index_apply::IndexApplyTarget for Db {
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+    fn apply_field_index_queues(&self) -> usize {
+        crate::db::workers::index_apply::IndexApplyTarget::apply_field_index_queues(&self.inner)
     }
 }
 

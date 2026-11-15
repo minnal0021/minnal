@@ -70,7 +70,7 @@ fn a_value_too_big_for_a_segment_is_rejected_before_the_wal() {
 
 #[test]
 fn put_and_delete_accept_normal_sized_keys_and_values() {
-    // Regression: the size guard must not reject ordinary writes.
+    // The size guard must not reject ordinary writes.
     let dir = TempDir::new().unwrap();
     let db = Database::open(dir.path(), create_db_config()).unwrap();
     db.put(b"k", &vec![0u8; 4096]).unwrap();
@@ -145,9 +145,9 @@ fn test_value_log_physical_and_segment_stats() {
 fn concurrent_same_key_puts_keep_value_log_accounting_exact() {
     // Under real concurrency, racing writers to the same keys must not drift the
     // value-log accounting GC selection relies on: total live bytes must equal
-    // exactly one live record per distinct key. (The deterministic form of the
-    // underlying bug is `a_lower_seq_put_charges_its_own_record_not_the_live_one`
-    // in kv_store; this guards the invariant end-to-end under load.)
+    // exactly one live record per distinct key. (The deterministic form of this
+    // is `a_lower_seq_put_charges_its_own_record_not_the_live_one` in kv_store;
+    // this guards the invariant end-to-end under load.)
     use std::sync::Arc;
     use std::thread;
 
@@ -270,8 +270,8 @@ fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
     assert!(avg < 30.0, "precondition: namespace average must be below the trigger, got {avg:.1}%");
     assert!(store.has_bucket_over_waste(30.0), "precondition: some bucket must be over the trigger");
 
-    // The per-bucket-aware trigger runs GC where the old average-only gate would have
-    // skipped the whole namespace.
+    // The per-bucket-aware trigger runs GC where a gate on the average alone would
+    // skip the whole namespace.
     ValueLogGcTarget::run_gc_if_needed(&db, 30.0);
 
     let after = store.get_waste_ratio();
@@ -284,7 +284,7 @@ fn gc_collects_a_hot_bucket_when_the_namespace_average_is_below_the_trigger() {
     db.shutdown().unwrap();
 }
 
-/// Item 3: `apply_with_retry` rides out transient apply failures and stops
+/// `apply_with_retry` rides out transient apply failures and stops
 /// as soon as one attempt succeeds.
 #[test]
 fn test_apply_with_retry_succeeds_after_transient_failure() {
@@ -299,7 +299,7 @@ fn test_apply_with_retry_succeeds_after_transient_failure() {
     assert_eq!(attempts.get(), 2, "should stop retrying once an attempt succeeds");
 }
 
-/// Item 3: `apply_with_retry` gives up after a bounded number of attempts
+/// `apply_with_retry` gives up after a bounded number of attempts
 /// (it never surfaces the error — the write is durable in the WAL).
 #[test]
 fn test_apply_with_retry_gives_up_after_max_attempts() {
@@ -405,4 +405,32 @@ fn a_write_too_large_for_a_wal_segment_is_refused() {
     assert_eq!(db.get(b"big").unwrap(), None);
     db.put(b"small", b"v").unwrap();
     assert_eq!(db.get(b"small").unwrap(), Some(b"v".to_vec()));
+}
+
+/// Key stripes are per namespace: a stripe held in one namespace (by a GC pass,
+/// a TTL pass or a slow merge closure) never holds up a write to another, even
+/// for the same key bytes.
+#[test]
+fn a_held_stripe_does_not_block_writes_to_another_namespace() {
+    let dir = TempDir::new().unwrap();
+    let db = std::sync::Arc::new(Database::open(dir.path(), create_db_config()).unwrap());
+    let held_ns = db.create_namespace("held").unwrap();
+    let other_ns = db.create_namespace("other").unwrap();
+
+    let held_store = db.get_store(held_ns).unwrap();
+    let _stripe = held_store.lock_key(b"k");
+
+    let (done, finished) = std::sync::mpsc::channel();
+    let writer = {
+        let db = std::sync::Arc::clone(&db);
+        std::thread::spawn(move || {
+            db.put_ns(other_ns, b"k", b"v").unwrap();
+            done.send(()).unwrap();
+        })
+    };
+    finished
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("a write to another namespace waited on this namespace's stripe");
+    writer.join().unwrap();
+    assert_eq!(db.get_ns(other_ns, b"k").unwrap().as_deref(), Some(b"v".as_slice()));
 }

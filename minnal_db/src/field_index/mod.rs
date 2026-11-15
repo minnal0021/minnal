@@ -6,7 +6,7 @@
 //!
 //! | Type | Role |
 //! |------|------|
-//! | [`FieldIndex<V>`] | Single-field index: `BTreeMap<V, RoaringBitmap>` |
+//! | [`FieldIndex<V>`] | Single-field index: each distinct value's `RoaringBitmap` of row IDs |
 //! | [`Predicate<V>`] | Per-field filter (Eq, Ne, Lt, Le, Gt, Ge, Between, In) |
 //!
 //! A [`FieldIndex`] maps each distinct field value to a bitmap of row IDs, and
@@ -44,7 +44,7 @@ pub mod value;
 
 pub use self::bitmap::RoaringBitmap;
 pub use self::bitmap::shared::SharedRoaringBitmap;
-pub use self::dyn_index::{DynFieldIndex, IndexBlobStats};
+pub use self::dyn_index::{DynFieldIndex, IndexBlobStats, RowChange};
 pub use self::field::{FieldId, FieldMeta, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 pub use self::overlay_budget::{IndexOverlayBudget, IndexOverlayStats};
 pub use self::predicate::Predicate;

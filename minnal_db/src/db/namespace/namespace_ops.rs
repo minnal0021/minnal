@@ -82,6 +82,10 @@ impl Database {
         if let Some(sender) = self.lsm_compaction_sender.read().as_ref() {
             kv_store.set_compaction_trigger(sender.clone());
         }
+        // Wake the field-index worker, if it is running.
+        if let Some(waker) = self.index_apply_waker.read().as_ref() {
+            kv_store.set_index_apply_wake(Some(Arc::clone(waker) as Arc<dyn crate::kv_store::index_set::IndexApplyWake>));
+        }
         // Inherit the index-checkpoint backpressure valve if the worker is running.
         if let Some(trigger) = self.index_checkpoint_trigger.read().as_ref() {
             kv_store.set_index_checkpoint_trigger(Some(Arc::clone(trigger) as Arc<dyn crate::kv_store::index_set::CheckpointRequests>));

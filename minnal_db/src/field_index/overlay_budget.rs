@@ -24,11 +24,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Default soft limit: request an early checkpoint (32 MiB).
-pub const DEFAULT_INDEX_OVERLAY_SOFT_BYTES: u64 = 32 * 1024 * 1024;
-/// Default hard limit: the writer spills its field before returning (64 MiB).
-pub const DEFAULT_INDEX_OVERLAY_HARD_BYTES: u64 = 64 * 1024 * 1024;
-
 /// Shared byte counter for field-index overlays, with a soft and a hard limit.
 /// See the module docs.
 #[derive(Debug)]
@@ -148,7 +143,10 @@ impl IndexOverlayBudget {
 
 impl Default for IndexOverlayBudget {
     fn default() -> Self {
-        Self::new(DEFAULT_INDEX_OVERLAY_SOFT_BYTES, DEFAULT_INDEX_OVERLAY_HARD_BYTES)
+        Self::new(
+            crate::defaults::thresholds::INDEX_OVERLAY_SOFT_BYTES,
+            crate::defaults::thresholds::INDEX_OVERLAY_HARD_BYTES,
+        )
     }
 }
 

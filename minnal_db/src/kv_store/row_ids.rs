@@ -63,8 +63,8 @@ impl KVStore {
     }
 
     /// Resolve the row ID for `key` **without allocating** — returns `None` when
-    /// the dense map has never seen the key. Used on the delete and query
-    /// fallback paths, where an unseen key simply has nothing indexed.
+    /// the dense map has never seen the key. Used on the delete and repair
+    /// paths, where an unseen key simply has nothing indexed.
     ///
     /// Like `resolve_row_id_alloc`, only reached with an active field index, so a
     /// `row_id_fn` or a loaded `RowMap` is always present. If neither is (which
@@ -85,7 +85,6 @@ impl KVStore {
         None
     }
 
-    /// Resolve a row ID back to its key via the dense map, if loaded.
     /// The key a field-index row ID stands for, from whichever source assigns
     /// row IDs here: the registered `RowToKeyFn`, else the dense row map.
     pub(crate) fn key_for_row(&self, row_id: u128) -> Option<Vec<u8>> {
@@ -128,16 +127,14 @@ impl KVStore {
     ///
     /// After this call every key passed through the index write path is
     /// assigned the row ID returned by `row_id_fn` instead of the default
-    /// dense row-ID map.  Providing `row_to_key_fn` (the inverse) also enables
-    /// O(|hits|) query resolution in `Database::query_keys` — the inverse
-    /// reconstructs each matching key directly from its row ID, requiring
-    /// zero extra memory and no maintenance on writes.
+    /// dense row-ID map, and `Database::query_keys` turns each matching row ID
+    /// back into its key with `row_to_key_fn`, with no map to keep up on writes.
     ///
     /// `row_id_fn` must be injective: distinct keys must produce distinct
     /// row IDs so that `row_to_key_fn` can invert it exactly.
-    pub fn set_row_id_fn(&self, f: RowIdFn, inv: Option<RowToKeyFn>) -> Result<()> {
+    pub fn set_row_id_fn(&self, f: RowIdFn, inv: RowToKeyFn) -> Result<()> {
         *self.row_id_fn.write() = Some(f);
-        *self.row_to_key_fn.write() = inv;
+        *self.row_to_key_fn.write() = Some(inv);
         Ok(())
     }
 }

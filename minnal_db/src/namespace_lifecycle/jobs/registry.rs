@@ -46,7 +46,7 @@ pub struct Jobs {
 /// apart (nothing it guards spans two stores), so stores need not share one.
 /// Striping keeps that without a map of per-store locks to look up, allocate
 /// and prune as stores come and go. Two stores on one stripe only wait for
-/// each other, as every store did with a single lock.
+/// each other, as every store would with a single lock.
 ///
 /// 64 is a judgment, not a measurement: with a few dozen stores running jobs
 /// at once, most land on different stripes, and the locks cost a few hundred

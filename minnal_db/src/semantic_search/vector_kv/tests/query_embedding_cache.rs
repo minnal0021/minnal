@@ -12,7 +12,7 @@ async fn open_db(dir: &TempDir) -> AsyncDb {
 }
 
 /// TTL used by the cache round-trip tests.
-const TEST_TTL: Duration = DEFAULT_QUERY_EMBEDDING_CACHE_TTL;
+const TEST_TTL: Duration = crate::defaults::semantic_search::QUERY_EMBEDDING_CACHE_TTL;
 const MODEL: &str = "gemma";
 
 // ── Encoding helpers ──────────────────────────────────────────────────────
@@ -145,6 +145,21 @@ async fn test_clear_removes_all_entries() {
     assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 0);
 }
 
+/// The clear deletes a page of keys at a time: it must reach entries past the
+/// first page.
+#[tokio::test]
+async fn test_clear_removes_entries_past_the_first_page() {
+    let dir = TempDir::new().unwrap();
+    let db = open_db(&dir).await;
+    let n = crate::kv_store::KEY_PAGE + 10;
+    for i in 0..n {
+        put_cached_query_embedding(&db, MODEL, &format!("query-{i}"), &[1.0f32, 0.0], TEST_TTL).await;
+    }
+
+    assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), n);
+    assert_eq!(clear_cached_query_embeddings(&db, TEST_TTL).await.unwrap(), 0);
+}
+
 /// Cache populates must stay off the WAL (no fsync on the query path),
 /// while the admin clear goes through it so it survives a crash. This pins
 /// the durability split for the TTL cache namespace.
@@ -174,10 +189,18 @@ async fn test_cache_populates_bypass_wal_and_clears_use_it() {
 
 /// Populate the cache and flush it to L0 — the state a long-running server
 /// is in once the periodic no-WAL flush tick has persisted cache entries.
+///
+/// Flushes the cache namespace unconditionally. The compaction worker's tick
+/// flushes no-WAL memtables too, and when it landed first the no-WAL flush
+/// found nothing left and returned 0, failing an assertion on that count about
+/// once in 200 runs; what the tests need is the entries on disk, whoever wrote
+/// them. A flush already running is waited for, not skipped.
 async fn populate_and_flush(db: &AsyncDb) {
     put_cached_query_embedding(db, MODEL, "q1", &[1.0f32, 0.0], TEST_TTL).await;
     put_cached_query_embedding(db, MODEL, "q2", &[0.0f32, 1.0], TEST_TTL).await;
-    assert!(db.coordinator_for_test().flush_no_wal_memtables() >= 1);
+    db.flush_namespaces(vec![query_cache::SYSTEM_QUERY_EMB_CACHE_NS.to_string()])
+        .await
+        .unwrap();
 }
 
 /// A clear must survive a graceful restart.

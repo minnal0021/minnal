@@ -10,7 +10,7 @@
 //! Between the drops and the re-adds no field index of the namespace exists, so
 //! no row ID is referenced anywhere: that is when the row map is reset
 //! ([`AsyncDb::reset_rowmap`]), and the rebuilt indexes get dense IDs for the
-//! live documents only (FR-006). The indexes are then rebuilt one after the
+//! live documents only. The indexes are then rebuilt one after the
 //! other. A `reindex-all` cannot be cancelled: its first step drops the old
 //! indexes.
 

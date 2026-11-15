@@ -86,9 +86,8 @@ pub(crate) struct WalPersistObserver {
     /// those two points an entry is visible in the tail while its key is
     /// nowhere. Moving the cut past such an entry tells recovery to skip a write
     /// that only ever existed in a memtable — and a crash before that memtable
-    /// flushes loses an acknowledged write. Measured: 4 acknowledged writes lost
-    /// in one round of `work/stress/repro/drop_loses_a_write.py`, and 1 in
-    /// 34,538 in the 2026-08-02 stress run.
+    /// flushes loses an acknowledged write (a stress run without this lost about
+    /// 1 write in 35,000).
     ///
     /// Registration happens **while the WAL metadata write lock is still held**,
     /// so anyone who can observe the new tail can also observe the registration.
@@ -112,8 +111,7 @@ pub(crate) struct WalPersistObserver {
 /// WAL append and the memtable apply (`get_store`), and a leaked registration
 /// pins [`WalPersistObserver::wal_cut_ceiling`] forever — which freezes the
 /// cut, so WAL GC never reclaims another segment and the WAL grows without
-/// bound. That is the same failure mode as the dropped
-/// namespace in `17a8a0c`, reached a different way.
+/// bound, as a dropped namespace that kept holding the cut would.
 pub(crate) struct InFlightWrite<'a> {
     observer: &'a WalPersistObserver,
     offset: u64,

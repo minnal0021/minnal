@@ -51,8 +51,8 @@ impl Indices {
 
         // Write everything to the index files, as a checkpoint does, so the
         // queries below read the files rather than the in-memory write buffer.
-        for (idx, name) in [(&mut status_idx, "status"), (&mut age_idx, "age"), (&mut active_idx, "active")] {
-            idx.flush(&dir.path().join(name)).expect("flush index");
+        for idx in [&mut status_idx, &mut age_idx, &mut active_idx] {
+            idx.flush().expect("flush index");
             assert_eq!(idx.overlay_bytes(), 0, "nothing may remain buffered");
         }
 

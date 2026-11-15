@@ -299,7 +299,7 @@ pub async fn index_query(
         "total": page.total,
         // Non-empty means these results may be MISSING documents: one or more
         // indices the predicate read is known to be incomplete and awaiting
-        // repair. See FR-001.
+        // repair (`GET /admin/indices/{ns}/health`).
         "degraded_fields": degraded_fields,
     })))
 }

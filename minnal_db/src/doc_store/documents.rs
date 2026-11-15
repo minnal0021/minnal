@@ -158,6 +158,20 @@ impl DocStore {
             }
         }
     }
+
+    /// Make every document write that has returned visible to field queries
+    /// ([`query`](Self::query) and filtered search).
+    ///
+    /// A write's field-index changes are applied by a background worker
+    /// after a short delay (`scheduled_tasks.index_apply_delay_ms`, 20 ms by
+    /// default, so a burst of writes is applied at once), and queries read only what it has
+    /// applied, so a query straight after a write may not see it yet (as with
+    /// semantic search, which waits for embedding). This applies everything
+    /// queued so far, in every store, and returns how many changes it applied.
+    /// For a caller that needs read-your-writes; queries never wait for it.
+    pub async fn sync_field_indexes(&self) -> Result<usize, DocStoreError> {
+        Ok(self.db.sync_field_indexes().await?)
+    }
 }
 
 #[cfg(test)]

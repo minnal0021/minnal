@@ -2,9 +2,11 @@
 //!
 //! A worker that runs file I/O (fsyncs, compactions) directly inside its Tokio
 //! task occupies a runtime thread for the whole pass, and tasks scheduled on that
-//! thread wait for it. M5 measured this on the index checkpoint: every 1.75 s,
-//! ~55 ms of fsyncs held up the requests queued behind it (get p99 4-10 ms
-//! against a 1.3 ms median). Workers must run such passes with `spawn_blocking`.
+//! thread wait for it. The system benchmark measured this on the index
+//! checkpoint: every 1.75 s, ~55 ms of fsyncs held up the requests queued
+//! behind it (get p99 4-10 ms against a 1.3 ms median). Workers run such passes
+//! through [`run_blocking_pass`](crate::support::run_blocking_pass) (or on the
+//! blocking pool).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -57,9 +57,4 @@ impl DocStore {
     pub fn lifecycle_parked(&self) -> Vec<(String, String)> {
         self.governor.get().map(Governor::parked).unwrap_or_default()
     }
-
-    /// Whether the lifecycle governor is running.
-    pub fn lifecycle_running(&self) -> bool {
-        self.running_governor().is_ok()
-    }
 }

@@ -80,7 +80,7 @@ fn periodic_flush_makes_no_wal_writes_survive_a_crash() {
 /// Clearing it on a flush that did not happen drops the namespace out of
 /// `flush_no_wal_memtables` permanently — no later tick retries it — so the
 /// next crash takes the whole memtable, which is exactly the loss the
-/// periodic flush was added to bound.
+/// periodic flush exists to bound.
 #[test]
 fn a_failed_flush_keeps_the_no_wal_flag_set() {
     use std::os::unix::fs::PermissionsExt;
@@ -97,7 +97,7 @@ fn a_failed_flush_keeps_the_no_wal_flag_set() {
     // Make the flush fail by taking write permission off the level-0 tree —
     // it can then neither create a bucket directory nor write an SSTable
     // into an existing one.
-    let level0 = store.lsm_path.join("level0");
+    let level0 = crate::layout::namespace_lsm_dir(&crate::layout::namespace_data_dir(dir.path(), "vectors")).join("level0");
     std::fs::create_dir_all(&level0).unwrap();
     let mut locked: Vec<(std::path::PathBuf, std::fs::Permissions)> = Vec::new();
     for entry in std::fs::read_dir(&level0).unwrap() {

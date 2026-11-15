@@ -77,9 +77,8 @@ async fn an_interrupted_vector_index_drop_is_finished_at_the_next_start() {
     assert!(store.list_queue_entries().await.is_empty(), "queue entries of the dropped index remain");
 }
 
-/// A finished reindex must not block the next one. Its record used to stay
-/// `"running"` for good, so every later `reindex-all` was refused as already
-/// in progress.
+/// A finished reindex must not block the next one: a record left `"running"`
+/// would make every later `reindex-all` be refused as already in progress.
 #[cfg(feature = "semantic-search")]
 #[tokio::test]
 async fn a_finished_reindex_does_not_block_the_next() {

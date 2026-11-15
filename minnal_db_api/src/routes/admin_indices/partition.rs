@@ -102,7 +102,7 @@ pub struct RecallCheckParams {
 }
 
 /// `GET /admin/indices/{ns}/vector/recall-check` — does the namespace's search
-/// miss what a full read finds (FR-007)? Samples real queries from the
+/// miss what a full read finds? Samples real queries from the
 /// query-embedding cache (this namespace's model and dimension); with fewer than
 /// 20 cached it samples stored chunks instead (their 1-bit reconstructions).
 /// Neither makes an embedding call; `query_source` in the result says which was
@@ -318,7 +318,7 @@ pub struct RebuildBody {
 
 /// `POST /admin/indices/{ns}/vector/rebuild` — re-cluster the namespace's
 /// partition from its stored codes (k-means, no embedding calls) and move every
-/// chunk to its nearest new posting, in the background (design doc M4). 202 on
+/// chunk to its nearest new posting, in the background. 202 on
 /// start; 409 while one is running. Progress and the result are the `rebuild`
 /// field of `GET /admin/indices/{ns}/vector/partition`.
 pub async fn vector_rebuild(State(state): State<AppState>, Path(ns): Path<String>, body: axum::body::Bytes) -> axum::response::Response {
@@ -479,8 +479,9 @@ pub struct CentresParams {
 /// `GET /admin/indices/{ns}/vector/centres` — every IVF centre's metadata (no
 /// vectors): the postings that name it, their state and origin, its norm and,
 /// with `codes`, how many chunk codes still decode against it. `by_state`
-/// counts every centre; with `codes`, `unused` counts centres that no posting
-/// that is not retired names and no code uses (what FR-008 would collect).
+/// counts every centre; with `codes`, `unused` counts centres that no live
+/// posting names and no code uses (nothing collects them yet: centres are
+/// append-only).
 pub async fn vector_centres(State(state): State<AppState>, Path(ns): Path<String>, Query(params): Query<CentresParams>) -> axum::response::Response {
     let bad = |msg: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg }))).into_response();
     let sort = params.sort.as_deref().unwrap_or("id");

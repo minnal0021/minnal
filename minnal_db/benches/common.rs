@@ -90,8 +90,8 @@ pub fn open_store_with_capacity(dir: &Path, capacity: usize) -> Db {
 /// touches on-disk L0/L1 files). Reopening a second `Db` over the same
 /// directory before the first one drops leaves both instances alive at once
 /// — the old instance's deferred Drop cleanup can then race the new
-/// instance's first reads and manifest load, surfacing as a spurious
-/// `NotFound` on a file the new instance expected to still be there. Always
+/// instance's first reads, surfacing as a spurious `NotFound` on a file the
+/// new instance expected to still be there. Always
 /// drop the old handle first.
 pub fn push_to_l1(store: Db, dir: &Path) -> Db {
     store.compact().expect("compact failed");

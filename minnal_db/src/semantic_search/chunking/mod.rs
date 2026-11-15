@@ -1,8 +1,7 @@
 //! Document chunking for embedding.
 //!
-//! Chunking used to live in the external embedding service; it now lives here so
-//! minnal sends the service pre-chunked strings (one embedding is returned per
-//! string). The service no longer splits text.
+//! minnal chunks documents itself and sends the embedding service pre-chunked
+//! strings, one embedding returned per string; the service never splits text.
 //!
 //! Only **documents** are chunked: [`chunk_document`] splits the text on
 //! **sentence** boundaries ([`split_sentences`]) and groups the sentences into

@@ -1,3 +1,6 @@
+//! `VectorIndex`, one quantised embedding as stored, and `VectorKvStore`, the
+//! storage interface search reads entries through.
+
 use crate::semantic_search::index::distance_estimator::DistanceEstimator;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::vec::ArchivedVec;

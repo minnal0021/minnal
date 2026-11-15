@@ -1,3 +1,7 @@
+//! Shared utilities with no better home: key bucketing and prefixes, durable
+//! file writes, running a worker's blocking pass, and the `file_lock`, `hex`,
+//! `metrics` and SIMD helpers.
+
 use mm3h::Murmur3Hasher;
 use std::hash::Hasher;
 use std::io::Write;
@@ -16,11 +20,11 @@ pub(crate) mod simd_support;
 /// without holding up the async runtime.
 ///
 /// On a multi-thread runtime, `block_in_place` hands this thread's queued tasks
-/// to another thread for the duration. Run plainly, the pass held up every task
-/// scheduled behind it: M5 traced every get over 15 ms to an index checkpoint
-/// (~55 ms of fsyncs every 1.75 s; get p99 4-10 ms against a 1.3 ms median).
-/// The pass still runs inside the worker's own task, so nothing it uses lives
-/// longer than before (`spawn_blocking` would keep the database alive past its
+/// to another thread for the duration. Run plainly, the pass holds up every
+/// task scheduled behind it: the system benchmark traced every get over 15 ms
+/// to an index checkpoint (~55 ms of fsyncs every 1.75 s; get p99 4-10 ms
+/// against a 1.3 ms median). The pass still runs inside the worker's own task,
+/// so nothing it uses outlives it (`spawn_blocking` would keep the database alive past its
 /// last handle while a pass ran). A current-thread runtime cannot hand its tasks
 /// off, so there the pass runs inline.
 pub(crate) fn run_blocking_pass<R>(pass: impl FnOnce() -> R) -> R {
@@ -70,31 +74,17 @@ pub fn write_atomic_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Default bucket count used by both the LSM tree and the sharded value log.
-/// All bucket-routing logic in the codebase must use a single bucket count so
-/// that a key always lands in the same bucket regardless of which layer handles it.
-///
-/// Must not exceed `u32::MAX + 1`: bucket indices are stored as `u32` in
-/// `ShardedValuePointer` and occupy the upper 32 bits of the encoded `u128`
-/// pointer, so a value above that limit would overflow the field.
-pub const DEFAULT_NUM_BUCKETS: usize = 16;
-
-const _: () = assert!(
-    DEFAULT_NUM_BUCKETS <= (u32::MAX as usize + 1),
-    "DEFAULT_NUM_BUCKETS exceeds u32::MAX + 1: bucket indices are stored as u32 in ShardedValuePointer and would overflow"
-);
-
 /// Bucket count used by tests that open a `Db`/`Database`/`KVStore` with the
 /// generic (non-sharding-specific) config.
 ///
 /// Each namespace eagerly opens `2 × num_buckets` file descriptors (one LSM L1
 /// file plus one value-log file per bucket), held for its lifetime. With the
-/// production default of 16 buckets a single fresh `Db` (which opens the
-/// `default` + `system` namespaces) holds ~65 fds; a namespace-heavy test can
+/// default of 8 buckets that is 16 per namespace, and a fresh database opens
+/// several (`default`, `system`, `system_catalog`); a namespace-heavy test can
 /// hold several hundred. `cargo test` runs one test per core, so on a
 /// many-core machine the aggregate fd demand blows past the typical 1024 soft
 /// limit ("Too many open files"). Keeping test databases at 2 buckets cuts the
-/// per-namespace fd cost ~8× while still exercising the multi-bucket routing,
+/// per-namespace fd cost 4× while still exercising the multi-bucket routing,
 /// scan-over-buckets, and per-bucket GC paths. Tests that specifically need a
 /// single bucket set `num_buckets: 1` explicitly.
 #[cfg(test)]
@@ -142,16 +132,6 @@ pub(crate) async fn assert_no_open_files_under(dir: &std::path::Path, what: &str
         assert!(std::time::Instant::now() < deadline, "{what}: {} files still open: {open:#?}", open.len());
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-}
-
-/// Validate that a runtime bucket count is within the u32 limit.
-#[allow(dead_code)]
-pub fn validate_num_buckets(num_buckets: usize) {
-    assert!(
-        num_buckets > 0 && num_buckets <= (u32::MAX as usize + 1),
-        "num_buckets must be between 1 and u32::MAX + 1, got {}",
-        num_buckets,
-    );
 }
 
 const SEED: u32 = 0xFEACBE01;

@@ -1,5 +1,5 @@
-//! Reassignment after a split (design doc *M3 split algorithm (LIRE)*, step 5;
-//! M3b).
+//! Reassignment after a split (`Dynamic-RaBitQ-Index-Design.md` → *M3 split
+//! algorithm (LIRE)*, step 5).
 //!
 //! A split moves the centre its chunks were routed by, so some chunks are now
 //! nearer another posting: chunks of the two halves that were nearer the old

@@ -64,8 +64,7 @@ impl NamespaceSchema {
     ///
     /// The [`FieldMeta`] is kept, so a later
     /// [`register_field`](Self::register_field) reuses the same [`FieldId`].
-    /// Saving the flag is what makes a drop completable after a crash — see
-    /// `FEATURE-REQUEST.md` (FR-001).
+    /// Saving the flag is what makes a drop completable after a crash.
     pub(crate) fn mark_field_dropped(&mut self, field_id: FieldId) -> Option<FieldMeta> {
         let f = self.fields.values_mut().find(|f| f.field_id == field_id && !f.dropped)?;
         f.dropped = true;

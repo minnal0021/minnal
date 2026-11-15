@@ -1,3 +1,8 @@
+//! Evaluates a parsed query (`RawExpr`) against the live field indexes,
+//! returning the `RoaringBitmap` of matching row IDs. The whole expression is
+//! validated (fields exist and are active, values fit their types) before any
+//! bitmap is read.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

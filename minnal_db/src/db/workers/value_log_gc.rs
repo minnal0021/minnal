@@ -3,7 +3,7 @@
 //! This module provides background garbage collection for the value log.
 //! It monitors the value log and triggers GC when needed based on waste ratio.
 
-use log::{debug, info};
+use log::info;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -18,8 +18,8 @@ pub trait ValueLogGcTarget: Send + Sync + 'static {
 
 /// Commands that can be sent to the GC worker
 pub enum GCCommand {
-    /// Trigger an immediate GC check
-    #[allow(dead_code)]
+    /// Run a GC check now.
+    #[cfg(test)]
     Trigger,
     /// Shutdown the worker gracefully
     Shutdown,
@@ -53,8 +53,8 @@ impl GCWorker {
         Self { tx, shutdown_notify }
     }
 
-    /// Send a command to trigger immediate GC
-    #[allow(dead_code)]
+    /// Run a GC check now.
+    #[cfg(test)]
     pub fn trigger_gc(&self) -> Result<(), mpsc::error::SendError<GCCommand>> {
         self.tx.send(GCCommand::Trigger)
     }
@@ -91,8 +91,9 @@ impl GCWorker {
 
                 Some(cmd) = rx.recv() => {
                     match cmd {
+                        #[cfg(test)]
                         GCCommand::Trigger => {
-                            debug!("[GCWorker] Triggered immediate GC check");
+                            log::debug!("[GCWorker] Triggered immediate GC check");
                             match target.upgrade() {
                                 Some(t) => Self::perform_gc_check(&t, waste_threshold),
                                 None => break,
@@ -217,7 +218,7 @@ mod tests {
         }
 
         let waste_ratio = db.waste_ratio();
-        debug!("Waste ratio: {:.2}%", waste_ratio);
+        log::debug!("Waste ratio: {:.2}%", waste_ratio);
 
         let worker = GCWorker::new(db.clone(), Duration::from_secs(1), 10.0);
         worker.trigger_gc().expect("failed to trigger gc");

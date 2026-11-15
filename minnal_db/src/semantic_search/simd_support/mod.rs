@@ -946,10 +946,11 @@ mod tests {
         sum
     }
 
-    // Dims that exercise a partial final 32-/64-dim group — the AVX2 single-bit
-    // OOB-read regression (groups counted as ceil(dim/8)/4 instead of dim/32).
-    // 25,57,89 sit in [n*32+1, n*32+8]; 31,63,95 are one short of a full group;
-    // 33 is one past. With q.len() == dim, the old code read q[dim] here.
+    // Dims that exercise a partial final 32-/64-dim group, where an AVX2 single-bit
+    // kernel that counted groups as ceil(dim/8)/4 instead of dim/32 would read
+    // past the query. 25,57,89 sit in [n*32+1, n*32+8]; 31,63,95 are one short of
+    // a full group; 33 is one past. With q.len() == dim, such a kernel reads
+    // q[dim] here.
     const PARTIAL_GROUP_DIMS: [usize; 7] = [25, 31, 33, 57, 63, 89, 95];
 
     #[test]

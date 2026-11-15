@@ -44,7 +44,7 @@ impl DocStore {
             .semantic_ctx
             .as_ref()
             .map(|c| c.config.query_embedding_cache_ttl)
-            .unwrap_or(vector_kv::DEFAULT_QUERY_EMBEDDING_CACHE_TTL);
+            .unwrap_or(crate::defaults::semantic_search::QUERY_EMBEDDING_CACHE_TTL);
         Ok(vector_kv::clear_cached_query_embeddings(&self.db, ttl).await?)
     }
 
@@ -713,6 +713,8 @@ mod tests {
             .put("users", DocId::U64(3), serde_json::json!({"active": true,  "name": "Carol"}))
             .await
             .unwrap();
+        // Field queries read what the field-index worker has applied: wait for it.
+        store.sync_field_indexes().await.unwrap();
 
         let active = store.query("users", "active = true", Pagination::default()).await.unwrap();
         let mut ids: Vec<u64> = active

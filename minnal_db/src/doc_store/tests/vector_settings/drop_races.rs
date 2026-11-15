@@ -5,7 +5,7 @@
 use super::support::*;
 use super::*;
 
-// ── Review fixes (2026-10-17) ──
+// ── Drops racing maintenance and writes ──
 
 /// Dropping a vector index, or its whole store, while a maintenance
 /// operation runs must wait for the operation and stop maintenance on that

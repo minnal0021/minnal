@@ -64,7 +64,7 @@ impl DocStore {
     }
 
     /// Check whether `namespace`'s searches miss what a full read finds, the
-    /// signal for a rebuild (FR-007): sample real queries from the query-embedding
+    /// signal for a rebuild: sample real queries from the query-embedding
     /// cache, or stored chunks when fewer than 20 are cached (no embedding call
     /// either way), and compare each search under the namespace's settings,
     /// or `overrides` of them, with one that probes every posting. The result is
@@ -138,7 +138,7 @@ impl DocStore {
     pub fn vector_partition_history_ttl(&self) -> std::time::Duration {
         self.semantic_ctx
             .as_ref()
-            .map_or(crate::semantic_search::ivf_split::history::DEFAULT_HISTORY_TTL, |c| {
+            .map_or(crate::defaults::semantic_search::PARTITION_HISTORY_TTL, |c| {
                 c.config.partition_history_ttl
             })
     }
@@ -161,8 +161,9 @@ impl DocStore {
         Ok(ctx.partition_history(&self.db, namespace, kind, limit).await?)
     }
 
-    /// Rebuild `namespace`'s partition from its codes (design doc M4), as a
-    /// `partition_rebuild` job in the background; returns the job's name. K-means
+    /// Rebuild `namespace`'s partition from its codes, as a `partition_rebuild`
+    /// job in the background (`Dynamic-RaBitQ-Index-Design.md` → *M4 — Rebuild
+    /// from codes*); returns the job's name. K-means
     /// into `postings` postings (default: as many as are active), every chunk
     /// moved to its nearest, then the usual splits and merges. No embedding call
     /// is made. Progress and the result show in

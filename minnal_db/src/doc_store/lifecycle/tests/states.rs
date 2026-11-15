@@ -46,6 +46,7 @@ async fn a_store_being_created_refuses_requests_and_the_next_open_finishes_it() 
     assert_eq!(store.schemas.state("docs"), Some(NamespaceState::Created));
     assert_eq!(store.list().unwrap()[0]["state"], "created");
     store.put("docs", DocId::U64(1), serde_json::json!({"active": true})).await.unwrap();
+    store.sync_field_indexes().await.unwrap();
     assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
     store.shutdown().await.unwrap();
 }
@@ -65,6 +66,7 @@ async fn a_creation_run_twice_keeps_what_the_first_run_made() {
         .unwrap();
     store.provision("docs").await.unwrap();
     assert_eq!(store.schemas.get("docs").unwrap().ns_id(), id, "the same namespace");
+    store.sync_field_indexes().await.unwrap();
     assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
     store.shutdown().await.unwrap();
 }
@@ -145,6 +147,7 @@ async fn a_store_in_index_maintenance_takes_requests_but_cannot_be_dropped() {
 
         store.put("docs", DocId::U64(1), serde_json::json!({"active": true})).await.unwrap();
         assert!(store.get("docs", DocId::U64(1)).await.unwrap().is_some());
+        store.sync_field_indexes().await.unwrap();
         assert_eq!(store.query("docs", "active = true", Pagination::default()).await.unwrap().total, 1);
         assert!(matches!(store.remove("docs").await, Err(DocStoreError::StoreInMaintenance { .. })));
         assert_eq!(store.list().unwrap()[0]["state"], "index_maintenance");

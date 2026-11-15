@@ -12,7 +12,7 @@ use std::time::Duration;
 use log::{debug, info};
 
 use super::*;
-use crate::namespace_lifecycle::{AuditLog, DEFAULT_AUDIT_RETENTION, Governor, Jobs};
+use crate::namespace_lifecycle::{AuditLog, Governor, Jobs};
 #[cfg(feature = "semantic-search")]
 use crate::semantic_search::service::SemanticSearchConfig;
 
@@ -50,7 +50,7 @@ impl DocStoreBuilder {
             db_path: db_path.as_ref().to_path_buf(),
             db_config: DbConfig::default(),
             lifecycle: LifecycleConfig::default(),
-            audit_retention: DEFAULT_AUDIT_RETENTION,
+            audit_retention: crate::defaults::lifecycle::AUDIT_RETENTION,
             #[cfg(feature = "semantic-search")]
             semantic_search: SemanticSearchContext::new(SemanticSearchConfig::default()),
             #[cfg(feature = "semantic-search")]
@@ -97,6 +97,22 @@ impl DocStoreBuilder {
     pub fn vector_index_config(mut self, config: VectorIndexConfig) -> Self {
         self.vector_index_config = config;
         self
+    }
+
+    /// Everything the config file sets: the engine, the lifecycle governor,
+    /// the audit retention and, with `semantic-search`, the embedding worker
+    /// and the semantic-search context. The database directory is the one
+    /// given to [`DocStore::builder`].
+    pub fn config_file(self, file: &crate::ConfigFile) -> Self {
+        let builder = self
+            .db_config(file.db_config())
+            .lifecycle(file.lifecycle_config())
+            .audit_retention(file.audit_retention());
+        #[cfg(feature = "semantic-search")]
+        let builder = builder
+            .vector_index_config(file.vector_index_config())
+            .semantic_search(file.semantic_search_context());
+        builder
     }
 
     /// Test hook: start no vector worker (see the field).

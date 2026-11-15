@@ -91,6 +91,7 @@ async fn keys_sharing_a_long_prefix_are_distinct_documents() {
     assert_eq!(store.get("slugs", sk(a)).await.unwrap(), Some(serde_json::json!({"status": "active"})));
     assert_eq!(store.get("slugs", sk(b)).await.unwrap(), Some(serde_json::json!({"status": "archived"})));
 
+    store.sync_field_indexes().await.unwrap();
     let active = store.query("slugs", "status = 'active'", Pagination::new(1, 100)).await.unwrap();
     assert_eq!(ids_of(&active.results), vec![a], "each key must own its own row in the index");
 }
@@ -108,6 +109,7 @@ async fn index_query_resolves_hits_back_to_string_keys() {
         store.put("slugs", sk(slug), serde_json::json!({ "status": status })).await.unwrap();
     }
 
+    store.sync_field_indexes().await.unwrap();
     let active = store.query("slugs", "status = 'active'", Pagination::new(1, 100)).await.unwrap();
     let mut ids = ids_of(&active.results);
     ids.sort();
@@ -153,6 +155,7 @@ async fn string_keys_and_index_hits_survive_a_restart() {
 
     // A write after the restart joins the same ID space.
     store.put("slugs", sk("delta"), serde_json::json!({"status": "active"})).await.unwrap();
+    store.sync_field_indexes().await.unwrap();
     let active = store.query("slugs", "status = 'active'", Pagination::new(1, 100)).await.unwrap();
     let mut ids = ids_of(&active.results);
     ids.sort();
@@ -240,6 +243,7 @@ async fn a_key_at_the_length_cap_round_trips() {
         store.get("slugs", sk(&max_key)).await.unwrap(),
         Some(serde_json::json!({"status": "active"}))
     );
+    store.sync_field_indexes().await.unwrap();
     let active = store.query("slugs", "status = 'active'", Pagination::new(1, 100)).await.unwrap();
     assert_eq!(ids_of(&active.results), vec![max_key]);
 }

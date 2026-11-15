@@ -6,10 +6,9 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use minnal_db::MinnalTomlConfig;
-use minnal_db::doc_store::schema::vector_settings::IndexDefaults;
-use minnal_db::doc_store::{DocStore, SemanticSearchContext, VectorIndexConfig};
-use minnal_db::semantic_search::service::SemanticSearchConfig;
+use minnal_db::ConfigFile;
+use minnal_db::config_file::API_SERVER_TABLES;
+use minnal_db::doc_store::DocStore;
 use serde::{Deserialize, Serialize};
 
 /// The benchmark's configuration file (JSON).
@@ -67,78 +66,6 @@ impl Config {
     }
 }
 
-/// The server TOML's settings the engine parser does not read. Every key the
-/// server would apply must be listed here, so a key this benchmark does not
-/// apply fails loudly instead of being silently ignored.
-#[derive(Deserialize, Default)]
-struct ServerExtras {
-    #[serde(default)]
-    vector_index: VectorIndexSection,
-    #[serde(default)]
-    semantic_search: SemanticSection,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VectorIndexSection {
-    #[serde(default = "two")]
-    retry_wait_secs: u64,
-    #[serde(default = "five")]
-    max_retries: u32,
-    #[serde(default = "four")]
-    concurrency: usize,
-}
-
-impl Default for VectorIndexSection {
-    fn default() -> Self {
-        Self {
-            retry_wait_secs: 2,
-            max_retries: 5,
-            concurrency: 4,
-        }
-    }
-}
-
-fn two() -> u64 {
-    2
-}
-fn five() -> u32 {
-    5
-}
-fn four() -> usize {
-    4
-}
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct SemanticSection {
-    /// Replaced by the replay's URL.
-    #[serde(default)]
-    #[allow(dead_code)]
-    embedding_service_url: Option<String>,
-    #[serde(default)]
-    supported_models: Vec<Model>,
-    #[serde(default)]
-    maintenance: MaintenanceSection,
-    /// Only the built-in search defaults are supported: an empty table.
-    #[serde(default)]
-    search_defaults: BTreeMap<String, toml::Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Model {
-    name: String,
-    dimension: u16,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct MaintenanceSection {
-    threads: Option<usize>,
-    rebuild_threads: Option<usize>,
-}
-
 /// What the run applied, for `run.json`.
 #[derive(Serialize, Clone)]
 pub struct EngineSettings {
@@ -150,47 +77,26 @@ pub struct EngineSettings {
     pub server_toml: String,
 }
 
-/// Open the doc store at `dir` (`db/`) with every background
-/// worker and the vector worker running, embedding through `embed_url`.
-/// `concurrency` overrides the vector worker's (recording only).
+/// Open the doc store at `dir` (`db/`) with every background worker and the
+/// vector worker running, configured from the server's TOML as the server
+/// configures itself, but embedding through `embed_url`. `concurrency`
+/// replaces the vector worker's.
 pub async fn open(cfg: &Config, dir: &Path, embed_url: &str, concurrency: Option<usize>) -> Result<(Arc<DocStore>, EngineSettings), String> {
-    let toml_text = std::fs::read_to_string(&cfg.server_toml).map_err(|e| format!("{}: {e}", cfg.server_toml))?;
-    let engine = MinnalTomlConfig::from_file(Path::new(&cfg.server_toml)).map_err(|e| format!("{}: {e}", cfg.server_toml))?;
-    let extras: ServerExtras = toml::from_str(&toml_text).map_err(|e| format!("{}: {e}", cfg.server_toml))?;
-    let sem = extras.semantic_search;
-    if !sem.search_defaults.is_empty() {
-        return Err("[semantic_search.search_defaults] is set; engine_bench applies only the built-in defaults".into());
+    let (mut file, _) = ConfigFile::from_file(Path::new(&cfg.server_toml), API_SERVER_TABLES).map_err(|e| e.to_string())?;
+    file.semantic_search.embedding_service_url = embed_url.to_string();
+    if let Some(c) = concurrency {
+        file.vector_index.concurrency = c;
     }
     let settings = EngineSettings {
-        vector_worker_concurrency: concurrency.unwrap_or(extras.vector_index.concurrency),
-        vector_worker_max_retries: extras.vector_index.max_retries,
-        maintenance_threads: sem.maintenance.threads.unwrap_or(2),
-        rebuild_threads: sem.maintenance.rebuild_threads.unwrap_or(2),
-        supported_models: sem
-            .supported_models
-            .iter()
-            .map(|m| (m.name.to_lowercase(), u32::from(m.dimension)))
-            .collect(),
+        vector_worker_concurrency: file.vector_index.concurrency,
+        vector_worker_max_retries: file.vector_index.max_retries,
+        maintenance_threads: file.semantic_search.maintenance.threads,
+        rebuild_threads: file.semantic_search.maintenance.rebuild_threads,
+        supported_models: file.semantic_search.supported_models(),
         server_toml: cfg.server_toml.clone(),
     };
-    let service = SemanticSearchConfig {
-        embedding_service_url: embed_url.to_string(),
-        ..Default::default()
-    };
     let store = DocStore::builder(dir.join("db"))
-        .db_config(engine.to_db_config())
-        .vector_index_config(VectorIndexConfig {
-            retry_wait_secs: extras.vector_index.retry_wait_secs,
-            max_retries: settings.vector_worker_max_retries,
-            concurrency: settings.vector_worker_concurrency,
-        })
-        .semantic_search(
-            SemanticSearchContext::new(service)
-                .with_supported_models(settings.supported_models.clone())
-                .with_index_defaults(IndexDefaults::default())
-                .with_maintenance_threads(settings.maintenance_threads)
-                .with_rebuild_threads(settings.rebuild_threads),
-        )
+        .config_file(&file)
         .open()
         .await
         .map_err(|e| format!("open {}: {e}", dir.display()))?;

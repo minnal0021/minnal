@@ -50,7 +50,7 @@ impl FakeHost {
             jobs: Arc::new(Jobs::new(
                 records,
                 Arc::new(
-                    crate::namespace_lifecycle::AuditLog::open(&db, crate::namespace_lifecycle::DEFAULT_AUDIT_RETENTION)
+                    crate::namespace_lifecycle::AuditLog::open(&db, crate::defaults::lifecycle::AUDIT_RETENTION)
                         .await
                         .unwrap(),
                 ),

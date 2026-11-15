@@ -24,6 +24,8 @@ mod async_db;
 mod catalog;
 mod crash;
 mod field_index;
+mod field_index_worker;
+mod gc_cost;
 mod in_flight;
 mod merge;
 mod namespaces;

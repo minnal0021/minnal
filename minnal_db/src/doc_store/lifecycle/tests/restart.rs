@@ -156,7 +156,9 @@ async fn test_predicate_query_after_delete_survives_restart() {
             .await
             .unwrap();
 
-        // Sanity: 3 active docs before delete.
+        // Sanity: 3 active docs before delete. Field queries read what the
+        // field-index worker has applied, so wait for it first.
+        store.sync_field_indexes().await.unwrap();
         let before = store.query("users", "active = true", Pagination::default()).await.unwrap();
         assert_eq!(before.total, 3);
 
@@ -164,6 +166,7 @@ async fn test_predicate_query_after_delete_survives_restart() {
         store.delete("users", DocId::U64(2)).await.unwrap();
 
         // Same session: only 2 active docs.
+        store.sync_field_indexes().await.unwrap();
         let after = store.query("users", "active = true", Pagination::default()).await.unwrap();
         assert_eq!(after.total, 2);
     }
@@ -213,7 +216,7 @@ fn rewind_index_checkpoints(db_dir: &Path) {
     }
 }
 
-/// Regression: the custom (key-type-derived) row-ID function must be
+/// The custom (key-type-derived) row-ID function must be
 /// installed *before* field indexes are activated, so the activation-time
 /// WAL-tail replay resolves row IDs the same way prior writes did. If the
 /// index is activated first, replay falls back to the dense `RowMap` and
