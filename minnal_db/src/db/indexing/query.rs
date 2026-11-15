@@ -233,8 +233,9 @@ mod tests {
     /// tombstoned the key, a put of the same value then inserted the row, and
     /// TTL's removal of the old value's row ran last — a live document gone
     /// from every query on the field, with no gap recorded (found within 300
-    /// rounds every run). Now every write changes a key's rows under its bucket
-    /// lock, and a reindex sets the row by compare-and-set under the same lock.
+    /// rounds every run). Now every write queues its change to a key's rows
+    /// under its bucket lock, and the queue applies them in that order; a
+    /// reindex queues its row by compare-and-set under the same lock.
     #[test]
     fn ttl_expiry_and_reindexing_racing_puts_keep_the_index_in_step() {
         use std::sync::atomic::{AtomicBool, Ordering};

@@ -10,7 +10,6 @@ use crate::namespace::NamespaceId;
 
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 impl Database {
     /// Register an indexed field for a namespace.
@@ -448,11 +447,7 @@ impl Database {
             }
         }
 
-        let entry = IndexEntry {
-            field_id,
-            extractor,
-            index: Arc::new(parking_lot::RwLock::new(dyn_index)),
-        };
+        let entry = IndexEntry::new(field_id, extractor, dyn_index);
         // The field now needs the WAL from its checkpoint (`field_consumers`).
         // Registered with the field, so the two cannot disagree.
         let wal_tail = self.wal_metadata.read().tail;

@@ -6,6 +6,7 @@
 
 use crate::namespace::NamespaceId;
 mod gc;
+pub(crate) mod index_queue;
 pub mod index_set;
 pub(crate) mod key_locks;
 mod maintenance;

@@ -57,6 +57,54 @@ fn a_range_page_past_many_deletes_widens_until_full() -> Result<()> {
     Ok(())
 }
 
+/// A whole range (`limit` = `usize::MAX`) is read first with a window it may
+/// outgrow, then again in full. 30,000 keys spread over Level 1, Level 0 and
+/// the memtable, every fifth deleted in the memtable, all come back in order;
+/// a range that fits the first window is read once.
+#[test]
+fn a_whole_range_comes_back_complete_whatever_its_size() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let lsm = LSMTree::open(temp_dir.path(), test_lsm_config())?;
+    let key = |i: u32| format!("w:{i:06}").into_bytes();
+    let mut seq = 0u64;
+    let mut next_seq = || {
+        seq += 1;
+        seq
+    };
+    for i in (0..30_000).filter(|i| i % 3 == 0) {
+        lsm.insert_with_seq(&key(i), u128::from(i) + 1, next_seq())?;
+    }
+    lsm.flush_memtable_to_level0()?;
+    lsm.compact_all()?;
+    for i in (0..30_000).filter(|i| i % 3 == 1) {
+        lsm.insert_with_seq(&key(i), u128::from(i) + 1, next_seq())?;
+    }
+    lsm.flush_memtable_to_level0()?;
+    lsm.purge_ro_memtables_for_test();
+    for i in (0..30_000).filter(|i| i % 3 == 2) {
+        lsm.insert_with_seq(&key(i), u128::from(i) + 1, next_seq())?;
+    }
+    for i in (0..30_000).filter(|i| i % 5 == 0) {
+        lsm.delete_with_seq(&key(i), next_seq())?;
+    }
+
+    let live = |range: std::ops::Range<u32>| range.filter(|i| i % 5 != 0).map(key).collect::<Vec<_>>();
+    let all: Vec<Vec<u8>> = lsm.range_pointers_bounded(b"w:", None, usize::MAX)?.into_iter().map(|e| e.0).collect();
+    assert_eq!(all, live(0..30_000));
+
+    // About 1,100 entries across the layers: read once, not twice.
+    range_scan::ENTRIES_READ.with(|n| n.set(0));
+    let part: Vec<Vec<u8>> = lsm
+        .range_pointers_bounded(b"w:", Some(&key(1_000)), usize::MAX)?
+        .into_iter()
+        .map(|e| e.0)
+        .collect();
+    let read = range_scan::ENTRIES_READ.with(|n| n.get());
+    assert_eq!(part, live(0..1_000));
+    assert!(read < 1_500, "a range of 1,000 keys read {read} entries");
+    Ok(())
+}
+
 // ── range pages and tombstones ────────────────────────────────────────────
 
 #[test]
@@ -541,7 +589,7 @@ fn test_bounded_page_walk_matches_unbounded_reference() -> Result<()> {
     for i in (0u128..500).filter(|i| i % 7 == 0) {
         lsm.delete(format!("row:{:04}", i).as_bytes())?;
     }
-    // Reference: one unbounded scan (uses the parallel read-everything path).
+    // Reference: one unbounded scan.
     let reference: Vec<Vec<u8>> = lsm
         .range_pointers_bounded(b"row:", None, usize::MAX)?
         .into_iter()

@@ -720,3 +720,53 @@ fn reset_rowmap_frees_every_row_id_once_no_field_exists() {
     assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys.len(), 500);
     db.shutdown().unwrap();
 }
+
+/// A write waiting for a field index's lock does not hold its value-log
+/// bucket lock meanwhile. A query or the index checkpoint can hold a field's
+/// lock for milliseconds (a range merging many values' bitmaps, an `msync`),
+/// and a writer that waited for it under the bucket lock held up every other
+/// write to the bucket, GC and TTL with it: 16 clients lost a sixth of their
+/// throughput in the engine benchmark. The write queues its change under the
+/// bucket lock and applies it after (`kv_store/index_queue.rs`).
+#[test]
+fn a_write_waiting_for_a_field_index_does_not_hold_its_bucket_lock() {
+    use std::time::{Duration, Instant};
+
+    let dir = TempDir::new().unwrap();
+    let db = Database::open(dir.path(), create_db_config()).unwrap();
+    let ns = DEFAULT_NAMESPACE_ID;
+    let field_id = activate_status_index(&db, ns);
+    let store = db.get_store(ns).unwrap();
+    let (index, queue) = {
+        let ns_index = store.namespace_index.read();
+        let entry = ns_index.get(field_id).unwrap();
+        (Arc::clone(&entry.index), Arc::clone(&entry.queue))
+    };
+    let key = b"doc:A";
+    let bucket = store.value_log.bucket_for_key(key);
+
+    // Held as the checkpoint holds it across an `msync`.
+    let held = index.read();
+    std::thread::scope(|s| {
+        let writer = s.spawn(|| db.put(key, br#"{"status":"active"}"#).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.len() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        // The writer is past its bucket lock, waiting for the field's: the
+        // bucket is free for anyone else.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let store = &store;
+        s.spawn(move || {
+            drop(store.value_log.lock_bucket_for_write(bucket).unwrap());
+            tx.send(()).unwrap();
+        });
+        let free = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(held);
+        writer.join().unwrap();
+        assert!(free, "the writer held its bucket lock while waiting for the field index");
+    });
+    // And the write's change is in the index once the write returns.
+    assert_eq!(db.query_keys(ns, "status = \"active\"").unwrap().keys, vec![key.to_vec()]);
+    db.shutdown().unwrap();
+}

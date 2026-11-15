@@ -6,6 +6,7 @@ use std::ops::ControlFlow;
 impl KVStore {
     /// Delete records whose creation epoch is older than `ttl`; see
     /// [`expire_records_with`](Self::expire_records_with).
+    #[cfg(test)]
     pub(crate) fn expire_records(&self, ttl: Duration, max_deletes_per_run: usize) -> Result<usize> {
         self.expire_records_with(ttl, max_deletes_per_run, |_| ())
     }
@@ -30,7 +31,9 @@ impl KVStore {
     /// ([`Version::next_system`]), so it needs no key stripe. A user write that
     /// drew its seq before the delete and has not applied yet is newer, and wins
     /// whenever it lands, after a crash too. `before_delete` runs between the
-    /// verdict and the compare-and-set: a test hook for landing a write there.
+    /// verdict and the compare-and-set: the TTL pass marks the namespace's
+    /// field indexes as exposed to a no-WAL write there (the tombstone is in no
+    /// WAL), and tests land a racing write there.
     pub(crate) fn expire_records_with(&self, ttl: Duration, max_deletes_per_run: usize, before_delete: impl Fn(&[u8])) -> Result<usize> {
         let now_millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let ttl_millis = ttl.as_millis() as u64;

@@ -72,8 +72,9 @@ key.
 Each namespace's `KVStore` owns its own 1,024 stripes (`KVStore::lock_key`),
 about 1 KiB per namespace, so a slow `merge` closure in one namespace never
 holds up writes to another. Reads, scans, GC, TTL and field reindexing take no
-stripe. The lock order is **key stripe → WAL → value-log bucket → field index**,
-and nothing waits for a lock while holding one later in that order.
+stripe. The lock order is **key stripe → WAL → value-log bucket → a field's
+change queue**, and nothing waits for a lock while holding one later in that
+order. A field index's own lock is taken with none of them held (below).
 
 ## System actions: GC and TTL expiry
 
@@ -114,19 +115,28 @@ In a namespace with field indexes, a write also moves the key's row in each
 field's bitmaps, and those changes must land in the order the key's versions
 do: each is a change relative to the key's previous value (take the row out of
 the old value's bitmap, add it to the new one's). User writes are ordered by
-the stripe, but TTL expiry takes none, so every writer changes the index
-**under the bucket lock**, with its memtable insert. Changed after the lock, a
-TTL tombstone and a put of the same value racing it could apply the other way
-round: the put adds the row, then the expiry's removal takes it out again, and
-a live document is missing from every query on the field.
+the stripe, but TTL expiry takes none, so the order is fixed under the bucket
+lock: every writer **queues** its change there, with its memtable insert, on
+the field's change queue (`kv_store/index_queue.rs`). Applied in any other
+order, a TTL tombstone and a put of the same value racing it could change the
+index the wrong way round: the put adds the row, then the expiry's removal
+takes it out again, and a live document is missing from every query on the
+field.
 
-The index change under the lock is in memory (the field's overlay). What can
-do I/O is left until the lock is released: a spill of a field the change took
-past the overlay budget's hard limit, and allocating a new key's row id (which
-can wait for a row-map flush) is done before the lock is taken.
+The change is applied after the bucket lock is released, not under it. The
+field's own lock can be held for milliseconds (a query merging many values'
+bitmaps, the index checkpoint's `msync`), and a writer waiting for it under the
+bucket lock would hold up every write to the bucket, GC and TTL with it. After
+releasing the bucket lock, the writer takes the field's write lock and applies
+every change queued so far, in queue order. Changes leave the queue only under
+that lock, so a writer that gets it finds its own change applied, by itself or
+by an earlier writer, and a write returns only once its change is in the index.
+A spill of a field past the overlay budget's hard limit follows, under the
+field's lock only; allocating a new key's row id (which can wait for a row-map
+flush) is done before the bucket lock is taken.
 
 A field reindex (`KVStore::reindex_field`: repair, a new index's build) reads
-the key's value with no lock and sets its row by compare-and-set: under the
+the key's value with no lock and queues its row by compare-and-set: under the
 bucket lock, only if the key still points at the record it read; otherwise it
 reads again.
 
@@ -135,10 +145,10 @@ reads again.
 Every writer to a bucket, GC and TTL wait while one of them holds its lock, so
 it is released as early as possible: a holder does memory work and the
 lookups its compare-and-set needs, and leaves anything else for after the
-lock. GC re-points one batch per hold; a write's index spill runs after it.
-Two things still wait for I/O under it, both rare: sealing a full segment
-(one fsync of it and a directory fsync, once per segment) and a field index
-whose checkpoint holds the field's lock across an `msync`.
+lock. GC re-points one batch per hold; a write's field-index changes are
+applied after it, and nothing waits for another lock under it that can be held
+across I/O. One thing still waits for I/O under it, rarely: sealing a full
+segment (one fsync of it and a directory fsync, once per segment).
 
 A version's system seq is a `u32`: about four billion system actions on one
 unchanged write. A copy that has used them all is re-pointed or expired as a user
@@ -252,7 +262,8 @@ the highest version.
 | `a_merge_over_a_put_that_never_applied_keeps_the_value_it_read` | a failed apply is not recorded, or replay brings it back over the merge |
 | `a_held_stripe_does_not_block_writes_to_another_namespace` | stripes are shared between namespaces |
 | `an_l0_file_never_points_at_a_value_a_power_loss_could_take` | a flush writes an L0 file before the value log is fsynced |
-| `ttl_expiry_and_reindexing_racing_puts_keep_the_index_in_step` | an index change is made after the bucket lock, or a reindex sets its row unchecked |
+| `ttl_expiry_and_reindexing_racing_puts_keep_the_index_in_step` | an index change is applied out of the order the bucket lock gives, or a reindex sets its row unchecked |
+| `a_write_waiting_for_a_field_index_does_not_hold_its_bucket_lock` | a write waits for a field's lock while holding its bucket lock |
 | `gc_releases_the_bucket_lock_between_batches_of_survivors` | GC re-points a whole segment under one hold of the lock |
 | `a_damaged_merged_through_fails_the_open_and_deletes_nothing` | the L1 header's CRC is not checked |
 | `an_aborted_merge_keeps_the_unapplied_marker` | a merge clears the unapplied mark before it writes |

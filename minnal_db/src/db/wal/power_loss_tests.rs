@@ -373,20 +373,28 @@ struct Expected {
 }
 
 /// Writers, a background thread doing what the workers do (flush, WAL GC,
-/// field-index checkpoints), small memtables and small WAL segments, so
-/// flushes, rotations, retirement and GC all happen often. At random moments
-/// every thread is stopped — writers either between operations or inside a
-/// commit — and the power-loss image is checked.
+/// field-index checkpoints, value-log GC, LSM compaction, TTL expiry, field
+/// reindexing), small memtables, small WAL and value-log segments, so flushes,
+/// rotations, retirement, relocation and expiry all happen often. At random
+/// moments every thread is stopped — writers either between operations or
+/// inside a commit — and the power-loss image is checked.
+///
+/// The `ttl` namespace is expired continuously (a TTL of zero), so its keys
+/// read as the last acknowledged value or absent; its field index must still
+/// agree with what it stores.
 fn power_loss_stress(seed: u64, images: usize) {
     const WRITERS: usize = 8;
     const KEYS_PER_WRITER: u64 = 40;
     let dir = TempDir::new().unwrap();
     let mut config = create_db_config();
     config.lsm_config.skip_list_capacity = 64;
+    config.segment_size_bytes = 64 * 1024;
     let db = Database::open_with_wal_segment_size(dir.path(), config, 4096).unwrap();
     let docs = db.create_namespace("docs").unwrap();
     let other = db.create_namespace("other").unwrap();
-    activate_status_index(&db, docs);
+    let ttl = db.create_namespace("ttl").unwrap();
+    let docs_status = activate_status_index(&db, docs);
+    activate_status_index(&db, ttl);
 
     // Each writer owns its keys, and no two writers' keys share a key-stripe
     // lock (stripes are per namespace): a writer stopped inside a commit holds its key's stripe, and a
@@ -397,7 +405,11 @@ fn power_loss_stress(seed: u64, images: usize) {
             let mut mine = Vec::new();
             let mut i = 0u64;
             while (mine.len() as u64) < KEYS_PER_WRITER {
-                let ns = if i.is_multiple_of(3) { other } else { docs };
+                let ns = match i % 5 {
+                    0 | 3 => other,
+                    4 => ttl,
+                    _ => docs,
+                };
                 let key = format!("w{w}/k{i}").into_bytes();
                 if taken.insert((ns, db.stripe_of(ns, &key))) {
                     mine.push((ns, key));
@@ -449,20 +461,51 @@ fn power_loss_stress(seed: u64, images: usize) {
             });
         }
         {
-            let (db, pause, parked, stop) = (&db, &pause, &parked, &stop);
+            let (db, pause, parked, stop, keys) = (&db, &pause, &parked, &stop, &keys);
             s.spawn(move || {
                 let mut i = 0u64;
+                let mut rng = Rng(seed ^ 0xBAC6_0000);
+                let stores = [docs, other, ttl].map(|ns| db.get_store(ns).unwrap());
                 while !stop.load(Ordering::SeqCst) {
                     park(pause, parked);
-                    match i % 3 {
+                    match i % 7 {
                         0 => {
                             db.flush_namespaces_pinning_wal();
                         }
                         1 => {
                             db.garbage_collect_wal().unwrap();
                         }
-                        _ => {
+                        2 => {
                             db.run_index_checkpoint().unwrap();
+                        }
+                        3 => {
+                            for store in &stores {
+                                store.garbage_collect_with_thresholds(0.0, 0.0).unwrap();
+                            }
+                        }
+                        4 => {
+                            for store in &stores {
+                                if rng.below(4) == 0 {
+                                    store.compact_lsm().unwrap();
+                                } else {
+                                    store.compact_lsm_due().unwrap();
+                                }
+                            }
+                        }
+                        5 => {
+                            // As the TTL worker does (`run_ttl_pass`).
+                            stores[2]
+                                .expire_records_with(Duration::ZERO, 20, |_| db.note_no_wal_index_exposure(ttl))
+                                .unwrap();
+                        }
+                        _ => {
+                            for _ in 0..8 {
+                                let mine = &keys[rng.below(WRITERS as u64) as usize];
+                                let (ns, key) = &mine[rng.below(KEYS_PER_WRITER) as usize];
+                                if *ns == docs {
+                                    db.reindex_field(docs, docs_status, key).unwrap();
+                                }
+                            }
                         }
                     }
                     i += 1;
@@ -506,30 +549,50 @@ fn power_loss_stress(seed: u64, images: usize) {
 
 fn check_image(image: &Database, expected: &Expected, seed: u64, round: usize) {
     let in_flight: HashMap<&(NamespaceId, Vec<u8>), &Option<Vec<u8>>> = expected.in_flight.values().map(|(k, v)| (k, v)).collect();
+    let ttl = image.get_namespace_id("ttl").unwrap();
     for ((ns, key), want) in &expected.acked {
         // Namespace ids are kept in the copied registry.
         let got = image.get_ns(*ns, key).unwrap();
-        let ok = got == *want || in_flight.get(&(*ns, key.clone())).is_some_and(|v| got == **v);
+        let ok = got == *want
+            || in_flight.get(&(*ns, key.clone())).is_some_and(|v| got == **v)
+            // An expiring namespace may have expired it.
+            || (*ns == ttl && got.is_none());
         let text = String::from_utf8_lossy(key);
         assert!(ok, "seed {seed} image {round}: ns {ns} {text} reads {got:?}, acknowledged {want:?}");
     }
     // The field index, rebuilt from its checkpoint and the WAL, agrees with the
     // documents themselves.
-    let docs = image.get_namespace_id("docs").unwrap();
-    activate_status_index(image, docs);
-    let mut indexed = image.query_keys(docs, "status = \"active\"").unwrap().keys;
-    indexed.sort();
-    let mut stored: Vec<Vec<u8>> = image
-        .get_store(docs)
-        .unwrap()
-        .scan_prefix_batch(b"")
-        .unwrap()
-        .into_iter()
-        .filter(|(_, v)| v.windows(17).any(|w| w == br#""status":"active""#))
-        .map(|(k, _)| k)
-        .collect();
-    stored.sort();
-    assert_eq!(indexed, stored, "seed {seed} image {round}: the field index disagrees with the documents");
+    for name in ["docs", "ttl"] {
+        let ns = image.get_namespace_id(name).unwrap();
+        let field = activate_status_index(image, ns);
+        // TTL's deletes are in no WAL, so a crash can leave its index behind;
+        // that must be recorded as a gap, and repair must bring it level.
+        if name == "ttl" && image.index_manager.read_gap(ns, field).is_some() {
+            image.repair_field_index(ns, field).unwrap();
+        }
+        let mut indexed = image.query_keys(ns, "status = \"active\"").unwrap().keys;
+        indexed.sort();
+        let mut stored: Vec<Vec<u8>> = image
+            .get_store(ns)
+            .unwrap()
+            .scan_prefix_batch(b"")
+            .unwrap()
+            .into_iter()
+            .filter(|(_, v)| v.windows(17).any(|w| w == br#""status":"active""#))
+            .map(|(k, _)| k)
+            .collect();
+        stored.sort();
+        assert_eq!(
+            indexed, stored,
+            "seed {seed} image {round}: {name}'s field index disagrees with the documents"
+        );
+    }
+    // Every layer holds a newer version than the layers below it.
+    for name in ["docs", "other", "ttl"] {
+        let ns = image.get_namespace_id(name).unwrap();
+        let violations = image.get_store(ns).unwrap().lsm.layer_order_violations().unwrap();
+        assert!(violations.is_empty(), "seed {seed} image {round}: {name}: {violations:?}");
+    }
 }
 
 #[test]

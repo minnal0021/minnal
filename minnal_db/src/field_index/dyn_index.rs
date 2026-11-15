@@ -637,11 +637,11 @@ impl DynFieldIndex {
     }
 
     /// Apply one row's `change` **without** the hard-limit spill every other
-    /// write method ends with, for a caller holding a lock no I/O may run
-    /// under: the store's write path changes the index under its value-log
-    /// bucket lock (so a key's index changes land in the order its versions
-    /// do), and calls [`spill_if_over_budget`](Self::spill_if_over_budget) once
-    /// that lock is released. Errors as the matching method's.
+    /// write method ends with, for a caller that applies several changes and
+    /// spills once after: the store's write path applies the changes writes
+    /// queued (`kv_store/index_queue.rs`), then calls
+    /// [`spill_if_over_budget`](Self::spill_if_over_budget). Errors as the
+    /// matching method's.
     pub fn apply_without_spill(&mut self, row_id: u128, change: RowChange<'_>) -> Result<(), String> {
         let rows = std::slice::from_ref(&row_id);
         match change {
@@ -683,7 +683,7 @@ impl DynFieldIndex {
     /// it after this field's write, spill this field before returning. Every
     /// write path (the store's write path, WAL replay, reindex) goes through
     /// these methods, so the bound holds wherever the index is changed; the
-    /// store's write path calls it itself, after its bucket lock
+    /// store's write path calls it itself, once per batch of queued changes
     /// ([`apply_without_spill`](Self::apply_without_spill)).
     pub fn spill_if_over_budget(&mut self) {
         if self.overlay_budget().over_hard() && self.overlay_bytes() > 0 {

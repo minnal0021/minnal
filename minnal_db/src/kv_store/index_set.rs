@@ -16,6 +16,7 @@ use parking_lot::RwLock;
 
 use crate::field_index::FieldId;
 use crate::field_index::{DynFieldIndex, IndexValue};
+use crate::kv_store::index_queue::ChangeQueue;
 
 /// Write-path sink for field-index updates that were **rejected**.
 ///
@@ -118,6 +119,21 @@ pub struct IndexEntry {
     /// The live in-memory index — shared between the KVStore write path and
     /// the checkpoint worker.
     pub index: Arc<RwLock<DynFieldIndex>>,
+    /// Row changes writes have queued under their bucket lock and not yet
+    /// applied to `index` ([`ChangeQueue`]).
+    pub(crate) queue: Arc<ChangeQueue>,
+}
+
+impl IndexEntry {
+    /// An entry for `field_id`'s live `index`, with nothing queued.
+    pub fn new(field_id: FieldId, extractor: ExtractorFn, index: DynFieldIndex) -> Self {
+        Self {
+            field_id,
+            extractor,
+            index: Arc::new(RwLock::new(index)),
+            queue: Arc::default(),
+        }
+    }
 }
 
 // ── NamespaceIndexSet ──────────────────────────────────────────────────────
@@ -176,11 +192,7 @@ mod tests {
     #[test]
     fn test_register_and_lookup() {
         let mut set = NamespaceIndexSet::new();
-        let entry = IndexEntry {
-            field_id: 0,
-            extractor: Arc::new(|_| Some(IndexValue::Int(1))),
-            index: Arc::new(RwLock::new(DynFieldIndex::new(IndexValueType::Int))),
-        };
+        let entry = IndexEntry::new(0, Arc::new(|_| Some(IndexValue::Int(1))), DynFieldIndex::new(IndexValueType::Int));
         set.register(entry);
         assert!(set.get(0).is_some());
         assert!(set.get(1).is_none());

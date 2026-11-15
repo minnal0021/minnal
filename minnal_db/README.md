@@ -596,7 +596,7 @@ merge(key, operand, closure)
 Three things fall out of that shape:
 
 - **The WAL never learns a merge happened.** It records the *result* as an ordinary `Upsert` or `Delete`, so recovery, WAL GC and index replay are byte-for-byte unchanged, and nothing re-runs the closure at replay — which is what makes an arbitrary Rust closure usable here at all.
-- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway. Field-index changes are made under the bucket lock, so a key's index changes land in the order its versions do even for TTL expiry, which takes no stripe.
+- **The stripe is above the WAL lock, not below it.** Holding the (global) WAL metadata lock across user code would stall every namespace's writes, and taking the value-log bucket lock first would invert the order the rest of the engine uses. A striped per-key mutex above both gives one uniform order — `key stripe → WAL → value-log bucket` — at effectively no cost, since every write already serialises on the WAL `fsync` anyway. Field-index changes are queued under the bucket lock and applied in that order just after it, so a key's index changes land in the order its versions do even for TTL expiry, which takes no stripe, and no write waits under the bucket lock for a field index a query is reading.
 - **`put` and `delete` take the stripe too**, so a blind write cannot land between a merge's read and its write. The guarantee is per key: this is not a transaction.
 
 ### Read Path
@@ -780,13 +780,13 @@ These are ballpark figures; treat them as orders of magnitude rather than guaran
 | `put` (small values) | ~1,350 ops/s for one writer on an NVMe drive without power-loss protection (0.73–0.75 ms each for 128 B–8 KiB values, measured on zero-filled WAL segments): each write waits for its own fsync. Concurrent writers share fsyncs, so together they do more (about 1,400 documents/s, each three WAL writes, with 16 clients in the semantic-search ingest benchmark). |
 | `delete` | ~1,350 ops/s for one writer — same fsync bound as `put` |
 | `merge` (small values) | ~1,350 ops/s for one writer — the read-modify-write and its per-key lock add ~0.5–0.7 µs, small next to the fsync it pays anyway |
-| `get` from memory | 1M–2.5M ops/s per thread |
-| `get` from disk (L1 SSTable) | 100k–300k ops/s per thread |
+| `get` from memory | 1.5M–3M ops/s per thread |
+| `get` from disk (L1 SSTable) | 170k–400k ops/s per thread |
 | Range / prefix scan | Proportional to the number of results |
 
-Actual numbers depend mostly on value size and the drive's fsync latency. [`benchmark.md`](benchmark.md) measures every figure above, with the hardware it ran on. Be suspicious of any write figure measured without the fsync: the same WAL append runs about 3,000 times faster with the sync left out, so it is easy to publish a write throughput that quietly assumes it away.
+Actual numbers depend mostly on value size and the drive's fsync latency. [`benchmark.md`](benchmark.md) measures every figure above, with the hardware it ran on. Be suspicious of any write figure measured without the fsync: the same WAL append runs up to about 1,900 times faster with the sync left out, so it is easy to publish a write throughput that quietly assumes it away.
 
-**For one writer, every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 2.8% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
+**For one writer, every durable write costs one fsync, and nothing else it does is measurable next to that.** `put`, `delete`, `merge`, and a typed write all land within 5% of each other on the same hardware — closer together than the run-to-run noise on any one of them — so the way to reason about write throughput is to count fsyncs, not operations. `merge`'s guarantee (an atomic read-modify-write under a per-key lock) is therefore effectively free: the hand-rolled `get`-then-`put` a caller would write instead measures no faster. See [`benchmark.md`](benchmark.md#what-merge-costs-over-put) for the decomposition.
 
 ---
 

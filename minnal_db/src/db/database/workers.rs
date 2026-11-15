@@ -337,8 +337,13 @@ impl TtlTarget for Database {
             let Some(store) = self.stores.read().get(&ns_id).cloned() else {
                 continue;
             };
-            // Expiry takes each key's stripe itself (see `KVStore::expire_records_with`).
-            match store.expire_records(ttl, max_deletes) {
+            // Expiry takes no key stripe: each delete is a compare-and-set at
+            // the expired copy's next system version (`KVStore::expire_records_with`).
+            // Its tombstones are in no WAL, so a field index on the namespace
+            // could not replay them after a crash: mark the namespace before the
+            // first delete, as every no-WAL write does, so an unclean shutdown
+            // records a gap instead of leaving a deleted key's row in the index.
+            match store.expire_records_with(ttl, max_deletes, |_| self.note_no_wal_index_exposure(ns_id)) {
                 Ok(deleted) => {
                     if deleted > 0 {
                         info!("[TtlWorker] ns_id={} expired {} record(s)", ns_id, deleted);

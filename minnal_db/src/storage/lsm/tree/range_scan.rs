@@ -9,7 +9,9 @@
 //! resolve exactly ([`fold_newest`]). If those keys hold fewer than `limit` live
 //! keys (newer layers' tombstones deleted the rest), the page is read again with
 //! a window four times larger. A page's work and memory are therefore about its
-//! size times the number of layers, whatever lies after the cursor.
+//! size times the number of layers, whatever lies after the cursor. A whole range
+//! (`limit` = `usize::MAX`) is first read with a window of [`PARALLEL_WINDOW`],
+//! on this thread, and only a range larger than that is read again in full.
 //!
 //! An example, with a page of 2 keys (so a window of 3) starting from `b`:
 //!
@@ -79,7 +81,12 @@ impl LSMTree {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut window = limit.saturating_add(1);
+        // A large limit (a whole range in one call: `usize::MAX`) reads a window
+        // small enough to stay on this thread first: most ranges fit in it, and a
+        // thread per bucket would cost more than the read. One that does not fit
+        // is read again with the full window.
+        let full = limit.saturating_add(1);
+        let mut window = full.min(PARALLEL_WINDOW);
         loop {
             let layers = self.read_range_window(start, end, window)?;
             // Keys at or below this are read in full from every layer.
@@ -101,7 +108,7 @@ impl LSMTree {
             if page.len() == limit || complete_to.is_none() {
                 return Ok(page);
             }
-            window = window.saturating_mul(4);
+            window = if window < full { full } else { window.saturating_mul(4) };
         }
     }
 
@@ -140,8 +147,13 @@ impl LSMTree {
             Ok((l1, l0))
         };
         let buckets: Vec<(LayerRun, Vec<LayerRun>)> = if window > PARALLEL_WINDOW {
+            // A thread only for a bucket with files to read in the range.
+            let busy = |b: usize| !l0_guards[b].is_empty() || self.l1_overlaps(b, start, end);
             std::thread::scope(|s| {
-                let handles: Vec<_> = (0..self.config.num_buckets).map(|b| s.spawn(move || read_bucket(b))).collect();
+                let handles: Vec<_> = (0..self.config.num_buckets)
+                    .filter(|b| busy(*b))
+                    .map(|b| s.spawn(move || read_bucket(b)))
+                    .collect();
                 handles
                     .into_iter()
                     .map(|h| {
