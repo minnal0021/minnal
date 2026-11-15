@@ -191,6 +191,11 @@ struct Inner {
     /// synced_offset` is everything this bucket holds that a power loss could
     /// still take away.
     synced_offset: u64,
+    /// Where the newest record in the active segment that **no log covers**
+    /// ends (a no-WAL write's value, a GC copy): see
+    /// [`mark_unlogged`](ValueLog::mark_unlogged). A flush fsyncs the log before
+    /// its L0 file points at such a record, since nothing could restore it.
+    unlogged_end: u64,
     total_gc_runs: u64,
     total_bytes_reclaimed: u64,
 }
@@ -467,6 +472,7 @@ impl ValueLog {
                 // What a previous process wrote reached at least the page cache,
                 // which survives that process; nothing here is newly written.
                 synced_offset: active_offset,
+                unlogged_end: active_offset,
                 total_gc_runs: persisted.total_gc_runs,
                 total_bytes_reclaimed: persisted.total_bytes_reclaimed,
             }),
@@ -544,6 +550,7 @@ impl ValueLog {
         inner.active_file = file;
         inner.active_offset = SEGMENT_HEADER_SIZE;
         inner.synced_offset = SEGMENT_HEADER_SIZE;
+        inner.unlogged_end = SEGMENT_HEADER_SIZE;
         Ok(())
     }
 
@@ -637,6 +644,33 @@ impl ValueLog {
             s.live_bytes = s.live_bytes.saturating_sub(bytes);
             s.garbage_bytes = s.garbage_bytes.saturating_add(bytes);
         }
+    }
+
+    /// Note that the record at `location` (for a key of `key_len` bytes) is in
+    /// no log: a no-WAL write's value or a GC copy. A logged write's value a
+    /// power loss takes is written again by replay; these cannot be, so
+    /// [`sync_unlogged`](Self::sync_unlogged) makes them durable before an L0
+    /// file points at them. Called right after the append, under the bucket
+    /// lock. A record in a segment sealed since needs nothing: sealing fsyncs.
+    pub fn mark_unlogged(&self, location: ValueLocation, key_len: usize) {
+        let end = u64::from(location.rec_offset) + ValueRecordHeader::record_len(key_len, location.value_len as usize);
+        let mut inner = self.inner.write();
+        if inner.active_id == location.segment_id {
+            inner.unlogged_end = inner.unlogged_end.max(end);
+        }
+    }
+
+    /// Make the records no log covers durable ([`mark_unlogged`](Self::mark_unlogged)):
+    /// a [`sync`](Self::sync) when one of them is past what is fsynced, else
+    /// nothing.
+    pub fn sync_unlogged(&self) -> Result<()> {
+        {
+            let inner = self.inner.read();
+            if inner.unlogged_end <= inner.synced_offset {
+                return Ok(());
+            }
+        }
+        self.sync()
     }
 
     /// Make every record appended so far durable. Sealed segments were fsynced

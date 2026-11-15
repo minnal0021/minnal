@@ -21,7 +21,7 @@ impl LSMTree {
     /// holds the key. [`get_with_seq`](Self::get_with_seq) is this with
     /// tombstones read as absent; the write path needs the tombstone's version
     /// to tell whether a write is newer than the delete.
-    pub(super) fn current_copy(&self, key: &[u8]) -> Result<Candidate> {
+    pub(crate) fn current_copy(&self, key: &[u8]) -> Result<Candidate> {
         if let Some(m) = self.metrics() {
             Metrics::bump(&m.lookups);
         }

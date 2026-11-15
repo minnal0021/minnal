@@ -172,11 +172,24 @@ namespace's safe offset can be older than a copy of its key already on disk:
 So `replay_upsert` and `replay_delete` check, under the bucket lock, whether the
 record is strictly newer than the key's current copy, tombstones included
 (`LSMTree::current_pointer_and_wins`). If not, the record is dropped: nothing is
-appended to the value log, no garbage is counted and no field index changes. An
-equal version is the same write, already stored, and its value is durable:
-every flush fsyncs the value log before it writes an L0 file
-(`SyncValueLogBeforePersist`), and open finds L0 files by listing their
-directories, so no L0 file on disk can point at a record a power loss took.
+appended to the value log, no garbage is counted and no field index changes.
+
+A record with the same user seq as the stored copy is the same write, already
+stored, unless a power loss took its value. A flush fsyncs the value log just
+before the logs retire the memtable's records, not before it writes the L0
+file (an fsync there costs concurrent writers), and open finds L0 files by
+listing their directories. So a power loss between the two leaves an L0 copy
+pointing at a record that is gone, or at an offset a later append has reused,
+while the log still holds the record. Replay checks the stored copy's record
+(whole, its checksum, carrying the write's seq: `ShardedValueLog::holds_record`)
+and, if it is not there, **heals** it: it appends the value again and points
+the key at it at the stored copy's next system version, as a GC relocation
+does. That copy is newer than the broken one and older than any later user
+write, and a second replay of the record finds it intact and drops it.
+
+Values no log covers (a no-WAL write's, a GC copy) could not be written again,
+so a flush fsyncs those before it writes an L0 file pointing at them
+(`ValueLog::mark_unlogged`, `sync_unlogged`).
 
 Both logs keep their own files and replay as they do, the vector index WAL
 first; with the check, the order between them does not matter. One merged log
@@ -261,7 +274,8 @@ the highest version.
 | `an_empty_merge_still_records_what_it_merged` | a merge that empties L1 loses its `merged_through` |
 | `a_merge_over_a_put_that_never_applied_keeps_the_value_it_read` | a failed apply is not recorded, or replay brings it back over the merge |
 | `a_held_stripe_does_not_block_writes_to_another_namespace` | stripes are shared between namespaces |
-| `an_l0_file_never_points_at_a_value_a_power_loss_could_take` | a flush writes an L0 file before the value log is fsynced |
+| `replay_writes_again_a_value_a_power_loss_took_from_under_an_l0_file` | replay drops a record whose stored copy's value a power loss took |
+| `an_l0_file_never_points_at_an_unlogged_value_a_power_loss_could_take` | a flush writes an L0 file pointing at a no-WAL value or a GC copy before fsyncing it |
 | `ttl_expiry_and_reindexing_racing_puts_keep_the_index_in_step` | an index change is applied out of the order the bucket lock gives, or a reindex sets its row unchecked |
 | `a_write_waiting_for_a_field_index_does_not_hold_its_bucket_lock` | a write waits for a field's lock while holding its bucket lock |
 | `gc_releases_the_bucket_lock_between_batches_of_survivors` | GC re-points a whole segment under one hold of the lock |

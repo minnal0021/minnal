@@ -552,28 +552,35 @@ impl KVStore {
     }
 }
 
-/// Makes a store's value log durable before any L0 file points into it.
+/// Makes a store's value log durable before anything durable depends on it.
 ///
-/// Writes fsync the WAL but not the value log (that is `records_per_sync`'s
-/// cadence), which is safe only while nothing durable points at an unsynced
-/// record. An L0 file is durable the moment it is written: open finds L0 files
-/// by listing their directories, registered or not. So the value log is fsynced
-/// when a flush **begins** (`on_ro_memtable_flushing`), before any L0 file is
-/// written. Every record the flushed memtable points at was appended before the
-/// memtable was sealed, so that one fsync covers them all; it is the flush's only
-/// value-log fsync (the written event, where both WALs retire the memtable's
-/// entries, needs none of its own).
+/// Writes fsync their log but not the value log (that is `records_per_sync`'s
+/// cadence). An L0 file is durable the moment it is written (open finds L0
+/// files by listing their directories, registered or not), so a power loss
+/// after it is written can leave it pointing at a value that was never
+/// fsynced. Two fsyncs keep that recoverable:
 ///
-/// Fsynced only at the written event, a power loss after the L0 file was
-/// written left a durable pointer to a lost record. A WAL-backed write was then
-/// lost too: replay drops a record whose version equals the stored copy's (the
-/// same write), so the WAL could not heal it. A GC relocation or a no-WAL write
-/// has no log at all. Guard:
-/// `an_l0_file_never_points_at_a_value_a_power_loss_could_take`.
+/// - **Before the WAL progress is saved** (`on_ro_memtable_written`, before
+///   the inner observer): every bucket appended to since its last fsync. Both
+///   logs retire the memtable's records there, so a logged write's value is
+///   durable before the record that could restore it is gone. Until then, a
+///   value a power loss took is written again by replay
+///   (`KVStore::replay_decision`).
+/// - **Before the L0 file is written** (`on_ro_memtable_flushing`): only the
+///   buckets holding a record **no log covers** past their last fsync (a
+///   no-WAL write's value, a GC copy; `ValueLog::mark_unlogged`). Nothing could
+///   write those again. Every record the memtable points at was appended
+///   before it was sealed, so this check sees them all.
+///
+/// An fsync of every bucket before the L0 file was measured costing concurrent
+/// writers up to 14% of their median latency (the engine benchmark, 8 and 16
+/// clients); the fsync after it, as here, cost nothing measurable. Guards:
+/// `an_l0_file_never_points_at_an_unlogged_value_a_power_loss_could_take`,
+/// `replay_writes_again_a_value_a_power_loss_took_from_under_an_l0_file`.
 ///
 /// Installed on every store, with or without a database observer (`inner`).
-/// A failed fsync vetoes the flush with nothing written: the memtable stays
-/// read-only and is flushed again later.
+/// A failed fsync vetoes the flush: the memtable stays read-only and is
+/// flushed again later.
 struct SyncValueLogBeforePersist {
     inner: Option<Arc<dyn LsmFlushObserver>>,
     logs: Vec<Arc<crate::storage::value_log::ValueLog>>,
@@ -588,7 +595,7 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
 
     fn on_ro_memtable_flushing(&self, version: u64) -> std::io::Result<()> {
         for log in &self.logs {
-            if let Err(e) = log.sync() {
+            if let Err(e) = log.sync_unlogged() {
                 error!("value-log fsync failed before memtable {version}'s L0 files were written; the flush is put off: {e:?}");
                 return Err(std::io::Error::other(format!("value-log fsync failed: {e}")));
             }
@@ -600,6 +607,12 @@ impl LsmFlushObserver for SyncValueLogBeforePersist {
     }
 
     fn on_ro_memtable_written(&self, version: u64) -> std::io::Result<()> {
+        for log in &self.logs {
+            if let Err(e) = log.sync() {
+                error!("value-log fsync failed before memtable {version}'s log records were retired; the flush is undone: {e:?}");
+                return Err(std::io::Error::other(format!("value-log fsync failed: {e}")));
+            }
+        }
         match &self.inner {
             Some(inner) => inner.on_ro_memtable_written(version),
             None => Ok(()),

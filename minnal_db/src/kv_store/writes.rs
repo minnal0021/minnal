@@ -5,6 +5,29 @@ use crate::field_index::{DynFieldIndex, FieldId};
 use crate::kv_store::index_queue::{ChangeOutcome, ChangeQueue, QueuedChange};
 use crate::kv_store::index_set::IndexEntry;
 
+/// Where a put comes from, which decides what replay does with it and whether
+/// a log covers its value.
+#[derive(Clone, Copy)]
+enum PutSource {
+    /// A live write. `logged`: a log (the main WAL or the vector index WAL)
+    /// holds it until its memtable is flushed, so replay can write its value
+    /// again if a power loss takes it.
+    Live { logged: bool },
+    /// Replayed from a log at its original seq.
+    Replayed,
+}
+
+/// What replay does with a record ([`KVStore::replay_decision`]).
+enum ReplayDecision {
+    /// Newer than every stored copy: apply it.
+    Apply,
+    /// Not newer, and the stored copy is intact: it is stored already.
+    Drop,
+    /// The same write as the stored copy, whose value a power loss took: write
+    /// the value again at this version (the stored copy's next system version).
+    Heal(Version),
+}
+
 /// The fields a write queued index changes on under its bucket lock, for
 /// [`KVStore::finish_index_follow_up`] to apply once the lock is released
 /// (see `kv_store/index_queue.rs`).
@@ -27,30 +50,31 @@ impl KVStore {
     /// Put a key-value pair into storage (LSM + value log).
     /// WAL writing is handled by the caller (Database coordinator).
     ///
-    /// Allocates the write sequence from the store's counter: for standalone
-    /// tests. Every database write path uses
-    /// [`put_to_storage_seq`](Self::put_to_storage_seq) with the seq it drew
-    /// under the key's stripe, so live order equals recovery's.
+    /// A write **no log covers**: the no-WAL writes (`put_ns_no_wal`,
+    /// `merge_ns_no_wal`) and standalone tests. Allocates the write sequence
+    /// from the store's counter; a flush makes its value durable before an L0
+    /// file points at it (`ValueLog::mark_unlogged`).
     pub fn put_to_storage(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.put_to_storage_inner(key, value, self.alloc_seq(), false)
+        self.put_to_storage_inner(key, value, self.alloc_seq(), PutSource::Live { logged: false })
     }
 
-    /// Put a key-value pair carrying an explicit global write sequence, so
-    /// concurrent writes to the same key resolve highest-sequence-wins
-    /// (live == recovery). `seq` is the full global `u64` sequence, stored at full
-    /// width in both the LSM and the value record.
+    /// A write a log covers (the main WAL, or the vector index WAL), carrying
+    /// the global write sequence it drew under the key's stripe, so live order
+    /// equals recovery's. `seq` is stored at full width in both the LSM and
+    /// the value record.
     pub fn put_to_storage_seq(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
-        self.put_to_storage_inner(key, value, seq, false)
+        self.put_to_storage_inner(key, value, seq, PutSource::Live { logged: true })
     }
 
     /// A put replayed from a log at its original `seq` (see
-    /// [`replay_upsert`](Self::replay_upsert)): dropped unless it is newer than
-    /// every stored copy of the key.
+    /// [`replay_upsert`](Self::replay_upsert)): applied if it is newer than
+    /// every stored copy of the key, its value written again if a power loss
+    /// took the stored copy's, else dropped ([`replay_decision`](Self::replay_decision)).
     pub(super) fn put_replayed(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
-        self.put_to_storage_inner(key, value, seq, true)
+        self.put_to_storage_inner(key, value, seq, PutSource::Replayed)
     }
 
-    fn put_to_storage_inner(&self, key: &[u8], value: &[u8], seq: u64, replayed: bool) -> Result<()> {
+    fn put_to_storage_inner(&self, key: &[u8], value: &[u8], seq: u64, source: PutSource) -> Result<()> {
         let epoch = current_epoch_millis();
         // Only field indexes need to know what this write replaces: its previous
         // value (for an `O(1)` targeted update instead of a scan of every value)
@@ -75,16 +99,21 @@ impl KVStore {
         let bucket = self.value_log.bucket_for_key(key);
         let bucket_guard = self.value_log.lock_bucket_for_write(bucket)?;
 
-        if replayed && !self.replay_wins(key, seq)? {
-            return Ok(());
-        }
+        let version = match source {
+            PutSource::Live { .. } => Version::user(seq),
+            PutSource::Replayed => match self.replay_decision(key, seq)? {
+                ReplayDecision::Apply => Version::user(seq),
+                ReplayDecision::Drop => return Ok(()),
+                ReplayDecision::Heal(version) => version,
+            },
+        };
 
         // A losing write (older than the key's current copy) leaves the index
         // alone, so it reads nothing. Live writes never lose (the stripe), and a
         // losing replay was dropped above; the check stays as the index's guard. Which write is
-        // newest is decided by `seq` alone, never by anything in the record.
+        // newest is decided by the version alone, never by anything in the record.
         let (wins, key_existed, old_value) = if indexed {
-            let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
+            let (existing_u128, wins) = self.lsm.current_pointer_and_wins(key, version)?;
             let displaced = if wins { existing_u128.and_then(decode_sharded_pointer) } else { None };
             let old_value = displaced.and_then(|old| self.value_log.read_value(old).ok());
             (wins, displaced.is_some(), old_value)
@@ -97,7 +126,10 @@ impl KVStore {
 
         let record_meta = ValueRecordMeta { epoch, seq };
         let pointer = self.value_log.append_to_locked_bucket(bucket, key, value, record_meta, false)?;
-        let applied = match self.lsm.insert_with_seq(key, pointer.to_u128(), seq) {
+        if let PutSource::Live { logged: false } = source {
+            self.value_log.mark_unlogged(pointer, key.len());
+        }
+        let applied = match self.lsm.insert_with_seq(key, pointer.to_u128(), version) {
             Ok(applied) => applied,
             Err(e) => {
                 // A failed insert inserts nothing, so nothing points at the record
@@ -389,6 +421,54 @@ impl KVStore {
     fn replay_wins(&self, key: &[u8], seq: u64) -> Result<bool> {
         let (_pointer, wins) = self.lsm.current_pointer_and_wins(key, seq)?;
         Ok(wins)
+    }
+
+    /// What replay does with a put of `key` at user seq `seq`: as
+    /// [`replay_wins`](Self::replay_wins), but a record that is the same write
+    /// as the stored copy (the same user seq) is checked against what that copy
+    /// points at. Called with the key's bucket lock held.
+    ///
+    /// A logged write's value is fsynced only before its log record is retired,
+    /// not before an L0 file points at it (an fsync per flush there cost
+    /// concurrent writers up to a sixth of their latency). So a power loss
+    /// between the two leaves an L0 copy of the write whose value is gone, or
+    /// whose offset a later append has reused, and the log record that can
+    /// restore it. The value is then written again and the key pointed at it,
+    /// at the stored copy's next system version, as a GC relocation does: the
+    /// copy is newer than the broken one, older than any later user write, and
+    /// a second replay of the record finds it intact. Reading the stored record
+    /// is I/O under the bucket lock, on the replay path only.
+    fn replay_decision(&self, key: &[u8], seq: u64) -> Result<ReplayDecision> {
+        let Some((pointer, stored)) = self.lsm.current_copy(key)? else {
+            return Ok(ReplayDecision::Apply);
+        };
+        if Version::user(seq) > stored {
+            return Ok(ReplayDecision::Apply);
+        }
+        // A tombstone of the same write (TTL expiry) has no value to lose.
+        let lost = stored.user == seq
+            && pointer
+                .and_then(decode_sharded_pointer)
+                .is_some_and(|p| !self.value_log.holds_record(p, seq));
+        if !lost {
+            return Ok(ReplayDecision::Drop);
+        }
+        match stored.next_system() {
+            Some(version) => {
+                warn!(
+                    "[KVStore:{}] replay: a power loss took the value of a write an L0 file points at; writing it again from the log",
+                    self.name
+                );
+                Ok(ReplayDecision::Heal(version))
+            }
+            None => {
+                error!(
+                    "[KVStore:{}] replay: a write's value is lost and its version has no system seq left to re-point it with",
+                    self.name
+                );
+                Ok(ReplayDecision::Drop)
+            }
+        }
     }
 
     /// `key`'s row id for a delete's index change, looked up **before** the

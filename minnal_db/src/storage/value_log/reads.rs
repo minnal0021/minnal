@@ -62,6 +62,32 @@ impl ValueLog {
         Ok((start..end, header.meta()))
     }
 
+    /// Whether `location` holds an intact record of the write whose user seq is
+    /// `seq`: the record is all there, its value matches its checksum (checked
+    /// whatever `verify_checksums_on_read` says) and it carries that seq.
+    ///
+    /// Replay asks this of a stored copy of the write it is replaying. A power
+    /// loss can take a value whose L0 pointer survived, and the active segment
+    /// is then appended to from where the surviving records end, so the pointer
+    /// can name a missing record or another write's. Write seqs are unique, and
+    /// a GC copy keeps its write's, so a record carrying `seq` is that write's.
+    pub fn holds_record(&self, location: ValueLocation, seq: u64) -> bool {
+        if location.segment_id == 0 {
+            return false;
+        }
+        let Ok(file) = self.segment_file(location.segment_id) else {
+            return false;
+        };
+        let mut buf = vec![0u8; ValueRecordHeader::SIZE + location.value_len as usize];
+        if read_exact_or_corrupt(&file, &mut buf, location.rec_offset as u64).is_err() {
+            return false;
+        }
+        let Some(header) = ValueRecordHeader::from_bytes(&buf) else {
+            return false;
+        };
+        header.value_len == location.value_len && header.seq == seq && value_checksum(&buf[ValueRecordHeader::SIZE..]) == header.checksum
+    }
+
     /// Read a value: **one `pread`** of exactly `header + value_len` bytes.
     pub fn read_value(&self, location: ValueLocation) -> Result<Vec<u8>> {
         Ok(self.read_value_and_meta(location)?.0)

@@ -49,7 +49,12 @@ async fn test_pending_queue_count_and_list_after_enqueue() {
     let db_dir = TempDir::new().unwrap();
     let store = open_fresh(db_dir.path()).await;
 
-    // Enqueue two entries directly via vector_kv primitives.
+    // Enqueue two entries directly via vector_kv primitives. Their namespaces
+    // exist: the vector worker discards an entry whose namespace does not, and
+    // could do so between the count and the list below.
+    for ns in ["ns_a", "ns_b"] {
+        store.db.namespace(ns.to_string()).await.unwrap();
+    }
     vector_kv::enqueue_embed(&store.db, "ns_a", b"doc1", "text a").await.unwrap();
     vector_kv::enqueue_embed(&store.db, "ns_b", b"doc2", "text b").await.unwrap();
 

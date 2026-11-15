@@ -336,12 +336,15 @@ sequenceDiagram
     participant G as WAL GC (every 60 s)
     M->>F: memtable full: seal it (read-only)
     F->>W: sealed event: note how far this memtable reaches in the WAL
-    F->>F: fsync the value log (every value the L0 files will point at)
+    F->>F: fsync any value no log covers (no-WAL writes, GC copies)
     F->>F: write and fsync its L0 files (not yet readable)
+    F->>F: fsync the value log (every value the L0 files point at)
     F->>W: written event: move this namespace's safe offset and the cut, save them
     F->>F: register the L0 files
     G->>W: delete every segment wholly below the cut
 ```
+
+The value log is made durable before the WAL entries that could rewrite its values are retired. A power loss after an L0 file is written but before that fsync can leave the file pointing at a lost value; replay, which still has the entry, writes the value again and points the key at it. Values no log covers are fsynced before any L0 file points at them, since nothing could rewrite them.
 
 The WAL lock is held only to append, never across an fsync. On the NVMe drive the benchmarks here were measured on, a single client's writes take about 0.75 ms each once the log is on zero-filled segments (measured: 0.73–0.75 ms per `put` for 128 B to 8 KiB values, about 1,350 a second); concurrent clients share each fsync, so together they make many more. A segment is fsynced as it is left (commit rounds fsync only the active segment), so everything below the active segment is always durable.
 

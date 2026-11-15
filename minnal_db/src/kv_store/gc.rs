@@ -263,6 +263,9 @@ impl KVStore {
             seq: version.user,
         };
         let new_pointer = self.value_log.append_to_locked_bucket(bucket, key, &survivor.value, meta, false)?;
+        // No log holds the copy, so nothing could write it again after a power
+        // loss: a flush makes it durable before an L0 file points at it.
+        self.value_log.mark_unlogged(new_pointer, key.len());
         let applied = match self.lsm.insert_with_seq(key, new_pointer.to_u128(), version) {
             Ok(applied) => applied,
             Err(e) => {

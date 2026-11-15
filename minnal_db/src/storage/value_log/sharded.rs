@@ -192,7 +192,22 @@ impl ShardedValueLog {
         }
     }
 
+    /// Note that the record `pointer` names is in no log
+    /// ([`ValueLog::mark_unlogged`]). Called under its bucket's write lock.
+    pub fn mark_unlogged(&self, pointer: ShardedValuePointer, key_len: usize) {
+        if let Ok(log) = self.get_bucket_log(pointer.bucket) {
+            log.mark_unlogged(pointer.location, key_len);
+        }
+    }
+
     // ── Reads ─────────────────────────────────────────────────────────────
+
+    /// Whether `pointer` names an intact record of the write with user seq
+    /// `seq` ([`ValueLog::holds_record`]).
+    pub fn holds_record(&self, pointer: ShardedValuePointer, seq: u64) -> bool {
+        self.get_bucket_log(pointer.bucket)
+            .is_ok_and(|log| log.holds_record(pointer.location, seq))
+    }
 
     pub fn read_value(&self, pointer: ShardedValuePointer) -> Result<Vec<u8>> {
         Ok(self.get_bucket_log(pointer.bucket)?.read_value(pointer.location)?)
