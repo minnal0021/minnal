@@ -123,14 +123,25 @@ w("- **Searches use cached query embeddings.** Every test query is embedded once
   "cache miss costs is the service's and is not measured.")
 w("- **A search's latency is the search alone**: ranked ids and scores, top 100. The REST route also fetches each "
   "result's document, which is not included here.")
-w(f"- **Single-operation cells**: one client sends one class back to back for {cfg['single_s']} s, while a trickle of "
-  f"{cfg['trickle_rate']:g} writes/s ({', '.join(f'{k} {v:g}' for k, v in cfg['trickle_mix'].items())}) keeps indexing, "
-  "flushes and maintenance working. The trickle's latencies are reported separately.")
-w(f"- **Concurrent cells are closed loop**: N clients, each sending its next operation when the last returns, for "
-  f"{cfg['concurrent_s']} s, drawing from the mix {', '.join(f'{k} {v:g}' for k, v in cfg['mix'].items())}. Latency is "
-  "the operation's own time with N in flight; there is no arrival schedule, so time a request would have waited to be "
-  "sent is not counted. Concurrency is measured at "
-  f"{', '.join(map(str, cfg['clients']))} clients only; nothing is extrapolated beyond {max(cfg['clients'])}.")
+open_rates = cfg.get("open_rates", [])
+mix_text = ", ".join(f"{k} {v:g}" for k, v in cfg["mix"].items())
+if cfg["single_s"] > 0:
+    w(f"- **Single-operation cells**: one client sends one class back to back for {cfg['single_s']} s, while a trickle of "
+      f"{cfg['trickle_rate']:g} writes/s ({', '.join(f'{k} {v:g}' for k, v in cfg['trickle_mix'].items())}) keeps indexing, "
+      "flushes and maintenance working. The trickle's latencies are reported separately.")
+if cfg["clients"]:
+    w(f"- **Closed-loop cells**: N clients, each sending its next operation when the last returns, for "
+      f"{cfg['concurrent_s']} s, drawing from the mix {mix_text}. Latency is "
+      "the operation's own time with N in flight; there is no arrival schedule, so time a request would have waited to be "
+      "sent is not counted, and a class that gets faster frees clients to queue at another. Concurrency is measured at "
+      f"{', '.join(map(str, cfg['clients']))} clients only; nothing is extrapolated beyond {max(cfg['clients'])}.")
+if open_rates:
+    w(f"- **Fixed-arrival-rate (open-loop) cells**: operations from the same mix arrive on a seeded Poisson schedule at "
+      f"{', '.join(f'{r:,}' for r in open_rates)} a second, for {cfg['concurrent_s']} s each, whatever the engine is "
+      "doing. Each latency runs from the operation's *scheduled* arrival, so time spent waiting anywhere counts. "
+      "The offered load is the same for every build, so a class's latency there is comparable across builds. A rate "
+      "the engine cannot keep up with has no steady state: once 1,024 operations are in flight, arrivals are shed and "
+      "the cell is marked saturated, its latencies a lower bound.")
 w(f"- **Clients and engine share the host**: one process, {run['host_cores']} cores, one Tokio runtime; the clients do "
   "almost no work of their own.")
 w(f"- **Every cell**: waits for the vector queue to drain (up to {cfg['drain_max_s']} s), runs {cfg['warm_s']} s "
@@ -149,11 +160,12 @@ w(f"- **The store keeps its size**: before each cell, unmeasured writes bring it
   "cells still run on a store that has seen more maintenance.\n")
 
 # ── single ───────────────────────────────────────────────────────────────────
-w("## One operation at a time\n")
-w("One client, one class, with the write trickle running. Milliseconds; median of repeats (lowest–highest).\n")
-w("| Class | ops/s | " + " | ".join(p for p, _ in PCTS) + " | max |")
-w("|---|---:|" + "---:|" * (len(PCTS) + 1))
-for c in CLASSES:
+if cfg["single_s"] > 0:
+    w("## One operation at a time\n")
+    w("One client, one class, with the write trickle running. Milliseconds; median of repeats (lowest–highest).\n")
+    w("| Class | ops/s | " + " | ".join(p for p, _ in PCTS) + " | max |")
+    w("|---|---:|" + "---:|" * (len(PCTS) + 1))
+for c in CLASSES if cfg["single_s"] > 0 else []:
     reps = [x["classes"].get(c) for x in repeats(f"single-{c}-")]
     reps = [x for x in reps if x]
     if not reps:
@@ -163,11 +175,12 @@ for c in CLASSES:
 w("")
 
 # ── concurrent ───────────────────────────────────────────────────────────────
-w("## Concurrent load\n")
-w("Closed loop over the mix. Throughput is completed operations per second, all classes; "
-  "Little's law check: clients ≈ throughput × mean latency.\n")
-w("| Clients | ops/s | mean latency ms | throughput × mean |")
-w("|---:|---:|---:|---:|")
+if cfg["clients"]:
+    w("## Concurrent load: closed loop\n")
+    w("Closed loop over the mix. Throughput is completed operations per second, all classes; "
+      "Little's law check: clients ≈ throughput × mean latency.\n")
+    w("| Clients | ops/s | mean latency ms | throughput × mean |")
+    w("|---:|---:|---:|---:|")
 for n in cfg["clients"]:
     reps = repeats(f"closed-{n:02d}-")
     if not reps:
@@ -192,6 +205,47 @@ for c in CLASSES:
         if reps:
             w(f"| {n} | {spread([x['ops_per_s'] for x in reps], 0)} | " + " | ".join(spread([x[k] for x in reps]) for _, k in PCTS) + " |")
     w("")
+
+# ── open loop ────────────────────────────────────────────────────────────────
+if open_rates:
+    w("## Concurrent load: fixed arrival rate\n")
+    w("Open loop over the same mix: operations arrive at the rate whatever the engine is doing, and each is timed from "
+      "its scheduled arrival. In flight: the mean is rate × mean latency (Little's law), the max the most at once. "
+      "Dispatch lag: from the scheduled arrival to the operation's start, the harness's own delay (timer and runtime), "
+      "already inside every latency. A rate that shed arrivals has latencies that are only a lower bound; every rate "
+      "from the first such one up is past capacity (queues build and drain at random), so its latencies are not a "
+      "steady state.\n")
+    first_shed = next((r for r in open_rates if any(x["open"]["shed"] for x in repeats(f"open-{r:05d}-"))), None)
+    w("| Rate /s | ops/s | mean in flight | max in flight | dispatch lag p99 ms | shed |")
+    w("|---:|---:|---:|---:|---:|---:|")
+    for rate in open_rates:
+        reps = repeats(f"open-{rate:05d}-")
+        if not reps:
+            continue
+        o = [x["open"] for x in reps]
+        shed = sum(x["shed"] for x in o)
+        w(f"| {rate:,} | {spread([x['total_ops_per_s'] for x in reps], 0)} | {spread([x['mean_in_flight'] for x in o], 1)} | "
+          f"{spread([x['max_in_flight'] for x in o], 0)} | {spread([x['dispatch_lag_p99_ms'] for x in o])} | "
+          + (f"**{shed:,} (saturated)**" if shed else "0") + " |")
+    w("")
+    for c in CLASSES:
+        if not any(x["classes"].get(c) for r in open_rates for x in repeats(f"open-{r:05d}-")):
+            continue
+        w(f"**`{c}`** (ms)\n")
+        w("| Rate /s | ops/s | " + " | ".join(p for p, _ in PCTS) + " |")
+        w("|---:|---:|" + "---:|" * len(PCTS))
+        for rate in open_rates:
+            cellreps = repeats(f"open-{rate:05d}-")
+            reps = [x["classes"].get(c) for x in cellreps]
+            reps = [x for x in reps if x]
+            if not reps:
+                continue
+            if any(x["open"]["saturated"] for x in cellreps):
+                w(f"| {rate:,} | shed arrivals |" + " — |" * len(PCTS))
+            else:
+                label = f"{rate:,} (past capacity)" if first_shed is not None and rate > first_shed else f"{rate:,}"
+                w(f"| {label} | {spread([x['ops_per_s'] for x in reps], 0)} | " + " | ".join(spread([x[k] for x in reps]) for _, k in PCTS) + " |")
+        w("")
 
 MEMORY = [("rss_anon_bytes", "Resident heap and stacks"), ("rss_file_bytes", "Resident mapped files"),
           ("heap_live_bytes", "Allocated, not freed"), ("heap_free_bytes", "Freed, kept by the allocator")]
@@ -237,7 +291,7 @@ rows = []
 for name, path in [("start", "quality-start.trec"), ("at rest", "quality-rest.trec")]:
     if os.path.exists(f"{run_dir}/{path}"):
         rows.append((name, quality(read_trec(f"{run_dir}/{path}"))))
-for label, prefix in [("under load: single", "single-search-"), ("under load: concurrent", "closed-"), ("under load: soak", "soak-")]:
+for label, prefix in [("under load: single", "single-search-"), ("under load: closed loop", "closed-"), ("under load: open loop", "open-"), ("under load: soak", "soak-")]:
     merged = {}
     for n in sorted(cells):
         if n.startswith(prefix) and os.path.exists(f"{run_dir}/cells/{n}.trec"):

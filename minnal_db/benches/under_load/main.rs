@@ -24,7 +24,10 @@
 //! with `RUSTFLAGS='--cfg minnal_bench_alloc="system"'` (or `"mimalloc"`), to
 //! compare allocators on the same engine. The library sets no allocator.
 
+mod counters;
 mod engine;
+mod load;
+mod open_loop;
 mod quality;
 mod record;
 mod replay;

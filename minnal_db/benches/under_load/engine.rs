@@ -37,6 +37,10 @@ pub struct Config {
     pub single_s: u64,
     pub concurrent_s: u64,
     pub clients: Vec<usize>,
+    /// Arrival rates (operations a second) for the open-loop cells, each run
+    /// for `concurrent_s`; none when absent.
+    #[serde(default)]
+    pub open_rates: Vec<u32>,
     pub soak_s: u64,
     pub soak_clients: usize,
     /// Unmeasured load before each cell's measurement.
@@ -56,10 +60,11 @@ impl Config {
     }
 
     /// The smoke variant: every cell, short.
+    /// Cells the config leaves out (`single_s` or `soak_s` 0) stay out.
     pub fn smoke(mut self) -> Self {
-        self.single_s = 10;
+        self.single_s = self.single_s.min(10);
         self.concurrent_s = 10;
-        self.soak_s = 30;
+        self.soak_s = self.soak_s.min(30);
         self.warm_s = 2;
         self.min_samples = 3;
         self
