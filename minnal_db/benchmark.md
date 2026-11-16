@@ -4,9 +4,10 @@ How fast the `minnal_db` engine is at the things an application does with it:
 writing, reading, scanning, querying a field index, and running a semantic
 search. Every number up to the last section is a single-threaded latency on an
 otherwise idle engine; [The engine at work](#the-engine-at-work) measures the
-same operations while the engine's background work runs, alone and with up to
-16 concurrent clients. All of it is measured on one machine (below), so read
-the absolute values as specific to that machine. The
+same operations while the engine's background work runs, alone, with up to
+16 concurrent clients, and with requests arriving at a fixed rate. All of it
+is measured on one machine (below), so read the absolute values as specific to
+that machine. The
 comparisons — memory against disk, small values against large ones — carry over
 to other hardware much better than the raw microseconds do.
 
@@ -21,7 +22,8 @@ to other hardware much better than the raw microseconds do.
 | A field-index equality query over 100,000 rows | 0.3–2.0 µs | [Field-index queries](#field-index-queries) |
 | A field-index range query over 100,000 rows | 55–130 µs | [Field-index queries](#field-index-queries) |
 | A semantic search over 5,000 documents | 1.0–4.8 ms, excluding the embedding call | [Semantic search](#semantic-search) |
-| The whole engine under load, 1 to 16 clients | 376 to 2,004 operations per second; writes 1.8 to 3.2 ms at the median; searches 4.2 to 15.8 ms; documents searchable 11–22 ms after their write at the median (embeddings replayed, not computed) | [Latency by number of clients](#latency-by-number-of-clients) |
+| The whole engine under load, 1 to 16 clients | 371 to 1,972 operations per second; writes 1.7 to 3.2 ms at the median; searches 4.4 to 16.3 ms; documents searchable 11–22 ms after their write at the median (embeddings replayed, not computed) | [Latency by number of clients](#latency-by-number-of-clients) |
+| The whole engine with requests arriving at a fixed rate | keeps up to about 1,650 operations per second: searches 5.0 to 9.5 ms at the median, writes 2.2 to 2.9 ms; at capacity by 1,800 | [Latency at a fixed arrival rate](#latency-at-a-fixed-arrival-rate) |
 
 The one number that shapes the write path: **a write costs 0.75 ms because it
 waits for the disk to confirm the data is safe** (an fsync). The WAL append
@@ -58,8 +60,8 @@ ran. So more writers mean more writes per fsync, not a queue for the disk.
 | Machine | AMD Ryzen 9 9950X3D (16 cores), 96 GB RAM, NVMe SSD, bare metal |
 | OS | Ubuntu 26.04, Linux 7.0.0-43 |
 | Rust | 1.99.1 |
-| Code | commit `9e8586a`; the range scans and typed iteration in [Scans](#scans) at commit `a11f16c`; [The engine at work](#the-engine-at-work) at commit `cf12cb1` |
-| Date | 2026-11-15 |
+| Code | commit `9e8586a`; the range scans and typed iteration in [Scans](#scans) at commit `a11f16c`; [The engine at work](#the-engine-at-work) at commit `ad09762` |
+| Date | 2026-11-15; [The engine at work](#the-engine-at-work) on 2026-11-16 |
 
 To reproduce everything, including the charts:
 
@@ -441,14 +443,14 @@ works, and what it leaves out, follows them.
 
 ### Latency by number of clients
 
-Code at commit `cf12cb1`, on 2026-11-15, on the machine under [Setup](#setup),
+Code at commit `ad09762`, on 2026-11-16, on the machine under [Setup](#setup),
 with jemalloc as the allocator. Each cell ran once, and the soak lasted
 10 minutes ([What is measured](#what-is-measured) explains both). Every cell
 was valid.
 
 ![Operations per second, by number of clients](docs/benchmarks/engine_throughput.png)
 
-Throughput rises from 376 operations per second with one client to 2,004 with
+Throughput rises from 371 operations per second with one client to 1,972 with
 16, 5.3 times as many. Throughput times mean latency equals the number of
 clients in every cell, as a closed loop requires.
 
@@ -461,18 +463,18 @@ p99.9 included, is in [engine_latency.md](docs/benchmarks/engine_latency.md).*
 What the charts show:
 
 - **Reads stay fast.** `get` has a median of 0.02–0.04 ms at every client
-  count; its p99 rises from 0.04 to 0.54 ms. `scan`'s median goes from 0.28 to
-  1.28 ms, and `field_query`'s from 2.3 to 6.4 ms, with a p99 of 12–25 ms.
-- **Searches slow as more of them wait.** The median `search` takes 4.2 ms
-  with one client and 15.8 ms with 16; its p99 goes from 5.0 to 26.5 ms. At
+  count; its p99 rises from 0.04 to 0.55 ms. `scan`'s median goes from 0.29 to
+  1.50 ms, and `field_query`'s from 2.3 to 6.7 ms, with a p99 of 11–24 ms.
+- **Searches slow as more of them wait.** The median `search` takes 4.4 ms
+  with one client and 16.3 ms with 16; its p99 goes from 5.2 to 26.6 ms. At
   most four searches score their candidates at once, each spread over the
   cores, and the others wait their turn in order, so a search's time grows
   with the searches ahead of it. `filtered_search` costs more than `search`:
-  1.0 ms more at the median with one client, 2.8 ms with 16.
+  1.0 ms more at the median with one client, 2.6 ms with 16.
 - **Writes return without waiting for the field indexes.** The median
-  `insert` and `update` take 1.8 ms with one client and 3.2 ms with 16 (p99
-  10 ms), while the clients write about 460 documents a second between them;
-  `delete` takes 4.9 ms and 9.6 ms. A document write is at least two WAL
+  `insert` and `update` take 1.7–1.8 ms with one client and 3.2 ms with 16 (p99
+  10 ms), while the clients write about 450 documents a second between them;
+  `delete` takes 4.9 ms and 9.5 ms. A document write is at least two WAL
   writes (the document, then its entry in the embedding queue), and
   concurrent writes share each fsync. A write queues its field-index changes
   and returns; a background worker applies them, waiting 20 ms after a write
@@ -482,43 +484,92 @@ What the charts show:
   its own, which is why it costs about three inserts with one client.
 - **Where the time goes with 16 clients.** Each client sends its next request
   when the last returns, so a client not waiting on one operation is waiting
-  on another. Writes return in about 3 ms, so between them they hold 2.6 of
+  on another. Writes return in about 3 ms, so between them they hold 2.5 of
   the 16 clients at a time, and much of the rest queue for the search gate:
-  8.1 searches are in flight on average, while the gate's four slots complete
-  one every 6.2 ms each. Most of a search's 15.8 ms median there is that
-  queue; with requests arriving at a steady rate rather than from a fixed set
-  of clients, it would be shorter. The busy cores are also why `scan`'s median
-  and `get`'s p99 rise with the client count.
+  10.8 searches (plain and filtered) are in flight on average, while each of
+  the gate's four slots completes one every 6.3 ms. Most of a search's 16.3 ms
+  median there is that queue. With requests arriving at a fixed rate instead,
+  the median search takes 9.5 ms while the engine completes 1,650 operations a
+  second ([next section](#latency-at-a-fixed-arrival-rate)). The busy cores are
+  also why `scan`'s median and `get`'s p99 rise with the client count.
 - **Indexing keeps up at every client count.** Embeddings come from a table
   recorded from the embedding service, so this leaves out the service's own
   time (see [How it runs](#how-it-runs)). The time from a write's
   acknowledgement until its document is searchable has a median of 11 ms
-  with 1 to 6 clients, 12 ms with 8 and 22 ms with 16, and a p99 of 12–60 ms.
-  In the 10-minute soak at 4 clients (1,064 operations per second) the median
-  stayed at 11 ms and the indexing backlog at 2 documents (6 at most). Disk use
-  rose and fell between 266 and 483 MiB as garbage collection reclaimed space,
-  with no upward trend, and resident memory stayed between 1.44 and 1.61 GiB
-  (0.93 GiB of it the benchmark's replay table).
+  with 1 to 8 clients and 22 ms with 16, and a p99 of 12–56 ms.
+  In the 10-minute soak at 4 clients (1,166 operations per second) the median
+  stayed at 11 ms and the indexing backlog at 2 documents (5 at most). Disk use
+  rose and fell between 303 and 459 MiB as garbage collection reclaimed space,
+  with no upward trend, and resident memory stayed between 2.06 and 2.32 GiB,
+  also with no upward trend. 0.94 GiB of that is the benchmark's replay table;
+  most of the rest is memory the allocator kept after the two fixed-rate cells
+  at capacity, which run just before the soak and took it to 2.5 GiB (about
+  1.7 GiB after the closed-loop cells).
 - **Alone against in the mix.** Reads sent alone are faster than the same
-  reads in the 1-client mix (`get` 0.01 against 0.02 ms, `scan` 0.21 against
-  0.28 ms), where they share the machine with searches and indexing. We have not
+  reads in the 1-client mix (`get` 0.01 against 0.02 ms, `scan` 0.22 against
+  0.29 ms), where they share the machine with searches and indexing. We have not
   measured which part of that work slows them. Inserts sent alone are *slower*
-  (2.4 against 1.8 ms at the median): a client sending only inserts drove
-  46,000 document writes in 2 minutes 15 seconds, with 150,000 key-value puts
+  (2.5 against 1.7 ms at the median): a client sending only inserts drove
+  46,000 document writes in 2 minutes 15 seconds, with 148,000 key-value puts
   across the engine and 826 vector-partition splits as the store grew, against
-  41,000 puts and no split in the 3 minutes 15 seconds of the 1-client mix.
+  40,000 puts and no split in the 3 minutes 15 seconds of the 1-client mix.
 
 Search quality held through the run (nDCG, FiQA test queries):
 
 | | @10 | @20 | @30 | @40 | @50 | @100 |
 |---|---:|---:|---:|---:|---:|---:|
 | Before the run | 0.501 | 0.527 | 0.538 | 0.545 | 0.551 | 0.564 |
-| Under load, concurrent cells | 0.507 | 0.536 | 0.544 | 0.551 | 0.556 | 0.570 |
-| At rest after the run | 0.507 | 0.535 | 0.545 | 0.551 | 0.556 | 0.569 |
+| Under load, closed-loop cells | 0.508 | 0.536 | 0.546 | 0.552 | 0.557 | 0.571 |
+| Under load, fixed-rate cells | 0.507 | 0.534 | 0.544 | 0.551 | 0.556 | 0.569 |
+| At rest after the run | 0.507 | 0.534 | 0.543 | 0.550 | 0.555 | 0.569 |
 
 The store changes during the run (documents are deleted, rewritten and
 inserted), so the rows measure slightly different stores, not only a busier
 index.
+
+### Latency at a fixed arrival rate
+
+The same run. In the closed loop above, a client sends its next request only
+when its last one returns, so each operation's latency depends on the others:
+when writes return sooner, their clients queue for searches instead, and
+search's latency rises with no change in its own cost. Here requests from the
+same mix arrive at a set rate whatever the engine is doing, as they would from
+many independent users, and each is timed from the moment it was due, so any
+time it waits is counted. Every operation then sees the same load, whatever
+the others cost.
+
+![Latency of each operation, by arrival rate](docs/benchmarks/engine_open_latency.png)
+
+*One panel per operation, on a log scale, each with its own range. The numbers
+at the right of a panel are its p50 and p99 at 1,650 operations a second, the
+highest rate the engine kept up with. Every figure, p99.9 and the rates past
+capacity included, is in
+[engine_open_latency.md](docs/benchmarks/engine_open_latency.md).*
+
+- **Up to 1,650 operations a second the engine keeps up.** The median search
+  takes 5.0 ms at 500 a second and 9.5 ms at 1,650; its p99 goes from 8 to
+  52 ms. On average 1.6 operations are under way at once at 500 a second, and
+  10 at 1,650.
+- **Most of the closed loop's search time at 16 clients was its own queue.**
+  At 1,500 a second, about what 8 closed-loop clients complete (1,570),
+  search's median is 8.3 ms against their 9.3 ms. At 1,650 a second, 84% of
+  what 16 clients complete, it is 9.5 ms against their 16.3 ms.
+- **Writes hardly change with the load.** `insert` and `update` take 2.2 to
+  2.9 ms at the median at every rate up to 1,650, with a p99 of 9–10 ms;
+  `delete` 6.3 to 8.5 ms. Documents are searchable 11–12 ms after their write
+  at the median.
+- **Reads.** `field_query`'s median goes from 2.7 to 4.6 ms, `scan`'s from
+  0.36 to about 0.6 ms. `get` takes 0.08–0.10 ms here against 0.02–0.04 ms
+  in the closed loop: about 0.06 ms of every latency here is the benchmark's
+  own hand-over of each request to the engine's threads, which it measures and
+  which a closed-loop client, already running there, does not pay.
+- **Capacity is about 1,800 operations a second.** At 1,800 and 1,950 a second
+  the medians still hold (search 9–11 ms), but random bursts of arrivals build
+  queues that the engine drains only slowly: the p99 reaches 20–90 ms for
+  `get`, 60–720 ms for writes, and 0.2–1.3 s for scans, field queries and
+  searches. At 1,800 a second, operations under way reached the benchmark's
+  limit of 1,024, and it dropped 35 of 324,000 arrivals; that marks the rate,
+  and every one above it, as past capacity, so the chart stops at 1,650.
 
 ### How it runs
 
@@ -616,14 +667,30 @@ indexed afterwards by the vector-index worker.
    fsyncs, the search scoring gate, the cores), so a line through the measured points does
    not predict higher ones. In a closed loop a client never has more than one
    request outstanding, so latency here is the operation's own time with that
-   many in flight, not including time a request would wait to be sent.
-3. **Soak.** 4 clients for an hour (10 minutes in the run reported above),
+   many in flight, not including time a request would wait to be sent. A
+   closed loop also couples the operations: a client not waiting on one kind is
+   waiting on another, so when one kind gets faster, its clients queue at the
+   others instead, and their latency rises with no change in their own cost.
+3. **A fixed arrival rate.** Operations from the same mix arrive at a set rate,
+   500 to 1,950 a second, for 3 minutes per rate, whatever the engine is doing
+   (an *open loop*): arrival times are drawn at random around that rate (a
+   Poisson process, seeded, so every run sends the same schedule). Each latency
+   runs from the operation's *scheduled* arrival, so time it spends waiting,
+   anywhere, is part of it. Two builds given the same rate get the same load,
+   so a change in one operation's latency is that operation's own. Reported:
+   the same percentiles per operation, and how many operations were in flight.
+   A rate past what the engine can complete has no steady state: once 1,024
+   operations are in flight, new arrivals are dropped and counted. That rate
+   and every higher one are reported as *past capacity*: near capacity, queues
+   build and drain at random, so a higher rate that happened not to drop any
+   is no steadier.
+4. **Soak.** 4 clients for an hour (10 minutes in the run reported above),
    sampled every 10 seconds, to show whether anything grows without bound:
    disk use, memory, the indexing backlog. Four clients is the highest load at
    which indexing keeps up with the writes; above it the backlog grows for as
    long as the load lasts, which the 3-minute concurrent measurements already
    show.
-4. **Search quality** (nDCG at 10, 20, 30, 40, 50 and 100, and recall at 100):
+5. **Search quality** (nDCG at 10, 20, 30, 40, 50 and 100, and recall at 100):
    before the run, under load, and at rest after it, to show that the
    background work does not cost search quality.
 
@@ -649,6 +716,11 @@ becomes searchable.
 - **Results are saved as each cell finishes** (`cells/<cell>.json`, plus a
   per-second timeline and the search results), with a manifest of what is
   done, so an interrupted run loses nothing.
+- **The arrival schedule is checked too.** In a fixed-arrival-rate cell, the
+  delay between an operation's scheduled arrival and its start (the
+  benchmark's own thread waking and handing it to the engine's runtime) is
+  recorded. It is part of every latency there, and it is reported so that a
+  benchmark falling behind its own schedule shows.
 - **A smoke run first.** `--smoke` runs every cell for a few seconds and
   produces the full report, to check the whole harness before a run of several
   hours.
@@ -710,12 +782,19 @@ the replay table and the output directory, and sets the mix, durations and
 repeats; `docs/benchmarks/engine/fiqa.example.json` is the full plan (relative
 paths resolve from `minnal_db/`, where `cargo bench` runs). The run reported
 above used it with `"repeats": 1` and `"soak_s": 600`, and takes about an hour;
-the full plan takes several hours. To redraw the charts and tables of
-[Latency by number of clients](#latency-by-number-of-clients) from a run:
+the full plan takes several hours. `open_rates` lists the fixed arrival rates.
+Setting `single_s` or `soak_s` to 0 leaves those cells out, but the single
+cells' inserts are also what grow the vector partition (from about 760
+postings in the starting database to about 1,600), so without them each
+search reads larger postings and costs more, and the run's numbers are not
+comparable with a full run's. To redraw the
+charts and tables of [Latency by number of clients](#latency-by-number-of-clients)
+and [Latency at a fixed arrival rate](#latency-at-a-fixed-arrival-rate) from a
+run:
 
 ```sh
 python3 minnal_db/docs/benchmarks/engine/plot.py OUT_DIR minnal_db/docs/benchmarks
 ```
 
-It needs gnuplot. `cargo bench` without a command skips this benchmark, so the Criterion report
+It draws each from the cells the run has, and needs gnuplot. `cargo bench` without a command skips this benchmark, so the Criterion report
 above does not run it.

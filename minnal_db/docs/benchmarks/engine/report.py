@@ -212,7 +212,10 @@ if open_rates:
     w("Open loop over the same mix: operations arrive at the rate whatever the engine is doing, and each is timed from "
       "its scheduled arrival. In flight: the mean is rate × mean latency (Little's law), the max the most at once. "
       "Dispatch lag: from the scheduled arrival to the operation's start, the harness's own delay (timer and runtime), "
-      "already inside every latency. A saturated rate shed arrivals and its latencies are only a lower bound.\n")
+      "already inside every latency. A rate that shed arrivals has latencies that are only a lower bound; every rate "
+      "from the first such one up is past capacity (queues build and drain at random), so its latencies are not a "
+      "steady state.\n")
+    first_shed = next((r for r in open_rates if any(x["open"]["shed"] for x in repeats(f"open-{r:05d}-"))), None)
     w("| Rate /s | ops/s | mean in flight | max in flight | dispatch lag p99 ms | shed |")
     w("|---:|---:|---:|---:|---:|---:|")
     for rate in open_rates:
@@ -238,9 +241,10 @@ if open_rates:
             if not reps:
                 continue
             if any(x["open"]["saturated"] for x in cellreps):
-                w(f"| {rate:,} | saturated |" + " — |" * len(PCTS))
+                w(f"| {rate:,} | shed arrivals |" + " — |" * len(PCTS))
             else:
-                w(f"| {rate:,} | {spread([x['ops_per_s'] for x in reps], 0)} | " + " | ".join(spread([x[k] for x in reps]) for _, k in PCTS) + " |")
+                label = f"{rate:,} (past capacity)" if first_shed is not None and rate > first_shed else f"{rate:,}"
+                w(f"| {label} | {spread([x['ops_per_s'] for x in reps], 0)} | " + " | ".join(spread([x[k] for x in reps]) for _, k in PCTS) + " |")
         w("")
 
 MEMORY = [("rss_anon_bytes", "Resident heap and stacks"), ("rss_file_bytes", "Resident mapped files"),

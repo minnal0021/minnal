@@ -15,9 +15,11 @@ and writes to OUT_DIR:
                            latency by arrival rate (open-loop cells)
   engine_open_latency.md   the same figures as Markdown tables
 
-Each pair is drawn only when the run has those cells. A rate that saturated the
-engine (it shed arrivals) is left off the chart and marked in the table: its
-latencies are only a lower bound.
+Each pair is drawn only when the run has those cells. The open-loop chart stops
+below the first rate that saturated the engine (it shed arrivals): near
+capacity, queues build and drain at random, so the rates above it are at
+capacity whether or not they happened to shed. The tables give every rate, a
+saturated one marked, its latencies only a lower bound.
 
 Every point is the median of the cell's repeats; the tables give the lowest and
 highest beside it. A percentile keeps one colour on every panel. Needs gnuplot.
@@ -153,8 +155,12 @@ def log_ticks(lo, hi):
 
 
 def open_latency_chart(open_, out, tmp):
-    """Latency by arrival rate, one panel per operation; saturated rates left off."""
-    rates = [r for r in sorted(open_) if not saturated(open_[r])]
+    """Latency by arrival rate, one panel per operation, up to the first saturated rate."""
+    rates = []
+    for r in sorted(open_):
+        if saturated(open_[r]):
+            break
+        rates.append(r)
     if not rates:
         sys.exit("every open-loop rate saturated the engine; nothing to chart")
     ops = [op for op in OPS if all(op in c["classes"] for r in rates for c in open_[r])]
@@ -193,8 +199,8 @@ set logscale y
 unset mytics
 set xlabel "Operations arriving per second"
 set ylabel "ms"
-set xtics ({", ".join(str(r) for r in rates)})
-set xrange [0:{max(rates) * 1.18}]
+set xtics ({", ".join(f'"{r:,}" {r}' for r in rates)}) rotate by -40
+set xrange [{min(rates) - (max(rates) - min(rates)) * 0.08}:{max(rates) + (max(rates) - min(rates)) * 0.2}]
 set key top left horizontal reverse Left font ",9"
 """ + "".join(plots) + "unset multiplot\n")
     return ops
@@ -203,21 +209,28 @@ set key top left horizontal reverse Left font ",9"
 def open_tables(open_, ops, out):
     rates = sorted(open_)
     repeats = max(len(v) for v in open_.values())
+    # Every rate from the first saturated one up is past capacity, whether or
+    # not its own random bursts happened to shed arrivals.
+    first = next((r for r in rates if saturated(open_[r])), None)
+    past = {r for r in rates if first is not None and r >= first}
     w = ["# Engine latency at a fixed arrival rate", "",
          "The figures behind the chart in `benchmark.md` → *Latency at a fixed arrival rate*, "
          "drawn by `docs/benchmarks/engine/plot.py`. Operations from the mix arrive at the rate "
          "whatever the engine is doing, and each latency runs from the operation's scheduled arrival. "
          "Milliseconds. In flight: operations under way at once, the mean (rate × mean latency) and the most. "
-         "A saturated rate shed arrivals; its latencies are only a lower bound and are not given. "
+         "A rate whose operations under way reached the limit (1,024) dropped arrivals; its latencies are only "
+         "a lower bound and are not given. Every rate from the first such one up is past capacity: near capacity, "
+         "random bursts of arrivals build queues that drain slowly, so its latencies are given but are not a steady state. "
          + ("Each cell ran once." if repeats == 1 else
             f"Median of {repeats} repeats, lowest–highest in brackets."), ""]
     w.append("| Arrivals per second | " + " | ".join(f"{r:,}" for r in rates) + " |")
     w.append("|---|" + "---:|" * len(rates))
     w.append("| Completed per second | " + " | ".join(cell_fmt([c["total_ops_per_s"] for c in open_[r]]) for r in rates) + " |")
     w.append("| Mean in flight | " + " | ".join(cell_fmt([c["open"]["mean_in_flight"] for c in open_[r]]) for r in rates) + " |")
-    w.append("| Most in flight | " + " | ".join(cell_fmt([c["open"]["max_in_flight"] for c in open_[r]]) for r in rates) + " |")
+    w.append("| Most in flight | " + " | ".join(f'{statistics.median(c["open"]["max_in_flight"] for c in open_[r]):,.0f}' for r in rates) + " |")
     w.append("| Dispatch lag p99 (ms) | " + " | ".join(cell_fmt([c["open"]["dispatch_lag_p99_ms"] for c in open_[r]]) for r in rates) + " |")
-    w.append("| Saturated | " + " | ".join("**yes**" if saturated(open_[r]) else "no" for r in rates) + " |")
+    w.append("| Arrivals dropped | " + " | ".join(f'{sum(c["open"]["shed"] for c in open_[r]):,}' for r in rates) + " |")
+    w.append("| Past capacity | " + " | ".join("**yes**" if r in past else "no" for r in rates) + " |")
     w.append("")
     for op in ops:
         w.append(f"**`{op}`** (ms)")
@@ -226,9 +239,10 @@ def open_tables(open_, ops, out):
         w.append("|---:|" + "---:|" * len(TABLE_PCTS))
         for r in rates:
             if saturated(open_[r]):
-                w.append(f"| {r:,} | saturated |" + " |" * (len(TABLE_PCTS) - 1))
+                w.append(f"| {r:,} (dropped arrivals) | — |" + " — |" * (len(TABLE_PCTS) - 1))
             else:
-                w.append(f"| {r:,} | " + " | ".join(cell_fmt([c["classes"][op][key] for c in open_[r]]) for key, _ in TABLE_PCTS) + " |")
+                label = f"{r:,} (past capacity)" if r in past else f"{r:,}"
+                w.append(f"| {label} | " + " | ".join(cell_fmt([c["classes"][op][key] for c in open_[r]]) for key, _ in TABLE_PCTS) + " |")
         w.append("")
     with open(f"{out}/engine_open_latency.md", "w") as f:
         f.write("\n".join(w).rstrip() + "\n")
