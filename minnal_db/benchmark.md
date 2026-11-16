@@ -798,3 +798,91 @@ python3 minnal_db/docs/benchmarks/engine/plot.py OUT_DIR minnal_db/docs/benchmar
 
 It draws each from the cells the run has, and needs gnuplot. `cargo bench` without a command skips this benchmark, so the Criterion report
 above does not run it.
+
+## Appendix: search under load at two commits
+
+This appendix compares search latency under load in the engine at commit
+`21d54d9` and at commit `c0f9da6`, 53 commits later. Those commits
+consolidate the configuration, clean up storage code, rework range scans,
+harden durability and move field-index upkeep off the write path. It answers
+one question: does a search take longer at `c0f9da6` when the same load
+arrives? It does, by a few percent at light load and 10–20% at 1,000
+operations a second, and which change causes it is not yet known. Measured
+on 2026-11-16 and 17 on the machine under [Setup](#setup).
+
+### How the two were compared
+
+- **A fixed arrival rate, not a fixed set of clients.** In the closed loop
+  ([Latency by number of clients](#latency-by-number-of-clients)), making one
+  kind of operation faster frees its clients to queue for the others, and
+  writes at `c0f9da6` return much sooner. So the closed loop shows search
+  slower at `c0f9da6` even where a search costs no more. Both builds were
+  therefore given the same arrival rates ([Latency at a fixed arrival
+  rate](#latency-at-a-fixed-arrival-rate)): 400, then 700, then 1,000
+  operations a second, 3 minutes each, after 10-second single-operation cells.
+- **Four runs per build, alternating** (`21d54d9`, `c0f9da6`, `21d54d9`, …),
+  each run on a fresh copy of a starting database built by that build (the
+  two read different on-disk formats), with about 840 vector-partition
+  postings during the cells. Runs are compared in the pairs they ran in: the
+  machine's own speed drifted by about 10% over the hours they took.
+
+### Results
+
+Median `search` latency in milliseconds, each pair run back to back:
+
+| Arrivals per second | Pair 1 | Pair 2 | Pair 3 | Pair 4 | Mean change |
+|---|---|---|---|---|---:|
+| 400 | 5.48 → 5.77 | 5.58 → 5.65 | 5.46 → 5.92 | 5.48 → 5.54 | +4% |
+| 700 | 6.66 → 6.80 | 6.91 → 7.03 | 6.83 → 8.80 | 6.77 → 7.06 | +9% |
+| 1,000 | 7.72 → 8.71 | 7.83 → 9.07 | 8.62 → 11.69 | 8.53 → 9.24 | +18% |
+
+`c0f9da6` is slower in every pair. Pair 3 at `c0f9da6` is an outlier at 700
+and 1,000 a second; without it the change is +2–4% at 700 and +8–16% at
+1,000. Every operation, as the mean over the four runs at 1,000 a second:
+
+| Operation | Median, `21d54d9` → `c0f9da6` | p99, `21d54d9` → `c0f9da6` |
+|---|---|---|
+| `search` | 8.17 → 9.68 ms (+18%) | 24.2 → 31.4 ms (+30%) |
+| `filtered_search` | 10.13 → 11.24 ms (+11%) | 30.7 → 35.1 ms (+15%) |
+| `field_query` | 3.93 → 3.92 ms (0%) | 20.6 → 19.1 ms (−7%) |
+| `scan` | 2.32 → 0.59 ms (−75%) | 8.1 → 5.0 ms (−38%) |
+| `get` | 0.09 → 0.09 ms | 0.8 → 0.9 ms |
+| `insert` | 3.29 → 2.67 ms (−19%) | 18.0 → 9.1 ms (−49%) |
+| `update` | 3.26 → 2.69 ms (−17%) | 18.2 → 9.3 ms (−49%) |
+| `delete` | 9.19 → 7.75 ms (−16%) | 37.4 → 29.5 ms (−21%) |
+
+So searches lose under load while scans and writes gain a lot.
+
+### What it is not
+
+- **Not the cost of a search.** Sent one at a time, a search's median is
+  3.99–4.61 ms at `21d54d9` and 3.93–4.08 ms at `c0f9da6`. The difference
+  appears only when searches share the machine with everything else.
+- **Not more background work.** During the 1,000-a-second cells `c0f9da6`
+  flushed 30–33 memtables and merged L0 into L1 91–116 times, against
+  40–44 and 123–139 at `21d54d9`, with half the value-log GC passes.
+- **Not the configuration.** Both builds read the same configuration file and
+  apply the same engine settings; their only difference, the default bucket
+  count, is overridden by the count each database was created with (8).
+- **Not the field-index worker**, the last change in the range. Its parent
+  `6daf8e4` and `c0f9da6` measured 10.34 and 10.10 ms at 1,000 a second (one
+  run each, on a coarser partition, where every search costs more).
+
+Which change it is was not found. A bisection needs about four pairs of runs
+per commit to see a difference this size, about two hours each. The next
+step is to record the process's CPU time per operation at a fixed rate,
+which varies far less between runs than latency, and if `c0f9da6` spends
+more, profile both builds at 1,000 a second and compare where the extra goes.
+
+### Measuring a difference this small
+
+- **Warm the store before the measured rate.** Right after the
+  single-operation cells, which move the store by tens of thousands of
+  documents, the clean-up work makes a cell's median swing by about ±1 ms
+  from run to run, more than the difference above. After two cells at lower
+  rates, repeats of one build agree within 0.1–0.4 ms.
+- **Alternate the builds and compare pairs.** The machine's speed drifts over
+  hours, so a run of one build late in the evening is not comparable with a
+  run of the other in the early evening.
+- **Repeat.** One run each can point either way; four pairs, all in one
+  direction, are what the table above rests on.
