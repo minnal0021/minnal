@@ -24,36 +24,33 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use minnal_db::MetricsSnapshot;
 use minnal_db::doc_store::schema::KeyType;
 use minnal_db::doc_store::{DocStore, Pagination};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::counters::{Counters, spawn_monitor};
 use crate::engine::{self, Config, EngineSettings};
+use crate::load::{rebalance, run_load};
 use crate::replay::{Replay, ReplayStats};
-use crate::stats::Recording;
-use crate::workload::{CLASSES, Cursors, Data, Generator, Op, Outcome, Target, execute, search_spec, weights};
-
-/// Shared by every generator of a run: one hot set of `get` ids.
-const HOT_SEED: u64 = 0x005e_ed0f_ae71;
+use crate::workload::{CLASSES, Cursors, Data, Target, search_spec, weights};
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum Kind {
+pub(crate) enum Kind {
     Single { class: usize },
     Closed { clients: usize },
     Soak { clients: usize },
 }
 
 #[derive(Clone, Serialize)]
-struct Cell {
-    name: String,
+pub(crate) struct Cell {
+    pub(crate) name: String,
     #[serde(flatten)]
-    kind: Kind,
-    measure_s: u64,
-    warm_s: u64,
+    pub(crate) kind: Kind,
+    pub(crate) measure_s: u64,
+    pub(crate) warm_s: u64,
 }
 
 fn plan(cfg: &Config) -> Vec<Cell> {
@@ -93,7 +90,7 @@ struct Manifest {
     complete: bool,
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -106,126 +103,15 @@ fn write_json(path: &Path, v: &impl Serialize) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-struct Ctx {
-    cfg: Config,
-    out: PathBuf,
-    data: Arc<Data>,
-    target: Arc<Target>,
-    replay: Arc<Replay>,
-    cursors: Arc<Mutex<Cursors>>,
-    mix: [f64; 8],
-    trickle_mix: [f64; 8],
-}
-
-/// Engine counters taken before and after a cell.
-#[derive(Serialize, Default, Clone, Copy)]
-struct Counters {
-    puts: u64,
-    deletes: u64,
-    reads: u64,
-    scans: u64,
-    wal_writes: u64,
-    memtable_flushes: u64,
-    l0_l1_compactions: u64,
-    compaction_bytes_merged: u64,
-    vlog_gc_runs: u64,
-    vlog_gc_bytes_reclaimed: u64,
-    wal_gc_runs: u64,
-    wal_segments_deleted: u64,
-    vector_wal_appends: u64,
-    vector_wal_fsyncs: u64,
-    vector_wal_gc_runs: u64,
-    vector_wal_segments_deleted: u64,
-    splits: u64,
-    merges: u64,
-    reassigns: u64,
-    postings: u64,
-    /// Highest field-index checkpoint offset: advances with each checkpoint
-    /// that wrote something.
-    checkpoint_offset: u64,
-    disk_bytes: u64,
-    rss_bytes: u64,
-    #[serde(flatten)]
-    memory: engine::Memory,
-}
-
-impl Counters {
-    async fn take(ctx: &Ctx) -> Self {
-        let m: MetricsSnapshot = ctx.target.store.db().ops_metrics();
-        let (mut splits, mut merges, mut reassigns, mut postings) = (0, 0, 0, 0);
-        if let Ok((_, h, _)) = ctx.target.store.vector_partition_health(&ctx.target.ns, false).await {
-            (splits, merges, reassigns, postings) = (h.maintenance.splits, h.maintenance.merges, h.maintenance.reassigns, h.postings as u64);
-        }
-        let checkpoint_offset = ctx
-            .target
-            .store
-            .index_health(&ctx.target.ns)
-            .await
-            .map(|fields| fields.iter().filter_map(|f| f.checkpoint_offset).max().unwrap_or(0))
-            .unwrap_or(0);
-        Self {
-            puts: m.puts,
-            deletes: m.deletes,
-            reads: m.reads,
-            scans: m.scans,
-            wal_writes: m.wal_writes,
-            memtable_flushes: m.memtable_flushes,
-            l0_l1_compactions: m.l0_l1_compactions,
-            compaction_bytes_merged: m.compaction_bytes_merged,
-            vlog_gc_runs: m.vlog_gc_runs,
-            vlog_gc_bytes_reclaimed: m.vlog_gc_bytes_reclaimed,
-            wal_gc_runs: m.wal_gc_runs,
-            wal_segments_deleted: m.wal_segments_deleted,
-            vector_wal_appends: m.vector_wal_appends,
-            vector_wal_fsyncs: m.vector_wal_fsyncs,
-            vector_wal_gc_runs: m.vector_wal_gc_runs,
-            vector_wal_segments_deleted: m.vector_wal_segments_deleted,
-            splits,
-            merges,
-            reassigns,
-            postings,
-            checkpoint_offset,
-            disk_bytes: engine::disk_bytes(&ctx.out.join("engine")),
-            rss_bytes: engine::rss_bytes(),
-            memory: engine::memory(),
-        }
-    }
-
-    /// Counters accumulated from `before` to `self`; gauges (`postings`,
-    /// `disk_bytes`, `rss_bytes`, `checkpoint_offset`) are the value after.
-    fn since(&self, b: &Counters) -> Counters {
-        let d = |a: u64, b: u64| a.saturating_sub(b);
-        Counters {
-            puts: d(self.puts, b.puts),
-            deletes: d(self.deletes, b.deletes),
-            reads: d(self.reads, b.reads),
-            scans: d(self.scans, b.scans),
-            wal_writes: d(self.wal_writes, b.wal_writes),
-            memtable_flushes: d(self.memtable_flushes, b.memtable_flushes),
-            l0_l1_compactions: d(self.l0_l1_compactions, b.l0_l1_compactions),
-            compaction_bytes_merged: d(self.compaction_bytes_merged, b.compaction_bytes_merged),
-            vlog_gc_runs: d(self.vlog_gc_runs, b.vlog_gc_runs),
-            vlog_gc_bytes_reclaimed: d(self.vlog_gc_bytes_reclaimed, b.vlog_gc_bytes_reclaimed),
-            wal_gc_runs: d(self.wal_gc_runs, b.wal_gc_runs),
-            wal_segments_deleted: d(self.wal_segments_deleted, b.wal_segments_deleted),
-            vector_wal_appends: d(self.vector_wal_appends, b.vector_wal_appends),
-            vector_wal_fsyncs: d(self.vector_wal_fsyncs, b.vector_wal_fsyncs),
-            vector_wal_gc_runs: d(self.vector_wal_gc_runs, b.vector_wal_gc_runs),
-            vector_wal_segments_deleted: d(self.vector_wal_segments_deleted, b.vector_wal_segments_deleted),
-            splits: d(self.splits, b.splits),
-            merges: d(self.merges, b.merges),
-            reassigns: d(self.reassigns, b.reassigns),
-            postings: self.postings,
-            checkpoint_offset: self.checkpoint_offset,
-            disk_bytes: self.disk_bytes,
-            rss_bytes: self.rss_bytes,
-            memory: self.memory,
-        }
-    }
-}
-
-async fn queue_depth(store: &DocStore) -> usize {
-    store.list_queue_entries().await.len()
+pub(crate) struct Ctx {
+    pub(crate) cfg: Config,
+    pub(crate) out: PathBuf,
+    pub(crate) data: Arc<Data>,
+    pub(crate) target: Arc<Target>,
+    pub(crate) replay: Arc<Replay>,
+    pub(crate) cursors: Arc<Mutex<Cursors>>,
+    pub(crate) mix: [f64; 8],
+    pub(crate) trickle_mix: [f64; 8],
 }
 
 /// Wait until the vector queue is empty; `None` if it took longer than `max`.
@@ -263,229 +149,6 @@ async fn drain(store: &DocStore, max: Duration) -> Option<f64> {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-}
-
-fn seed_of(name: &str, salt: u64) -> u64 {
-    // FNV-1a: the same cell always sends the same operations.
-    name.bytes()
-        .fold(0xcbf2_9ce4_8422_2325u64 ^ salt, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
-}
-
-/// What one stretch of load produced.
-#[derive(Default)]
-struct Load {
-    measured: Recording,
-    trickle: Recording,
-    /// First ranked reply per test query.
-    trec: BTreeMap<String, Vec<(u64, f32)>>,
-    lag_tasks: Vec<tokio::task::JoinHandle<Option<f64>>>,
-}
-
-/// After an insert is acknowledged, poll its queue entry until it is gone: the
-/// time until the document is searchable.
-fn spawn_lag(target: &Arc<Target>, id: u64, acked: Instant) -> tokio::task::JoinHandle<Option<f64>> {
-    let target = Arc::clone(target);
-    tokio::spawn(async move {
-        while acked.elapsed() < Duration::from_secs(1800) {
-            if target.store.get_queue_entry(&target.ns, &id.to_be_bytes()).await.is_none() {
-                return Some(acked.elapsed().as_secs_f64() * 1e3);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        None
-    })
-}
-
-/// Deletes per second a delete-only cell's starting pool covers, for its whole
-/// warm-up and measurement. Deletes remove the deletable base and then earlier
-/// inserts, so a cell that starts at the base's size can delete only about
-/// `deletable` documents (10,000 in the FiQA data) before it runs out, and
-/// fast deletes do that within one cell. The fastest delete-only rate measured
-/// is about 120 a second; this leaves three times that.
-const DELETE_CELL_MAX_RATE: u64 = 400;
-
-/// Documents a cell starts with beyond the base: enough for a delete-only
-/// cell's deletes ([`DELETE_CELL_MAX_RATE`]), none for any other cell.
-fn extra_documents(cell: &Cell) -> i64 {
-    match cell.kind {
-        Kind::Single { class } if CLASSES[class] == "delete" => ((cell.warm_s + cell.measure_s) * DELETE_CELL_MAX_RATE) as i64,
-        _ => 0,
-    }
-}
-
-/// Bring the store back to the base's size, unmeasured, before a cell: a
-/// single-class insert or delete cell moves it by thousands, and later cells
-/// would otherwise run on a different store. A delete-only cell starts larger
-/// ([`extra_documents`]), so it cannot run out of documents to delete. Inserts
-/// or deletes in order, 16 at a time, as the load would; returns how many
-/// (+ inserted, - deleted).
-async fn rebalance(ctx: &Ctx, cell: &Cell) -> Result<i64, String> {
-    let base = ctx.data.base.len();
-    let gap = ctx.cursors.lock().documents(base) - (base as i64 + extra_documents(cell));
-    if gap == 0 {
-        return Ok(0);
-    }
-    let class = if gap < 0 { 1 } else { 3 };
-    let left = Arc::new(std::sync::atomic::AtomicI64::new(gap.abs()));
-    let workers: Vec<_> = (0..16)
-        .map(|w| {
-            let (target, left) = (Arc::clone(&ctx.target), Arc::clone(&left));
-            let mut g = Generator::new(Arc::clone(&ctx.data), HOT_SEED, seed_of(&cell.name, 0x5eed ^ w), Arc::clone(&ctx.cursors));
-            tokio::spawn(async move {
-                while left.fetch_sub(1, Ordering::SeqCst) > 0 {
-                    let op = g.op(class).ok_or("rebalance: no document to delete")?;
-                    execute(&target, &op).await.map_err(|e| format!("rebalance: {e}"))?;
-                }
-                Ok::<(), String>(())
-            })
-        })
-        .collect();
-    for w in workers {
-        w.await.map_err(|e| e.to_string())??;
-    }
-    Ok(-gap)
-}
-
-/// Run `kind`'s load for `secs`. `salt` separates warm-up from measurement.
-async fn run_load(ctx: &Ctx, cell: &Cell, secs: u64, salt: u64) -> Load {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    let (clients, single) = match cell.kind {
-        Kind::Single { class } => (1, Some(class)),
-        Kind::Closed { clients } | Kind::Soak { clients } => (clients, None),
-    };
-    let stop = Arc::new(AtomicBool::new(false));
-    let trickle = single.map(|_| {
-        let (target, data, cursors, stop) = (
-            Arc::clone(&ctx.target),
-            Arc::clone(&ctx.data),
-            Arc::clone(&ctx.cursors),
-            Arc::clone(&stop),
-        );
-        let (mix, period) = (ctx.trickle_mix, Duration::from_secs_f64(1.0 / ctx.cfg.trickle_rate));
-        let seed = seed_of(&cell.name, salt ^ 0x7c);
-        tokio::spawn(async move {
-            let mut g = Generator::new(data, HOT_SEED, seed, cursors);
-            let mut rec = Recording::default();
-            let mut tick = tokio::time::interval(period);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            while !stop.load(Ordering::SeqCst) {
-                tick.tick().await;
-                let class = g.class(&mix);
-                let Some(op) = g.op(class) else {
-                    rec.0[class].unavailable += 1;
-                    continue;
-                };
-                let t = Instant::now();
-                match execute(&target, &op).await {
-                    Ok(_) => rec.0[class].ok(t.elapsed()),
-                    Err(e) => rec.0[class].error(t.elapsed(), e),
-                }
-            }
-            rec
-        })
-    });
-    let tasks: Vec<_> = (0..clients)
-        .map(|k| {
-            let (target, data, cursors) = (Arc::clone(&ctx.target), Arc::clone(&ctx.data), Arc::clone(&ctx.cursors));
-            let (mix, lag_every) = (ctx.mix, ctx.cfg.lag_every);
-            let seed = seed_of(&cell.name, salt ^ (k as u64) << 8);
-            tokio::spawn(async move {
-                let mut g = Generator::new(data, HOT_SEED, seed, cursors);
-                let mut load = Load::default();
-                let mut inserts = 0u64;
-                while Instant::now() < deadline {
-                    let class = single.unwrap_or_else(|| g.class(&mix));
-                    let Some(op) = g.op(class) else {
-                        load.measured.0[class].unavailable += 1;
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                        continue;
-                    };
-                    let t = Instant::now();
-                    let r = execute(&target, &op).await;
-                    let took = t.elapsed();
-                    let rec = &mut load.measured.0[class];
-                    match r {
-                        Ok(Outcome::Ok) => rec.ok(took),
-                        Ok(Outcome::NotFound) => rec.not_found(took),
-                        Ok(Outcome::Ranked(hits)) => {
-                            rec.ok(took);
-                            if let Op::Search { qid, .. } = &op {
-                                load.trec.entry(qid.clone()).or_insert(hits);
-                            }
-                        }
-                        Err(e) => rec.error(took, e),
-                    }
-                    if let Op::Insert(d) = &op {
-                        inserts += 1;
-                        if lag_every > 0 && inserts.is_multiple_of(lag_every) {
-                            load.lag_tasks.push(spawn_lag(&target, d.id, Instant::now()));
-                        }
-                    }
-                }
-                load
-            })
-        })
-        .collect();
-    let mut load = Load::default();
-    for t in tasks {
-        if let Ok(l) = t.await {
-            load.measured.merge(&l.measured);
-            for (q, h) in l.trec {
-                load.trec.entry(q).or_insert(h);
-            }
-            load.lag_tasks.extend(l.lag_tasks);
-        }
-    }
-    stop.store(true, Ordering::SeqCst);
-    if let Some(t) = trickle
-        && let Ok(rec) = t.await
-    {
-        load.trickle = rec;
-    }
-    load
-}
-
-/// One sample of the time series kept during a cell.
-#[derive(Serialize)]
-struct Sample {
-    t_s: f64,
-    queue: usize,
-    rss_bytes: u64,
-    #[serde(flatten)]
-    memory: engine::Memory,
-    disk_bytes: u64,
-    puts: u64,
-    deletes: u64,
-    reads: u64,
-    memtable_flushes: u64,
-    l0_l1_compactions: u64,
-    vector_wal_appends: u64,
-}
-
-fn spawn_monitor(ctx: &Ctx, every: Duration, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<Vec<Sample>> {
-    let (store, dir) = (Arc::clone(&ctx.target.store), ctx.out.join("engine"));
-    tokio::spawn(async move {
-        let t0 = Instant::now();
-        let mut out = Vec::new();
-        while !stop.load(Ordering::SeqCst) {
-            let m = store.db().ops_metrics();
-            out.push(Sample {
-                t_s: t0.elapsed().as_secs_f64(),
-                queue: queue_depth(&store).await,
-                rss_bytes: engine::rss_bytes(),
-                memory: engine::memory(),
-                disk_bytes: engine::disk_bytes(&dir),
-                puts: m.puts,
-                deletes: m.deletes,
-                reads: m.reads,
-                memtable_flushes: m.memtable_flushes,
-                l0_l1_compactions: m.l0_l1_compactions,
-                vector_wal_appends: m.vector_wal_appends,
-            });
-            tokio::time::sleep(every).await;
-        }
-        out
-    })
 }
 
 pub(crate) fn write_trec(path: &Path, trec: &BTreeMap<String, Vec<(u64, f32)>>, run: &str) -> Result<(), String> {
