@@ -27,6 +27,7 @@
 mod counters;
 mod engine;
 mod load;
+mod open_loop;
 mod quality;
 mod record;
 mod replay;

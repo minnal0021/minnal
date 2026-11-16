@@ -28,6 +28,27 @@ pub(crate) struct Load {
     /// First ranked reply per test query.
     pub(crate) trec: BTreeMap<String, Vec<(u64, f32)>>,
     pub(crate) lag_tasks: Vec<tokio::task::JoinHandle<Option<f64>>>,
+    /// How a fixed-arrival-rate stretch kept to its schedule (open-loop cells
+    /// only).
+    pub(crate) open: Option<crate::open_loop::OpenStats>,
+}
+
+impl Load {
+    /// Record one measured operation of `class` that took `took`.
+    pub(crate) fn record(&mut self, class: usize, op: &Op, r: Result<Outcome, String>, took: Duration) {
+        let rec = &mut self.measured.0[class];
+        match r {
+            Ok(Outcome::Ok) => rec.ok(took),
+            Ok(Outcome::NotFound) => rec.not_found(took),
+            Ok(Outcome::Ranked(hits)) => {
+                rec.ok(took);
+                if let Op::Search { qid, .. } = op {
+                    self.trec.entry(qid.clone()).or_insert(hits);
+                }
+            }
+            Err(e) => rec.error(took, e),
+        }
+    }
 }
 
 /// After an insert is acknowledged, poll its queue entry until it is gone: the
@@ -101,6 +122,7 @@ pub(crate) async fn run_load(ctx: &Ctx, cell: &Cell, secs: u64, salt: u64) -> Lo
     let (clients, single) = match cell.kind {
         Kind::Single { class } => (1, Some(class)),
         Kind::Closed { clients } | Kind::Soak { clients } => (clients, None),
+        Kind::Open { rate } => return crate::open_loop::run_open(ctx, cell, rate, secs, salt).await,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let trickle = single.map(|_| {
@@ -151,19 +173,7 @@ pub(crate) async fn run_load(ctx: &Ctx, cell: &Cell, secs: u64, salt: u64) -> Lo
                     };
                     let t = Instant::now();
                     let r = execute(&target, &op).await;
-                    let took = t.elapsed();
-                    let rec = &mut load.measured.0[class];
-                    match r {
-                        Ok(Outcome::Ok) => rec.ok(took),
-                        Ok(Outcome::NotFound) => rec.not_found(took),
-                        Ok(Outcome::Ranked(hits)) => {
-                            rec.ok(took);
-                            if let Op::Search { qid, .. } = &op {
-                                load.trec.entry(qid.clone()).or_insert(hits);
-                            }
-                        }
-                        Err(e) => rec.error(took, e),
-                    }
+                    load.record(class, &op, r, t.elapsed());
                     if let Op::Insert(d) = &op {
                         inserts += 1;
                         if lag_every > 0 && inserts.is_multiple_of(lag_every) {

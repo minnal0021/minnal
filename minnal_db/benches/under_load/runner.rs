@@ -10,7 +10,13 @@
 //!    separately.
 //! 2. `closed-{n}-r{k}`: `n` clients, each sending the next operation from
 //!    `mix` as soon as its last returns.
-//! 3. `soak-{n}`: `soak_clients` clients for `soak_s`, sampled every 10 s.
+//! 3. `open-{rate}-r{k}`: operations from `mix` arriving at `rate` a second
+//!    (each of `open_rates`) on a Poisson schedule, timed from their scheduled
+//!    arrival (see `open_loop`).
+//! 4. `soak-{n}`: `soak_clients` clients for `soak_s`, sampled every 10 s.
+//!
+//! `single_s` or `soak_s` set to 0 leaves those cells out, for a run that
+//! compares builds on the concurrent cells only.
 //!
 //! Every cell: wait for the vector queue to drain, take counters, run
 //! `warm_s` unmeasured, measure, wait for the queue to drain again (so
@@ -42,6 +48,7 @@ pub(crate) enum Kind {
     Single { class: usize },
     Closed { clients: usize },
     Soak { clients: usize },
+    Open { rate: u32 },
 }
 
 #[derive(Clone, Serialize)]
@@ -61,9 +68,11 @@ fn plan(cfg: &Config) -> Vec<Cell> {
         measure_s,
         warm_s: cfg.warm_s,
     };
-    for r in 1..=cfg.repeats {
-        for (class, c) in CLASSES.iter().enumerate() {
-            cells.push(cell(format!("single-{c}-r{r}"), Kind::Single { class }, cfg.single_s));
+    if cfg.single_s > 0 {
+        for r in 1..=cfg.repeats {
+            for (class, c) in CLASSES.iter().enumerate() {
+                cells.push(cell(format!("single-{c}-r{r}"), Kind::Single { class }, cfg.single_s));
+            }
         }
     }
     for r in 1..=cfg.repeats {
@@ -71,11 +80,18 @@ fn plan(cfg: &Config) -> Vec<Cell> {
             cells.push(cell(format!("closed-{clients:02}-r{r}"), Kind::Closed { clients }, cfg.concurrent_s));
         }
     }
-    cells.push(cell(
-        format!("soak-{:02}", cfg.soak_clients),
-        Kind::Soak { clients: cfg.soak_clients },
-        cfg.soak_s,
-    ));
+    for r in 1..=cfg.repeats {
+        for &rate in &cfg.open_rates {
+            cells.push(cell(format!("open-{rate:05}-r{r}"), Kind::Open { rate }, cfg.concurrent_s));
+        }
+    }
+    if cfg.soak_s > 0 {
+        cells.push(cell(
+            format!("soak-{:02}", cfg.soak_clients),
+            Kind::Soak { clients: cfg.soak_clients },
+            cfg.soak_s,
+        ));
+    }
     cells
 }
 
@@ -210,6 +226,10 @@ struct CellResult<'a> {
     /// allocator to return what it keeps free, so a growth can be split into
     /// live allocations and memory freed but kept.
     trim: Option<(engine::Memory, engine::Memory)>,
+    /// Open-loop cells only: how the arrivals kept to their schedule, and
+    /// whether the rate saturated the engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open: Option<crate::open_loop::OpenStats>,
 }
 
 async fn run_cell(ctx: &Ctx, cell: &Cell) -> Result<bool, String> {
@@ -237,7 +257,12 @@ async fn run_cell(ctx: &Ctx, cell: &Cell) -> Result<bool, String> {
     }
     let t = Instant::now();
     let load = run_load(ctx, cell, cell.measure_s, 2).await;
-    let measured = t.elapsed();
+    // An open-loop cell's rates are over its arrival window; operations still
+    // in flight at its end finish after it.
+    let measured = match cell.kind {
+        Kind::Open { .. } => Duration::from_secs(cell.measure_s),
+        _ => t.elapsed(),
+    };
     let drain_after_s = drain(&ctx.target.store, max_drain).await;
     let mut lags: Vec<f64> = Vec::new();
     for h in load.lag_tasks {
@@ -317,6 +342,7 @@ async fn run_cell(ctx: &Ctx, cell: &Cell) -> Result<bool, String> {
         engine_after: after,
         trim,
         cursors_after: cursors,
+        open: load.open.clone(),
     };
     let dir = ctx.out.join("cells");
     write_json(&dir.join(format!("{}.json", cell.name)), &result)?;
@@ -325,8 +351,12 @@ async fn run_cell(ctx: &Ctx, cell: &Cell) -> Result<bool, String> {
     if !load.trec.is_empty() {
         write_trec(&dir.join(format!("{}.trec", cell.name)), &load.trec, &cell.name)?;
     }
+    let saturated = match &load.open {
+        Some(o) if o.saturated => format!(" — SATURATED: {} of {} arrivals shed", o.shed, o.scheduled),
+        _ => String::new(),
+    };
     eprintln!(
-        "[{}] {}: {} — {:.1} ops/s, errors {errors}{}",
+        "[{}] {}: {} — {:.1} ops/s, errors {errors}{}{saturated}",
         now_unix(),
         cell.name,
         if valid { "valid" } else { "INVALID" },

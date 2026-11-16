@@ -12,6 +12,7 @@
   "single_s": 120,
   "concurrent_s": 180,
   "clients": [1, 4, 6, 8, 16],
+  "open_rates": [500, 1000, 1500, 1650, 1800, 1950],
   "soak_s": 3600,
   "soak_clients": 4,
   "warm_s": 15,
