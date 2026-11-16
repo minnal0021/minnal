@@ -145,6 +145,13 @@ def saturated(cells):
     return any(c["open"]["saturated"] for c in cells)
 
 
+def log_ticks(lo, hi):
+    """1-2-5 ticks from lo to hi, every one if the range is narrow, decades if wide."""
+    ticks = [m * 10.0 ** e for e in range(-3, 6) for m in (1, 2, 5)]
+    ticks = [t for t in ticks if lo <= t <= hi]
+    return ticks if len(ticks) <= 8 else [t for t in ticks if f"{t:g}".lstrip("0.").startswith("1")]
+
+
 def open_latency_chart(open_, out, tmp):
     """Latency by arrival rate, one panel per operation; saturated rates left off."""
     rates = [r for r in sorted(open_) if not saturated(open_[r])]
@@ -159,6 +166,7 @@ def open_latency_chart(open_, out, tmp):
                 row = [statistics.median(c["classes"][op][key] for c in open_[r]) for key, _ in PCTS]
                 f.write(f"{r} " + " ".join(f"{v}" for v in row) + "\n")
         top = max(statistics.median(c["classes"][op]["p99_ms"] for c in open_[r]) for r in rates)
+        bottom = min(statistics.median(c["classes"][op]["p50_ms"] for c in open_[r]) for r in rates)
         lines = ", \\\n     ".join(
             f'"{dat}" using 1:{i + 2} with linespoints lw 2 pt 7 ps 0.7 lc rgb "{COLOURS[i]}" title "{label}"'
             for i, (_, label) in enumerate(PCTS)
@@ -168,19 +176,24 @@ def open_latency_chart(open_, out, tmp):
                   f'     "{dat}" every ::{len(rates) - 1} using 1:5:(sprintf("%.3g", $5)) with labels left offset 0.6,0 tc rgb "{COLOURS[3]}" notitle')
         plots.append(f"""
 set title "{op}" noenhanced
-set yrange [0:{top * 1.12}]
+set yrange [{bottom / 1.6}:{top * 1.6}]
+set ytics ({", ".join(f"{t:g}" for t in log_ticks(bottom / 1.6, top * 1.6))})
 plot {lines}, \\
      {labels}
 """)
     rows = (len(ops) + 1) // 2
+    # A log scale: near capacity the queue grows by orders of magnitude, and a
+    # linear axis would flatten every rate below it.
     gnuplot(f"""
 set terminal pngcairo size 1000,{280 * rows + 40} font "DejaVu Sans,10"
 set output "{out}/engine_open_latency.png"
-set multiplot layout {rows},2 title "Latency by arrival rate (ms; operations from the mix arriving at a fixed rate)"
+set multiplot layout {rows},2 title "Latency by arrival rate (ms, log scale; operations from the mix arriving at a fixed rate)"
 set grid ytics lc rgb "#dddddd"
+set logscale y
+unset mytics
 set xlabel "Operations arriving per second"
 set ylabel "ms"
-set xtics ({", ".join(str(r) for r in rates)}) rotate by -30
+set xtics ({", ".join(str(r) for r in rates)})
 set xrange [0:{max(rates) * 1.18}]
 set key top left horizontal reverse Left font ",9"
 """ + "".join(plots) + "unset multiplot\n")
