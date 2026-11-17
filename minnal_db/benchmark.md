@@ -695,9 +695,13 @@ indexed afterwards by the vector-index worker.
    background work does not cost search quality.
 
 Each measurement (a *cell*) also records the background work done during it
-(flushes, compactions, garbage collection, checkpoints, splits and merges) and
+(flushes, compactions, garbage collection, checkpoints, splits and merges),
 the **ingestion lag**: how long after a write is acknowledged its document
-becomes searchable.
+becomes searchable, and **where the CPU went**: the process's CPU time per
+operation, the CPU time of the threads that score searches per search, how
+long threads were ready to run but waited for a free core, and the machine's
+CPU pressure (the share of time in which some ready thread waited for a
+core).
 
 ### How a number is made trustworthy
 
@@ -806,9 +810,14 @@ This appendix compares search latency under load in the engine at commit
 consolidate the configuration, clean up storage code, rework range scans,
 harden durability and move field-index upkeep off the write path. It answers
 one question: does a search take longer at `c0f9da6` when the same load
-arrives? It does, by a few percent at light load and 10–20% at 1,000
-operations a second, and which change causes it is not yet known. Measured
-on 2026-11-16 and 17 on the machine under [Setup](#setup).
+arrives? Not measurably. Two sets of four paired runs, on consecutive
+evenings, disagree: in the first, `c0f9da6` was slower in every pair, by 18%
+on average at 1,000 operations a second; in the second, the pairs went both
+ways and the mean difference was 2%. The CPU time each operation costs, and
+how long threads waited for a free core, are the same at both commits. Any
+difference left is smaller than the spread between runs of one build.
+Measured on 2026-11-16 (set 1) and 2026-11-17 (set 2) on the machine under
+[Setup](#setup).
 
 ### How the two were compared
 
@@ -820,59 +829,100 @@ on 2026-11-16 and 17 on the machine under [Setup](#setup).
   therefore given the same arrival rates ([Latency at a fixed arrival
   rate](#latency-at-a-fixed-arrival-rate)): 400, then 700, then 1,000
   operations a second, 3 minutes each, after 10-second single-operation cells.
-- **Four runs per build, alternating** (`21d54d9`, `c0f9da6`, `21d54d9`, …),
-  each run on a fresh copy of a starting database built by that build (the
-  two read different on-disk formats), with about 840 vector-partition
-  postings during the cells. Runs are compared in the pairs they ran in: the
-  machine's own speed drifted by about 10% over the hours they took.
+- **Four runs per build in each set, alternating** (`21d54d9`, `c0f9da6`,
+  `21d54d9`, …), each run on a fresh copy of a starting database built by
+  that build (the two read different on-disk formats), with about 840
+  vector-partition postings during the cells. Runs are compared in the pairs
+  they ran in: the machine's own speed drifted by about 10% over the hours a
+  set took.
+- **Set 2 also recorded CPU use** (see [What is measured](#what-is-measured)).
+  Both builds ran the same benchmark code. Set 2's `c0f9da6` side was built
+  from `16287f3` with the CPU recording added; `16287f3`'s changes since
+  `c0f9da6` are to the benchmark and the documentation only, so the engine
+  is `c0f9da6`'s.
 
 ### Results
 
 Median `search` latency in milliseconds, each pair run back to back:
 
-| Arrivals per second | Pair 1 | Pair 2 | Pair 3 | Pair 4 | Mean change |
-|---|---|---|---|---|---:|
-| 400 | 5.48 → 5.77 | 5.58 → 5.65 | 5.46 → 5.92 | 5.48 → 5.54 | +4% |
-| 700 | 6.66 → 6.80 | 6.91 → 7.03 | 6.83 → 8.80 | 6.77 → 7.06 | +9% |
-| 1,000 | 7.72 → 8.71 | 7.83 → 9.07 | 8.62 → 11.69 | 8.53 → 9.24 | +18% |
+| Arrivals per second | Set | Pair 1 | Pair 2 | Pair 3 | Pair 4 | Mean change |
+|---|---|---|---|---|---|---:|
+| 400 | 1 | 5.48 → 5.77 | 5.58 → 5.65 | 5.46 → 5.92 | 5.48 → 5.54 | +4% |
+| 400 | 2 | 5.71 → 5.46 | 5.43 → 5.58 | 5.30 → 5.51 | 5.46 → 5.53 | +1% |
+| 700 | 1 | 6.66 → 6.80 | 6.91 → 7.03 | 6.83 → 8.80 | 6.77 → 7.06 | +9% |
+| 700 | 2 | 7.54 → 6.75 | 6.94 → 6.93 | 6.63 → 6.66 | 6.61 → 6.88 | −2% |
+| 1,000 | 1 | 7.72 → 8.71 | 7.83 → 9.07 | 8.62 → 11.69 | 8.53 → 9.24 | +18% |
+| 1,000 | 2 | 9.37 → 8.62 | 9.13 → 9.13 | 8.53 → 8.89 | 7.89 → 8.91 | +2% |
 
-`c0f9da6` is slower in every pair. Pair 3 at `c0f9da6` is an outlier at 700
-and 1,000 a second; without it the change is +2–4% at 700 and +8–16% at
-1,000. Every operation, as the mean over the four runs at 1,000 a second:
+In set 1, `c0f9da6` is slower in every pair; its pair 3 is an outlier at 700
+and 1,000 a second, and without it the change is +2–4% at 700 and +8–16% at
+1,000. In set 2, at 1,000 a second, `c0f9da6` is faster in one pair, equal in
+one and slower in two, and `21d54d9`'s own four runs span 7.89–9.37 ms,
+wider than any difference between the builds.
 
-| Operation | Median, `21d54d9` → `c0f9da6` | p99, `21d54d9` → `c0f9da6` |
+Every operation at 1,000 a second, median latency as the mean over the four
+runs of each set, `21d54d9` → `c0f9da6`:
+
+| Operation | Set 1 | Set 2 |
 |---|---|---|
-| `search` | 8.17 → 9.68 ms (+18%) | 24.2 → 31.4 ms (+30%) |
-| `filtered_search` | 10.13 → 11.24 ms (+11%) | 30.7 → 35.1 ms (+15%) |
-| `field_query` | 3.93 → 3.92 ms (0%) | 20.6 → 19.1 ms (−7%) |
-| `scan` | 2.32 → 0.59 ms (−75%) | 8.1 → 5.0 ms (−38%) |
-| `get` | 0.09 → 0.09 ms | 0.8 → 0.9 ms |
-| `insert` | 3.29 → 2.67 ms (−19%) | 18.0 → 9.1 ms (−49%) |
-| `update` | 3.26 → 2.69 ms (−17%) | 18.2 → 9.3 ms (−49%) |
-| `delete` | 9.19 → 7.75 ms (−16%) | 37.4 → 29.5 ms (−21%) |
+| `search` | 8.17 → 9.68 ms (+18%) | 8.73 → 8.89 ms (+2%) |
+| `filtered_search` | 10.13 → 11.24 ms (+11%) | 11.19 → 10.56 ms (−6%) |
+| `field_query` | 3.93 → 3.92 ms (0%) | 4.50 → 3.85 ms (−14%) |
+| `scan` | 2.32 → 0.59 ms (−75%) | 2.43 → 0.54 ms (−78%) |
+| `get` | 0.09 → 0.09 ms | 0.09 → 0.09 ms |
+| `insert` | 3.29 → 2.67 ms (−19%) | 3.55 → 2.63 ms (−26%) |
+| `update` | 3.26 → 2.69 ms (−17%) | 3.51 → 2.65 ms (−25%) |
+| `delete` | 9.19 → 7.75 ms (−16%) | 9.48 → 7.62 ms (−20%) |
 
-So searches lose under load while scans and writes gain a lot.
+Scans and writes are much faster at `c0f9da6` in both sets; searches are
+where the sets disagree.
 
-### What it is not
+### Where the CPU went
+
+Set 2, mean over the four runs of each build, `21d54d9` → `c0f9da6`.
+*Alone* is the cell that sends one search at a time, beside the trickle of
+writes. The *scoring threads* are the pool that ranks a search's candidates;
+their *wait* is time they were ready to run but had no free core, per second
+they ran. *CPU pressure* is the share of time in which some ready thread on
+the machine waited for a core, which also covers the short-lived threads
+that LSM and value-log scans start for each call.
+
+| | Alone | 400 a second | 700 a second | 1,000 a second |
+|---|---|---|---|---|
+| CPU per operation | 18.0 → 17.9 ms | 8.6 → 8.5 ms | 10.0 → 9.7 ms | 11.2 → 11.5 ms |
+| Scoring CPU per search | 6.9 → 6.7 ms | 7.1 → 6.9 ms | 8.2 → 7.9 ms | 9.3 → 9.1 ms |
+| Scoring threads' wait | 3% → 3% | 8% → 9% | 13% → 13% | 22% → 24% |
+| CPU pressure | 0.6% → 0.6% | 0.7% → 0.6% | 1.7% → 1.6% | 3.8% → 4.0% |
+
+So `c0f9da6` spends no more CPU per operation or per search, and its threads
+wait no longer for a core: its searches are not starved of CPU. Across all
+eight runs of set 2, a run's search median at 1,000 a second follows its CPU
+per operation (correlation 0.87) and its CPU pressure (0.84), not which build
+ran it: the slower runs were those that spent more CPU per operation, most of
+the difference on the per-call scan threads. Every run sent the same
+operations, and the partition held 835–857 postings in all of them.
+
+Both builds share a cost that grows with load: a search's scoring CPU rises
+from 6.9 ms alone to 9.3 ms at 1,000 a second, and its scoring threads wait
+for a core 22% of the time they run although about 11 of the 32 cores are
+busy. Why is not yet investigated; the candidates are the scoring pool's
+wake-ups, the threads scans start for each call, and the time a woken thread
+takes to get a core.
+
+### What else it is not
 
 - **Not the cost of a search.** Sent one at a time, a search's median is
-  3.99–4.61 ms at `21d54d9` and 3.93–4.08 ms at `c0f9da6`. The difference
-  appears only when searches share the machine with everything else.
-- **Not more background work.** During the 1,000-a-second cells `c0f9da6`
-  flushed 30–33 memtables and merged L0 into L1 91–116 times, against
-  40–44 and 123–139 at `21d54d9`, with half the value-log GC passes.
+  3.9–4.6 ms at both commits, in both sets. A difference could only appear
+  when searches share the machine with everything else.
+- **Not more background work.** During set 1's 1,000-a-second cells
+  `c0f9da6` flushed 30–33 memtables and merged L0 into L1 91–116 times,
+  against 40–44 and 123–139 at `21d54d9`, with half the value-log GC passes.
 - **Not the configuration.** Both builds read the same configuration file and
   apply the same engine settings; their only difference, the default bucket
   count, is overridden by the count each database was created with (8).
-- **Not the field-index worker**, the last change in the range. Its parent
-  `6daf8e4` and `c0f9da6` measured 10.34 and 10.10 ms at 1,000 a second (one
-  run each, on a coarser partition, where every search costs more).
 
-Which change it is was not found. A bisection needs about four pairs of runs
-per commit to see a difference this size, about two hours each. The next
-step is to record the process's CPU time per operation at a fixed rate,
-which varies far less between runs than latency, and if `c0f9da6` spends
-more, profile both builds at 1,000 a second and compare where the extra goes.
+No bisection was run: one would need several pairs of runs per commit to
+resolve a difference that two sets of four pairs do not agree on.
 
 ### Measuring a difference this small
 
@@ -880,9 +930,13 @@ more, profile both builds at 1,000 a second and compare where the extra goes.
   single-operation cells, which move the store by tens of thousands of
   documents, the clean-up work makes a cell's median swing by about ±1 ms
   from run to run, more than the difference above. After two cells at lower
-  rates, repeats of one build agree within 0.1–0.4 ms.
+  rates, repeats of one build agree more closely.
 - **Alternate the builds and compare pairs.** The machine's speed drifts over
   hours, so a run of one build late in the evening is not comparable with a
   run of the other in the early evening.
-- **Repeat.** One run each can point either way; four pairs, all in one
-  direction, are what the table above rests on.
+- **Repeat on another day.** Four pairs all pointing one way on one evening
+  (set 1) did not hold on the next (set 2).
+- **Read the CPU beside the latency.** A run's CPU per operation at a fixed
+  rate explains most of its latency's spread from other runs of the same
+  build, so a latency difference that comes with no CPU difference is more
+  likely the run than the build.

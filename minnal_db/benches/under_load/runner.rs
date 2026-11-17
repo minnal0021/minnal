@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::counters::{Counters, spawn_monitor};
+use crate::cpu::{CpuSnapshot, CpuUse};
 use crate::engine::{self, Config, EngineSettings};
 use crate::load::{rebalance, run_load};
 use crate::replay::{Replay, ReplayStats};
@@ -230,6 +231,9 @@ struct CellResult<'a> {
     /// whether the rate saturated the engine.
     #[serde(skip_serializing_if = "Option::is_none")]
     open: Option<crate::open_loop::OpenStats>,
+    /// Where the CPU went during the measured stretch (warm-up excluded), and
+    /// how long threads waited for a core (`cpu`).
+    cpu: CpuUse,
 }
 
 async fn run_cell(ctx: &Ctx, cell: &Cell) -> Result<bool, String> {
@@ -255,8 +259,10 @@ async fn run_cell(ctx: &Ctx, cell: &Cell) -> Result<bool, String> {
             t.abort();
         }
     }
+    let cpu_before = CpuSnapshot::take();
     let t = Instant::now();
     let load = run_load(ctx, cell, cell.measure_s, 2).await;
+    let cpu_after = CpuSnapshot::take();
     // An open-loop cell's rates are over its arrival window; operations still
     // in flight at its end finish after it.
     let measured = match cell.kind {
@@ -276,6 +282,12 @@ async fn run_cell(ctx: &Ctx, cell: &Cell) -> Result<bool, String> {
     let trim = matches!(cell.kind, Kind::Soak { .. }).then(engine::trim);
     let replay = ctx.replay.stats().since(&replay_before);
     let delta = after.since(&before);
+    let searches = ["search", "filtered_search"]
+        .iter()
+        .filter_map(|n| CLASSES.iter().position(|c| c == n))
+        .map(|c| load.measured.count(c) + load.trickle.count(c))
+        .sum();
+    let cpu = cpu_after.since(&cpu_before, load.measured.completed() + load.trickle.completed(), searches);
 
     // Validity.
     let mut reasons = Vec::new();
@@ -343,6 +355,7 @@ async fn run_cell(ctx: &Ctx, cell: &Cell) -> Result<bool, String> {
         trim,
         cursors_after: cursors,
         open: load.open.clone(),
+        cpu,
     };
     let dir = ctx.out.join("cells");
     write_json(&dir.join(format!("{}.json", cell.name)), &result)?;
