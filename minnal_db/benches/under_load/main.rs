@@ -25,6 +25,7 @@
 //! compare allocators on the same engine. The library sets no allocator.
 
 mod counters;
+mod cpu;
 mod engine;
 mod load;
 mod open_loop;
@@ -60,6 +61,12 @@ fn main() {
         eprintln!("engine_bench: no command (run | record | quality); skipped. See the module docs.");
         return;
     }
+    // Rayon's global pool, as it would build itself (one thread per core), but
+    // named, so each cell's CPU accounting can tell search scoring apart (`cpu`).
+    rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("rayon-{i}"))
+        .build_global()
+        .expect("the rayon pool is built once, before anything uses it");
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     let result = runtime.block_on(async {
         match command.as_str() {
