@@ -228,21 +228,34 @@ pub async fn discard_orphaned_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<
 /// Remove every queue entry of `namespace` (a store being dropped), durable on
 /// return; returns how many there were.
 ///
-/// The keys start with the namespace, so one prefix scan finds them. They are
-/// deleted without the WAL and made durable by one flush of the queue's
-/// memtable: a WAL-backed delete costs an fsync each, which made dropping a
-/// store with 20 000 queued entries take 48 s.
+/// The keys start with the namespace, so they are one key range. It is walked a
+/// page of keys at a time ([`KEY_PAGE`](crate::kv_store::KEY_PAGE)) and no value
+/// is read: an entry's value is the document's text, and a store dropped after a
+/// bulk load can have every document queued, so reading the range whole held all
+/// of that text at once. The next page starts at a key not yet deleted, so the
+/// tombstones left behind never fall in a page's window.
+///
+/// The keys are deleted without the WAL and made durable by one flush of the
+/// queue's memtable: a WAL-backed delete costs an fsync each, which made
+/// dropping a store with 20 000 queued entries take 48 s.
 pub async fn clear_queue_for(db: &AsyncDb, namespace: &str) -> Result<usize, crate::KVError> {
     let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
-    let entries = queue_ns.scan_prefix(queue_key(namespace, &[])).await?;
-    if entries.is_empty() {
-        return Ok(0);
+    let prefix = queue_prefix(namespace);
+    let end = crate::support::prefix_upper_bound(&prefix);
+    let mut cursor = Some(prefix);
+    let mut removed = 0usize;
+    while let Some(start) = cursor {
+        let (keys, next) = queue_ns.key_page(Some(start), end.clone(), crate::kv_store::KEY_PAGE).await?;
+        for key in keys {
+            queue_ns.delete_no_wal(key).await?;
+            removed += 1;
+        }
+        cursor = next;
     }
-    for (key, _) in &entries {
-        queue_ns.delete_no_wal(key.clone()).await?;
+    if removed > 0 {
+        db.flush_namespaces(vec![PENDING_VEC_INDEX_NS.to_string()]).await?;
     }
-    db.flush_namespaces(vec![PENDING_VEC_INDEX_NS.to_string()]).await?;
-    Ok(entries.len())
+    Ok(removed)
 }
 
 /// Return all pending embedding queue entries.
