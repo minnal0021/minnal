@@ -302,3 +302,28 @@ async fn queued_namespaces_finds_each_namespace_once() {
     assert_eq!(namespaces, ["a", "ab", "abc", "b"]);
     assert_eq!(count_queue_entries(&db).await.unwrap(), 53);
 }
+
+/// Clearing one namespace's entries walks them a page of keys at a time, so it
+/// must reach entries past the first page and stop at the namespace's end:
+/// neighbours whose names share a prefix with it (`a`, `abc`) or sort right
+/// after it (`b`) keep their entries.
+#[tokio::test]
+async fn clearing_a_namespace_reaches_every_page_and_spares_its_neighbours() {
+    let dir = TempDir::new().unwrap();
+    let db = open_db(&dir).await;
+
+    let entries = crate::kv_store::KEY_PAGE as u32 + 5;
+    for doc in 0..entries {
+        enqueue_embed(&db, "ab", &doc.to_be_bytes(), "t").await.unwrap();
+    }
+    enqueue_embed(&db, "a", b"\xff\xff", "t").await.unwrap();
+    enqueue_embed(&db, "abc", b"d", "t").await.unwrap();
+    enqueue_embed(&db, "b", b"d", "t").await.unwrap();
+
+    assert_eq!(clear_queue_for(&db, "ab").await.unwrap(), entries as usize);
+
+    let namespaces: Vec<String> = queued_namespaces(&db).await.unwrap().into_iter().collect();
+    assert_eq!(namespaces, ["a", "abc", "b"]);
+    assert_eq!(count_queue_entries(&db).await.unwrap(), 3);
+    assert_eq!(clear_queue_for(&db, "ab").await.unwrap(), 0, "a second clear finds nothing");
+}
