@@ -171,14 +171,20 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    pub async fn iter(&self) -> Result<Vec<KeyValue>> {
+    /// Every live key-value pair, all in memory at once (crate-internal: callers
+    /// outside the crate page with [`scan`](Self::scan)).
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn iter(&self) -> Result<Vec<crate::kv_store::KeyValue>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_range_batch(&[], None))
             .await
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    pub async fn keys(&self) -> Result<Vec<Vec<u8>>> {
+    /// Every live key, all in memory at once (crate-internal: callers outside
+    /// the crate page with `key_page` or [`scan`](Self::scan)).
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn keys(&self) -> Result<Vec<Vec<u8>>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.keys())
             .await
@@ -204,14 +210,10 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    pub async fn range(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> Result<Vec<KeyValue>> {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.scan_range_batch(&start, end.as_deref()))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    pub async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<Vec<KeyValue>> {
+    /// Every live key-value pair whose key starts with `prefix`, all in memory at
+    /// once (crate-internal: callers outside the crate page with [`scan`](Self::scan)).
+    #[cfg(any(feature = "doc-store", feature = "semantic-search"))]
+    pub(crate) async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<Vec<crate::kv_store::KeyValue>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.scan_prefix_batch(&prefix))
             .await
@@ -311,45 +313,5 @@ impl AsyncNamespace {
             Some(bytes) => Ok(Some(rkyv_deserialize::<V>(&bytes)?)),
             None => Ok(None),
         }
-    }
-
-    // ── Typed Iteration (rkyv ser/de) ─────────────────────────────────
-
-    /// Iterate over all typed key-value pairs.
-    pub async fn iter_typed<K, V>(&self) -> Result<Vec<(K, V)>>
-    where
-        K: RkyvDecode,
-        V: RkyvDecode,
-    {
-        deserialize_pairs(self.iter().await?)
-    }
-
-    /// Iterate over all typed keys.
-    pub async fn keys_typed<K>(&self) -> Result<Vec<K>>
-    where
-        K: RkyvDecode,
-    {
-        deserialize_keys(self.keys().await?)
-    }
-
-    /// Iterate over typed key-value pairs in `[start, end)`.
-    pub async fn range_typed<K, V>(&self, start: &K, end: Option<&K>) -> Result<Vec<(K, V)>>
-    where
-        K: RkyvEncode + RkyvDecode,
-        V: RkyvDecode,
-    {
-        let start_bytes = rkyv_serialize(start)?;
-        let end_bytes = end.map(|e| rkyv_serialize(e)).transpose()?;
-        let raw = self.range(start_bytes, end_bytes).await?;
-        deserialize_pairs(raw)
-    }
-
-    /// Iterate over typed key-value pairs whose keys start with `prefix`.
-    pub async fn scan_prefix_typed<K, V>(&self, prefix: Vec<u8>) -> Result<Vec<(K, V)>>
-    where
-        K: RkyvDecode,
-        V: RkyvDecode,
-    {
-        deserialize_pairs(self.scan_prefix(prefix).await?)
     }
 }

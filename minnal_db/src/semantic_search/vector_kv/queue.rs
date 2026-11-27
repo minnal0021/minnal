@@ -229,7 +229,7 @@ pub async fn discard_orphaned_entry(db: &AsyncDb, entry: &QueueEntry) -> Result<
 /// return; returns how many there were.
 ///
 /// The keys start with the namespace, so they are one key range. It is walked a
-/// page of keys at a time ([`KEY_PAGE`](crate::kv_store::KEY_PAGE)) and no value
+/// page of keys at a time (1,024 keys) and no value
 /// is read: an entry's value is the document's text, and a store dropped after a
 /// bulk load can have every document queued, so reading the range whole held all
 /// of that text at once. The next page starts at a key not yet deleted, so the

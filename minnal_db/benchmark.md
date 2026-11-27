@@ -60,7 +60,7 @@ ran. So more writers mean more writes per fsync, not a queue for the disk.
 | Machine | AMD Ryzen 9 9950X3D (16 cores), 96 GB RAM, NVMe SSD, bare metal |
 | OS | Ubuntu 26.04, Linux 7.0.0-43 |
 | Rust | 1.99.1 |
-| Code | commit `9e8586a`; the range scans and typed iteration in [Scans](#scans) at commit `a11f16c`; [The engine at work](#the-engine-at-work) at commit `ad09762` |
+| Code | commit `9e8586a`; the range scans in [Scans](#scans) at commit `a11f16c`; [The engine at work](#the-engine-at-work) at commit `ad09762` |
 | Date | 2026-11-15; [The engine at work](#the-engine-at-work) on 2026-11-16 |
 
 To reproduce everything, including the charts:
@@ -229,10 +229,13 @@ check reads no file.
 
 ## Scans
 
-Four ways to read many keys at once, each measured in memory and on disk. On
-disk, a scan costs between the same as and 1.6 times the in-memory scan. Where
-disk costs more, the ratio shrinks as the result grows, because most of the
-on-disk extra is a fixed setup cost per scan.
+Three ways to read many keys at once, each measured in memory and on disk. The
+prefix and range scans return their whole result at once; minnal uses them
+internally, for results it needs whole. Applications and the REST API read
+through the cursor-paginated scan, the last one below, which reads a page at a
+time. On disk, a scan costs between the same as and 1.6 times the in-memory
+scan. Where disk costs more, the ratio shrinks as the result grows, because
+most of the on-disk extra is a fixed setup cost per scan.
 
 ![Prefix scan by number of matching keys](docs/benchmarks/scan_prefix.png)
 
@@ -244,13 +247,6 @@ bytes here; 32-byte keys measure within 4% of these.*
 
 *Range scan: all keys between a start and end key, from a store of 2,000. The
 two tiers are within 5% of each other at every result count.*
-
-![Reading all keys with their values](docs/benchmarks/scan_iter.png)
-
-*Reading all 2,000 keys with their values. On disk costs 1.14x memory with
-128-byte values and 1.01x with 4 KiB values. The larger the values, the more of
-the time goes into reading them from the value log. That cost is the same on
-both tiers.*
 
 ![One page of a cursor-paginated scan, by page size](docs/benchmarks/scan_cursor.png)
 
@@ -265,9 +261,9 @@ only for the page.
 
 ## Typed API
 
-The typed API (`put_typed`, `get_typed`, and so on) serialises your own Rust
-types with `rkyv`, on top of the byte-oriented API. For single-key operations
-it adds nothing measurable:
+The typed API (`put_typed`, `get_typed`, `delete_typed`, `merge_typed`)
+serialises your own Rust types with `rkyv`, on top of the byte-oriented API. It
+adds nothing measurable:
 
 | Operation | Raw bytes | Typed |
 |---|---:|---:|
@@ -279,28 +275,6 @@ it adds nothing measurable:
 
 The differences between the two columns, in either direction, are within the
 noise.
-
-Scans cost 5–24% more typed, because every returned pair is deserialised. The
-extra is largest in memory, where nothing else in the scan is slow:
-
-| Scan | Raw bytes | Typed | Extra |
-|---|---:|---:|---:|
-| range, 100 results, in memory | 53 µs | 56 µs | +5% |
-| range, 1,000 results, in memory | 334 µs | 370 µs | +11% |
-| range, 100 results, on disk | 54 µs | 57 µs | +5% |
-| range, 1,000 results, on disk | 352 µs | 387 µs | +10% |
-| prefix, 100 keys, in memory | 49 µs | 55 µs | +13% |
-| prefix, 1,000 keys, in memory | 294 µs | 365 µs | +24% |
-| prefix, 100 keys, on disk | 78 µs | 82 µs | +6% |
-| prefix, 1,000 keys, on disk | 394 µs | 419 µs | +6% |
-
-One typed operation is slow for a structural reason. `keys_typed`, which lists
-keys without values, takes 144–156 µs even for 100 keys, in memory or on disk.
-That is nearly three times as long as reading the same 100 keys *with*
-their values from memory (54 µs). Key listing goes through the whole-store
-merge that rebuilds the value log's accounting; reading with values uses the
-faster range scan. Until that changes, a range or prefix scan is the cheaper way
-to list keys.
 
 ## Field-index queries
 

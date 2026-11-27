@@ -50,9 +50,8 @@ where
 /// Deserialize bytes into a value via rkyv, **validating them first**.
 ///
 /// The bytes are whatever is stored under the key, and nothing ties them to `T`:
-/// a caller can `put` raw bytes and then `get_typed` the key, `put_typed` one type
-/// and `get_typed` another, or run a typed range scan over keys written any way at
-/// all. This used `access_unchecked` on the assumption that the bytes always came
+/// a caller can `put` raw bytes and then `get_typed` the key, or `put_typed` one
+/// type and `get_typed` another. This used `access_unchecked` on the assumption that the bytes always came
 /// from `rkyv_serialize` of the same `T`, which made a safe public function able
 /// to follow archived relative pointers out of bounds — undefined behaviour. Every
 /// typed entry point already requires `T::Archived: CheckBytes`, so validating
@@ -62,30 +61,4 @@ where
     T: RkyvDecode,
 {
     rkyv::from_bytes::<T, RkyvError>(bytes).map_err(|e| KVError::Serialization(format!("rkyv deserialize: {:?}", e)))
-}
-
-// ── Shared helpers ─────────────────────────────────────────────────────
-
-/// Deserialize a list of raw key-value byte pairs into typed pairs.
-pub fn deserialize_pairs<K, V>(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<Vec<(K, V)>>
-where
-    K: RkyvDecode,
-    V: RkyvDecode,
-{
-    pairs
-        .into_iter()
-        .map(|(kb, vb)| {
-            let key = rkyv_deserialize::<K>(&kb)?;
-            let val = rkyv_deserialize::<V>(&vb)?;
-            Ok((key, val))
-        })
-        .collect()
-}
-
-/// Deserialize a list of raw key bytes into typed keys.
-pub fn deserialize_keys<K>(keys: Vec<Vec<u8>>) -> Result<Vec<K>>
-where
-    K: RkyvDecode,
-{
-    keys.into_iter().map(|kb| rkyv_deserialize::<K>(&kb)).collect()
 }

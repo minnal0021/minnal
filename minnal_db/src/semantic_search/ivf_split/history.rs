@@ -16,6 +16,7 @@
 //! to expire; a namespace re-created under the same name shows them until then,
 //! each stamped with when it was taken.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::support::now_ms;
@@ -94,6 +95,10 @@ pub async fn record(db: &AsyncDb, namespace: &str, kind: RecordKind, data: &impl
 /// `namespace`'s records, newest first: at most `limit` (capped at
 /// [`MAX_HISTORY_LIMIT`]), of `kind` only when given. `ttl` is the namespace's
 /// TTL, as for [`record`] (a different one would re-register it).
+///
+/// The keys are read a page at a time, oldest first, keeping only the newest
+/// `limit` that match; then only those records' values are read. Memory stays at
+/// one page plus `limit` records however long the history is.
 pub async fn read(
     db: &AsyncDb,
     namespace: &str,
@@ -101,26 +106,42 @@ pub async fn read(
     limit: usize,
     ttl: Duration,
 ) -> Result<Vec<HistoryRecord>, crate::KVError> {
-    let rows = db
-        .namespace_with_ttl(HISTORY_NS.to_string(), ttl, HISTORY_MAX_DELETES)
-        .await?
-        .scan_prefix(prefix(namespace))
-        .await?;
-    let mut out = Vec::new();
-    for (k, v) in rows.into_iter().rev() {
-        if out.len() >= limit.min(MAX_HISTORY_LIMIT) {
-            break;
+    let limit = limit.min(MAX_HISTORY_LIMIT);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let ns = db.namespace_with_ttl(HISTORY_NS.to_string(), ttl, HISTORY_MAX_DELETES).await?;
+    let start = prefix(namespace);
+    // `namespace ‖ 0x01`: the first key past every `namespace ‖ 0x00 ‖ …` key.
+    let mut end = start.clone();
+    *end.last_mut().expect("the prefix ends with 0x00") = 1;
+    let mut newest = VecDeque::with_capacity(limit);
+    let mut cursor = Some(start);
+    loop {
+        let (keys, next) = ns.key_page(cursor, Some(end.clone()), crate::kv_store::KEY_PAGE).await?;
+        for k in keys {
+            if kind.is_some_and(|want| k.last() != Some(&want.tag())) {
+                continue;
+            }
+            if newest.len() == limit {
+                newest.pop_front();
+            }
+            newest.push_back(k);
         }
-        if kind.is_some_and(|want| k.last() != Some(&want.tag())) {
-            continue;
-        }
-        // A record that does not decode is skipped: the history is a convenience,
-        // and one bad record must not hide the rest.
-        if let Ok(r) = serde_json::from_slice::<HistoryRecord>(&v) {
-            out.push(r);
+        match next {
+            Some(n) => cursor = Some(n),
+            None => break,
         }
     }
-    Ok(out)
+    let values = ns.get_multiple(newest.into_iter().rev().collect()).await?;
+    // A record that expired since its key was read is gone; one that does not
+    // decode is skipped: the history is a convenience, and one bad record must
+    // not hide the rest.
+    Ok(values
+        .into_iter()
+        .flatten()
+        .filter_map(|v| serde_json::from_slice::<HistoryRecord>(&v).ok())
+        .collect())
 }
 
 #[cfg(test)]
@@ -193,6 +214,42 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_newest_records_are_found_across_key_pages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = AsyncDb::open_with_config(dir.path().to_owned(), crate::support::test_db_config())
+            .await
+            .unwrap();
+        let ttl = crate::defaults::semantic_search::PARTITION_HISTORY_TTL;
+        let ns = db.namespace_with_ttl(HISTORY_NS.to_string(), ttl, HISTORY_MAX_DELETES).await.unwrap();
+        // More records than one key page, one millisecond apart, every tenth a
+        // recall check; written directly so their timestamps are distinct.
+        let n = crate::kv_store::KEY_PAGE as u64 * 2 + 7;
+        for t in 0..n {
+            let kind = if t % 10 == 0 { RecordKind::RecallCheck } else { RecordKind::Codes };
+            let mut key = prefix("a");
+            key.extend_from_slice(&t.to_be_bytes());
+            key.push(kind.tag());
+            let value = serde_json::to_vec(&HistoryRecord {
+                recorded_at_ms: t,
+                kind,
+                data: serde_json::json!({}),
+            })
+            .unwrap();
+            ns.put(key, value).await.unwrap();
+        }
+        let at = |records: Vec<HistoryRecord>| records.iter().map(|r| r.recorded_at_ms).collect::<Vec<_>>();
+        assert_eq!(at(read(&db, "a", None, 3, ttl).await.unwrap()), [n - 1, n - 2, n - 3]);
+        let last_check = (n - 1) / 10 * 10;
+        assert_eq!(
+            at(read(&db, "a", Some(RecordKind::RecallCheck), 2, ttl).await.unwrap()),
+            [last_check, last_check - 10]
+        );
+        assert_eq!(read(&db, "a", None, MAX_HISTORY_LIMIT + 50, ttl).await.unwrap().len(), MAX_HISTORY_LIMIT);
+        assert!(read(&db, "a", None, 0, ttl).await.unwrap().is_empty());
         db.shutdown().await.unwrap();
     }
 }

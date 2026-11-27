@@ -472,34 +472,6 @@ impl AsyncDb {
 
     // ── Iteration ─────────────────────────────────────────────────────
 
-    pub async fn iter(&self) -> Result<Vec<KeyValue>> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.iter())
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    pub async fn keys(&self) -> Result<Vec<Vec<u8>>> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.keys())
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    pub async fn range(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> Result<Vec<KeyValue>> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.range(&start, end.as_deref()))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
-    pub async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<Vec<KeyValue>> {
-        let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.scan_prefix(&prefix))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
     /// Paginated cursor scan over `[cursor, end)` on the default namespace.
     ///
     /// Returns up to `limit` key-value pairs starting from `cursor`

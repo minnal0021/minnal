@@ -4,7 +4,7 @@
 // Measures the overhead of the *_typed() convenience layer which adds rkyv
 // serialization on write and deserialization on read, compared to raw bytes.
 //
-// Read-side cases (get/iter/keys/range/scan_prefix) are measured on both the
+// Read-side cases (get) are measured on both the
 // active memtable and the on-disk L1 SSTable tier (`TIERS` in common.rs) —
 // memtable-only numbers are cheap but not representative of steady-state
 // reads once data ages onto disk. Write-side cases (put/delete) are NOT
@@ -16,7 +16,7 @@ mod common;
 use common::*;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use minnal_db::bench_internals::{Db, deserialize_keys, deserialize_pairs, rkyv_deserialize, rkyv_serialize};
+use minnal_db::bench_internals::{Db, rkyv_deserialize, rkyv_serialize};
 use minnal_db::rkyv_derives::{Archive, Deserialize, Serialize};
 use minnal_db::{KVError, RkyvDecode, RkyvEncode};
 use std::hint::black_box;
@@ -30,10 +30,6 @@ trait Typed {
     fn put_typed<K: RkyvEncode, V: RkyvEncode>(&self, key: &K, value: &V) -> Result<(), KVError>;
     fn get_typed<K: RkyvEncode, V: RkyvDecode>(&self, key: &K) -> Result<Option<V>, KVError>;
     fn delete_typed<K: RkyvEncode>(&self, key: &K) -> Result<(), KVError>;
-    fn iter_typed<K: RkyvDecode, V: RkyvDecode>(&self) -> Result<Vec<(K, V)>, KVError>;
-    fn keys_typed<K: RkyvDecode>(&self) -> Result<Vec<K>, KVError>;
-    fn range_typed<K: RkyvEncode + RkyvDecode, V: RkyvDecode>(&self, start: &K, end: Option<&K>) -> Result<Vec<(K, V)>, KVError>;
-    fn scan_prefix_typed<K: RkyvDecode, V: RkyvDecode>(&self, prefix: &[u8]) -> Result<Vec<(K, V)>, KVError>;
 }
 
 impl Typed for Db {
@@ -48,20 +44,6 @@ impl Typed for Db {
     }
     fn delete_typed<K: RkyvEncode>(&self, key: &K) -> Result<(), KVError> {
         self.delete(&rkyv_serialize(key)?)
-    }
-    fn iter_typed<K: RkyvDecode, V: RkyvDecode>(&self) -> Result<Vec<(K, V)>, KVError> {
-        deserialize_pairs(self.iter()?)
-    }
-    fn keys_typed<K: RkyvDecode>(&self) -> Result<Vec<K>, KVError> {
-        deserialize_keys(self.keys()?)
-    }
-    fn range_typed<K: RkyvEncode + RkyvDecode, V: RkyvDecode>(&self, start: &K, end: Option<&K>) -> Result<Vec<(K, V)>, KVError> {
-        let start_bytes = rkyv_serialize(start)?;
-        let end_bytes = end.map(|e| rkyv_serialize(e)).transpose()?;
-        deserialize_pairs(self.range(&start_bytes, end_bytes.as_deref())?)
-    }
-    fn scan_prefix_typed<K: RkyvDecode, V: RkyvDecode>(&self, prefix: &[u8]) -> Result<Vec<(K, V)>, KVError> {
-        deserialize_pairs(self.scan_prefix(prefix)?)
     }
 }
 
@@ -99,18 +81,9 @@ impl AutoCloseDb {
     }
 }
 
-// `prefix` is declared FIRST: `put_typed` uses the raw rkyv-archived bytes of
-// the key directly as the on-disk key, and archived struct layout follows
-// declaration order — so `prefix` must lead for `scan_prefix_typed(b"bench_kk")`
-// to actually match anything. With `id` first (the original field order),
-// the archived key started with `id`'s bytes and "bench_kk" landed at
-// offset 8, so every prefix scan matched zero entries and reported a
-// near-instant, meaningless latency instead of a real scan cost.
-//
-// `id` is stored as big-endian bytes, not a `u64`: rkyv archives integers
-// little-endian, whose byte order is not numeric order, so a byte range from
-// key 0 to key 100 would not select ids 0..100 and `typed/range`'s result
-// counts would be wrong. Big-endian bytes make key order match id order.
+// A fixed 8-byte prefix and a big-endian id: `put_typed` uses the key's rkyv
+// bytes as the stored key, and rkyv archives integers little-endian, so the
+// id is kept as bytes for key order to match id order.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[rkyv(compare(PartialEq), derive(Debug))]
 struct BenchKey {
@@ -229,145 +202,11 @@ fn bench_delete_typed(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_iter_typed(c: &mut Criterion) {
-    let mut group = c.benchmark_group("typed/iter");
-    group.measurement_time(Duration::from_secs(10));
-
-    for num_keys in [100u64, 1_000] {
-        let value = BenchValue::new(128);
-
-        for tier in TIERS {
-            let temp = bench_tempdir();
-            let mut db = AutoCloseDb::open(temp.path());
-
-            for seq in 0..num_keys {
-                db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-            }
-            if tier == "l1" {
-                db = db.push_to_l1(temp.path());
-            }
-
-            group.throughput(Throughput::Elements(num_keys));
-            let label = format!("{tier}_keys");
-            group.bench_with_input(BenchmarkId::new(label, num_keys), &num_keys, |b, _| {
-                b.iter(|| {
-                    let pairs = db.db().iter_typed::<BenchKey, BenchValue>().unwrap();
-                    black_box(pairs.len())
-                });
-            });
-        }
-    }
-    group.finish();
-}
-
-fn bench_keys_typed(c: &mut Criterion) {
-    let mut group = c.benchmark_group("typed/keys");
-    group.measurement_time(Duration::from_secs(10));
-
-    for num_keys in [100u64, 1_000] {
-        let value = BenchValue::new(128);
-
-        for tier in TIERS {
-            let temp = bench_tempdir();
-            let mut db = AutoCloseDb::open(temp.path());
-
-            for seq in 0..num_keys {
-                db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-            }
-            if tier == "l1" {
-                db = db.push_to_l1(temp.path());
-            }
-
-            group.throughput(Throughput::Elements(num_keys));
-            let label = format!("{tier}_keys");
-            group.bench_with_input(BenchmarkId::new(label, num_keys), &num_keys, |b, _| {
-                b.iter(|| {
-                    let keys = db.db().keys_typed::<BenchKey>().unwrap();
-                    black_box(keys.len())
-                });
-            });
-        }
-    }
-    group.finish();
-}
-
-fn bench_range_typed(c: &mut Criterion) {
-    const TOTAL_KEYS: u64 = 2_000;
-    let mut group = c.benchmark_group("typed/range");
-    group.measurement_time(Duration::from_secs(10));
-
-    for tier in TIERS {
-        let temp = bench_tempdir();
-        let mut db = AutoCloseDb::open(temp.path());
-        let value = BenchValue::new(128);
-
-        for seq in 0..TOTAL_KEYS {
-            db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-        }
-        if tier == "l1" {
-            db = db.push_to_l1(temp.path());
-        }
-
-        for result_count in [100u64, 500, 1_000] {
-            let start = BenchKey::new(0);
-            let end = BenchKey::new(result_count);
-            // The label is the result count, so check the range really returns it.
-            let n = db.db().range_typed::<BenchKey, BenchValue>(&start, Some(&end)).unwrap().len();
-            assert_eq!(n as u64, result_count, "typed/range: [0, {result_count}) returned {n} keys");
-
-            group.throughput(Throughput::Elements(result_count));
-            let label = format!("{tier}_result_count");
-            group.bench_with_input(BenchmarkId::new(label, result_count), &result_count, |b, _| {
-                b.iter(|| {
-                    let pairs = db.db().range_typed::<BenchKey, BenchValue>(&start, Some(&end)).unwrap();
-                    black_box(pairs.len())
-                });
-            });
-        }
-    }
-    group.finish();
-}
-
-fn bench_scan_prefix_typed(c: &mut Criterion) {
-    let mut group = c.benchmark_group("typed/scan_prefix");
-    group.measurement_time(Duration::from_secs(10));
-
-    for num_keys in [100u64, 1_000] {
-        let value = BenchValue::new(128);
-
-        for tier in TIERS {
-            let temp = bench_tempdir();
-            let mut db = AutoCloseDb::open(temp.path());
-
-            for seq in 0..num_keys {
-                db.db().put_typed(&BenchKey::new(seq), &value).unwrap();
-            }
-            if tier == "l1" {
-                db = db.push_to_l1(temp.path());
-            }
-
-            group.throughput(Throughput::Elements(num_keys));
-            let label = format!("{tier}_keys");
-            group.bench_with_input(BenchmarkId::new(label, num_keys), &num_keys, |b, _| {
-                b.iter(|| {
-                    let pairs = db.db().scan_prefix_typed::<BenchKey, BenchValue>(b"bench_kk").unwrap();
-                    black_box(pairs.len())
-                });
-            });
-        }
-    }
-    group.finish();
-}
-
 criterion_group!(
     name    = typed_benches;
     config  = Criterion::default().measurement_time(Duration::from_secs(10));
     targets = bench_put_typed,
               bench_get_typed,
-              bench_delete_typed,
-              bench_iter_typed,
-              bench_keys_typed,
-              bench_range_typed,
-              bench_scan_prefix_typed
+              bench_delete_typed
 );
 criterion_main!(typed_benches);

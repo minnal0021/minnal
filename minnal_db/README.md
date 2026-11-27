@@ -70,7 +70,7 @@ The diagram below shows how a request flows through MinnalDB. At the top, caller
 │   engine-wide operations                                                 │
 │                                                                          │
 │ put · get · delete · merge (and _typed forms via rkyv)                   │
-│ iter · range · scan_prefix · scan (cursor-paginated)                     │
+│ scan (cursor-paginated); on a namespace also key_page · count            │
 └──────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼

@@ -143,8 +143,16 @@ db.put(b"hello".to_vec(), b"world".to_vec()).await?;
 let val = db.get(b"hello".to_vec()).await?;          // Some(b"world")
 db.delete(b"hello".to_vec()).await?;
 
-for (key, value) in db.scan_prefix(b"user:".to_vec()).await? { /* … */ }
-for (key, value) in db.range(b"a".to_vec(), Some(b"z".to_vec())).await? { /* … */ }
+// Many keys: a page at a time, each page reading only its own values.
+// `scan(cursor, end, limit)` reads keys in [cursor, end); a prefix ends at
+// `prefix_upper_bound(prefix)`. Pass each page's `next` back as the cursor.
+let end = minnal_db::prefix_upper_bound(b"user:");
+let mut cursor = Some(b"user:".to_vec());
+while let Some(from) = cursor {
+    let (page, next) = db.scan(Some(from), end.clone(), 100).await?;
+    for (key, value) in page { /* … */ }
+    cursor = next;
+}
 
 // Namespaces — each has its own isolated keyspace
 let ns = db.namespace("orders".to_string()).await?;
