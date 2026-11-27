@@ -258,22 +258,47 @@ pub async fn clear_queue_for(db: &AsyncDb, namespace: &str) -> Result<usize, cra
     Ok(removed)
 }
 
-/// Return all pending embedding queue entries.
-///
-/// Called by the `VecIndexWorker` on startup (crash recovery) and after
-/// each wake-up signal.  Returns an empty list when the queue is empty.
+/// Every queue entry, all at once (test-only). The values are the documents'
+/// texts and the queue can hold every document, so nothing outside tests reads
+/// it whole: walk it with [`for_each_queue_entry`] or [`queue_page`].
+#[cfg(test)]
 pub async fn list_queue_entries(db: &AsyncDb) -> Result<Vec<QueueEntry>, crate::KVError> {
-    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
-    let entries = queue_ns.iter().await?;
-    let mut result = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        if let Some((namespace, doc_id_bytes)) = decode_queue_key(&key)
-            && let Some(value) = decode_queue_value(&value)
-        {
-            result.push(value.into_entry(namespace, doc_id_bytes));
+    let mut entries = Vec::new();
+    for_each_queue_entry(db, None, |e| entries.push(e)).await?;
+    Ok(entries)
+}
+
+/// Entries read per page when the queue is walked whole.
+pub(super) const QUEUE_WALK_PAGE: usize = 256;
+
+/// Call `visit` for every queue entry of `namespace` (of every namespace when
+/// `None`), in key order, reading the queue a page at a time: memory is one page
+/// of entries whatever the queue's length.
+pub async fn for_each_queue_entry(db: &AsyncDb, namespace: Option<&str>, mut visit: impl FnMut(QueueEntry)) -> Result<(), crate::KVError> {
+    let (start, end) = match namespace {
+        Some(ns) => {
+            let prefix = queue_prefix(ns);
+            let end = crate::support::prefix_upper_bound(&prefix);
+            (prefix, end)
         }
+        None => (Vec::new(), None),
+    };
+    let mut cursor = Some(start);
+    while let Some(from) = cursor {
+        let (entries, next) = queue_page(db, from, end.clone(), QUEUE_WALK_PAGE).await?;
+        entries.into_iter().for_each(&mut visit);
+        cursor = next;
     }
-    Ok(result)
+    Ok(())
+}
+
+/// Whether `namespace` has any entry in the embedding queue. Reads one key.
+pub async fn has_queue_entries(db: &AsyncDb, namespace: &str) -> Result<bool, crate::KVError> {
+    let queue_ns = db.namespace(PENDING_VEC_INDEX_NS.to_string()).await?;
+    let prefix = queue_prefix(namespace);
+    let end = crate::support::prefix_upper_bound(&prefix);
+    let (keys, _) = queue_ns.key_page(Some(prefix), end, 1).await?;
+    Ok(!keys.is_empty())
 }
 
 /// How many entries the embedding queue holds, counted from the keys alone.
@@ -321,8 +346,8 @@ pub fn queue_prefix(namespace: &str) -> Vec<u8> {
 }
 
 /// One page of at most `limit` queue entries with keys in `[start, end)`, and the
-/// key the next page starts at (`None` after the last page). Unlike
-/// [`list_queue_entries`], memory is bounded by the page.
+/// key the next page starts at (`None` after the last page): memory is bounded
+/// by the page.
 pub async fn queue_page(
     db: &AsyncDb,
     start: Vec<u8>,
@@ -356,10 +381,9 @@ pub async fn get_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8])
 
 // ── Conditional queue updates ─────────────────────────────────────────────────
 //
-// The worker snapshots the whole queue at the start of a pass, then embeds the
-// snapshot entries one by one, so an upsert or delete of a document can land at
-// any point between the snapshot and that entry's completion — minutes, during a
-// bulk load. Every write the worker makes *after* embedding is therefore
+// The worker reads a page of each namespace's entries at the start of a pass,
+// then embeds them one by one, so an upsert or delete of a document can land at
+// any point between that read and the entry's completion. Every write the worker makes *after* embedding is therefore
 // conditional on the entry still being the one it took, checked atomically
 // under the key's stripe lock via `merge`:
 //
@@ -611,13 +635,16 @@ pub async fn reset_queue_entry(db: &AsyncDb, namespace: &str, doc_id_bytes: &[u8
 /// Reset the retry count of every entry of `namespace` that has reached
 /// `max_retries`, so the worker picks them up again. Returns how many were reset.
 pub async fn reset_exhausted_queue_entries(db: &AsyncDb, namespace: &str, max_retries: u32) -> Result<usize, crate::KVError> {
-    let entries = list_queue_entries(db).await?;
-    let exhausted: Vec<_> = entries
-        .into_iter()
-        .filter(|e| e.namespace == namespace && e.retry_count >= max_retries)
-        .collect();
-    for entry in &exhausted {
-        reset_queue_entry(db, &entry.namespace, &entry.doc_id_bytes).await?;
+    // Only the exhausted entries' ids are kept, never their texts.
+    let mut exhausted = Vec::new();
+    for_each_queue_entry(db, Some(namespace), |e| {
+        if e.retry_count >= max_retries {
+            exhausted.push(e.doc_id_bytes);
+        }
+    })
+    .await?;
+    for doc_id_bytes in &exhausted {
+        reset_queue_entry(db, namespace, doc_id_bytes).await?;
     }
     Ok(exhausted.len())
 }

@@ -18,6 +18,8 @@ mod search;
 mod support;
 #[cfg(feature = "semantic-search")]
 mod vector_jobs;
+#[cfg(feature = "semantic-search")]
+mod worker_paging;
 
 use super::test_support::*;
 #[cfg(feature = "semantic-search")]

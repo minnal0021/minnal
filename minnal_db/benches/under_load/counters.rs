@@ -120,7 +120,8 @@ impl Counters {
 }
 
 pub(crate) async fn queue_depth(store: &DocStore) -> usize {
-    store.list_queue_entries().await.len()
+    // Counted from the keys alone: the values are the documents' texts.
+    store.pending_vector_index_count().await.unwrap_or(0)
 }
 
 /// One sample of the time series kept during a cell.

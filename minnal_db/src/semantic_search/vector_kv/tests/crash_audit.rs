@@ -120,7 +120,7 @@ async fn check(db: &AsyncDb, docs: &[&[u8]]) -> Result<(), String> {
         return Err(format!("queue not drained: {} entr(y/ies)", queue.len()));
     }
     let mut keys: BTreeMap<Vec<u8>, BTreeSet<u32>> = BTreeMap::new();
-    for (key, _) in db.namespace(sparse_vectors_ns(NS)).await.unwrap().iter().await.unwrap() {
+    for (key, _) in db.namespace(sparse_vectors_ns(NS)).await.unwrap().scan_prefix(Vec::new()).await.unwrap() {
         let (cluster, doc) = composite_key::decode(&key).unwrap();
         keys.entry(doc.to_vec()).or_default().insert(cluster);
     }

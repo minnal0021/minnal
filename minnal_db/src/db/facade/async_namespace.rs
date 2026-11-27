@@ -171,16 +171,6 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Every live key-value pair, all in memory at once (crate-internal: callers
-    /// outside the crate page with [`scan`](Self::scan)).
-    #[cfg(feature = "semantic-search")]
-    pub(crate) async fn iter(&self) -> Result<Vec<crate::kv_store::KeyValue>> {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.scan_range_batch(&[], None))
-            .await
-            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
-    }
-
     /// Every live key, all in memory at once (crate-internal: callers outside
     /// the crate page with `key_page` or [`scan`](Self::scan)).
     #[cfg(feature = "semantic-search")]

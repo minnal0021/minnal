@@ -74,7 +74,7 @@ pub async fn quality(args: &[String]) -> Result<(), String> {
     let data = Data::load(&cfg.data)?;
     let ns = cfg.namespace.as_str();
 
-    while !store.list_queue_entries().await.is_empty() {
+    while store.pending_vector_index_count().await.unwrap_or(0) > 0 {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let mut passes = serde_json::Map::new();

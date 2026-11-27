@@ -56,7 +56,7 @@ async fn put_all(store: &Arc<DocStore>, ns: &str, phase: &str, docs: Vec<Doc>) -
 
 async fn drain(store: &DocStore, replay: &Replay, phase: &str) {
     let t = Instant::now();
-    while !store.list_queue_entries().await.is_empty() {
+    while store.pending_vector_index_count().await.unwrap_or(0) > 0 {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let s = replay.stats();

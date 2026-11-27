@@ -327,3 +327,50 @@ async fn clearing_a_namespace_reaches_every_page_and_spares_its_neighbours() {
     assert_eq!(count_queue_entries(&db).await.unwrap(), 3);
     assert_eq!(clear_queue_for(&db, "ab").await.unwrap(), 0, "a second clear finds nothing");
 }
+
+/// Walking one namespace's entries reads a page at a time, so it must reach
+/// entries past the first page and stop at the namespace's end: `a` and `abc`,
+/// whose names share a prefix with `ab`, are not visited. Resetting exhausted
+/// entries and the one-key "anything queued?" check use the same range.
+#[tokio::test]
+async fn a_namespace_walk_reaches_every_page_and_spares_its_neighbours() {
+    let dir = TempDir::new().unwrap();
+    let db = open_db(&dir).await;
+
+    let entries = super::super::queue::QUEUE_WALK_PAGE as u32 * 2 + 3;
+    for doc in 0..entries {
+        enqueue_embed(&db, "ab", &doc.to_be_bytes(), "t").await.unwrap();
+    }
+    enqueue_embed(&db, "a", b"\xff\xff", "t").await.unwrap();
+    enqueue_embed(&db, "abc", b"d", "t").await.unwrap();
+
+    let mut seen = Vec::new();
+    for_each_queue_entry(&db, Some("ab"), |e| seen.push((e.namespace, e.doc_id_bytes)))
+        .await
+        .unwrap();
+    let expected: Vec<(String, Vec<u8>)> = (0..entries).map(|d| ("ab".to_string(), d.to_be_bytes().to_vec())).collect();
+    assert_eq!(seen, expected);
+
+    let mut all = 0;
+    for_each_queue_entry(&db, None, |_| all += 1).await.unwrap();
+    assert_eq!(all, entries + 2);
+
+    // Exhaust the last entry of `ab`, two pages in, and one of `abc`.
+    let max_retries = 2;
+    for (ns, doc) in [("ab", (entries - 1).to_be_bytes().to_vec()), ("abc", b"d".to_vec())] {
+        for _ in 0..max_retries {
+            let entry = get_queue_entry(&db, ns, &doc).await.unwrap().unwrap();
+            record_queue_failure(&db, &entry, "boom").await.unwrap();
+        }
+    }
+    assert_eq!(reset_exhausted_queue_entries(&db, "ab", max_retries).await.unwrap(), 1);
+    let last = get_queue_entry(&db, "ab", &(entries - 1).to_be_bytes()).await.unwrap().unwrap();
+    assert_eq!(last.retry_count, 0);
+    let neighbour = get_queue_entry(&db, "abc", b"d").await.unwrap().unwrap();
+    assert_eq!(neighbour.retry_count, max_retries, "another namespace's entry was reset");
+
+    assert!(has_queue_entries(&db, "ab").await.unwrap());
+    assert!(has_queue_entries(&db, "a").await.unwrap());
+    clear_queue_for(&db, "a").await.unwrap();
+    assert!(!has_queue_entries(&db, "a").await.unwrap(), "`ab`'s entries counted for `a`");
+}

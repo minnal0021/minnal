@@ -48,8 +48,10 @@
 //!
 //! # Scheduling
 //!
-//! Entries are grouped by namespace and processed in **round-robin** order so
-//! that a large backlog in one namespace cannot starve others.  Up to
+//! The queue is drained in rounds, a page of each namespace's entries per pass
+//! (`drain.rs`), never read whole. Within a pass entries are grouped by
+//! namespace and processed in **round-robin** order so that a large backlog in
+//! one namespace cannot starve others.  Up to
 //! [`VectorIndexConfig::concurrency`] embedding calls are in-flight at once
 //! via a [`JoinSet`].
 //!
