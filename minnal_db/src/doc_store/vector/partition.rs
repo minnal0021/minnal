@@ -28,8 +28,9 @@ impl DocStore {
 
     /// The health of `namespace`'s partition (document or KV store): every
     /// posting's size, state and lineage from memory, and with `codes` also the
-    /// code metrics (residual inflation, error band, foreign and zero-centre
-    /// shares), which read every chunk code. Returns the namespace's
+    /// code metrics (centre drift, error band, foreign and zero-centre shares),
+    /// computed afresh by one read of every chunk code, kept as the namespace's
+    /// last pass and recorded in the partition history. Returns the namespace's
     /// maintenance settings beside them.
     #[cfg(feature = "semantic-search")]
     pub async fn vector_partition_health(
@@ -51,16 +52,43 @@ impl DocStore {
 
     /// Every IVF centre of `namespace` (document or KV store) with the postings
     /// that name it, from memory; with `codes` also how many chunk codes decode
-    /// against each, which reads every chunk code. No centre vectors are
-    /// returned.
+    /// against each, from the namespace's last full code-metrics pass (one is
+    /// run if there is none yet), and when that pass ran (Unix ms). No centre
+    /// vectors are returned.
     #[cfg(feature = "semantic-search")]
     pub async fn vector_centres(
         &self,
         namespace: &str,
         codes: bool,
-    ) -> Result<Vec<crate::semantic_search::ivf_split::health::CentreHealth>, DocStoreError> {
+    ) -> Result<(Vec<crate::semantic_search::ivf_split::health::CentreHealth>, Option<u64>), DocStoreError> {
         let (ctx, settings, ns_id) = self.vector_admin_target(namespace)?;
         Ok(ctx.centre_health(&self.db, namespace, ns_id, &settings, codes).await?)
+    }
+
+    /// `namespace`'s last full code-metrics pass (every posting's code metrics
+    /// and every centre's use), or a new one when there is none yet: one read
+    /// of every chunk code, recorded in the partition history. Postings
+    /// created since it have none; `computed_at_ms` says how old it is.
+    /// `vector_partition_health` with `codes` runs a new pass.
+    #[cfg(feature = "semantic-search")]
+    pub async fn vector_code_metrics(
+        &self,
+        namespace: &str,
+    ) -> Result<std::sync::Arc<crate::semantic_search::ivf_split::health::CodeMetrics>, DocStoreError> {
+        let (ctx, settings, ns_id) = self.vector_admin_target(namespace)?;
+        Ok(ctx.code_metrics(&self.db, namespace, ns_id, &settings).await?)
+    }
+
+    /// The code metrics of just `postings` of `namespace`, reading only their
+    /// codes: for a page of postings. Nothing is kept or recorded.
+    #[cfg(feature = "semantic-search")]
+    pub async fn vector_postings_code_health(
+        &self,
+        namespace: &str,
+        postings: &[u32],
+    ) -> Result<std::collections::HashMap<u32, crate::semantic_search::ivf_split::health::CodeHealth>, DocStoreError> {
+        let (ctx, settings, ns_id) = self.vector_admin_target(namespace)?;
+        Ok(ctx.postings_code_health(&self.db, namespace, ns_id, &settings, postings).await?)
     }
 
     /// Check whether `namespace`'s searches miss what a full read finds, the

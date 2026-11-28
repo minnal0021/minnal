@@ -2278,10 +2278,14 @@ The store's IVF partition at a glance, from memory: `postings` (K), `entries`,
 `unfinished_operations` (maintenance a crash interrupted, finished at startup),
 `maintenance` (splits, merges, reassignments and chunk moves since the partition
 loaded), the store's `target_posting_size`, `split_limit` and `merge_limit`, and
-`rebuild` (the last rebuild since the server started, or `null`). With
-`?codes=true` it also reads every chunk code and adds `codes` (mean centre drift
-and error band) and `reencode_candidates`, and records them in the
-[history](#get-adminindicesnsvectorhistory). `last_recall_check` is the latest
+`rebuild` (the last rebuild since the server started, or `null`), and
+`size_histogram`: the postings that are not retired, by size, as `counts` in 24
+bins of `bin_width` chunks from 0, wide enough to show the split limit. With
+`?codes=true` it also reads every chunk code (a *code-metrics pass*) and adds
+`codes` (mean centre drift and error band), `reencode_candidates` and
+`codes_computed_at_ms`, and records them in the
+[history](#get-adminindicesnsvectorhistory). The server keeps the store's last
+pass: code-sorted pages of the posting and centre lists are served from it. `last_recall_check` is the latest
 recorded [recall check](#get-adminindicesnsvectorrecall-check), or `null`; it is
 read from the history, never run here.
 
@@ -2308,6 +2312,19 @@ Cursor-paginated: `cursor`, `limit` (default 1,000, at most 10,000); sorted by
 as a small record (its id, centre, parent and origin) so the split tree stays
 complete and its id is never handed out again.
 
+Without code metrics everything comes from memory. With `codes=true` each
+posting also has `codes` (its centre drift, error band and foreign and
+zero-centre shares), and `codes_computed_at_ms` says when they were computed:
+
+- Sorted by `id`, `entries` or `chunks`, only the page's postings' codes are
+  read, afresh, for every page.
+- Sorted by `drift`, which needs every posting's, they come from the store's
+  last code-metrics pass (`partition?codes=true`), or a pass is run once if
+  there is none. Postings created since that pass have no `codes` and sort
+  last; run `partition?codes=true` again to refresh. Paging reads nothing more.
+
+Nothing here is recorded in the history: only a code-metrics pass is.
+
 ```bash
 curl 'http://localhost:8080/admin/indices/products/vector/postings?state=active&sort=chunks'
 ```
@@ -2326,9 +2343,11 @@ retired posting's centre usually stays in use.
 With `codes=true` each centre also has `codes` (chunk codes encoded against it)
 and `code_postings` (the postings those codes are filed under), and `unused`
 counts the centres that no posting that is not retired names and no code uses —
-the ones that could be reclaimed. This reads every chunk code of the store
-(about half a second for 170,000 chunks). Without it, everything comes from
-memory.
+the ones that could be reclaimed. These come from the store's last
+code-metrics pass (`partition?codes=true`), or a pass is run once if there is
+none (it reads every chunk code: about half a second for 170,000 chunks), and
+`codes_computed_at_ms` says when it ran. Paging reads nothing more. Without
+`codes`, everything comes from memory.
 
 Cursor-paginated like the posting list; sorted by `sort` (`id`, `codes`, which
 implies `codes=true`, or `postings`) and `order`, filtered by `state`.
@@ -2338,7 +2357,8 @@ implies `codes=true`, or `postings`) and `order`, filtered by `state`.
 curl 'http://localhost:8080/admin/indices/products/vector/centres?codes=true&state=retired&sort=codes&order=asc'
 # → {"centres": 1893, "by_state": {"active": 946, "retired": 947}, "unused": 23,
 #    "matched": 947, "results": [{"centre_id": 37, "state": "retired", "postings": [37],
-#    "created_by": "split", "norm": 0.633, "codes": 0, "code_postings": 0}, ...], "next_cursor": null}
+#    "created_by": "split", "norm": 0.633, "codes": 0, "code_postings": 0}, ...], "next_cursor": null,
+#    "codes_computed_at_ms": 1764300000000}
 ```
 
 ---
@@ -2566,7 +2586,8 @@ curl http://localhost:8080/admin/indices/vector/settings
 #### `GET /admin/indices/{ns}/vector/history`
 
 What the store's partition looked like over time, without recomputing anything:
-every `partition?codes=true` read (`kind` `codes`), recall check
+every code-metrics pass (`kind` `codes`: a `partition?codes=true` read, or the
+pass a code-sorted posting or centre page ran when there was none), recall check
 (`recall_check`) and finished rebuild (`rebuild`), each with `recorded_at_ms` and
 the result as its endpoint returned it under `data`. Newest first; `kind` keeps
 one kind, `limit` sets how many (default 50, at most 1,000). Records are kept in

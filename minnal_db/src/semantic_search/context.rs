@@ -95,6 +95,12 @@ pub struct SemanticSearchContext {
     /// `ns_id`, so a namespace dropped and recreated under the same name never
     /// reuses the old one.
     ivfs: parking_lot::RwLock<std::collections::HashMap<(String, NamespaceId), Arc<PartitionHandle>>>,
+    /// Each namespace's last full code-metrics pass (it reads every chunk code),
+    /// keyed as `ivfs` and forgotten with its partition: what code-sorted pages
+    /// of postings and centres are served from, so a page does not read every
+    /// code again. `partition_admin.rs`.
+    pub(crate) code_metrics:
+        parking_lot::RwLock<std::collections::HashMap<(String, NamespaceId), Arc<crate::semantic_search::ivf_split::health::CodeMetrics>>>,
     /// Namespaces whose vector index is being dropped: no partition of theirs
     /// is loaded or handed out until the drop ends ([`begin_drop`](Self::begin_drop)).
     dropping: parking_lot::Mutex<std::collections::HashSet<String>>,
@@ -132,6 +138,7 @@ impl SemanticSearchContext {
             rebuild_threads: crate::defaults::semantic_search::maintenance::REBUILD_THREADS,
             maintenance_tx: std::sync::OnceLock::new(),
             ivfs: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            code_metrics: parking_lot::RwLock::new(std::collections::HashMap::new()),
             dropping: parking_lot::Mutex::new(std::collections::HashSet::new()),
             drops_begun: std::sync::atomic::AtomicU64::new(0),
         }
@@ -187,6 +194,7 @@ impl SemanticSearchContext {
         if !crate::semantic_search::vector_kv::ivf_exists(db, namespace).await? {
             crate::semantic_search::vector_kv::init_ivf(db, namespace, settings.embedding_dim as usize).await?;
             self.ivfs.write().retain(|(name, _), _| name != namespace);
+            self.code_metrics.write().retain(|(name, _), _| name != namespace);
         }
         Ok(())
     }
@@ -194,6 +202,7 @@ impl SemanticSearchContext {
     /// Forget every loaded partition of `namespace` (it was dropped).
     pub fn evict(&self, namespace: &str) {
         self.ivfs.write().retain(|(name, _), _| name != namespace);
+        self.code_metrics.write().retain(|(name, _), _| name != namespace);
     }
 
     /// Start dropping `namespace`'s vector index: refuse to load or hand out
@@ -223,6 +232,7 @@ impl SemanticSearchContext {
             });
             out
         };
+        self.code_metrics.write().retain(|(name, _), _| name != namespace);
         for partition in loaded {
             partition.mark_dropped();
             drop(partition.lock_maintenance().await);

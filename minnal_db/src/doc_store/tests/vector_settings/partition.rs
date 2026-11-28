@@ -328,3 +328,76 @@ async fn dropping_a_store_removes_its_partition_and_a_recreated_store_gets_its_o
     store.shutdown_vec_index_worker().await;
     store.shutdown().await.unwrap();
 }
+
+/// Code metrics read every chunk code, so one full pass serves every
+/// code-sorted page: a page asking for them again reuses it, and only a full
+/// pass is recorded in the partition history. A page sorted by size reads only
+/// its own postings, and finds what the full pass found. A drop forgets the
+/// namespace's pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_code_metrics_pass_serves_every_page_and_is_recorded_once() {
+    use crate::semantic_search::ivf_split::history::RecordKind;
+    let (url, _seen) = spawn_text_service();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_with(db_dir.path(), |b| b.semantic_search(context(&url))).await;
+    store
+        .create(semantic_schema(
+            "g",
+            Some(spec(r#"{"embedding_dim":8,"maintenance":{"target_posting_size":16}}"#)),
+        ))
+        .await
+        .unwrap();
+    for i in 0..40u64 {
+        let text = format!("Doc {i} one. Doc {i} two. Doc {i} three. Doc {i} four. Doc {i} five. Doc {i} six.");
+        store.put("g", DocId::U64(i), serde_json::json!({"text": text})).await.unwrap();
+    }
+    wait_for_empty_queue(&store).await;
+    let partition = partition(&store, "g").await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while partition.snapshot().postings() <= 2 {
+        assert!(std::time::Instant::now() < deadline, "the root never split");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Nothing moves while the counts are compared.
+    let _quiet = partition.lock_maintenance().await;
+    let recorded = async || store.vector_partition_history("g", Some(RecordKind::Codes), 100).await.unwrap().len();
+    assert_eq!(recorded().await, 0);
+
+    let first = store.vector_code_metrics("g").await.unwrap();
+    assert_eq!(recorded().await, 1, "the first pass is recorded");
+    let again = store.vector_code_metrics("g").await.unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &again), "a second page reuses the pass");
+    let (centres, at) = store.vector_centres("g", true).await.unwrap();
+    assert_eq!(at, Some(first.computed_at_ms));
+    let (_, cheap, _) = store.vector_partition_health("g", false).await.unwrap();
+    assert!(cheap.chunks > 0);
+    assert_eq!(
+        centres.iter().filter_map(|c| c.codes).sum::<u64>(),
+        cheap.chunks,
+        "every chunk is counted once"
+    );
+    assert_eq!(recorded().await, 1, "pages record nothing");
+
+    // A page of postings by size reads only its own, and agrees with the pass.
+    let (_, _, postings) = store.vector_partition_health("g", false).await.unwrap();
+    let page: Vec<u32> = postings.iter().filter(|p| p.state != "retired").map(|p| p.posting_id).take(2).collect();
+    let own = store.vector_postings_code_health("g", &page).await.unwrap();
+    assert_eq!(own.len(), page.len());
+    for id in &page {
+        assert_eq!(format!("{:?}", own[id]), format!("{:?}", first.postings[id]), "posting {id}");
+    }
+    assert_eq!(recorded().await, 1);
+
+    // An explicit compute is a new pass, kept and recorded.
+    let (_, summary, _) = store.vector_partition_health("g", true).await.unwrap();
+    assert!(summary.codes.is_some() && summary.codes_computed_at_ms.is_some());
+    assert_eq!(recorded().await, 2);
+    let latest = store.vector_code_metrics("g").await.unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&first, &latest), "the explicit compute replaced the pass");
+    drop(_quiet);
+
+    let ctx = std::sync::Arc::clone(store.semantic_ctx.as_ref().unwrap());
+    store.remove("g").await.unwrap();
+    assert!(ctx.code_metrics.read().keys().all(|(n, _)| n != "g"), "the drop forgot the pass");
+    store.shutdown().await.unwrap();
+}

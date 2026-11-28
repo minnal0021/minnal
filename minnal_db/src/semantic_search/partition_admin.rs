@@ -4,12 +4,13 @@
 //! asked about and resolves its settings.
 
 use crate::namespace::NamespaceId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::AsyncDb;
-use crate::semantic_search::cluster::layout::{PostingOrigin, PostingState};
+use crate::semantic_search::cluster::layout::{PartitionHandle, PostingOrigin, PostingState};
 use crate::semantic_search::context::{ContextError, NamespaceSemantics, SemanticSearchContext};
-use crate::semantic_search::ivf_split::health::{self, CentreHealth, PartitionHealth, PostingHealth};
+use crate::semantic_search::ivf_split::health::{self, CentreHealth, CodeHealth, CodeMetrics, PartitionHealth, PostingHealth};
 use crate::semantic_search::ivf_split::history::{self, HistoryRecord, RecordKind};
 use crate::semantic_search::ivf_split::rebuild::{self, RebuildParams, RebuildReport, RebuildState, RebuildStatus};
 use crate::semantic_search::ivf_split::recall_check::{self, RecallCheck, RecallCheckParams};
@@ -30,9 +31,9 @@ async fn record_history(db: &AsyncDb, ttl: std::time::Duration, namespace: &str,
 }
 
 impl SemanticSearchContext {
-    /// `namespace`'s partition summary and every posting's health; with `codes`
-    /// also the code metrics, which read every chunk code and are recorded in the
-    /// partition history.
+    /// `namespace`'s partition summary and every posting's health, from memory;
+    /// with `codes` also the code metrics, computed afresh by one read of every
+    /// chunk code ([`refresh_code_metrics`](Self::refresh_code_metrics)).
     pub(crate) async fn partition_health(
         &self,
         db: &AsyncDb,
@@ -42,14 +43,67 @@ impl SemanticSearchContext {
         codes: bool,
     ) -> Result<(PartitionHealth, Vec<PostingHealth>), ContextError> {
         let ns = self.for_namespace(db, namespace, ns_id, settings).await?;
-        let (summary, postings) = health::partition_health(db, namespace, &ns.partition, codes).await?;
-        if codes {
-            record_history(db, self.config.partition_history_ttl, namespace, RecordKind::Codes, &summary).await;
-        }
-        Ok((summary, postings))
+        let metrics = match codes {
+            true => Some(self.refresh_code_metrics(db, namespace, ns_id, &ns.partition).await?),
+            false => None,
+        };
+        Ok(health::partition_health(db, namespace, &ns.partition, metrics.as_deref()).await?)
     }
 
-    /// Every IVF centre of `namespace` with the postings that name it.
+    /// `namespace`'s last full code-metrics pass, or a new one when there is
+    /// none yet (see [`refresh_code_metrics`](Self::refresh_code_metrics)).
+    /// Postings created since it have no metrics in it; its
+    /// `computed_at_ms` says how old it is.
+    pub(crate) async fn code_metrics(
+        &self,
+        db: &AsyncDb,
+        namespace: &str,
+        ns_id: NamespaceId,
+        settings: &VectorIndexSettings,
+    ) -> Result<Arc<CodeMetrics>, ContextError> {
+        let ns = self.for_namespace(db, namespace, ns_id, settings).await?;
+        let cached = self.code_metrics.read().get(&(namespace.to_owned(), ns_id)).cloned();
+        match cached {
+            Some(m) => Ok(m),
+            None => self.refresh_code_metrics(db, namespace, ns_id, &ns.partition).await,
+        }
+    }
+
+    /// The code metrics of just `postings`, reading only their codes (nothing
+    /// cached, nothing recorded).
+    pub(crate) async fn postings_code_health(
+        &self,
+        db: &AsyncDb,
+        namespace: &str,
+        ns_id: NamespaceId,
+        settings: &VectorIndexSettings,
+        postings: &[u32],
+    ) -> Result<HashMap<u32, CodeHealth>, ContextError> {
+        let ns = self.for_namespace(db, namespace, ns_id, settings).await?;
+        Ok(health::postings_code_health(db, namespace, &ns.partition, postings).await?)
+    }
+
+    /// Compute `namespace`'s code metrics (one read of every chunk code), keep
+    /// them as its last pass, and record their summary in the partition
+    /// history: once per pass, whichever request ran it.
+    async fn refresh_code_metrics(
+        &self,
+        db: &AsyncDb,
+        namespace: &str,
+        ns_id: NamespaceId,
+        partition: &PartitionHandle,
+    ) -> Result<Arc<CodeMetrics>, ContextError> {
+        let metrics = Arc::new(health::compute_code_metrics(db, namespace, partition).await?);
+        let (summary, _) = health::partition_health(db, namespace, partition, Some(&metrics)).await?;
+        record_history(db, self.config.partition_history_ttl, namespace, RecordKind::Codes, &summary).await;
+        self.code_metrics.write().insert((namespace.to_owned(), ns_id), Arc::clone(&metrics));
+        Ok(metrics)
+    }
+
+    /// Every IVF centre of `namespace` with the postings that name it, from
+    /// memory; with `codes` also how many chunk codes decode against each, from
+    /// the last full code-metrics pass ([`code_metrics`](Self::code_metrics)),
+    /// whose time is returned beside them.
     pub(crate) async fn centre_health(
         &self,
         db: &AsyncDb,
@@ -57,9 +111,16 @@ impl SemanticSearchContext {
         ns_id: NamespaceId,
         settings: &VectorIndexSettings,
         codes: bool,
-    ) -> Result<Vec<CentreHealth>, ContextError> {
+    ) -> Result<(Vec<CentreHealth>, Option<u64>), ContextError> {
         let ns = self.for_namespace(db, namespace, ns_id, settings).await?;
-        Ok(health::centre_health(db, namespace, &ns.partition, codes).await?)
+        let metrics = match codes {
+            true => Some(self.code_metrics(db, namespace, ns_id, settings).await?),
+            false => None,
+        };
+        Ok((
+            health::centre_health(&ns.partition, metrics.as_deref()),
+            metrics.map(|m| m.computed_at_ms),
+        ))
     }
 
     /// Compare `namespace`'s searches with full reads, preferring real queries from

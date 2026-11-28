@@ -1541,10 +1541,10 @@ async fn recall_check_report(
     config: &SemanticSearchConfig,
     frozen: &Frozen,
 ) {
+    use crate::semantic_search::ivf_split::health::{compute_code_metrics, partition_health};
     use crate::semantic_search::ivf_split::recall_check::{RecallCheckParams, recall_check};
-    let (summary, _) = crate::semantic_search::ivf_split::health::partition_health(db, NS, handle, true)
-        .await
-        .unwrap();
+    let metrics = compute_code_metrics(db, NS, handle).await.unwrap();
+    let (summary, _) = partition_health(db, NS, handle, Some(&metrics)).await.unwrap();
     let c = summary.codes.unwrap_or_default();
     eprintln!(
         "  [{when}] {} postings; drift mean {:.3}, p90 {:.3}, foreign {:.3}",
