@@ -2532,6 +2532,9 @@ one stored row each.
 where whole groups of codes are deleted or re-embedded and their centres are
 left with no code at all.
 
+A proposed design that collects them in two passes, outside rebuilds, is in
+`Centre-Collection-Design.md` (FR-008).
+
 **If it is built: collect during a rebuild.** A rebuild reads every code, so as
 its last step it can delete every centre that no code and no non-retired
 posting references. The risks, and what keeps each safe:

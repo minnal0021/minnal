@@ -1239,7 +1239,11 @@ patch.
 
 The design and its risk table are in
 `minnal_db/src/semantic_search/docs/Dynamic-RaBitQ-Index-Design.md` →
-*Known limitation: centres are never collected*.
+*Known limitation: centres are never collected*. A proposed implementation,
+for review, is `minnal_db/src/semantic_search/docs/Centre-Collection-Design.md`:
+two passes (mark unused centres, then collect them only if a later scan, at
+least a quarantine after the mark, agrees), run on a timer by the partition
+maintenance task.
 
 ---
 
