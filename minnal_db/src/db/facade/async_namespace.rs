@@ -171,9 +171,9 @@ impl AsyncNamespace {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Every live key, all in memory at once (crate-internal: callers outside
-    /// the crate page with `key_page` or [`scan`](Self::scan)).
-    #[cfg(feature = "semantic-search")]
+    /// Every live key, all in memory at once (test-only: callers page with
+    /// `key_page` or [`scan`](Self::scan)).
+    #[cfg(all(test, feature = "semantic-search"))]
     pub(crate) async fn keys(&self) -> Result<Vec<Vec<u8>>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || store.keys())
