@@ -101,12 +101,14 @@ impl Db {
     // ── Iteration (default namespace) ─────────────────────────────────
 
     /// Iterate over all key-value pairs in key order.
-    pub fn iter(&self) -> Result<Vec<KeyValue>> {
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn iter(&self) -> Result<Vec<crate::kv_store::KeyValue>> {
         let store = self.inner.default_store()?;
         store.scan_range_batch(&[], None)
     }
 
     /// Iterate over all keys (does not touch the value log).
+    #[cfg(any(test, feature = "bench-internals"))]
     pub fn keys(&self) -> Result<Vec<Vec<u8>>> {
         let store = self.inner.default_store()?;
         store.keys()
@@ -114,13 +116,15 @@ impl Db {
 
     /// Iterate over key-value pairs in `[start, end)`.
     /// Pass `None` for `end` to scan to the last key.
-    pub fn range(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<KeyValue>> {
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn range(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<crate::kv_store::KeyValue>> {
         let store = self.inner.default_store()?;
         store.scan_range_batch(start, end)
     }
 
     /// Iterate over key-value pairs whose keys start with `prefix`.
-    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<KeyValue>> {
+    #[cfg(any(test, feature = "bench-internals"))]
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<crate::kv_store::KeyValue>> {
         let store = self.inner.default_store()?;
         store.scan_prefix_batch(prefix)
     }

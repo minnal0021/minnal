@@ -150,13 +150,20 @@ impl DocStore {
             .namespace_semantics(namespace, schema.ns_id, &self.schemas.vector_settings(namespace)?.0, overrides)
             .await?;
 
-        // Phase 1: collect ALL doc IDs that satisfy the predicate (no pagination
-        // here — the full set is needed as an ANN filter before scoring).
-        // A degraded predicate index means the candidate set itself is short, so
-        // the ANN results are filtered against an incomplete allow-list. That has
-        // to reach the caller just as it does for a plain query.
-        let (all_keys, degraded_fields) = self.query_all_keys(namespace, predicate).await?;
-        let allowed_ids: std::collections::HashSet<Vec<u8>> = all_keys.into_iter().collect();
+        // Phase 1: evaluate the predicate into a test on document keys. Pass 1
+        // applies it to every chunk it scans, before scoring, so the predicate
+        // filters candidates ahead of top-k selection (a pre-filter: a selective
+        // predicate still gets its top k). The matches stay a row bitmap unless
+        // they are few (`db::indexing::row_filter`): they are never all turned
+        // into keys. A degraded predicate index means the candidate set itself
+        // is short, so the ANN results are filtered against an incomplete
+        // allow-list. That has to reach the caller just as it does for a plain
+        // query.
+        let schema_ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
+            namespace: namespace.to_owned(),
+        })?;
+        let (filter, outcome) = self.db.query_filter(schema_ns_id, predicate.to_owned()).await?;
+        let degraded_fields = self.degraded_field_names(schema_ns_id, &outcome);
 
         // Phase 2: ANN search with the filter closure.
         let (query_dense, query_sparse) = ns.query_embeddings(&self.db, query_text).await?;
@@ -176,7 +183,7 @@ impl DocStore {
             &query_sparse,
             &query_dense,
             &db_store,
-            Some(move |id: &[u8]| allowed_ids.contains(id)),
+            Some(move |id: &[u8]| filter.contains(id)),
             None,
         )
         .await?;
@@ -366,21 +373,6 @@ impl DocStore {
                     .unwrap_or_else(|| fid.to_string())
             })
             .collect()
-    }
-
-    /// Collect all raw key bytes that match `predicate` without pagination.
-    ///
-    /// Used internally by [`search_semantic_filtered`] to build the full
-    /// candidate ID set before ANN scoring.
-    #[cfg(feature = "semantic-search")]
-    async fn query_all_keys(&self, namespace: &str, predicate: &str) -> Result<(Vec<Vec<u8>>, Vec<String>), DocStoreError> {
-        let schema = self.load_schema(namespace)?;
-        let ns_id = schema.ns_id.ok_or_else(|| DocStoreError::MissingNsId {
-            namespace: namespace.to_owned(),
-        })?;
-        let outcome = self.db.query_index(ns_id, predicate.to_owned()).await?;
-        let degraded = self.degraded_field_names(ns_id, &outcome);
-        Ok((outcome.keys, degraded))
     }
 }
 

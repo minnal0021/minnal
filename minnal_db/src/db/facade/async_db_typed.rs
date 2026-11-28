@@ -71,41 +71,4 @@ impl AsyncDb {
     {
         self.default_namespace().await?.merge_typed(key, value, merge_fn).await
     }
-
-    // ── Typed Iteration (rkyv ser/de) ─────────────────────────────────
-
-    /// Iterate over all typed key-value pairs.
-    pub async fn iter_typed<K, V>(&self) -> Result<Vec<(K, V)>>
-    where
-        K: RkyvDecode,
-        V: RkyvDecode,
-    {
-        self.default_namespace().await?.iter_typed().await
-    }
-
-    /// Iterate over all typed keys.
-    pub async fn keys_typed<K>(&self) -> Result<Vec<K>>
-    where
-        K: RkyvDecode,
-    {
-        self.default_namespace().await?.keys_typed().await
-    }
-
-    /// Iterate over typed key-value pairs in `[start, end)`.
-    pub async fn range_typed<K, V>(&self, start: &K, end: Option<&K>) -> Result<Vec<(K, V)>>
-    where
-        K: RkyvEncode + RkyvDecode,
-        V: RkyvDecode,
-    {
-        self.default_namespace().await?.range_typed(start, end).await
-    }
-
-    /// Iterate over typed key-value pairs whose keys start with `prefix`.
-    pub async fn scan_prefix_typed<K, V>(&self, prefix: Vec<u8>) -> Result<Vec<(K, V)>>
-    where
-        K: RkyvDecode,
-        V: RkyvDecode,
-    {
-        self.default_namespace().await?.scan_prefix_typed(prefix).await
-    }
 }

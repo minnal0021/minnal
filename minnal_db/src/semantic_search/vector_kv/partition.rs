@@ -9,9 +9,8 @@
 
 use std::collections::HashMap;
 
-use super::{create_vector_namespaces, decode_sparse_meta, ivf_centres_ns, ivf_postings_ns, sparse_vectors_meta_ns, sparse_vectors_ns};
+use super::{create_vector_namespaces, decode_sparse_meta, ivf_centres_ns, ivf_postings_ns, sparse_vectors_meta_ns};
 use crate::AsyncDb;
-use crate::semantic_search::composite_key;
 
 /// The first byte of every posting row: its format version.
 const POSTING_ROW_FORMAT: u8 = 0xB2;
@@ -193,8 +192,12 @@ pub async fn count_postings(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32
 
 /// Entries per posting in `namespace`'s Pass-1 store, counted from its keys
 /// (`posting_id ‖ doc_id`) alone: the value log is never read. A check against
-/// the document records' counts ([`count_postings`]).
+/// the document records' counts ([`count_postings`]); test-only, since it holds
+/// every chunk key of the namespace at once.
+#[cfg(test)]
 pub async fn count_posting_entries(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, u64>, crate::KVError> {
+    use super::sparse_vectors_ns;
+    use crate::semantic_search::composite_key;
     let mut counts = HashMap::new();
     // Count nothing rather than create the namespace.
     let Some(sparse) = db.existing_namespace(sparse_vectors_ns(namespace)).await? else {

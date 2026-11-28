@@ -130,7 +130,7 @@ mod tests {
 
         db.garbage_collect().await?;
 
-        assert!(db.iter().await.is_ok());
+        assert!(db.scan(None, None, 1_000).await.is_ok());
 
         db.shutdown().await?;
         Ok(())
@@ -153,7 +153,7 @@ mod tests {
 
         for _round in 0..10 {
             db.garbage_collect().await?;
-            assert!(db.iter().await.is_ok());
+            assert!(db.scan(None, None, 1_000).await.is_ok());
         }
 
         db.shutdown().await?;

@@ -564,12 +564,49 @@ impl Wal {
         Ok(out)
     }
 
-    /// Every entry in `[start, end)`, in log order.
+    /// Every entry in `[start, end)`, in log order, all in memory at once
+    /// (test-only: replay streams with [`for_each_entry_of`](Self::for_each_entry_of)).
+    #[cfg(test)]
     pub fn scan_entries(&self, start: u64, end: u64) -> Result<Vec<(WalPointer, WalEntry)>> {
         self.walk(start, end, |at, body| {
             let entry = WalEntry::from_bytes(body).map_err(|e| undecodable(at, e))?;
             Ok((WalPointer::new(at, body.len() as u32), entry))
         })
+    }
+
+    /// Call `visit` for every entry in `[start, end)` whose namespace `wanted`
+    /// accepts, in log order, one entry at a time: unlike
+    /// `scan_entries` (test-only) nothing is collected, so memory is
+    /// one entry however long the range, and an entry `wanted` refuses is never
+    /// decoded (its value is not copied).
+    pub fn for_each_entry_of(
+        &self,
+        start: u64,
+        end: u64,
+        mut wanted: impl FnMut(NamespaceId) -> bool,
+        mut visit: impl FnMut(WalPointer, WalEntry) -> Result<()>,
+    ) -> Result<()> {
+        self.log.for_each(start, end, |at, body| -> Result<()> {
+            let (namespace, _) = WalEntry::peek_namespace_and_key(body).map_err(|e| undecodable(at, e))?;
+            if !wanted(namespace) {
+                return Ok(());
+            }
+            let entry = WalEntry::from_bytes(body).map_err(|e| undecodable(at, e))?;
+            visit(WalPointer::new(at, body.len() as u32), entry)
+        })?;
+        Ok(())
+    }
+
+    /// Call `visit` with the `(namespace_id, key)` of every entry in
+    /// `[start, end)`, in log order and with duplicates, **without materialising
+    /// any values** and without collecting them.
+    pub fn for_each_key_in_entries(&self, start: u64, end: u64, mut visit: impl FnMut(NamespaceId, Vec<u8>)) -> Result<()> {
+        self.log.for_each(start, end, |at, body| -> Result<()> {
+            let (namespace, key) = WalEntry::peek_namespace_and_key(body).map_err(|e| undecodable(at, e))?;
+            visit(namespace, key);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// `(namespace_id, key)` of every entry in `[start, end)`, **without

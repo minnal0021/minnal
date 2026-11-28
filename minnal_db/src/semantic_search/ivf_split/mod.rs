@@ -1229,8 +1229,10 @@ pub mod recall_check;
 #[cfg(test)]
 mod tests;
 
-/// Postings and their stored chunk counts, for tests and health checks:
-/// `posting → chunks`, counted from the stored keys' values.
+/// Postings and their stored chunk counts (test-only: it reads every chunk
+/// code of the namespace at once): `posting → chunks`, counted from the stored
+/// keys' values.
+#[cfg(test)]
 pub async fn recount_chunks(db: &AsyncDb, namespace: &str) -> Result<HashMap<u32, u64>, crate::KVError> {
     let mut out = HashMap::new();
     for (k, v) in companion(db, sparse_vectors_ns(namespace)).await?.scan_prefix(Vec::new()).await? {

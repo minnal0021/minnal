@@ -4,7 +4,10 @@
 //!
 //! Sizes, states and lineage come from memory (the partition snapshot and its
 //! exact counts) and are cheap to poll. The code metrics read every chunk code
-//! of the namespace, so they are computed only when asked for (`codes`).
+//! of the namespace, so they are computed only when asked for, in one pass
+//! ([`compute_code_metrics`]) that the context keeps as the namespace's last
+//! result; a page of postings sorted by size reads only its own postings
+//! ([`postings_code_health`]).
 //!
 //! **Centre drift** of a code is the distance from the centre it was encoded
 //! against, `c`, to its current posting's centre `c'`, relative to its residual
@@ -100,6 +103,9 @@ pub struct PartitionHealth {
     /// for a re-encode. Present when code metrics were asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reencode_candidates: Option<Vec<u32>>,
+    /// When the code metrics shown were computed (Unix ms), when there are any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codes_computed_at_ms: Option<u64>,
 }
 
 fn state_name(s: PostingState) -> &'static str {
@@ -137,14 +143,130 @@ fn code_metrics(ivf: &NamespaceIvf, code: &VectorIndex, posting_centre: &[f32]) 
     Some((shift / r_norm.max(1e-12), eb))
 }
 
-/// A namespace's partition health; with `codes`, also the code metrics (reads
-/// every chunk code). Returns the summary and every posting, retired ones
+/// A namespace's code metrics, from one read of every chunk code
+/// ([`compute_code_metrics`]): each posting's [`CodeHealth`], and for each
+/// centre how many codes decode against it and under how many postings.
+#[derive(Debug, Clone, Default)]
+pub struct CodeMetrics {
+    /// When they were computed (Unix ms). Postings created since have none.
+    pub computed_at_ms: u64,
+    /// Each live posting's code metrics (a posting with no codes has none).
+    pub postings: HashMap<u32, CodeHealth>,
+    /// Each centre's codes and the postings they are filed under, for centres
+    /// any code uses.
+    pub centres: HashMap<u32, (u64, usize)>,
+}
+
+/// Read every chunk code of `namespace`'s live postings once, a posting at a
+/// time, and compute every posting's code metrics and every centre's use.
+/// Retired postings hold no keys, so the live ones hold every code.
+pub async fn compute_code_metrics(db: &AsyncDb, namespace: &str, handle: &PartitionHandle) -> Result<CodeMetrics, crate::KVError> {
+    let ivf = handle.snapshot();
+    let zero = zero_centres(&ivf);
+    let mut live: Vec<(u32, u32)> = ivf
+        .posting_infos()
+        .iter()
+        .filter(|(_, i)| i.state != PostingState::Retired)
+        .map(|(&id, i)| (id, i.centre_id))
+        .collect();
+    live.sort_unstable();
+    let mut out = CodeMetrics {
+        computed_at_ms: crate::support::now_ms(),
+        ..CodeMetrics::default()
+    };
+    let mut used: HashMap<u32, (u64, std::collections::HashSet<u32>)> = HashMap::new();
+    for (posting, centre) in live {
+        let entries = posting_entries(db, namespace, posting).await?;
+        for (_, list) in &entries {
+            for code in list {
+                let u = used.entry(code.centre_id).or_default();
+                u.0 += 1;
+                u.1.insert(posting);
+            }
+        }
+        if let Some(h) = posting_code_health(&ivf, &zero, centre, &entries) {
+            out.postings.insert(posting, h);
+        }
+    }
+    out.centres = used.into_iter().map(|(id, (n, postings))| (id, (n, postings.len()))).collect();
+    Ok(out)
+}
+
+/// The code metrics of just `postings` (live ones; others have none), reading
+/// only their codes: what a page of postings sorted by anything but drift needs.
+pub async fn postings_code_health(
+    db: &AsyncDb,
+    namespace: &str,
+    handle: &PartitionHandle,
+    postings: &[u32],
+) -> Result<HashMap<u32, CodeHealth>, crate::KVError> {
+    let ivf = handle.snapshot();
+    let zero = zero_centres(&ivf);
+    let mut out = HashMap::new();
+    for &posting in postings {
+        let Some(info) = ivf.posting_infos().get(&posting) else { continue };
+        if info.state == PostingState::Retired {
+            continue;
+        }
+        let entries = posting_entries(db, namespace, posting).await?;
+        if let Some(h) = posting_code_health(&ivf, &zero, info.centre_id, &entries) {
+            out.insert(posting, h);
+        }
+    }
+    Ok(out)
+}
+
+/// Which centres are zero vectors.
+fn zero_centres(ivf: &NamespaceIvf) -> HashMap<u32, bool> {
+    ivf.centre_ids()
+        .into_iter()
+        .map(|id| (id, ivf.centre(id).is_some_and(|c| c.iter().all(|&x| x == 0.0))))
+        .collect()
+}
+
+/// One posting's code metrics from its entries; `None` without codes, or when
+/// its centre is unknown.
+fn posting_code_health(ivf: &NamespaceIvf, zero: &HashMap<u32, bool>, centre: u32, entries: &[(Vec<u8>, Vec<VectorIndex>)]) -> Option<CodeHealth> {
+    let posting_centre = ivf.rotated_centre(centre)?;
+    let (mut n, mut foreign, mut zeroed, mut band) = (0usize, 0usize, 0usize, 0.0f64);
+    let mut drift = Vec::new();
+    for (_, list) in entries {
+        for code in list {
+            n += 1;
+            foreign += usize::from(code.centre_id != centre);
+            zeroed += usize::from(zero.get(&code.centre_id).copied().unwrap_or(false));
+            if let Some((dr, eb)) = code_metrics(ivf, code, posting_centre) {
+                drift.push(dr);
+                band += eb;
+            }
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    drift.sort_by(f64::total_cmp);
+    let m = drift.len().max(1) as f64;
+    Some(CodeHealth {
+        foreign_share: foreign as f64 / n as f64,
+        zero_centre_share: zeroed as f64 / n as f64,
+        drift_mean: drift.iter().sum::<f64>() / m,
+        drift_p90: drift
+            .get(((drift.len() as f64 * 0.9) as usize).min(drift.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(1.0),
+        error_band_mean: band / m,
+    })
+}
+
+/// A namespace's partition health, from memory; with `metrics` (from
+/// [`compute_code_metrics`]), also each posting's code metrics and their
+/// entry-weighted summary. Returns the summary and every posting, retired ones
 /// included.
 pub async fn partition_health(
     db: &AsyncDb,
     namespace: &str,
     handle: &PartitionHandle,
-    codes: bool,
+    metrics: Option<&CodeMetrics>,
 ) -> Result<(PartitionHealth, Vec<PostingHealth>), crate::KVError> {
     let ivf = handle.snapshot();
     let mut postings: Vec<PostingHealth> = ivf
@@ -168,45 +290,10 @@ pub async fn partition_health(
 
     let mut summary_codes = None;
     let mut candidates = None;
-    if codes {
-        let zero: HashMap<u32, bool> = ivf
-            .centre_ids()
-            .into_iter()
-            .map(|id| (id, ivf.centre(id).is_some_and(|c| c.iter().all(|&x| x == 0.0))))
-            .collect();
+    if let Some(metrics) = metrics {
         let (mut w_sum, mut acc) = (0.0f64, CodeHealth::default());
         for p in postings.iter_mut().filter(|p| p.state != "retired") {
-            let Some(posting_centre) = ivf.rotated_centre(p.centre_id).map(<[f32]>::to_vec) else {
-                continue;
-            };
-            let (mut n, mut foreign, mut zeroed, mut band) = (0usize, 0usize, 0usize, 0.0f64);
-            let mut drift = Vec::new();
-            for (_, list) in posting_entries(db, namespace, p.posting_id).await? {
-                for code in &list {
-                    n += 1;
-                    foreign += usize::from(code.centre_id != p.centre_id);
-                    zeroed += usize::from(zero.get(&code.centre_id).copied().unwrap_or(false));
-                    if let Some((dr, eb)) = code_metrics(&ivf, code, &posting_centre) {
-                        drift.push(dr);
-                        band += eb;
-                    }
-                }
-            }
-            if n == 0 {
-                continue;
-            }
-            drift.sort_by(f64::total_cmp);
-            let m = drift.len().max(1) as f64;
-            let h = CodeHealth {
-                foreign_share: foreign as f64 / n as f64,
-                zero_centre_share: zeroed as f64 / n as f64,
-                drift_mean: drift.iter().sum::<f64>() / m,
-                drift_p90: drift
-                    .get(((drift.len() as f64 * 0.9) as usize).min(drift.len().saturating_sub(1)))
-                    .copied()
-                    .unwrap_or(1.0),
-                error_band_mean: band / m,
-            };
+            let Some(&h) = metrics.postings.get(&p.posting_id) else { continue };
             let w = p.entries as f64;
             w_sum += w;
             acc.foreign_share += w * h.foreign_share;
@@ -251,6 +338,7 @@ pub async fn partition_health(
         size_p10_p50_p90_max: [pct(0.1), pct(0.5), pct(0.9), sizes.last().copied().unwrap_or(0)],
         codes: summary_codes,
         reencode_candidates: candidates,
+        codes_computed_at_ms: metrics.map(|m| m.computed_at_ms),
     };
     Ok((summary, postings))
 }
@@ -280,33 +368,14 @@ pub struct CentreHealth {
     pub code_postings: Option<usize>,
 }
 
-/// Every centre of a namespace with the postings that name it; with `codes`,
-/// also how many chunk codes decode against each (reads every chunk code).
-pub async fn centre_health(db: &AsyncDb, namespace: &str, handle: &PartitionHandle, codes: bool) -> Result<Vec<CentreHealth>, crate::KVError> {
+/// Every centre of a namespace with the postings that name it, from memory;
+/// with `metrics`, also how many chunk codes decode against each and under how
+/// many postings.
+pub fn centre_health(handle: &PartitionHandle, metrics: Option<&CodeMetrics>) -> Vec<CentreHealth> {
     let ivf = handle.snapshot();
     let mut named: HashMap<u32, Vec<(u32, PostingState, PostingOrigin)>> = HashMap::new();
     for (&id, info) in ivf.posting_infos() {
         named.entry(info.centre_id).or_default().push((id, info.state, info.origin));
-    }
-    let mut used: HashMap<u32, (u64, std::collections::HashSet<u32>)> = HashMap::new();
-    if codes {
-        // Retired postings hold no keys, so the live ones hold every code.
-        let mut live: Vec<u32> = ivf
-            .posting_infos()
-            .iter()
-            .filter(|(_, i)| i.state != PostingState::Retired)
-            .map(|(&id, _)| id)
-            .collect();
-        live.sort_unstable();
-        for posting in live {
-            for (_, list) in posting_entries(db, namespace, posting).await? {
-                for code in &list {
-                    let u = used.entry(code.centre_id).or_default();
-                    u.0 += 1;
-                    u.1.insert(posting);
-                }
-            }
-        }
     }
     let mut out: Vec<CentreHealth> = ivf
         .centre_ids()
@@ -314,7 +383,7 @@ pub async fn centre_health(db: &AsyncDb, namespace: &str, handle: &PartitionHand
         .map(|id| {
             let mut by = named.remove(&id).unwrap_or_default();
             by.sort_by_key(|&(p, s, _)| (s as u8, p));
-            let u = used.get(&id);
+            let used = metrics.map(|m| m.centres.get(&id).copied().unwrap_or((0, 0)));
             CentreHealth {
                 centre_id: id,
                 postings: by.iter().map(|&(p, ..)| p).collect(),
@@ -323,13 +392,13 @@ pub async fn centre_health(db: &AsyncDb, namespace: &str, handle: &PartitionHand
                 norm: ivf
                     .centre(id)
                     .map_or(0.0, |c| c.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt()),
-                codes: codes.then(|| u.map_or(0, |u| u.0)),
-                code_postings: codes.then(|| u.map_or(0, |u| u.1.len())),
+                codes: used.map(|u| u.0),
+                code_postings: used.map(|u| u.1),
             }
         })
         .collect();
     out.sort_by_key(|c| c.centre_id);
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -343,14 +412,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = super::super::tests::setup(&dir, 60).await;
         let h = super::super::tests::handle(&db).await;
-        let (before, _) = partition_health(&db, super::super::tests::NS, &h, true).await.unwrap();
+        let m = compute_code_metrics(&db, super::super::tests::NS, &h).await.unwrap();
+        let (before, _) = partition_health(&db, super::super::tests::NS, &h, Some(&m)).await.unwrap();
         let c = before.codes.unwrap();
         assert!(c.drift_mean.abs() < 1e-9, "{c:?}");
         assert_eq!((c.foreign_share, c.zero_centre_share), (0.0, 1.0));
         maintain_partition(&db, super::super::tests::NS, &h, &super::super::tests::settings(40))
             .await
             .unwrap();
-        let (after, postings) = partition_health(&db, super::super::tests::NS, &h, true).await.unwrap();
+        let m = compute_code_metrics(&db, super::super::tests::NS, &h).await.unwrap();
+        let (after, postings) = partition_health(&db, super::super::tests::NS, &h, Some(&m)).await.unwrap();
         let c = after.codes.unwrap();
         assert!(c.foreign_share > 0.9, "every code moved off the root: {c:?}");
         assert!(
@@ -364,18 +435,25 @@ mod tests {
         assert_eq!(postings.iter().filter(|p| p.state == "retired").count(), after.retired);
         // Every code decodes against some listed centre; the root's centre,
         // retired with the root, is still what the moved codes use.
-        let centres = centre_health(&db, super::super::tests::NS, &h, true).await.unwrap();
+        let centres = centre_health(&h, Some(&m));
         assert_eq!(centres.len(), after.centres);
         assert_eq!(centres.iter().filter_map(|c| c.codes).sum::<u64>(), 180);
         let root = centres.iter().find(|c| c.postings.contains(&0)).unwrap();
         assert_eq!((root.state, root.codes), ("retired", Some(180)));
         assert_eq!(root.norm, 0.0);
         assert!(centres.iter().filter(|c| c.state == "active").all(|c| c.codes == Some(0)));
-        let cheap = centre_health(&db, super::super::tests::NS, &h, false).await.unwrap();
+        let cheap = centre_health(&h, None);
         assert!(cheap.iter().all(|c| c.codes.is_none() && c.code_postings.is_none()));
         // Without code metrics nothing is read but memory.
-        let (cheap, _) = partition_health(&db, super::super::tests::NS, &h, false).await.unwrap();
+        let (cheap, _) = partition_health(&db, super::super::tests::NS, &h, None).await.unwrap();
         assert!(cheap.codes.is_none() && cheap.reencode_candidates.is_none());
+        // A page's metrics, read from its own postings, are the full pass's.
+        let page: Vec<u32> = postings.iter().filter(|p| p.state != "retired").map(|p| p.posting_id).take(3).collect();
+        let some = postings_code_health(&db, super::super::tests::NS, &h, &page).await.unwrap();
+        assert_eq!(some.len(), page.len());
+        for id in &page {
+            assert_eq!(format!("{:?}", some[id]), format!("{:?}", m.postings[id]), "posting {id}");
+        }
         db.shutdown().await.unwrap();
     }
 }

@@ -189,13 +189,7 @@ impl DocStore {
         let record = self.jobs.get(JobKey::new(ns_id, JobKind::VectorReindex)).ok()??;
         let progress: ReindexProgress = record.progress()?;
         let mut status = record.status;
-        if status == BuildStatus::Complete
-            && vector_kv::list_queue_entries(&self.db)
-                .await
-                .ok()?
-                .iter()
-                .any(|e| e.namespace == namespace)
-        {
+        if status == BuildStatus::Complete && vector_kv::has_queue_entries(&self.db, namespace).await.ok()? {
             status = BuildStatus::Running;
         }
         Some(VecReindexProgress {

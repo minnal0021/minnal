@@ -6,7 +6,6 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
 };
 use minnal_db::hex_to_bytes;
 use minnal_db::{Page, Pagination, QueueEntry, QueueEntryKind};
@@ -14,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
 use crate::AppState;
+use crate::error::AppError;
 
 // ── Vector queue monitoring ───────────────────────────────────────────────────
 
@@ -75,8 +75,7 @@ fn default_page_no() -> usize {
     1
 }
 
-fn build_queue_response(entries: Vec<QueueEntry>, pagination: Pagination) -> QueueListResponse {
-    let page: Page<QueueEntry> = Page::from_vec(entries, pagination);
+fn build_queue_response(page: Page<QueueEntry>) -> QueueListResponse {
     QueueListResponse {
         total: page.total,
         page_no: page.page_no,
@@ -85,10 +84,40 @@ fn build_queue_response(entries: Vec<QueueEntry>, pagination: Pagination) -> Que
     }
 }
 
+/// One page of the queue entries `keep` accepts — of `namespace`, or of every
+/// namespace when `None` — with how many it accepts in all. The queue is read a
+/// page at a time and only this page's entries are kept: the entries carry the
+/// documents' texts, and after a bulk load the queue can hold every document.
+async fn queue_listing(
+    state: &AppState,
+    namespace: Option<&str>,
+    keep: impl Fn(&QueueEntry) -> bool,
+    pagination: Pagination,
+) -> Result<QueueListResponse, AppError> {
+    let (offset, size) = (pagination.offset(), pagination.page_size);
+    let mut total = 0usize;
+    let mut results = Vec::new();
+    state
+        .store
+        .for_each_queue_entry(namespace, |e| {
+            if keep(&e) {
+                if total >= offset && results.len() < size {
+                    results.push(e);
+                }
+                total += 1;
+            }
+        })
+        .await?;
+    Ok(build_queue_response(Page::from_slice(results, pagination, total)))
+}
+
 /// `GET /admin/indices/vector/queue/retried` — entries retried at least once (all namespaces).
-pub async fn vector_queue_retried(State(state): State<AppState>, Query(params): Query<QueuePaginationParams>) -> impl IntoResponse {
-    let entries: Vec<_> = state.store.list_queue_entries().await.into_iter().filter(|e| e.retry_count > 0).collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
+pub async fn vector_queue_retried(
+    State(state): State<AppState>,
+    Query(params): Query<QueuePaginationParams>,
+) -> Result<Json<QueueListResponse>, AppError> {
+    let pagination = Pagination::new(params.page_no, params.page_size.get());
+    Ok(Json(queue_listing(&state, None, |e| e.retry_count > 0, pagination).await?))
 }
 
 /// `GET /admin/indices/vector/queue/summary` — global queue depth and lag.
@@ -111,45 +140,48 @@ pub struct QueueSummaryResponse {
     by_namespace: Vec<NsQueueSummary>,
 }
 
-pub async fn vector_queue_summary(State(state): State<AppState>) -> impl IntoResponse {
-    let entries = state.store.list_queue_entries().await;
+pub async fn vector_queue_summary(State(state): State<AppState>) -> Result<Json<QueueSummaryResponse>, AppError> {
     let max_retries = state.store.vector_index_max_retries();
 
+    // Counted a page of the queue at a time (see `queue_listing`).
     let mut by_ns: std::collections::BTreeMap<String, NsQueueSummary> = std::collections::BTreeMap::new();
-
-    for e in &entries {
-        let s = by_ns.entry(e.namespace.clone()).or_insert_with(|| NsQueueSummary {
-            namespace: e.namespace.clone(),
-            pending: 0,
-            actionable: 0,
-            retrying: 0,
-            exhausted: 0,
-        });
-        s.pending += 1;
-        if e.retry_count >= max_retries {
-            s.exhausted += 1;
-        } else {
-            s.actionable += 1;
-            if e.retry_count > 0 {
-                s.retrying += 1;
+    let mut total_pending = 0u32;
+    state
+        .store
+        .for_each_queue_entry(None, |e| {
+            total_pending += 1;
+            let s = by_ns.entry(e.namespace.clone()).or_insert_with(|| NsQueueSummary {
+                namespace: e.namespace.clone(),
+                pending: 0,
+                actionable: 0,
+                retrying: 0,
+                exhausted: 0,
+            });
+            s.pending += 1;
+            if e.retry_count >= max_retries {
+                s.exhausted += 1;
+            } else {
+                s.actionable += 1;
+                if e.retry_count > 0 {
+                    s.retrying += 1;
+                }
             }
-        }
-    }
+        })
+        .await?;
 
     let by_namespace: Vec<NsQueueSummary> = by_ns.into_values().collect();
-    let total_pending = entries.len() as u32;
     let total_actionable: u32 = by_namespace.iter().map(|s| s.actionable).sum();
     let total_retrying: u32 = by_namespace.iter().map(|s| s.retrying).sum();
     let total_exhausted: u32 = by_namespace.iter().map(|s| s.exhausted).sum();
 
-    Json(QueueSummaryResponse {
+    Ok(Json(QueueSummaryResponse {
         max_retries_configured: max_retries,
         total_pending,
         total_actionable,
         total_retrying,
         total_exhausted,
         by_namespace,
-    })
+    }))
 }
 
 /// `GET /admin/indices/{ns}/vector/queue` — queue entries for one namespace.
@@ -157,9 +189,9 @@ pub async fn vector_queue_by_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
     Query(params): Query<QueuePaginationParams>,
-) -> impl IntoResponse {
-    let entries: Vec<_> = state.store.list_queue_entries().await.into_iter().filter(|e| e.namespace == ns).collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
+) -> Result<Json<QueueListResponse>, AppError> {
+    let pagination = Pagination::new(params.page_no, params.page_size.get());
+    Ok(Json(queue_listing(&state, Some(&ns), |_| true, pagination).await?))
 }
 
 /// `GET /admin/indices/{ns}/vector/queue/retried` — retried entries for one namespace.
@@ -167,15 +199,9 @@ pub async fn vector_queue_retried_by_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
     Query(params): Query<QueuePaginationParams>,
-) -> impl IntoResponse {
-    let entries: Vec<_> = state
-        .store
-        .list_queue_entries()
-        .await
-        .into_iter()
-        .filter(|e| e.namespace == ns && e.retry_count > 0)
-        .collect();
-    Json(build_queue_response(entries, Pagination::new(params.page_no, params.page_size.get())))
+) -> Result<Json<QueueListResponse>, AppError> {
+    let pagination = Pagination::new(params.page_no, params.page_size.get());
+    Ok(Json(queue_listing(&state, Some(&ns), |e| e.retry_count > 0, pagination).await?))
 }
 
 /// `GET /admin/indices/{ns}/vector/queue/{doc_id}` — look up one queue entry.
@@ -212,14 +238,7 @@ pub async fn vector_queue_delete_entry(
         )
     })?;
 
-    let exists = state
-        .store
-        .list_queue_entries()
-        .await
-        .into_iter()
-        .any(|e| e.namespace == ns && e.doc_id_bytes == doc_id_bytes);
-
-    if !exists {
+    if state.store.get_queue_entry(&ns, &doc_id_bytes).await.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({

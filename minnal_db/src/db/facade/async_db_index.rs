@@ -167,7 +167,9 @@ impl AsyncDb {
     }
 
     /// Evaluate a query string against the active field indices of a namespace
-    /// and return the raw keys of all matching documents.
+    /// and return the raw keys of all matching documents, all at once
+    /// (test-only: callers page with [`query_index_paginated`](Self::query_index_paginated)).
+    #[cfg(test)]
     pub async fn query_index(&self, namespace_id: NamespaceId, query: impl Into<String> + Send + 'static) -> Result<QueryOutcome> {
         let db = Arc::clone(&self.inner);
         let q = query.into();
@@ -176,10 +178,27 @@ impl AsyncDb {
             .map_err(|e| KVError::Io(std::io::Error::other(e)))?
     }
 
-    /// Like [`query_index`] but returns only the `[offset, offset+limit)` window
-    /// of matching keys together with the full match count.
-    ///
-    /// [`query_index`]: AsyncDb::query_index
+    /// Evaluate `query` and return a test on keys for its matches, with the
+    /// query's outcome (no keys): what a filtered search checks each candidate
+    /// against. See `db::indexing::row_filter`.
+    #[cfg(all(feature = "doc-store", feature = "semantic-search"))]
+    pub(crate) async fn query_filter(
+        &self,
+        namespace_id: NamespaceId,
+        query: impl Into<String> + Send + 'static,
+    ) -> Result<(crate::db::indexing::row_filter::RowFilter, QueryOutcome)> {
+        let db = Arc::clone(&self.inner);
+        let q = query.into();
+        tokio::task::spawn_blocking(move || db.inner.query_filter(namespace_id, &q))
+            .await
+            .map_err(|e| KVError::Io(std::io::Error::other(e)))?
+    }
+
+    /// Evaluate a query string against the active field indices of a namespace
+    /// and return the `[offset, offset+limit)` window of matching keys, with
+    /// the full match count (`total`) and any degraded fields. Only the window's
+    /// keys are resolved, whatever the number of matches; page on until
+    /// `offset >= total`.
     pub async fn query_index_paginated(
         &self,
         namespace_id: NamespaceId,

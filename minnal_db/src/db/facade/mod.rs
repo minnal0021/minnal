@@ -32,12 +32,12 @@ use crate::db::workers::wal_gc::WalGcWorker;
 use crate::field_index::IndexValueType;
 use crate::field_index::{FieldId, FieldReindexOutcome, FieldRepairOutcome, QueryOutcome};
 use crate::kv_store::index_set::ExtractorFn;
-use crate::kv_store::{KVStore, KeyValue, ScanPage};
+use crate::kv_store::{KVStore, ScanPage};
 
 mod typed;
 
 pub use typed::{RkyvDecode, RkyvEncode};
-use typed::{deserialize_keys, deserialize_pairs, rkyv_deserialize, rkyv_serialize};
+use typed::{rkyv_deserialize, rkyv_serialize};
 
 /// Not API (feature `bench-internals`): what the benches need to time the
 /// engine directly. Nothing here is stable.
@@ -45,7 +45,7 @@ use typed::{deserialize_keys, deserialize_pairs, rkyv_deserialize, rkyv_serializ
 #[doc(hidden)]
 pub mod bench_internals {
     pub use super::db::Db;
-    pub use super::typed::{deserialize_keys, deserialize_pairs, rkyv_deserialize, rkyv_serialize};
+    pub use super::typed::{rkyv_deserialize, rkyv_serialize};
 }
 
 #[cfg(test)]

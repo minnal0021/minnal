@@ -152,6 +152,10 @@ pub use db::config::ThresholdConfig;
 /// reading either needs the matching decoder.
 pub use support::hex::{bytes_to_hex, hex_to_bytes};
 
+/// The exclusive end of a prefix scan: pass a prefix as `scan`'s first cursor
+/// and this as its `end`.
+pub use support::prefix_upper_bound;
+
 /// Intervals at which the background workers run.
 pub use db::config::ScheduledTaskConfig;
 
@@ -226,7 +230,7 @@ pub use kv_store::index_set::RowIdFn;
 /// Inverse of [`RowIdFn`]: reconstructs the raw key bytes from a row ID.
 ///
 /// Registering this alongside [`RowIdFn`] enables O(|hits|) query resolution
-/// in [`AsyncDb::query_index`] with zero memory overhead — no in-memory map needed.
+/// in [`AsyncDb::query_index_paginated`] with zero memory overhead — no in-memory map needed.
 pub use kv_store::index_set::RowToKeyFn;
 
 /// Namespace ID for the implicit default namespace.
@@ -290,7 +294,7 @@ pub use storage::value_log::SegmentStats;
 pub use doc_store::{
     AttributeDef, AttributeType, AuditEvent, AuditRecord, BuildStatus, CursorPage, DocId, DocStore, DocStoreError, DocStoreSchema,
     FieldBuildProgress, IndexKind, IndexSpec, IndexType, JobRecord, KeyType, KvKeyType, KvStoreSchema, KvValueType, LifecycleConfig, MAX_INDICES,
-    MAX_STR_KEY_LEN, NamespaceState, Page, Pagination, SchemaAmendment, SchemaError, StoreType, StrKey, prefix_upper_bound,
+    MAX_STR_KEY_LEN, NamespaceState, Page, Pagination, SchemaAmendment, SchemaError, StoreType, StrKey,
 };
 
 // Document-store types that only exist alongside `semantic-search`.

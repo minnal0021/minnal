@@ -40,10 +40,11 @@ pub async fn vector_partition(
     Path(ns): Path<String>,
     Query(params): Query<PartitionParams>,
 ) -> axum::response::Response {
-    let (maintenance, summary, _) = match state.store.vector_partition_health(&ns, params.codes).await {
+    let (maintenance, summary, postings) = match state.store.vector_partition_health(&ns, params.codes).await {
         Ok(r) => r,
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     };
+    let histogram = size_histogram(&postings, u64::from(maintenance.split_limit()));
     // The last recall check, from the history (never run here: it is costly).
     let last_check = state
         .store
@@ -58,8 +59,27 @@ pub async fn vector_partition(
         obj.extend(m);
         obj.insert("rebuild".into(), serde_json::to_value(rebuild).unwrap_or_default());
         obj.insert("last_recall_check".into(), serde_json::to_value(last_check).unwrap_or_default());
+        obj.insert("size_histogram".into(), histogram);
     }
     Json(body).into_response()
+}
+
+/// Bars in [`size_histogram`].
+const SIZE_HISTOGRAM_BINS: u64 = 24;
+
+/// Live (not retired) postings by size in chunks, in `SIZE_HISTOGRAM_BINS`
+/// bins of `bin_width` chunks from 0, wide enough to show the split limit:
+/// what a size chart needs, so a client never fetches every posting for it.
+fn size_histogram(postings: &[minnal_db::semantic_search::ivf_split::health::PostingHealth], split_limit: u64) -> serde_json::Value {
+    let live: Vec<u64> = postings.iter().filter(|p| p.state != "retired").map(|p| p.chunks).collect();
+    let max = live.iter().copied().max().unwrap_or(0).max(split_limit.saturating_add(1));
+    let width = (max + 1).div_ceil(SIZE_HISTOGRAM_BINS).max(1);
+    let mut counts = vec![0u64; SIZE_HISTOGRAM_BINS as usize];
+    for chunks in live {
+        let last = counts.len() - 1;
+        counts[((chunks / width) as usize).min(last)] += 1;
+    }
+    serde_json::json!({ "bin_width": width, "counts": counts })
 }
 
 /// `GET /admin/indices/vector/settings` — the server's semantic-search
@@ -415,11 +435,26 @@ pub async fn vector_postings(
     {
         return bad(format!("state must be active, draining or retired, got {s:?}"));
     }
-    let codes = params.codes || sort == "drift";
-    let (maintenance, summary, mut postings) = match state.store.vector_partition_health(&ns, codes).await {
+    // From memory; code metrics come in below, without reading every code
+    // for every page.
+    let (maintenance, summary, mut postings) = match state.store.vector_partition_health(&ns, false).await {
         Ok(r) => r,
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     };
+    let mut codes_computed_at_ms = None;
+    if sort == "drift" {
+        // Sorting by drift needs every posting's: the namespace's last full
+        // pass (one is run if there is none). Postings created since have none
+        // and sort last.
+        let metrics = match state.store.vector_code_metrics(&ns).await {
+            Ok(m) => m,
+            Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
+        };
+        for p in &mut postings {
+            p.codes = metrics.postings.get(&p.posting_id).copied();
+        }
+        codes_computed_at_ms = Some(metrics.computed_at_ms);
+    }
     if let Some(s) = params.state.as_deref() {
         postings.retain(|p| p.state == s);
     }
@@ -435,8 +470,21 @@ pub async fn vector_postings(
         let o = key(a).total_cmp(&key(b)).then(a.posting_id.cmp(&b.posting_id));
         if descending { o.reverse() } else { o }
     });
-    let page: Vec<_> = postings.iter().skip(start).take(limit).collect();
+    let mut page: Vec<_> = postings.iter().skip(start).take(limit).cloned().collect();
     let next_cursor = (start + page.len() < postings.len()).then(|| (start + page.len()).to_string());
+    if params.codes && sort != "drift" {
+        // Any other order is from memory, so only this page's codes are read.
+        let ids: Vec<u32> = page.iter().map(|p| p.posting_id).collect();
+        let fresh = match state.store.vector_postings_code_health(&ns, &ids).await {
+            Ok(m) => m,
+            Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
+        };
+        for p in &mut page {
+            p.codes = fresh.get(&p.posting_id).copied();
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        codes_computed_at_ms = Some(now.map_or(0, |d| d.as_millis() as u64));
+    }
     let mut body = serde_json::json!({
         "namespace": ns,
         "postings": summary.postings,
@@ -445,6 +493,7 @@ pub async fn vector_postings(
         "matched": postings.len(),
         "results": page,
         "next_cursor": next_cursor,
+        "codes_computed_at_ms": codes_computed_at_ms,
     });
     if let (Some(obj), serde_json::Value::Object(m)) = (body.as_object_mut(), maintenance_json(&maintenance)) {
         obj.extend(m);
@@ -510,7 +559,7 @@ pub async fn vector_centres(State(state): State<AppState>, Path(ns): Path<String
         None => 0,
     };
     let codes = params.codes || sort == "codes";
-    let mut centres = match state.store.vector_centres(&ns, codes).await {
+    let (mut centres, codes_computed_at_ms) = match state.store.vector_centres(&ns, codes).await {
         Ok(r) => r,
         Err(e) => return crate::routes::AppError::from(e).with_ns(&ns).into_response(),
     };
@@ -550,6 +599,7 @@ pub async fn vector_centres(State(state): State<AppState>, Path(ns): Path<String
         "matched": centres.len(),
         "results": page,
         "next_cursor": next_cursor,
+        "codes_computed_at_ms": codes_computed_at_ms,
     }))
     .into_response()
 }

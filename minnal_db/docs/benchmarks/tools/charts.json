@@ -223,37 +223,6 @@
     ]
   },
   {
-    "file": "scan_iter.png",
-    "title": "Reading all 2,000 keys with their values",
-    "ylabel": "Mean latency, ms",
-    "unit": "ms",
-    "scale": "linear",
-    "zero_based": true,
-    "cases": [
-      "scan_iter/.*"
-    ],
-    "group_by": "/(\\d+B)$",
-    "color_by": "/(memtable|l1)_",
-    "legend": {
-      "memtable": "in memory",
-      "l1": "on disk"
-    },
-    "relabel": [
-      [
-        "^scan_iter/\\w+_value_size/",
-        ""
-      ],
-      [
-        "^128B$",
-        "128 B/values"
-      ],
-      [
-        "^4096B$",
-        "4 KiB/values"
-      ]
-    ]
-  },
-  {
     "file": "wal_fsync.png",
     "title": "One write-ahead log append, with and without the fsync",
     "ylabel": "Mean latency, µs (log scale)",

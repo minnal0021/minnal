@@ -98,16 +98,24 @@ impl DocStore {
         })
     }
 
-    /// Return all entries currently in the async vector-index queue.
-    ///
-    /// Includes entries that are still pending, currently being retried, and
-    /// those that have exceeded the configured `max_retries` threshold and are
-    /// waiting for manual removal via [`delete_queue_entry`].
-    ///
-    /// [`delete_queue_entry`]: DocStore::delete_queue_entry
-    #[cfg(feature = "semantic-search")]
+    /// Every entry in the vector-index queue, all at once (test-only; see
+    /// [`for_each_queue_entry`](Self::for_each_queue_entry)).
+    #[cfg(all(test, feature = "semantic-search"))]
     pub async fn list_queue_entries(&self) -> Vec<vector_kv::QueueEntry> {
         vector_kv::list_queue_entries(&self.db).await.unwrap_or_default()
+    }
+
+    /// Call `visit` for every entry in the vector-index queue — of `namespace`,
+    /// or of every namespace when `None` — in key order, a page at a time, so
+    /// memory is one page of entries however long the queue is.
+    ///
+    /// Entries include those still pending, those being retried, and those
+    /// that have reached `max_retries` and wait for an operator
+    /// ([`delete_queue_entry`](Self::delete_queue_entry),
+    /// [`retry_queue_entry`](Self::retry_queue_entry)).
+    #[cfg(feature = "semantic-search")]
+    pub async fn for_each_queue_entry(&self, namespace: Option<&str>, visit: impl FnMut(vector_kv::QueueEntry)) -> Result<(), DocStoreError> {
+        Ok(vector_kv::for_each_queue_entry(&self.db, namespace, visit).await?)
     }
 
     /// Look up a single pending embedding queue entry by namespace and document ID.

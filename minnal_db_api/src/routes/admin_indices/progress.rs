@@ -71,17 +71,19 @@ async fn build_progress_response(state: &AppState, ns_filter: Option<&str>) -> R
         v
     };
 
-    let queue_entries = state.store.list_queue_entries().await;
+    // Counted a page of the queue at a time: the entries carry the documents'
+    // texts, and after a bulk load the queue can hold every document.
     let mut pending_by_ns: HashMap<String, u64> = HashMap::new();
     let mut exhausted_by_ns: HashMap<String, u64> = HashMap::new();
-    for e in &queue_entries {
-        if ns_filter.is_none_or(|f| e.namespace == f) {
-            *pending_by_ns.entry(e.namespace.clone()).or_default() += 1;
+    state
+        .store
+        .for_each_queue_entry(ns_filter, |e| {
             if e.retry_count >= max_retries {
                 *exhausted_by_ns.entry(e.namespace.clone()).or_default() += 1;
             }
-        }
-    }
+            *pending_by_ns.entry(e.namespace).or_default() += 1;
+        })
+        .await?;
 
     let mut vector_progress = Vec::with_capacity(ss_namespaces.len());
     for ns in ss_namespaces {

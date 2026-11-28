@@ -38,7 +38,6 @@ impl Database {
     /// replay during activation uses the same row IDs that future writes will
     /// produce.
     ///
-    /// [`query_keys`]: Self::query_keys
     /// [`activate_field_index`]: Self::activate_field_index
     pub fn set_row_id_fn(
         &self,
@@ -309,19 +308,23 @@ impl Database {
                         );
                     }
 
-                    let entries = self.wal.scan_entries(wal_head.max(checkpoint_offset), wal_tail)?;
+                    // Keys only, one entry at a time: the window can be every
+                    // segment WAL GC kept for this field, and only the keys are
+                    // needed (each key's current value is read below).
+                    let mut scanned = 0usize;
                     let mut affected_keys = std::collections::BTreeSet::<Vec<u8>>::new();
-                    for (_, wal_entry) in &entries {
-                        if wal_entry.namespace_id == namespace_id {
-                            affected_keys.insert(wal_entry.key.clone());
+                    self.wal.for_each_key_in_entries(wal_head.max(checkpoint_offset), wal_tail, |ns, key| {
+                        scanned += 1;
+                        if ns == namespace_id {
+                            affected_keys.insert(key);
                         }
-                    }
+                    })?;
                     debug!(
                         "[activate_field_index] ns={} field={} WAL replay: \
                          {} entries scanned, {} keys affected",
                         namespace_id,
                         field_id,
-                        entries.len(),
+                        scanned,
                         affected_keys.len()
                     );
 

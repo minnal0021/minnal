@@ -148,7 +148,7 @@ multi-key transaction primitive.
 
 #### Prefix scan with SIMD acceleration
 
-`scan_prefix` returns all live key-value pairs whose keys start with a given byte prefix. It merges results across all storage layers — active memtable, read-only memtable, L0 SSTables, and the L1 SSTable — deduplicating by key and honouring tombstones. It is available on `AsyncDb` and `AsyncNamespace`, including a typed variant for callers who store typed values.
+`scan_prefix` returns all live key-value pairs whose keys start with a given byte prefix. It merges results across all storage layers — active memtable, read-only memtable, L0 SSTables, and the L1 SSTable — deduplicating by key and honouring tombstones. minnal uses it internally, for results it needs whole (every store's schema at open, say). Applications page through a prefix instead, with the cursor-paginated `scan`: the prefix as the first cursor and `prefix_upper_bound(prefix)` as the end, so each page reads only its own values.
 
 Three layers of acceleration keep prefix scans fast even as data accumulates across layers:
 

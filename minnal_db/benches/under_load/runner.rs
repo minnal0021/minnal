@@ -136,8 +136,9 @@ async fn drain(store: &DocStore, max: Duration) -> Option<f64> {
     let t = Instant::now();
     let mut reported = Duration::ZERO;
     loop {
-        let entries = store.list_queue_entries().await;
-        if entries.is_empty() {
+        // Counted from the keys alone: the values are the documents' texts.
+        let depth = store.pending_vector_index_count().await.unwrap_or(0);
+        if depth == 0 {
             return Some(t.elapsed().as_secs_f64());
         }
         if t.elapsed() > max {
@@ -146,23 +147,27 @@ async fn drain(store: &DocStore, max: Duration) -> Option<f64> {
         // A queue that does not drain says why every 30 s.
         if t.elapsed() >= reported + Duration::from_secs(30) {
             reported = t.elapsed();
-            let clear = entries
-                .iter()
-                .filter(|e| matches!(e.kind, minnal_db::semantic_search::vector_kv::QueueEntryKind::Clear))
-                .count();
-            let retried = entries.iter().filter(|e| e.retry_count > 0).count();
-            let e = &entries[0];
-            eprintln!(
-                "[{}] queue not drained after {:.0} s: {} entries ({clear} clear, {retried} retried); first: {} {:02x?} {:?} retries {} error {:?}",
-                now_unix(),
-                t.elapsed().as_secs_f64(),
-                entries.len(),
-                e.namespace,
-                e.doc_id_bytes,
-                e.kind,
-                e.retry_count,
-                e.last_error
-            );
+            let (mut clear, mut retried) = (0usize, 0usize);
+            let mut first = None;
+            let _ = store
+                .for_each_queue_entry(None, |e| {
+                    clear += usize::from(matches!(e.kind, minnal_db::semantic_search::vector_kv::QueueEntryKind::Clear));
+                    retried += usize::from(e.retry_count > 0);
+                    first.get_or_insert(e);
+                })
+                .await;
+            if let Some(e) = first {
+                eprintln!(
+                    "[{}] queue not drained after {:.0} s: {depth} entries ({clear} clear, {retried} retried); first: {} {:02x?} {:?} retries {} error {:?}",
+                    now_unix(),
+                    t.elapsed().as_secs_f64(),
+                    e.namespace,
+                    e.doc_id_bytes,
+                    e.kind,
+                    e.retry_count,
+                    e.last_error
+                );
+            }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }

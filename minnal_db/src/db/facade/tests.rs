@@ -41,7 +41,7 @@ async fn test_db_open_and_crud() {
 }
 
 #[tokio::test]
-async fn test_db_iteration() {
+async fn test_db_scan_pages_through_every_pair() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir).await;
 
@@ -49,17 +49,16 @@ async fn test_db_iteration() {
     db.put(b("b"), b("2")).await.unwrap();
     db.put(b("c"), b("3")).await.unwrap();
 
-    let all = db.iter().await.unwrap();
-    assert_eq!(all, vec![(b("a"), b("1")), (b("b"), b("2")), (b("c"), b("3"))]);
-
-    let keys = db.keys().await.unwrap();
-    assert_eq!(keys, vec![b("a"), b("b"), b("c")]);
+    let (first, next) = db.scan(None, None, 2).await.unwrap();
+    assert_eq!(first, vec![(b("a"), b("1")), (b("b"), b("2"))]);
+    let (rest, next) = db.scan(next, None, 2).await.unwrap();
+    assert_eq!((rest, next), (vec![(b("c"), b("3"))], None));
 
     db.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn test_db_range() {
+async fn test_db_scan_stops_before_end() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir).await;
 
@@ -67,26 +66,9 @@ async fn test_db_range() {
         db.put(b(k), b(v)).await.unwrap();
     }
 
-    let range = db.range(b("b"), Some(b("d"))).await.unwrap();
-    assert_eq!(range.len(), 2);
-    assert_eq!(range[0].0, b("b"));
-    assert_eq!(range[1].0, b("c"));
-
-    db.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_db_scan_prefix() {
-    let dir = TempDir::new().unwrap();
-    let db = open(&dir).await;
-
-    db.put(b("user:1"), b("alice")).await.unwrap();
-    db.put(b("user:2"), b("bob")).await.unwrap();
-    db.put(b("order:1"), b("item")).await.unwrap();
-
-    let users = db.scan_prefix(b("user:")).await.unwrap();
-    assert_eq!(users.len(), 2);
-    assert_eq!(users[0].0, b("user:1"));
+    let (range, next) = db.scan(Some(b("b")), Some(b("d")), 10).await.unwrap();
+    assert_eq!(range.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), [b("b"), b("c")]);
+    assert_eq!(next, None);
 
     db.shutdown().await.unwrap();
 }
@@ -109,7 +91,7 @@ async fn test_db_namespaces() {
     assert_eq!(users.get(b("global")).await.unwrap(), None);
 
     assert_eq!(users.get(b("u1")).await.unwrap(), Some(b("alice")));
-    assert_eq!(users.keys().await.unwrap().len(), 2);
+    assert_eq!(users.count().await.unwrap(), 2);
 
     // default + users
     assert!(db.list_namespaces().len() >= 2);
@@ -313,45 +295,6 @@ async fn test_namespace_typed_crud() {
     // Isolation: the default namespace doesn't have it
     let from_default: Option<UserProfile> = db.get_typed(&key).await.unwrap();
     assert_eq!(from_default, None);
-
-    db.shutdown().await.unwrap();
-}
-
-// ── Typed Iteration tests ─────────────────────────────────────────
-
-#[tokio::test]
-async fn test_db_typed_iter() {
-    let dir = TempDir::new().unwrap();
-    let db = open(&dir).await;
-
-    for (id, name, age) in [(1, "Alice", 30), (2, "Bob", 25), (3, "Charlie", 35)] {
-        db.put_typed(&UserId(id), &UserProfile { name: name.into(), age }).await.unwrap();
-    }
-
-    let all: Vec<(UserId, UserProfile)> = db.iter_typed().await.unwrap();
-    assert_eq!(all.len(), 3);
-    assert_eq!(all[0].1.name, "Alice");
-
-    let keys: Vec<UserId> = db.keys_typed().await.unwrap();
-    assert_eq!(keys.len(), 3);
-
-    db.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_namespace_typed_iter() {
-    let dir = TempDir::new().unwrap();
-    let db = open(&dir).await;
-
-    let ns = db.namespace("items".to_string()).await.unwrap();
-    ns.put_typed(&1u64, &"first".to_string()).await.unwrap();
-    ns.put_typed(&2u64, &"second".to_string()).await.unwrap();
-
-    let all: Vec<(u64, String)> = ns.iter_typed().await.unwrap();
-    assert_eq!(all.len(), 2);
-
-    let keys: Vec<u64> = ns.keys_typed().await.unwrap();
-    assert_eq!(keys.len(), 2);
 
     db.shutdown().await.unwrap();
 }

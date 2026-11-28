@@ -143,8 +143,16 @@ db.put(b"hello".to_vec(), b"world".to_vec()).await?;
 let val = db.get(b"hello".to_vec()).await?;          // Some(b"world")
 db.delete(b"hello".to_vec()).await?;
 
-for (key, value) in db.scan_prefix(b"user:".to_vec()).await? { /* … */ }
-for (key, value) in db.range(b"a".to_vec(), Some(b"z".to_vec())).await? { /* … */ }
+// Many keys: a page at a time, each page reading only its own values.
+// `scan(cursor, end, limit)` reads keys in [cursor, end); a prefix ends at
+// `prefix_upper_bound(prefix)`. Pass each page's `next` back as the cursor.
+let end = minnal_db::prefix_upper_bound(b"user:");
+let mut cursor = Some(b"user:".to_vec());
+while let Some(from) = cursor {
+    let (page, next) = db.scan(Some(from), end.clone(), 100).await?;
+    for (key, value) in page { /* … */ }
+    cursor = next;
+}
 
 // Namespaces — each has its own isolated keyspace
 let ns = db.namespace("orders".to_string()).await?;
@@ -293,14 +301,24 @@ async fn main() -> Result<(), KVError> {
     // Queries read what the worker has applied: wait for it, to read your writes.
     db.sync_field_indexes().await?;
 
-    // 4. Query with the predicate DSL (=, !=, <, <=, >, >=, IN, AND, OR, NOT).
-    let outcome = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active" AND age > 20"#).await?;
-    if !outcome.degraded_fields.is_empty() {
-        eprintln!("an index is missing updates; results may be incomplete");
-    }
-    for key in outcome.keys {
-        if let Some(value) = db.get(key.clone()).await? {
-            println!("{} => {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
+    // 4. Query with the predicate DSL (=, !=, <, <=, >, >=, IN, AND, OR, NOT),
+    //    a page of matching keys at a time.
+    let predicate = r#"status = "active" AND age > 20"#;
+    const PAGE: usize = 100;
+    let mut offset = 0;
+    loop {
+        let page = db.query_index_paginated(DEFAULT_NAMESPACE_ID, predicate, offset, PAGE).await?;
+        if offset == 0 && !page.degraded_fields.is_empty() {
+            eprintln!("an index is missing updates; results may be incomplete");
+        }
+        for key in page.keys {
+            if let Some(value) = db.get(key.clone()).await? {
+                println!("{} => {}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
+            }
+        }
+        offset += PAGE;
+        if offset >= page.total {
+            break;
         }
     }
     // → user:1 and user:3
@@ -314,8 +332,10 @@ A few things are worth knowing before you build on this:
 
 - The `IndexValue` your extractor returns has to match the type you registered
   the field with — one of `Bool`, `Int` (an `i64`), or `Str`.
-- A query returns a `QueryOutcome`: the matching `keys`, the `total` number of
-  matches, and `degraded_fields`. A field lands in `degraded_fields` when its
+- A query returns a `QueryOutcome` for one page: that page's `keys`, the
+  `total` number of matches (page on until `offset >= total`), and
+  `degraded_fields`. Only the page's keys are looked up, however many records
+  match. A field lands in `degraded_fields` when its
   index is known to be missing updates (after a crash that outran its WAL
   retention, say), so a non-empty list means the result may be incomplete.
 - A query reads what the field-index worker has applied, so a query sent
@@ -325,9 +345,6 @@ A few things are worth knowing before you build on this:
   `sync_field_indexes()` waits it out when you
   need to read your own writes, and each field's `apply_queue` in
   `index_health` shows what is pending.
-- When a query can match many records, use
-  `query_index_paginated(ns, predicate, offset, limit)`: it resolves only the
-  requested window of keys rather than the whole match set.
 
 ---
 

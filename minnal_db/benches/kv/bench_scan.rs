@@ -164,56 +164,9 @@ fn bench_cursor_scan(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Async iter (full collection) ──────────────────────────────────────────────
-//
-// Measures end-to-end cost of fetching all key-value pairs via the async API.
-
-fn bench_iter(c: &mut Criterion) {
-    const NUM_KEYS: u64 = 2_000;
-    let mut group = c.benchmark_group("scan/iter");
-    group.measurement_time(Duration::from_secs(10));
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    for value_size in [128usize, 4_096] {
-        let value = vec![0u8; value_size];
-
-        for tier in TIERS {
-            let temp = bench_tempdir();
-            let db_path = temp.path().to_path_buf();
-            let mut store = rt.block_on(async {
-                let store = AsyncDb::open_with_config(db_path.clone(), bench_config()).await.unwrap();
-                for seq in 0..NUM_KEYS {
-                    store.put(make_key("st:", seq), value.clone()).await.unwrap();
-                }
-                store
-            });
-            if tier == "l1" {
-                store = rt.block_on(async { push_to_l1_async(store, &db_path).await });
-            }
-            let store = Arc::new(store);
-
-            let s = store.clone();
-            group.throughput(Throughput::Elements(NUM_KEYS));
-            let label = format!("{tier}_value_size");
-            group.bench_with_input(BenchmarkId::new(label, format!("{value_size}B")), &value_size, |b, _| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let count = s.iter().await.unwrap().len();
-                        black_box(count)
-                    })
-                });
-            });
-
-            rt.block_on(async { store.shutdown().await.unwrap() });
-        }
-    }
-    group.finish();
-}
-
 criterion_group!(
     name    = scan_benches;
     config  = Criterion::default().measurement_time(Duration::from_secs(12));
-    targets = bench_prefix_scan, bench_range_scan, bench_cursor_scan, bench_iter
+    targets = bench_prefix_scan, bench_range_scan, bench_cursor_scan
 );
 criterion_main!(scan_benches);

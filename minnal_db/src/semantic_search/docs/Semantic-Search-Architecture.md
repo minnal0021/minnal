@@ -383,7 +383,9 @@ Pass 2 scores each candidate against a **single whole-query dense embedding** �
 
 `doc_filter` is an optional closure `Fn(&[u8]) -> bool` applied **only in Pass 1**, per document, before scoring. Documents that fail the filter are excluded from both passes. Pass 2 operates on the already-filtered `sparse_ranked` list and never re-evaluates the predicate.
 
-This is how filtered semantic search (`POST /stores/{ns}/semantic-search/filtered`) works: it evaluates the index predicate into the set of matching doc IDs and passes a membership check as the `doc_filter` closure. That combines "semantically similar to X" with "and `status = 'active'`" in one query, with predicate evaluation kept outside the vector pipeline.
+This is how filtered semantic search (`POST /stores/{ns}/semantic-search/filtered`) works: it evaluates the index predicate and passes a membership check as the `doc_filter` closure. That combines "semantically similar to X" with "and `status = 'active'`" in one query, with predicate evaluation kept outside the vector pipeline. Because the check runs in Pass 1, before top-k selection, it is a **pre-filter**: a selective predicate still gets up to `top_k` matching results, rather than whatever survives of an unfiltered top k.
+
+The predicate's matches are kept as the field index's row bitmap. Only when they are few (up to 10,000 rows) are they turned into a set of document keys, the cheapest test per candidate. A broader predicate would otherwise cost one key lookup and allocation per match on every request, before the search starts. Instead, each scanned chunk's document key is turned into its row id and tested against the bitmap. For a `u64` store the row id is the key itself, so there is no lookup; other stores look the key up in the row map.
 
 ---
 
@@ -431,13 +433,15 @@ The embedding service being unreachable is **never fatal**:
 
 ### Background worker
 
-`VecIndexWorker` runs as a single background tokio task. On startup it first **drains any surviving queue entries** (crash recovery), then loops, woken by a write `notify` signal or a 30 s fallback poll. Each pass:
+`VecIndexWorker` runs as a single background tokio task. On startup it first **drains any surviving queue entries** (crash recovery), then loops, woken by a write `notify` signal or a 30 s fallback poll.
 
-- Scans all pending queue entries and **skips exhausted ones** (`retry_count ≥ max_retries`).
-- Groups the remainder by namespace and visits them in **round-robin** order so no single namespace can starve others.
+The worker never reads the queue whole: its values are the documents' texts, and after a bulk load it can hold every document. It works in *rounds*. A round walks each namespace that has queued entries from its first entry to its last, with a cursor per namespace, and each *pass* of the round reads the next page (up to 1,024 entries) of every namespace. Another round follows while the last one carried out, failed or rewrote anything, so entries that arrived behind a cursor are picked up too. Each pass:
+
+- **Skips exhausted entries** (`retry_count ≥ max_retries`). They stay in the queue; the cursor moves past them, so they never hold up the entries behind them.
+- Groups the rest by namespace and visits them in **round-robin** order so no single namespace can starve others.
 - Calls `embed_document_floats` (one embedding call per document — whole text + chunks in a single ordered batch) for up to `concurrency` entries at once.
 - **On success:** writes the `VectorIndex` entries across all three companion namespaces. Written entries collect in a batch of up to 256; the batch is made durable with one fsync of the vector index WAL, and only then is each entry **completed** (removed from the queue). These are independent writes (not atomic), so a crash between them just re-processes the entry idempotently on the next pass.
-- **Completion is conditional.** A pass works from a snapshot of the whole queue, so an upsert or delete of a document can land between the snapshot and that entry's completion, for minutes during a bulk load. Completion and failure bookkeeping are each an atomic read-modify-write of the queue key (a `merge`) that only acts if the stored entry is still the one the worker took (same kind and text). Failure bookkeeping is WAL-backed; completion uses `merge_no_wal`, the same operation without a WAL entry (see *Queue durability* below):
+- **Completion is conditional.** A pass works from the page it read, so an upsert or delete of a document can land between that read and the entry's completion. Completion and failure bookkeeping are each an atomic read-modify-write of the queue key (a `merge`) that only acts if the stored entry is still the one the worker took (same kind and text). Failure bookkeeping is WAL-backed; completion uses `merge_no_wal`, the same operation without a WAL entry (see *Queue durability* below):
   - a newer upsert's entry is left for the next pass, so its text still gets embedded (otherwise the entry would be deleted and the stale vectors kept);
   - a failure never overwrites a newer entry with the older text;
   - if the entry has become a `Clear` tombstone, the document was deleted mid-embed, so the worker deletes the vectors it just wrote and retires the tombstone.
@@ -448,7 +452,7 @@ The worker's behaviour is tuned by the `[vector_index]` TOML section: `concurren
 
 ### Retry & exhaustion
 
-A failed entry is retried up to `max_retries` times (incrementing `retry_count` each failure, with a `retry_wait_secs` back-off between passes). Once `retry_count` reaches `max_retries` the entry is **exhausted**:
+A failed entry is retried up to `max_retries` times (incrementing `retry_count` each failure, with a `retry_wait_secs` back-off after a round with a failure). Once `retry_count` reaches `max_retries` the entry is **exhausted**:
 
 - It is **skipped on every subsequent pass** and **left in the queue** (never auto-deleted) for inspection.
 - Each pass logs a `WARN` that *N* entries have reached `max_retries` and await action.

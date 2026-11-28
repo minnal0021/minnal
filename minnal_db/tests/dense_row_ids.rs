@@ -101,7 +101,10 @@ async fn dense_bitmap_stays_compact() -> Result<(), KVError> {
 
     // Sanity: the query still returns every doc.
     db.sync_field_indexes().await?;
-    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#).await?.keys;
+    let active = db
+        .query_index_paginated(DEFAULT_NAMESPACE_ID, r#"status = "active""#, 0, usize::MAX)
+        .await?
+        .keys;
     assert_eq!(active.len(), n as usize);
 
     db.shutdown().await?;
@@ -131,7 +134,10 @@ async fn ids_survive_clean_restart() -> Result<(), KVError> {
     db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())
         .await?;
 
-    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#).await?.keys;
+    let active = db
+        .query_index_paginated(DEFAULT_NAMESPACE_ID, r#"status = "active""#, 0, usize::MAX)
+        .await?
+        .keys;
     let mut ids: Vec<u64> = active
         .iter()
         .map(|kb| access::<Archived<u64>, rancor::Error>(kb).unwrap().to_native())
@@ -143,7 +149,10 @@ async fn ids_survive_clean_restart() -> Result<(), KVError> {
     put_user(&db, 0, "inactive").await?;
     // The change reaches the index through the field-index worker: wait for it.
     db.sync_field_indexes().await?;
-    let active_after = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#).await?.keys;
+    let active_after = db
+        .query_index_paginated(DEFAULT_NAMESPACE_ID, r#"status = "active""#, 0, usize::MAX)
+        .await?
+        .keys;
     assert_eq!(active_after.len(), 99, "doc 0 must move out of 'active', not linger under a stale id");
 
     db.shutdown().await?;
@@ -185,7 +194,10 @@ async fn ids_rebuilt_by_wal_replay_after_crash() -> Result<(), KVError> {
     db.activate_field_index(DEFAULT_NAMESPACE_ID, field, IndexValueType::Str, status_extractor())
         .await?;
 
-    let active = db.query_index(DEFAULT_NAMESPACE_ID, r#"status = "active""#).await?.keys;
+    let active = db
+        .query_index_paginated(DEFAULT_NAMESPACE_ID, r#"status = "active""#, 0, usize::MAX)
+        .await?
+        .keys;
     let mut ids: Vec<u64> = active
         .iter()
         .map(|kb| access::<Archived<u64>, rancor::Error>(kb).unwrap().to_native())
