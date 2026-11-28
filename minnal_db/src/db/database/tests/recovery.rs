@@ -159,9 +159,10 @@ fn a_torn_tail_survives_reopen_append_and_gc() {
 
 /// Several single-op writes to one key, laid down in the
 /// WAL with sequences *out of physical order*, must resolve to the
-/// highest-sequence value. This directly exercises the sequence sort in
-/// recovery (a naive scan-order replay would pick the physically-last entry,
-/// which here has a lower sequence).
+/// highest-sequence value. Recovery replays in log order, which live writers
+/// keep equal to sequence order; this checks that a record older than the
+/// stored copy is still dropped (`replay_wins`), so a log out of order cannot
+/// put the physically-last, lower-sequence value back.
 #[test]
 fn test_recovery_applies_same_key_writes_in_sequence_order() {
     use crate::db::wal::{Wal, WalEntry, WalMetadata};

@@ -158,8 +158,20 @@ fn bench_wal_scan(c: &mut Criterion) {
         group.throughput(Throughput::Elements(num_entries));
         group.bench_function(&label, |b| {
             b.iter(|| {
-                let entries = wal.scan_entries(0, tail).unwrap();
-                black_box(entries.len())
+                // Recovery's read: every entry decoded, one at a time.
+                let mut n = 0usize;
+                wal.for_each_entry_of(
+                    0,
+                    tail,
+                    |_| true,
+                    |_, entry| {
+                        n += 1;
+                        black_box(entry);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                black_box(n)
             });
         });
     }

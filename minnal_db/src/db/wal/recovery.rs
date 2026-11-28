@@ -109,15 +109,23 @@ impl Database {
             return Ok(0);
         }
         let replay_from = wal_metadata.replay_from(NamespaceId::CATALOG);
-        let mut eligible: Vec<WalEntry> = self
-            .wal
-            .scan_entries(start, wal_metadata.tail)?
-            .into_iter()
-            .filter(|(pointer, entry)| entry.namespace_id == NamespaceId::CATALOG && pointer.offset >= replay_from)
-            .map(|(_, entry)| entry)
-            .collect();
-        eligible.sort_by_key(|e| e.sequence);
-        let (recovered, failed) = self.apply_wal_entries(eligible);
+        // Streamed in log order, which is sequence order (writers draw their
+        // sequence under the WAL lock; a record not newer than the stored copy is
+        // dropped in any case, `replay_wins`); other namespaces' entries are not
+        // decoded.
+        let mut replay = Replay::default();
+        self.wal.for_each_entry_of(
+            start,
+            wal_metadata.tail,
+            |ns| ns == NamespaceId::CATALOG,
+            |pointer, entry| {
+                if pointer.offset >= replay_from {
+                    replay.apply(self, entry);
+                }
+                Ok(())
+            },
+        )?;
+        let (recovered, failed) = replay.finish(self);
         if recovered + failed > 0 {
             info!("[RECOVERY] system catalog: replayed {recovered} record(s), {failed} failed (see the fail log)");
         }
@@ -140,16 +148,16 @@ impl Database {
 
         info!("[RECOVERY] Starting WAL recovery: replaying from {start} to {tail}");
 
-        let all_entries = self.wal.scan_entries(start, tail)?;
-
-        // Collect every eligible entry into a single flat list, then replay
-        // strictly in global sequence order.
+        // Replay every eligible entry as it is read, one at a time, in log order:
+        // the log can hold everything written since the cut, so it is never read
+        // into memory whole.
         //
         // Replaying in sequence order is essential for correctness: the *last*
         // write to a key by sequence must win after recovery, exactly as it did
         // before the crash. Sequence == WAL append order (writers allocate the
-        // sequence under the WAL lock), so sorting by sequence reproduces the
-        // original order.
+        // sequence under the WAL lock, `put_ns_locked`), so log order is that
+        // order; and a replayed record not newer than the stored copy is dropped
+        // anyway (`replay_wins`).
         //
         // Eligibility:
         //   • Entries below their namespace's saved safe offset are skipped:
@@ -170,36 +178,37 @@ impl Database {
         let known_namespaces: HashSet<NamespaceId> = self.stores.read().keys().copied().collect();
         let mut skipped_unknown_ns_count = 0u64;
         let mut warned_namespaces: HashSet<NamespaceId> = HashSet::new();
-        let mut eligible: Vec<WalEntry> = Vec::new();
         let mut skipped_flushed_count = 0u64;
-        for (pointer, entry) in all_entries {
-            if pointer.offset < wal_metadata.replay_from(entry.namespace_id) {
-                skipped_flushed_count += 1;
-                continue;
-            }
-            if entry.namespace_id == NamespaceId::CATALOG {
-                continue; // replayed first, by `recover_catalog_from_wal`
-            }
-            if !known_namespaces.contains(&entry.namespace_id) {
-                // Log once per namespace to avoid flooding the log when a deleted
-                // namespace had many un-persisted entries at crash time.
-                if warned_namespaces.insert(entry.namespace_id) {
-                    warn!(
-                        "[RECOVERY] Skipping WAL entries for unknown namespace ns={} \
-                         (likely a namespace deleted just before the crash). Its writes \
-                         will not be replayed.",
-                        entry.namespace_id
-                    );
+        let mut replay = Replay::default();
+        self.wal.for_each_entry_of(
+            start,
+            tail,
+            // Replayed first, by `recover_catalog_from_wal`.
+            |ns| ns != NamespaceId::CATALOG,
+            |pointer, entry| {
+                if pointer.offset < wal_metadata.replay_from(entry.namespace_id) {
+                    skipped_flushed_count += 1;
+                    return Ok(());
                 }
-                skipped_unknown_ns_count += 1;
-                continue;
-            }
-            eligible.push(entry);
-        }
-        // Stable sort by sequence so entries replay in their original order.
-        eligible.sort_by_key(|e| e.sequence);
-
-        let (recovered_count, error_count) = self.apply_wal_entries(eligible);
+                if !known_namespaces.contains(&entry.namespace_id) {
+                    // Log once per namespace to avoid flooding the log when a deleted
+                    // namespace had many un-persisted entries at crash time.
+                    if warned_namespaces.insert(entry.namespace_id) {
+                        warn!(
+                            "[RECOVERY] Skipping WAL entries for unknown namespace ns={} \
+                             (likely a namespace deleted just before the crash). Its writes \
+                             will not be replayed.",
+                            entry.namespace_id
+                        );
+                    }
+                    skipped_unknown_ns_count += 1;
+                    return Ok(());
+                }
+                replay.apply(self, entry);
+                Ok(())
+            },
+        )?;
+        let (recovered_count, error_count) = replay.finish(self);
 
         // Flush all namespaces that had recovered entries, then retire the whole
         // log: every replayed entry is in L0 now (or in the fail log, which is
@@ -227,56 +236,6 @@ impl Database {
         Ok(())
     }
 
-    /// Apply `eligible` (in sequence order) to their stores, retrying each
-    /// once *immediately* on failure, and write what still fails to the fail
-    /// log. Returns how many were applied and how many failed.
-    fn apply_wal_entries(&self, eligible: Vec<WalEntry>) -> (u64, u64) {
-        // Immediate (rather than deferred) retry is what preserves the ordering
-        // guarantee: a failed entry has no effect, so retrying it before
-        // moving on means a later write to the same key still lands afterwards.
-        let mut recovered_count = 0u64;
-        let mut error_count = 0u64;
-        let mut failed_entries: Vec<(WalEntry, String)> = Vec::new();
-
-        for entry in eligible {
-            match self.apply_wal_entry(&entry) {
-                Ok(()) => recovered_count += 1,
-                Err(e) => {
-                    warn!(
-                        "[RECOVERY] Apply failed for op '{}' key='{}' (ns={}): {}. Retrying once.",
-                        entry.op_name,
-                        display_key(&entry.key),
-                        entry.namespace_id,
-                        e
-                    );
-                    match self.apply_wal_entry(&entry) {
-                        Ok(()) => recovered_count += 1,
-                        Err(e2) => {
-                            error!(
-                                "[RECOVERY] Retry also failed for op '{}' key='{}' (ns={}): {}. \
-                                 Writing to fail log.",
-                                entry.op_name,
-                                display_key(&entry.key),
-                                entry.namespace_id,
-                                e2
-                            );
-                            error_count += 1;
-                            failed_entries.push((entry, e2.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Write any persistent failures to the fail log — one record per failed op.
-        if !failed_entries.is_empty() {
-            let failures: Vec<(&WalEntry, String)> = failed_entries.iter().map(|(e, msg)| (e, msg.clone())).collect();
-            crate::db::wal::wal_fail_log::write_fail_log(&self.fail_log_dir, &self.db_path, &failures);
-        }
-
-        (recovered_count, error_count)
-    }
-
     /// Apply a single WAL entry to its KV store.  Returns `Err` if the
     /// namespace is missing or the underlying storage write fails.
     ///
@@ -296,5 +255,59 @@ impl Database {
             }
             WalOperationType::Delete => kv_store.replay_delete(&entry.key, seq),
         }
+    }
+}
+
+/// Entries replayed so far: each is applied to its store as it is read,
+/// retried once *immediately* on failure, and one that still fails is kept for
+/// the fail log.
+///
+/// Immediate (rather than deferred) retry is what preserves the ordering
+/// guarantee: a failed entry has no effect, so retrying it before moving on
+/// means a later write to the same key still lands afterwards.
+#[derive(Default)]
+struct Replay {
+    recovered: u64,
+    failed: Vec<(WalEntry, String)>,
+}
+
+impl Replay {
+    fn apply(&mut self, db: &Database, entry: WalEntry) {
+        match db.apply_wal_entry(&entry) {
+            Ok(()) => self.recovered += 1,
+            Err(e) => {
+                warn!(
+                    "[RECOVERY] Apply failed for op '{}' key='{}' (ns={}): {}. Retrying once.",
+                    entry.op_name,
+                    display_key(&entry.key),
+                    entry.namespace_id,
+                    e
+                );
+                match db.apply_wal_entry(&entry) {
+                    Ok(()) => self.recovered += 1,
+                    Err(e2) => {
+                        error!(
+                            "[RECOVERY] Retry also failed for op '{}' key='{}' (ns={}): {}. \
+                             Writing to fail log.",
+                            entry.op_name,
+                            display_key(&entry.key),
+                            entry.namespace_id,
+                            e2
+                        );
+                        self.failed.push((entry, e2.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write what failed to the fail log (one record per failed op) and return
+    /// how many entries were applied and how many failed.
+    fn finish(self, db: &Database) -> (u64, u64) {
+        if !self.failed.is_empty() {
+            let failures: Vec<(&WalEntry, String)> = self.failed.iter().map(|(e, msg)| (e, msg.clone())).collect();
+            crate::db::wal::wal_fail_log::write_fail_log(&db.fail_log_dir, &db.db_path, &failures);
+        }
+        (self.recovered, self.failed.len() as u64)
     }
 }
