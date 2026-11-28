@@ -230,7 +230,7 @@ pub use kv_store::index_set::RowIdFn;
 /// Inverse of [`RowIdFn`]: reconstructs the raw key bytes from a row ID.
 ///
 /// Registering this alongside [`RowIdFn`] enables O(|hits|) query resolution
-/// in [`AsyncDb::query_index`] with zero memory overhead — no in-memory map needed.
+/// in [`AsyncDb::query_index_paginated`] with zero memory overhead — no in-memory map needed.
 pub use kv_store::index_set::RowToKeyFn;
 
 /// Namespace ID for the implicit default namespace.

@@ -31,6 +31,7 @@ impl Database {
     /// Only fields activated via `activate_field_index` are queryable.
     /// Unindexed fields in the predicate produce a [`KVError::Query`](crate::KVError::Query)
     /// carrying a [`crate::field_index::query::QueryError::InactiveField`].
+    #[cfg(test)]
     pub fn query_keys(&self, namespace_id: NamespaceId, query_str: &str) -> Result<QueryOutcome> {
         let store = self.get_store(namespace_id)?;
         let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;
@@ -120,10 +121,7 @@ impl Database {
     /// full match count (bitmap cardinality) and `page_keys` contains at most
     /// `limit` keys starting from `offset` in iteration order.
     ///
-    /// More efficient than [`query_keys`] when only a page of results is needed:
-    /// only the page's rows are resolved to keys.
-    ///
-    /// [`query_keys`]: Self::query_keys
+    /// Only the page's rows are resolved to keys, however many rows match.
     pub fn query_keys_paginated(&self, namespace_id: NamespaceId, query_str: &str, offset: usize, limit: usize) -> Result<QueryOutcome> {
         let store = self.get_store(namespace_id)?;
         let (bitmap, touched) = self.evaluate_predicate(namespace_id, &store, query_str)?;

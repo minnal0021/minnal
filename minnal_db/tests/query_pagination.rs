@@ -40,10 +40,10 @@ fn status_extractor() -> ExtractorFn {
 const PREDICATE: &str = r#"status = "active""#;
 
 /// Page through `PREDICATE` in `page_size` chunks and assert the walk reproduces
-/// the unpaginated result exactly — same keys, same order, no gaps, no repeats —
+/// one window holding every match exactly — same keys, same order, no gaps, no repeats —
 /// and that the reported total is stable across every page.
 async fn assert_paged_walk_matches_full_query(db: &AsyncDb, page_size: usize) -> Result<(), KVError> {
-    let full = db.query_index(DEFAULT_NAMESPACE_ID, PREDICATE).await?;
+    let full = db.query_index_paginated(DEFAULT_NAMESPACE_ID, PREDICATE, 0, usize::MAX).await?;
     assert!(!full.keys.is_empty(), "fixture should match something");
     assert!(!full.is_degraded(), "fixture index should be healthy");
 

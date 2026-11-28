@@ -34,8 +34,9 @@ pub struct FieldMeta {
 /// A bare `Vec` of keys would let a degraded index serve results that *look*
 /// complete, so a caller could not tell a genuinely empty result from a missing
 /// one. The status is carried here rather than only at the REST boundary because
-/// [`AsyncDb::query_index`](crate::AsyncDb::query_index) is a documented entry
-/// point of its own: flagging only in `doc_store` would leave embedders unwarned.
+/// [`AsyncDb::query_index_paginated`](crate::AsyncDb::query_index_paginated) is a
+/// documented entry point of its own: flagging only in `doc_store` would leave
+/// embedders unwarned.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueryOutcome {
     /// The matching keys. For a paginated query, only the requested window.

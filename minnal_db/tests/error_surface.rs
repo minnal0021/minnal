@@ -81,7 +81,10 @@ async fn invalid_predicates_surface_as_query_errors() {
     db.put(b"k1".to_vec(), b"active".to_vec()).await.unwrap();
 
     // A field with no index cannot be queried...
-    let err = db.query_index(DEFAULT_NAMESPACE_ID, r#"nosuchfield = "x""#).await.unwrap_err();
+    let err = db
+        .query_index_paginated(DEFAULT_NAMESPACE_ID, r#"nosuchfield = "x""#, 0, usize::MAX)
+        .await
+        .unwrap_err();
     match err {
         KVError::Query(inner) => {
             let named: QueryError = inner;
@@ -92,13 +95,16 @@ async fn invalid_predicates_surface_as_query_errors() {
     }
 
     // ...nor is a syntactically broken predicate an engine failure.
-    let err = db.query_index(DEFAULT_NAMESPACE_ID, "status === ").await.unwrap_err();
+    let err = db
+        .query_index_paginated(DEFAULT_NAMESPACE_ID, "status === ", 0, usize::MAX)
+        .await
+        .unwrap_err();
     assert!(matches!(err, KVError::Query(QueryError::Syntax { .. })), "got {err:?}");
 
     // The complexity bound reports itself as a query fault too, so the API can
     // answer 400 instead of appearing to have crashed.
     let deep = format!("{}status = \"active\"{}", "(".repeat(50_000), ")".repeat(50_000));
-    let err = db.query_index(DEFAULT_NAMESPACE_ID, deep).await.unwrap_err();
+    let err = db.query_index_paginated(DEFAULT_NAMESPACE_ID, deep, 0, usize::MAX).await.unwrap_err();
     assert!(matches!(err, KVError::Query(QueryError::TooComplex { .. })), "got {err:?}");
 
     db.shutdown().await.unwrap();

@@ -38,7 +38,6 @@ impl Database {
     /// replay during activation uses the same row IDs that future writes will
     /// produce.
     ///
-    /// [`query_keys`]: Self::query_keys
     /// [`activate_field_index`]: Self::activate_field_index
     pub fn set_row_id_fn(
         &self,
