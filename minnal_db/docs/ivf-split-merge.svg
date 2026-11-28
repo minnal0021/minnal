@@ -51,7 +51,8 @@
 <text class="t2" x="44" y="64" font-size="13">Chunks stay where they are. What changes is the posting each one is filed under, and the centres that route new chunks.</text>
 <style>
   .halo { paint-order: stroke; stroke: #f2f1ec; stroke-width: 4px; stroke-linejoin: round; }
-  @media (prefers-color-scheme: dark) { .halo { stroke: #1f1f24; } }
+  .outline { fill: none; stroke: #0b0b0b; }
+  @media (prefers-color-scheme: dark) { .halo { stroke: #1f1f24; } .outline { stroke: #f4f4f2; } }
 </style>
 <rect class="panel" x="44" y="92" width="420" height="420" rx="10"/>
 <g><animate attributeName="opacity" calcMode="discrete" values="1;1;1;1;0;0;0;0;0;0;0;0;0" keyTimes="0.00000;0.07692;0.15385;0.23077;0.30769;0.38462;0.46154;0.53846;0.61538;0.69231;0.76923;0.84615;0.92308" dur="36.4s" repeatCount="indefinite"/><polygon points="58.0,106.0 450.0,106.0 450.0,498.0 58.0,498.0" fill="#86857f" fill-opacity="0.10" stroke="#86857f" stroke-opacity="0.45" stroke-dasharray="4 4" stroke-width="1"/></g>

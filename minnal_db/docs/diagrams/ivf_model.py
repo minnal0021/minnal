@@ -164,25 +164,65 @@ class Partition:
             self._move(m, dest)
         return drained, kept
 
+    def maintain(self, rounds=100):
+        """What the maintenance task does after writes: split every posting
+        over the split limit (each followed by its reassignment), then merge
+        every posting at the merge limit, until nothing is left to do."""
+        for _ in range(rounds):
+            big = self.over_split_limit()
+            if big:
+                halves = self.split(big[0])
+                if halves:
+                    self.reassign(big[0], halves)
+                    continue
+            small = self.at_merge_limit()
+            if small and self.merge(small[0]):
+                continue
+            return
+
+    def read_postings(self, query, max_probes):
+        """The postings a search reads: the `max_probes` active postings whose
+        centres are nearest the query."""
+        return sorted(self.active(), key=lambda p: (dist2(query, self.centre_of(p)), p))[:max_probes]
+
+    # A rebuild, in the steps ivf_split/rebuild.rs takes them.
+    def plan_rebuild(self, k=None, seed=3, iterations=20):
+        """Plan: k-means over every chunk, as many centres as active postings.
+        A centre no chunk is nearest is dropped. Nothing changes yet."""
+        self.moved = set()
+        pts = [self.chunks[i]["pos"] for i in sorted(self.chunks)]
+        centres = kmeans(pts, k or len(self.active()), seed, iterations)
+        used = sorted({min(range(len(centres)), key=lambda j: dist2(p, centres[j])) for p in pts})
+        return [centres[j] for j in used]
+
+    def publish_rebuild(self, centres):
+        """Prepare and publish: the new postings, empty; the old ones draining."""
+        self.moved = set()
+        old = self.active()
+        new = [self._new_posting(c, "rebuild") for c in centres]
+        for p in old:
+            self.postings[p]["state"] = "draining"
+        return old, new
+
+    def copy_rebuild(self, new):
+        """Copy: every chunk to its nearest new posting."""
+        self.moved = set()
+        for i in sorted(self.chunks):
+            dest = min(new, key=lambda q: (dist2(self.chunks[i]["pos"], self.centre_of(q)), q))
+            self._move(i, dest)
+
+    def retire_rebuild(self, old):
+        """Retire: the drained postings."""
+        self.moved = set()
+        for p in old:
+            self.postings[p]["state"] = "retired"
+
     def rebuild(self, k=None, seed=3, iterations=20):
         """Refit the partition with k-means over every chunk; every chunk moves
         to its nearest new posting. Returns the new postings."""
-        self.moved = set()
-        old = self.active()
-        k = k or len(old)
-        ids = sorted(self.chunks)
-        pts = [self.chunks[i]["pos"] for i in ids]
-        centres = kmeans(pts, k, seed, iterations)
-        # A centre no chunk is nearest is dropped.
-        used = sorted({min(range(len(centres)), key=lambda j: dist2(p, centres[j])) for p in pts})
-        new = [self._new_posting(centres[j], "rebuild") for j in used]
-        for p in old:
-            self.postings[p]["state"] = "draining"
-        for i in ids:
-            dest = min(new, key=lambda q: (dist2(self.chunks[i]["pos"], self.centre_of(q)), q))
-            self._move(i, dest)
-        for p in old:
-            self.postings[p]["state"] = "retired"
+        old, new = self.publish_rebuild(self.plan_rebuild(k, seed, iterations))
+        self.copy_rebuild(new)
+        self.retire_rebuild(old)
         return new
 
     # ── what a picture needs ─────────────────────────────────────────────

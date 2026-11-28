@@ -26,7 +26,8 @@ PAD = 14
 # chunk or a boundary behind them never makes them hard to read.
 HALO_STYLE = """<style>
   .halo { paint-order: stroke; stroke: #f2f1ec; stroke-width: 4px; stroke-linejoin: round; }
-  @media (prefers-color-scheme: dark) { .halo { stroke: #1f1f24; } }
+  .outline { fill: none; stroke: #0b0b0b; }
+  @media (prefers-color-scheme: dark) { .halo { stroke: #1f1f24; } .outline { stroke: #f4f4f2; } }
 </style>"""
 
 # Where a centre's label may go, relative to the centre: (dx, dy, anchor).
@@ -95,11 +96,13 @@ def cells(centres):
     return res
 
 
-def draw_plane(anim, snaps, x, y, size, colours=None, op_labels=None, query=None):
+def draw_plane(anim, snaps, x, y, size, colours=None, op_labels=None, planned=None, query=None):
     """The plane of chunks and centres, `size` px square at (x, y).
 
-    `query`: optional per-step value None or (pos, read_postings, nearest_ids)
-    for a query marker, the postings it reads and its true nearest chunks."""
+    `planned`: optional per-step None or a tuple of centre positions k-means
+    has fitted but no posting uses yet (drawn as dashed crosses).
+    `query`: optional per-step None or (pos, read_postings, nearest_chunk_ids):
+    a query, the postings it reads (outlined) and its nearest chunks (ringed)."""
     inner = size - 2 * PAD
     X = lambda v: round(x + PAD + v / 100 * inner, 1)
     Y = lambda v: round(y + PAD + v / 100 * inner, 1)
@@ -175,13 +178,44 @@ def draw_plane(anim, snaps, x, y, size, colours=None, op_labels=None, query=None
 
         out.append(anim.states([s["chunks"].get(i) for s in snaps], render))
 
+    if planned:
+        def render_planned(v):
+            parts = []
+            for cx, cy in v:
+                px, py, r = X(cx), Y(cy), 8
+                parts.append(f'<circle cx="{px}" cy="{py}" r="11" fill="none" class="line" stroke-width="1.4" '
+                             f'stroke-dasharray="3 2"/>'
+                             f'<path d="M {px - r} {py - r} L {px + r} {py + r} M {px - r} {py + r} L {px + r} {py - r}" '
+                             f'class="line" stroke-width="2.4" stroke-dasharray="3 2"/>')
+            return "".join(parts)
+        out.append(anim.states(planned, render_planned))
+
     if query:
+        def q_state(i, s):
+            v = query[i]
+            if v is None:
+                return None
+            pos, read, nearest = v
+            areas = tuple(sorted((p, s["centres"][c]) for p, (c, st, _) in s["postings"].items() if st == "active"))
+            near = tuple(s["chunks"][c][0] for c in nearest)
+            return (pos, tuple(read), near, areas)
+
         def render_q(v):
-            (qx, qy), _, nearest = v
+            (qx, qy), read, near, areas = v
+            parts = []
+            for pid, poly in cells(list(areas)):
+                if pid in read and len(poly) >= 3:
+                    pts = " ".join(f"{X(px)},{Y(py)}" for px, py in poly)
+                    parts.append(f'<polygon points="{pts}" class="outline" stroke-width="2.4"/>')
+            for cx, cy in near:
+                parts.append(f'<circle cx="{X(cx)}" cy="{Y(cy)}" r="10.5" class="outline" stroke-width="2"/>')
             px, py = X(qx), Y(qy)
-            return (f'<path d="M {px} {py - 9} L {px + 9} {py} L {px} {py + 9} L {px - 9} {py} Z" class="pill-on" '
-                    f'stroke-width="2"/>' + text(px + 12, py + 4, "query", "t1", 11, extra=' font-weight="700"'))
-        out.append(anim.states(query, render_q))
+            parts.append(f'<path d="M {px} {py - 9} L {px + 9} {py} L {px} {py + 9} L {px - 9} {py} Z" class="pill-on" '
+                         f'stroke-width="2"/>')
+            parts.append(text(px - 13, py + 4, "query", "t1 halo", 11, "end", ' font-weight="700"'))
+            return "".join(parts)
+
+        out.append(anim.states([q_state(i, s) for i, s in enumerate(snaps)], render_q))
 
     if op_labels:
         out.append(anim.states(op_labels, lambda v: (
@@ -205,7 +239,8 @@ def plane_legend(x, y):
     return "\n".join(parts)
 
 
-def draw_sizes(anim, snaps, x, y, w, split_limit, merge_limit, max_chunks, rows, colours=None, row_h=30):
+def draw_sizes(anim, snaps, x, y, w, split_limit, merge_limit, max_chunks, rows, colours=None, row_h=30,
+               only=None, extra_counter=None):
     """One row per posting (in creation order): its size against the limits,
     then the counters."""
     label_w, bar_x0 = 44, x + 44
@@ -219,7 +254,7 @@ def draw_sizes(anim, snaps, x, y, w, split_limit, merge_limit, max_chunks, rows,
         lx = round(bar_x0 + v * unit, 1)
         out.append(f'<line class="axis" x1="{lx}" y1="{top - 8}" x2="{lx}" y2="{bottom - 6}" stroke-dasharray="4 3"/>')
         out.append(text(lx + (4 if anchor == "start" else -4), top - 14, name, "t3", 10.5, anchor))
-    ids = sorted({p for s in snaps for p in s["postings"]})
+    ids = sorted({p for s in snaps for p in s["postings"]} if only is None else only)
     assert len(ids) <= rows, (ids, rows)
     for row, pid in enumerate(ids):
         ry = top + row * row_h
@@ -261,11 +296,15 @@ def draw_sizes(anim, snaps, x, y, w, split_limit, merge_limit, max_chunks, rows,
         return (active, retired, len(s["centres"]), s["moves"], f"{foreign} of {chunks}")
 
     labels = ["active postings", "retired", "centres stored", "chunk moves", "hollow chunks"]
-    xs = [x, x + 112, x + 186, x + 286, x + 0]
+    xs = [x, x + 112, x + 186, x + 286]
     for i, lab in enumerate(labels[:4]):
         out.append(text(xs[i], cy, lab, "t3 mono", 10.5))
     out.append(text(x, cy + 54, labels[4], "t3 mono", 10.5))
     out.append(anim.states([counters(s) for s in snaps], lambda v: "".join(
         text(xs[i], cy + 24, str(v[i]), "t1 mono", 18, extra=' font-weight="700"') for i in range(4))
         + text(x, cy + 78, v[4], "t1 mono", 18, extra=' font-weight="700"')))
+    if extra_counter:
+        label, values = extra_counter
+        out.append(text(xs[2], cy + 54, label, "t3 mono", 10.5))
+        out.append(anim.states(values, lambda v: text(xs[2], cy + 78, v, "t1 mono", 18, extra=' font-weight="700"')))
     return "\n".join(out)
