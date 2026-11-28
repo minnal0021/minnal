@@ -576,7 +576,7 @@ impl Wal {
 
     /// Call `visit` for every entry in `[start, end)` whose namespace `wanted`
     /// accepts, in log order, one entry at a time: unlike
-    /// [`scan_entries`](Self::scan_entries) nothing is collected, so memory is
+    /// `scan_entries` (test-only) nothing is collected, so memory is
     /// one entry however long the range, and an entry `wanted` refuses is never
     /// decoded (its value is not copied).
     pub fn for_each_entry_of(

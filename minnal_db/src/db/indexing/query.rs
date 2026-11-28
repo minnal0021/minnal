@@ -63,7 +63,7 @@ impl Database {
     /// index lookup closure exactly once per field it needs, so recording those
     /// ids is both free and exact — no second parse, and no risk of the two
     /// disagreeing about which fields a query touched.
-    fn evaluate_predicate(
+    pub(super) fn evaluate_predicate(
         &self,
         namespace_id: NamespaceId,
         store: &Arc<KVStore>,
@@ -108,7 +108,7 @@ impl Database {
     /// One marker read per touched field — a predicate references a handful of
     /// fields, not the whole schema, so this is bounded by the query rather than
     /// by the namespace.
-    fn degraded_among(&self, namespace_id: NamespaceId, touched: &[FieldId]) -> Vec<FieldId> {
+    pub(super) fn degraded_among(&self, namespace_id: NamespaceId, touched: &[FieldId]) -> Vec<FieldId> {
         touched
             .iter()
             .copied()
@@ -747,7 +747,7 @@ mod differential_tests {
 /// lookup per row. A namespace with an active field index always has one of
 /// the two (`activate_field_index` loads the row map, and a `RowIdFn` is
 /// registered with its inverse), so the error is an internal fault.
-fn keys_for_rows(store: &KVStore, rows: impl Iterator<Item = u128>) -> Result<Vec<Vec<u8>>> {
+pub(super) fn keys_for_rows(store: &KVStore, rows: impl Iterator<Item = u128>) -> Result<Vec<Vec<u8>>> {
     if let Some(inv) = &*store.row_to_key_fn.read() {
         return Ok(rows.map(|row_id| inv(row_id)).collect());
     }

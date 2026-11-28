@@ -383,7 +383,9 @@ Pass 2 scores each candidate against a **single whole-query dense embedding** â€
 
 `doc_filter` is an optional closure `Fn(&[u8]) -> bool` applied **only in Pass 1**, per document, before scoring. Documents that fail the filter are excluded from both passes. Pass 2 operates on the already-filtered `sparse_ranked` list and never re-evaluates the predicate.
 
-This is how filtered semantic search (`POST /stores/{ns}/semantic-search/filtered`) works: it evaluates the index predicate into the set of matching doc IDs and passes a membership check as the `doc_filter` closure. That combines "semantically similar to X" with "and `status = 'active'`" in one query, with predicate evaluation kept outside the vector pipeline.
+This is how filtered semantic search (`POST /stores/{ns}/semantic-search/filtered`) works: it evaluates the index predicate and passes a membership check as the `doc_filter` closure. That combines "semantically similar to X" with "and `status = 'active'`" in one query, with predicate evaluation kept outside the vector pipeline. Because the check runs in Pass 1, before top-k selection, it is a **pre-filter**: a selective predicate still gets up to `top_k` matching results, rather than whatever survives of an unfiltered top k.
+
+The predicate's matches are kept as the field index's row bitmap. Only when they are few (up to 10,000 rows) are they turned into a set of document keys, the cheapest test per candidate. A broader predicate would otherwise cost one key lookup and allocation per match on every request, before the search starts. Instead, each scanned chunk's document key is turned into its row id and tested against the bitmap. For a `u64` store the row id is the key itself, so there is no lookup; other stores look the key up in the row map.
 
 ---
 

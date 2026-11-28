@@ -402,3 +402,53 @@ async fn a_model_or_dimension_the_server_lacks_is_rejected_on_create_and_enable(
     store.shutdown_vec_index_worker().await;
     store.shutdown().await.unwrap();
 }
+
+/// A filtered search filters candidates *before* top-k selection (a
+/// pre-filter): with every document scored, it returns exactly the documents
+/// the predicate matches and no other. Run on a `u64` store (row ids from the
+/// key) and a `str` store (row ids from the row map), with more matches than
+/// the tests' key-set limit, so each tests its keys against the bitmap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filtered_search_returns_exactly_the_matching_documents() {
+    let (url, _seen) = spawn_text_service();
+    for str_keys in [false, true] {
+        let db_dir = TempDir::new().unwrap();
+        let store = open_with(db_dir.path(), |b| b.semantic_search(context(&url))).await;
+        let mut schema = semantic_schema("g", Some(spec(r#"{"embedding_dim":8}"#)));
+        if str_keys {
+            schema.key_type = KeyType::Str;
+        }
+        schema.indices = vec![IndexSpec {
+            field: "tag".to_owned(),
+            index_type: IndexType::Str,
+        }];
+        store.create(schema).await.unwrap();
+        let key = |i: u64| -> (DocId, Vec<u8>) {
+            if str_keys {
+                let s = format!("d{i:03}");
+                (DocId::Str(StrKey::new(&s).unwrap()), s.into_bytes())
+            } else {
+                (DocId::U64(i), i.to_be_bytes().to_vec())
+            }
+        };
+        for i in 0..12u64 {
+            let tag = if i % 3 == 0 { "a" } else { "b" };
+            let text = format!("Doc {i} one. Doc {i} two. Doc {i} three.");
+            store.put("g", key(i).0, serde_json::json!({"text": text, "tag": tag})).await.unwrap();
+        }
+        wait_for_empty_queue(&store).await;
+        store.sync_field_indexes().await.unwrap();
+
+        let page = store
+            .search_semantic_filtered("g", "Doc one", "tag = 'a'", &SearchSpec::default(), Pagination::new(1, 100))
+            .await
+            .unwrap();
+        let mut got: Vec<Vec<u8>> = page.results.iter().map(|r| r.document_id.clone()).collect();
+        got.sort();
+        let mut want: Vec<Vec<u8>> = (0..12u64).filter(|i| i % 3 == 0).map(|i| key(i).1).collect();
+        want.sort();
+        assert_eq!(got, want, "str keys: {str_keys}");
+        assert!(page.degraded_fields.is_empty());
+        store.shutdown().await.unwrap();
+    }
+}
